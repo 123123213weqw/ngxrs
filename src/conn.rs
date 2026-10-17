@@ -5,7 +5,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
 use crate::http::request::{HttpError, Request};
@@ -24,8 +24,74 @@ impl From<io::Error> for RecvError {
     }
 }
 
+/// Plain TCP or a TLS session over TCP. `sendfile(2)` only applies to the
+/// former, so TLS falls back to a buffered copy.
+pub enum Stream {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
+}
+
+impl Stream {
+    fn tcp(&self) -> Option<&TcpStream> {
+        match self {
+            Stream::Plain(s) => Some(s),
+            Stream::Tls(s) => Some(s.get_ref().0),
+        }
+    }
+
+    pub fn is_tls(&self) -> bool {
+        matches!(self, Stream::Tls(_))
+    }
+}
+
+impl AsyncRead for Stream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            Stream::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            Stream::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for Stream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Stream::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            Stream::Tls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            Stream::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
+            Stream::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            Stream::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            Stream::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
 pub struct Conn {
-    stream: TcpStream,
+    stream: Stream,
     pub peer: SocketAddr,
     pub tcp_nopush: bool,
     buf: Vec<u8>,
@@ -36,7 +102,7 @@ pub struct Conn {
 }
 
 impl Conn {
-    pub fn new(stream: TcpStream, peer: SocketAddr, tcp_nopush: bool) -> Self {
+    pub fn new(stream: Stream, peer: SocketAddr, tcp_nopush: bool) -> Self {
         Conn {
             stream,
             peer,
@@ -57,10 +123,11 @@ impl Conn {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
+            let Some(tcp) = self.stream.tcp() else { return };
             let v: libc::c_int = i32::from(on);
             unsafe {
                 libc::setsockopt(
-                    self.stream.as_raw_fd(),
+                    tcp.as_raw_fd(),
                     libc::IPPROTO_TCP,
                     libc::TCP_CORK,
                     &v as *const libc::c_int as *const libc::c_void,
@@ -75,7 +142,9 @@ impl Conn {
     }
 
     pub fn set_read_timeout(&self, dur: Duration) -> io::Result<()> {
-        self.stream.set_nodelay(true)?;
+        if let Some(tcp) = self.stream.tcp() {
+            tcp.set_nodelay(true)?;
+        }
         // tokio has no per-socket read timeout; the handler wraps reads in
         // tokio::time::timeout, so this is deliberately a no-op placeholder.
         let _ = dur;
@@ -267,9 +336,6 @@ impl Conn {
 
     /// Hand this connection's socket to a bidirectional pipe (WebSocket).
     pub async fn pipe_with(&mut self, mut upstream: TcpStream) -> io::Result<()> {
-        // `self.stream` cannot be moved out, so split the piping work: copy
-        // client->upstream on this task and upstream->client on a helper task
-        // that owns a cloned handle.
         let _ = tokio::io::copy_bidirectional(&mut self.stream, &mut upstream).await;
         Ok(())
     }
@@ -279,7 +345,31 @@ impl Conn {
     }
 
     pub async fn send_file(&mut self, file: &File, offset: u64, len: u64) -> io::Result<u64> {
-        send_file_impl(&mut self.stream, file, offset, len).await
+        match &mut self.stream {
+            Stream::Plain(tcp) => send_file_impl(tcp, file, offset, len).await,
+            // TLS cannot use sendfile: copy through a bounded buffer instead.
+            stream => {
+                use std::os::unix::fs::FileExt;
+                let mut remaining = len;
+                let mut pos = offset;
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut sent = 0u64;
+                while remaining > 0 {
+                    let want = remaining.min(buf.len() as u64) as usize;
+                    let n = match file.read_at(&mut buf[..want], pos) {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(e),
+                    };
+                    stream.write_all(&buf[..n]).await?;
+                    pos += n as u64;
+                    remaining -= n as u64;
+                    sent += n as u64;
+                }
+                Ok(sent)
+            }
+        }
     }
 
     pub async fn shutdown(&mut self) {

@@ -19,6 +19,8 @@ use request::{Method, Request};
 pub struct Ctx {
     pub config: Arc<Config>,
     pub logger: Arc<Logger>,
+    /// One TLS configuration per listen group (`None` for plain HTTP).
+    pub tls: Arc<Vec<Option<Arc<rustls::ServerConfig>>>>,
 }
 
 pub enum Body {

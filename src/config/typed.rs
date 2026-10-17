@@ -153,6 +153,11 @@ pub struct Server {
     pub error_pages: BTreeMap<u16, String>,
     pub access_log_off: bool,
     pub regex_names: Vec<regex::Regex>,
+    // ---- TLS ----
+    pub ssl: bool,
+    pub ssl_certificate: Option<PathBuf>,
+    pub ssl_certificate_key: Option<PathBuf>,
+    pub http2: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +165,8 @@ pub struct ListenGroup {
     pub addr: SocketAddr,
     pub servers: Vec<usize>,
     pub default_server: usize,
+    /// True when any server on this socket enabled TLS.
+    pub ssl: bool,
 }
 
 #[derive(Debug)]
@@ -808,6 +815,10 @@ impl Builder {
         let mut keepalive = http_keepalive;
         let mut tokens = http_tokens;
         let mut access_log_off = false;
+        let mut ssl = false;
+        let mut http2 = false;
+        let mut ssl_certificate: Option<PathBuf> = None;
+        let mut ssl_certificate_key: Option<PathBuf> = None;
 
         for child in block {
             match child.name.as_str() {
@@ -829,6 +840,12 @@ impl Builder {
                     let is_default = child.args[1..]
                         .iter()
                         .any(|p| p == "default_server" || p == "default");
+                    if child.args[1..].iter().any(|p| p == "ssl") {
+                        ssl = true;
+                    }
+                    if child.args[1..].iter().any(|p| p == "http2" || p == "quic") {
+                        http2 = true;
+                    }
                     listens.push((addr, is_default));
                 }
                 "server_name" => names.extend(child.args.iter().cloned()),
@@ -864,6 +881,26 @@ impl Builder {
                         keepalive = parse_time(v)
                             .ok_or_else(|| sem(&child.file, child.line, "invalid keepalive_timeout"))?;
                     }
+                }
+                "ssl_certificate" => {
+                    if let Some(v) = child.args.first() {
+                        ssl_certificate = Some(resolve_path(&self.prefix, v));
+                        ssl = true;
+                    }
+                }
+                "ssl_certificate_key" => {
+                    if let Some(v) = child.args.first() {
+                        ssl_certificate_key = Some(resolve_path(&self.prefix, v));
+                        ssl = true;
+                    }
+                }
+                "ssl_protocols" | "ssl_ciphers" | "ssl_prefer_server_ciphers"
+                | "ssl_session_cache" | "ssl_session_timeout" | "ssl_session_tickets"
+                | "ssl_dhparam" | "ssl_ecdh_curve" | "ssl_stapling" | "ssl_stapling_verify"
+                | "ssl_buffer_size" | "ssl_verify_client" | "ssl_client_certificate"
+                | "ssl_trusted_certificate" | "ssl_early_data" | "ssl_conf_command"
+                | "http2_max_field_size" | "http2_max_header_size" | "http2_idle_timeout" => {
+                    // Parsed and accepted; rustls picks safe defaults.
                 }
                 "server_tokens" => {
                     if let Some(v) = child.args.first() {
@@ -913,6 +950,10 @@ impl Builder {
                 server_tokens: tokens,
                 access_log_off,
                 regex_names,
+                ssl,
+                ssl_certificate,
+                ssl_certificate_key,
+                http2,
             },
             listens,
         ))
@@ -1177,6 +1218,7 @@ pub fn build(
                 addr,
                 servers: Vec::new(),
                 default_server: 0,
+                ssl: false,
             });
             if addr.ip().is_unspecified() {
                 group.addr = addr;
@@ -1186,6 +1228,9 @@ pub fn build(
             }
             if is_default {
                 group.default_server = idx;
+            }
+            if http.servers[idx].ssl {
+                group.ssl = true;
             }
         }
     }

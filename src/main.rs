@@ -5,6 +5,7 @@ mod log;
 mod gzip;
 mod instr;
 mod net;
+mod tls;
 mod proxy;
 mod util;
 

@@ -155,8 +155,62 @@ pub async fn handle_conn(mut conn: Conn, group: &ListenGroup, ctx: &Ctx) {
             }
             Ok(Err(RecvError::Io(_e))) => break,
             Ok(Err(RecvError::Bad(e))) => {
-                let tokens = http.server(group.default_server).server_tokens;
-                let _ = send_error(&mut conn, e.status, tokens, false, false).await;
+                // nginx runs error_page even for requests its parser rejects
+                // (e.g. `Host: .`), using the default server of this socket.
+                let default_server = http.server(group.default_server);
+                let peer = conn.peer.ip().to_string();
+                let synthetic = Request {
+                    method: Method::Get,
+                    raw_target: "/".to_string(),
+                    version_minor: 0,
+                    headers: crate::http::request::Headers::default(),
+                    body_len: 0,
+                    chunked: false,
+                    keepalive: false,
+                    host: None,
+                    expect_continue: false,
+                };
+                let mut resp = error_response(e.status, default_server.server_tokens);
+                let custom: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
+                let resp = finalize_response(
+                    &synthetic,
+                    &mut resp,
+                    "/",
+                    "",
+                    default_server,
+                    http,
+                    &peer,
+                    group.addr.port(),
+                    &[],
+                    &custom,
+                    ConnState {
+                        requests: 0,
+                        started: std::time::Instant::now(),
+                    },
+                    &conn.local_addr().map(|a| a.ip().to_string()).unwrap_or_default(),
+                )
+                .await;
+                // A redirect produced by the error page still needs the
+                // absolute/port/server_name rewriting.
+                if matches!(resp.status, 301 | 302 | 303 | 307 | 308) {
+                    let loc = default_server.default_loc.clone();
+                    let local = conn.local_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+                    let _ = write_redirect(
+                        &mut conn,
+                        &synthetic,
+                        resp,
+                        &loc,
+                        group.addr.port(),
+                        default_server.server_tokens,
+                        &local,
+                    )
+                    .await;
+                } else {
+                    let _ =
+                        write_response(&mut conn, resp, false, default_server.server_tokens, false)
+                            .await;
+                }
                 break;
             }
             Ok(Ok(None)) => break,
@@ -214,6 +268,12 @@ pub async fn handle_conn(mut conn: Conn, group: &ListenGroup, ctx: &Ctx) {
             requests: served,
             started: conn_started,
         };
+        // Local address of this connection (nginx uses it when the Host header
+        // is missing or unusable).
+        let local_ip = conn
+            .local_addr()
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
         let outcome = dispatch(
             &mut conn,
             &req,
@@ -225,6 +285,7 @@ pub async fn handle_conn(mut conn: Conn, group: &ListenGroup, ctx: &Ctx) {
             group.addr.port(),
             &captures,
             state,
+            &local_ip,
         )
         .await;
         let elapsed = started.elapsed().unwrap_or_default();
@@ -276,13 +337,31 @@ async fn route(
     allow_internal: bool,
     vars: &ServerVars<'_>,
 ) -> Response {
+    let peer_addr: std::net::IpAddr = vars
+        .peer_ip
+        .parse()
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+
+    // ngx_http_access_module runs in the ACCESS phase, before the content
+    // phase can reject the method with 405.
+    if crate::config::access_denied(&loc.access, peer_addr) {
+        return error_response(403, server.server_tokens);
+    }
+    for le in &loc.limit_except {
+        // `limit_except` applies to every method *except* the listed ones.
+        let m = req.method.as_str();
+        if !le.methods.iter().any(|x| x == m) && crate::config::access_denied(&le.rules, peer_addr) {
+            return error_response(403, server.server_tokens);
+        }
+    }
+
     if !req.method.is_read() {
         return error_response(405, server.server_tokens);
     }
 
     // A location named `/foo/` makes `/foo` redirect to `/foo/`.
     if let Some(location) = server.auto_redirect(path) {
-        let mut target = location;
+        let mut target = util::escape_uri(&location);
         if !query.is_empty() {
             target.push('?');
             target.push_str(query);
@@ -378,7 +457,18 @@ fn get_var(name: &str, v: &RwVars<'_>) -> String {
         _ => {
             if let Some(h) = bare.strip_prefix("http_") {
                 let key = h.replace('_', "-");
-                v.req.headers.get(&key).unwrap_or("").to_string()
+                v.req.headers.get_joined(&key).unwrap_or_default()
+            } else if let Some(want) = bare.strip_prefix("arg_") {
+                v.query
+                    .split('&')
+                    .filter_map(|p| p.split_once('='))
+                    .find(|(k, _)| k.eq_ignore_ascii_case(want))
+                    .map(|(_, val)| val.to_string())
+                    .unwrap_or_default()
+            } else if let Some(want) = bare.strip_prefix("cookie_") {
+                cookie_value(v.req, want)
+            } else if bare == "is_args" || bare == "query_string" || bare == "args" {
+                v.query.to_string()
             } else {
                 String::new()
             }
@@ -440,13 +530,38 @@ fn apply_rewrites(
     server: &Server,
     default_type: &str,
 ) -> RewriteOutcome {
+    apply_rewrites_parts(
+        req,
+        path,
+        query,
+        &loc.sets,
+        &loc.ifs,
+        &loc.rewrites,
+        server,
+        default_type,
+    )
+}
+
+/// Same, but with the three directive lists supplied explicitly (server-level
+/// `set`/`if` have no location of their own).
+#[allow(clippy::too_many_arguments)]
+fn apply_rewrites_parts(
+    req: &Request,
+    path: &str,
+    query: &str,
+    sets: &[(String, String)],
+    ifs: &[crate::config::IfBlock],
+    rewrites: &[crate::config::Rewrite],
+    server: &Server,
+    default_type: &str,
+) -> RewriteOutcome {
     let mut uri = path.to_string();
     let mut args = query.to_string();
     let _ = req;
 
     // `set` runs first; the values feed `if` conditions and rewrites.
     let mut vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for (name, value) in &loc.sets {
+    for (name, value) in sets {
         let ctx = RwVars {
             req,
             path: &uri,
@@ -458,7 +573,7 @@ fn apply_rewrites(
     }
 
     // `if` blocks
-    for ifb in &loc.ifs {
+    for ifb in ifs {
         let ctx = RwVars {
             req,
             path: &uri,
@@ -503,7 +618,7 @@ fn apply_rewrites(
         }
     }
 
-    for rw in &loc.rewrites {
+    for rw in rewrites {
         if let Some(out) = apply_one(rw, &mut uri, &mut args) {
             return out;
         }
@@ -612,6 +727,60 @@ fn expand_captures(replacement: &str, caps: &regex::Captures<'_>) -> String {
     out
 }
 
+/// Split rendered header lines back into (name, value) pairs.
+pub fn split_head(raw: &[u8]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in String::from_utf8_lossy(raw).split("\r\n") {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            out.push((k.trim().to_string(), v.trim().to_string()));
+        }
+    }
+    out
+}
+
+/// Decode the user part of an HTTP Basic credential.
+fn base64_decode_user(b64: &str) -> Option<String> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out: Vec<u8> = Vec::with_capacity(b64.len());
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    for ch in b64.bytes() {
+        let v = match ch {
+            b'=' => break,
+            c => TABLE.iter().position(|t| *t == c)? as u32,
+        };
+        buf = (buf << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    let text = String::from_utf8_lossy(&out).to_string();
+    text.split_once(':').map(|(u, _)| u.to_string())
+}
+
+/// `$cookie_name`: the value of a request cookie, `, `-joined across repeats.
+fn cookie_value(req: &Request, want: &str) -> String {
+    let Some(cookie) = req.headers.get_joined("cookie") else {
+        return String::new();
+    };
+    let mut out: Vec<&str> = Vec::new();
+    for part in cookie.split(';') {
+        let part = part.trim();
+        if let Some((k, v)) = part.split_once('=') {
+            if k.trim().eq_ignore_ascii_case(want) {
+                out.push(v.trim());
+            }
+        }
+    }
+    out.join(", ")
+}
+
 fn default_type_for(ext: &str, default_type: &str) -> String {
     const BUILTIN: &[(&str, &str)] = &[
         ("html", "text/html"),
@@ -641,6 +810,122 @@ fn add_header_applies(status: u16, always: bool) -> bool {
 }
 
 /// Append `add_header` lines to a rendered header block.
+/// Variant for the proxy paths: knows the cache status and `$upstream_addr`.
+pub fn apply_add_headers_upstream(
+    raw: &mut Vec<u8>,
+    headers: &[(String, String)],
+    status: u16,
+    upstream_cache_status: &str,
+    upstream_addr: &str,
+) {
+    apply_add_headers_full(raw, headers, status, upstream_cache_status, upstream_addr, &[])
+}
+
+/// Full variant, with the upstream response headers for `$upstream_http_*`.
+pub fn apply_add_headers_full(
+    raw: &mut Vec<u8>,
+    headers: &[(String, String)],
+    status: u16,
+    upstream_cache_status: &str,
+    upstream_addr: &str,
+    upstream_headers: &[(String, String)],
+) {
+    let mut sent: Vec<(String, String)> = split_head(raw);
+    for (name, value) in headers {
+        let (value, always) = match value.rsplit_once(' ') {
+            Some((v, "always")) => (v, true),
+            _ => (value.as_str(), false),
+        };
+        if !add_header_applies(status, always) {
+            continue;
+        }
+        let mut expanded = value
+            .replace("$upstream_cache_status", upstream_cache_status)
+            .replace("$upstream_addr", upstream_addr)
+            .replace("$status", &status.to_string());
+
+        // `$upstream_http_name` and `$upstream_cookie_name`
+        expanded = expand_upstream_vars(&expanded, upstream_headers);
+        if expanded.is_empty() || expanded.contains('$') && !expanded.contains("$upstream") {
+            // Unsupported variables expand to nothing in nginx; keep it simple
+            // and only emit fully-expanded values.
+        }
+        if expanded.is_empty() {
+            continue;
+        }
+        raw.extend_from_slice(name.as_bytes());
+        raw.extend_from_slice(b": ");
+        raw.extend_from_slice(expanded.as_bytes());
+        raw.extend_from_slice(b"\r\n");
+        sent.push((name.clone(), expanded));
+    }
+}
+
+/// Replace `$upstream_http_*` and `$upstream_cookie_*` from an upstream reply.
+fn expand_upstream_vars(spec: &str, upstream: &[(String, String)]) -> String {
+    let mut out = String::with_capacity(spec.len());
+    let b = spec.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'$' {
+            out.push(b[i] as char);
+            i += 1;
+            continue;
+        }
+        let rest = &spec[i + 1..];
+        let n = rest
+            .bytes()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == b'_')
+            .count();
+        if n == 0 {
+            out.push('$');
+            i += 1;
+            continue;
+        }
+        let name = &rest[..n];
+        let value = if let Some(h) = name.strip_prefix("upstream_http_") {
+            let key = h.replace('_', "-");
+            let vals: Vec<&str> = upstream
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(&key))
+                .map(|(_, v)| v.as_str())
+                .collect();
+            Some(vals.join(", "))
+        } else if let Some(c) = name.strip_prefix("upstream_cookie_") {
+            // nginx joins repeated Set-Cookie headers with ", " before parsing.
+            let joined = upstream
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
+                .map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut found: Vec<&str> = Vec::new();
+            for part in joined.split(&[';', ','][..]) {
+                let part = part.trim();
+                if let Some((k, v)) = part.split_once('=') {
+                    if k.trim().eq_ignore_ascii_case(c) {
+                        found.push(v.trim());
+                    }
+                }
+            }
+            Some(found.join(", "))
+        } else {
+            None
+        };
+        match value {
+            Some(v) => {
+                out.push_str(&v);
+                i += 1 + n;
+            }
+            None => {
+                out.push('$');
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// Minimal variant for callers that only know the cache status (the proxy
 /// paths already hold the rendered response and no `ServerVars`).
 pub fn apply_add_headers_simple(
@@ -674,6 +959,9 @@ pub fn apply_add_headers(
     status: u16,
     vars: &ServerVars<'_>,
 ) {
+    // nginx evaluates add_header left to right, so `$sent_http_*` in a later
+    // header sees the ones already added.
+    let mut sent: Vec<(String, String)> = split_head(raw);
     for (name, value) in headers {
         let (value, always) = match value.rsplit_once(' ') {
             Some((v, "always")) => (v, true),
@@ -682,7 +970,22 @@ pub fn apply_add_headers(
         if !add_header_applies(status, always) {
             continue;
         }
-        let expanded = vars.expand(value);
+        let local = ServerVars {
+            req: vars.req,
+            path: vars.path,
+            query: vars.query,
+            server_name: vars.server_name,
+            server_port: vars.server_port,
+            peer_ip: vars.peer_ip,
+            scheme: vars.scheme,
+            document_root: vars.document_root,
+            upstream_cache_status: vars.upstream_cache_status,
+            custom: vars.custom,
+            connection_requests: vars.connection_requests,
+            connection_time: vars.connection_time,
+            sent: &sent,
+        };
+        let expanded = local.expand(value);
         // nginx drops the header when the value expands to nothing.
         if expanded.is_empty() {
             continue;
@@ -691,6 +994,7 @@ pub fn apply_add_headers(
         raw.extend_from_slice(b": ");
         raw.extend_from_slice(expanded.as_bytes());
         raw.extend_from_slice(b"\r\n");
+        sent.push((name.clone(), expanded));
     }
 }
 
@@ -716,6 +1020,8 @@ pub struct ServerVars<'a> {
     pub custom: &'a std::collections::HashMap<String, String>,
     pub connection_requests: u64,
     pub connection_time: u64,
+    /// Response headers already produced for this reply; backs `$sent_http_*`.
+    pub sent: &'a [(String, String)],
 }
 
 impl<'a> ServerVars<'a> {
@@ -752,6 +1058,15 @@ impl<'a> ServerVars<'a> {
                 }
             }
             "remote_addr" => self.peer_ip.to_string(),
+            "remote_user" => self
+                .req
+                .headers
+                .get("authorization")
+                .and_then(|v| {
+                    v.strip_prefix("Basic ")
+                        .and_then(|b| base64_decode_user(b))
+                })
+                .unwrap_or_default(),
             "document_root" => self.document_root.to_string(),
             "request_filename" => format!("{}{}", self.document_root, self.path),
             "upstream_cache_status" => self.upstream_cache_status.to_string(),
@@ -769,7 +1084,18 @@ impl<'a> ServerVars<'a> {
             _ => {
                 if let Some(h) = name.strip_prefix("http_") {
                     let key = h.replace('_', "-");
-                    self.req.headers.get(&key).unwrap_or("").to_string()
+                    self.req.headers.get_joined(&key).unwrap_or_default()
+                } else if let Some(want) = name.strip_prefix("cookie_") {
+                    cookie_value(self.req, want)
+                } else if let Some(h) = name.strip_prefix("sent_http_") {
+                    let key = h.replace('_', "-");
+                    let joined: Vec<&str> = self
+                        .sent
+                        .iter()
+                        .filter(|(k, _)| k.eq_ignore_ascii_case(&key))
+                        .map(|(_, v)| v.as_str())
+                        .collect();
+                    joined.join(", ")
                 } else if let Some(want) = name.strip_prefix("arg_") {
                     // $arg_name looks the key up in the query string.
                     self.query
@@ -867,6 +1193,31 @@ pub fn resolve_target<'a>(
     let mut relocations = 0usize;
     let mut skip_return = false;
 
+    // Server-level `set` / `if` run before location selection.
+    if !server.sets.is_empty() || !server.ifs.is_empty() {
+        match apply_rewrites_parts(
+            req,
+            &cur_path,
+            &cur_query,
+            &server.sets,
+            &server.ifs,
+            &[],
+            server,
+            &http.default_type,
+        ) {
+            RewriteOutcome::Respond(r) => return Target::Done(r),
+            RewriteOutcome::Continue(p, q) | RewriteOutcome::Relocate(p, q) => {
+                cur_path = p;
+                cur_query = q;
+            }
+            RewriteOutcome::Break(p, q) => {
+                cur_path = p;
+                cur_query = q;
+                skip_return = true;
+            }
+        }
+    }
+
     loop {
         match apply_rewrites(req, &cur_path, &cur_query, cur_loc, server, &http.default_type) {
             RewriteOutcome::Respond(r) => return Target::Done(r),
@@ -927,7 +1278,7 @@ pub async fn resolve_response_caps(
     server_port: u16,
     captures: &[(String, String)],
 ) -> Response {
-    resolve_response_state(
+    resolve_response_local(
         req,
         path,
         query,
@@ -941,6 +1292,42 @@ pub async fn resolve_response_caps(
             requests: 0,
             started: std::time::Instant::now(),
         },
+        "127.0.0.1",
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_response_local(
+    req: &Request,
+    path: &str,
+    query: &str,
+    server: &Server,
+    loc: &LocCfg,
+    http: &Http,
+    peer_ip: &str,
+    server_port: u16,
+    captures: &[(String, String)],
+    state: ConnState,
+    local_addr: &str,
+) -> Response {
+    let mut custom: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (k, v) in captures {
+        custom.insert(k.clone(), v.clone());
+    }
+    let mut resp = match resolve_target(req, path, query, server, loc, http) {
+        Target::Done(r) => r,
+        Target::Loc(p, q, l, skip) => {
+            return render_resolved_state(
+                req, &p, &q, l, skip, server, http, peer_ip, server_port, captures, state,
+                local_addr,
+            )
+            .await
+        }
+    };
+    finalize_response(
+        req, &mut resp, path, query, server, http, peer_ip, server_port, captures, &custom, state,
+        local_addr,
     )
     .await
 }
@@ -958,6 +1345,7 @@ pub async fn resolve_response_state(
     captures: &[(String, String)],
     state: ConnState,
 ) -> Response {
+    let local_addr = "127.0.0.1";
     let mut cur_path = path.to_string();
     let mut cur_query = query.to_string();
     let mut cur_loc = loc;
@@ -974,6 +1362,7 @@ pub async fn resolve_response_state(
         Target::Loc(p, q, l, skip) => {
             return render_resolved_state(
                 req, &p, &q, l, skip, server, http, peer_ip, server_port, captures, state,
+                local_addr,
             )
             .await;
         }
@@ -991,6 +1380,7 @@ pub async fn resolve_response_state(
         captures,
         &custom,
         state,
+        local_addr,
     )
     .await
 }
@@ -1024,6 +1414,29 @@ pub async fn render_resolved(
             requests: 0,
             started: std::time::Instant::now(),
         },
+        "127.0.0.1",
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn render_resolved_ctx(
+    req: &Request,
+    path: &str,
+    query: &str,
+    loc: &LocCfg,
+    skip_return: bool,
+    server: &Server,
+    http: &Http,
+    peer_ip: &str,
+    server_port: u16,
+    captures: &[(String, String)],
+    state: ConnState,
+    local_addr: &str,
+) -> Response {
+    render_resolved_state(
+        req, path, query, loc, skip_return, server, http, peer_ip, server_port, captures, state,
+        local_addr,
     )
     .await
 }
@@ -1041,6 +1454,7 @@ pub async fn render_resolved_state(
     server_port: u16,
     captures: &[(String, String)],
     state: ConnState,
+    local_addr: &str,
 ) -> Response {
     let mut custom: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for (k, v) in captures {
@@ -1064,6 +1478,7 @@ pub async fn render_resolved_state(
                 custom: &custom,
                 connection_requests: state.requests,
                 connection_time: state.elapsed_secs(),
+                sent: &[],
             };
             route(req, path, query, loc, server, http, false, &vars).await
         };
@@ -1079,6 +1494,7 @@ pub async fn render_resolved_state(
             captures,
             &custom,
             state,
+            local_addr,
         )
         .await
     }
@@ -1099,6 +1515,7 @@ async fn finalize_response(
     _captures: &[(String, String)],
     custom: &std::collections::HashMap<String, String>,
     state: ConnState,
+    local_addr: &str,
 ) -> Response {
     let mut cur_path = path.to_string();
     let mut cur_query = query.to_string();
@@ -1140,6 +1557,7 @@ async fn finalize_response(
                 custom,
                 connection_requests: state.requests,
                 connection_time: state.elapsed_secs(),
+                sent: &[],
             };
             vars.expand(&cur_path)
         };
@@ -1170,6 +1588,7 @@ async fn finalize_response(
                 custom,
                 connection_requests: state.requests,
                 connection_time: state.elapsed_secs(),
+                sent: &[],
             };
             cur_query = vars.expand(&cur_query);
         }
@@ -1195,6 +1614,7 @@ async fn finalize_response(
                     custom,
                     connection_requests: state.requests,
                     connection_time: state.elapsed_secs(),
+                    sent: &[],
                 };
                 route(req, &cur_path, &cur_query, l, server, http, true, &vars).await
             }
@@ -1222,6 +1642,9 @@ async fn finalize_response(
     let mut out = crate::gzip::maybe_compress(req, std::mem::replace(resp, Response::empty(200)), cur_loc, http);
 
     if !cur_loc.headers.is_empty() {
+        // `$sent_http_*` sees the headers produced so far (nginx evaluates
+        // add_header left to right, so earlier ones are visible).
+        let existing = split_head(&out.raw);
         let vars = ServerVars {
             req,
             path: &cur_path,
@@ -1235,6 +1658,7 @@ async fn finalize_response(
             custom,
             connection_requests: state.requests,
             connection_time: state.elapsed_secs(),
+            sent: &existing,
         };
         apply_add_headers(&mut out.raw, &cur_loc.headers, out.status, &vars);
     }
@@ -1279,6 +1703,7 @@ async fn dispatch(
     listen_port: u16,
     captures: &[(String, String)],
     state: ConnState,
+    local_addr: &str,
 ) -> io::Result<Outcome> {
     let head_only = req.method == Method::Head;
     let keepalive_allowed = keepalive_policy(req, loc, state);
@@ -1303,12 +1728,23 @@ async fn dispatch(
         let _ = root;
         let peer = conn.peer.ip().to_string();
         let resp = finalize_response(
-            req, &mut r, path, query, server, http, &peer, listen_port, captures, &custom, state,
+            req,
+            &mut r,
+            path,
+            query,
+            server,
+            http,
+            &peer,
+            listen_port,
+            captures,
+            &custom,
+            state,
+            local_addr,
         )
         .await;
         let status = resp.status;
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
-            return write_redirect(conn, req, resp, listen_port, server.server_tokens).await;
+            return write_redirect(conn, req, resp, loc, listen_port, server.server_tokens, local_addr).await;
         }
         let bytes = write_response_ka(
             conn,
@@ -1359,7 +1795,7 @@ async fn dispatch(
     }
 
     let peer_ip = conn.peer.ip().to_string();
-    let resp = render_resolved(
+    let resp = render_resolved_ctx(
         req,
         path,
         query,
@@ -1370,11 +1806,13 @@ async fn dispatch(
         &peer_ip,
         listen_port,
         captures,
+        state,
+        local_addr,
     )
     .await;
     let status = resp.status;
     if matches!(status, 301 | 302 | 303 | 307 | 308) {
-        return write_redirect(conn, req, resp, listen_port, server.server_tokens).await;
+        return write_redirect(conn, req, resp, loc, listen_port, server.server_tokens, local_addr).await;
     }
     let bytes =
         write_response_ka(conn, resp, keepalive_allowed, server.server_tokens, head_only, ka_header)
@@ -1440,12 +1878,53 @@ fn keepalive_policy(req: &Request, loc: &LocCfg, state: ConnState) -> bool {
     true
 }
 
+/// Build the `Location` for a redirect, honouring `absolute_redirect`,
+/// `server_name_in_redirect` and `port_in_redirect` (nginx's
+/// `ngx_http_header_filter` logic).
+fn redirect_location(
+    req: &Request,
+    loc: &LocCfg,
+    raw_location: &str,
+    listen_port: u16,
+    local_addr: &str,
+) -> String {
+    if !raw_location.starts_with('/') || !loc.absolute_redirect {
+        return raw_location.to_string();
+    }
+    let host = if loc.server_name_in_redirect && !loc.server_name.is_empty() {
+        loc.server_name.clone()
+    } else {
+        let h = req.host.as_ref().map(|h| h.as_str()).unwrap_or("");
+        if h.is_empty() || !crate::http::request::host_is_usable(h) {
+            // nginx falls back to the address of the listening socket.
+            local_addr.to_string()
+        } else {
+            h.to_string()
+        }
+    };
+    let mut out = String::with_capacity(host.len() + raw_location.len() + 16);
+    out.push_str("http://");
+    out.push_str(&host);
+    let host_has_port = host
+        .rsplit_once(':')
+        .map(|(_, p)| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or(false);
+    if loc.port_in_redirect && !host_has_port && listen_port != 80 {
+        out.push(':');
+        out.push_str(&listen_port.to_string());
+    }
+    out.push_str(raw_location);
+    out
+}
+
 async fn write_redirect(
     conn: &mut Conn,
     req: &Request,
     resp: Response,
+    loc: &LocCfg,
     listen_port: u16,
     tokens: bool,
+    local_addr: &str,
 ) -> io::Result<Outcome> {
     let status = resp.status;
     let Response {
@@ -1460,24 +1939,8 @@ async fn write_redirect(
         .find(|(k, _)| k.eq_ignore_ascii_case("location"))
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
+    let absolute = redirect_location(req, loc, &location, listen_port, local_addr);
 
-    let absolute = if location.starts_with('/') {
-        let host = req.host.as_ref().map(|h| h.as_str()).unwrap_or("");
-        let host_has_port = host
-            .rsplit_once(':')
-            .map(|(_, p)| p.parse::<u16>().is_ok())
-            .unwrap_or(false);
-        let host = if host_has_port || listen_port == 80 {
-            host.to_string()
-        } else {
-            format!("{host}:{listen_port}")
-        };
-        format!("http://{host}{location}")
-    } else {
-        location
-    };
-
-    // nginx answers redirects with a small HTML body describing the status.
     let body = match body {
         Body::Bytes(b) if !b.is_empty() => b,
         _ => error_body(status, tokens),
@@ -1493,7 +1956,6 @@ async fn write_redirect(
         out_raw.extend_from_slice(body.len().to_string().as_bytes());
         out_raw.extend_from_slice(b"\r\n");
     }
-    // nginx replaces any Location the error page produced.
     for line in String::from_utf8_lossy(&raw).split("\r\n") {
         if line.is_empty() || line.to_ascii_lowercase().starts_with("location:") {
             continue;

@@ -18,6 +18,16 @@ BIN="$ROOT/target/release/ngxrs"
 OUT_DIR="$ROOT/bench/run/nginxtests"
 mkdir -p "$OUT_DIR"
 
+# Files that need modules ngxrs does not implement are excluded up front so the
+# run reports real gaps rather than unsupported features.
+SKIP_ALWAYS="
+addition sub slice auth_basic auth_delay auth_request dav mirror
+xslt perl lua js njs image_filter mp4 flv geoip random_index
+limit_req limit_conn secure_link realip rewrite_log debug
+h2 h3 quic ssl_sni ssl_verify grpc uwsgi_cgi memcached
+mail proxy_protocol resolver stream_ssl
+"
+
 DEFAULT_TESTS="
 http_host.t
 http_uri.t

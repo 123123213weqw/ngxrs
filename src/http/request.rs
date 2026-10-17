@@ -80,6 +80,30 @@ impl Headers {
             .map(|(_, v)| v.as_str())
     }
 
+    /// nginx joins repeated request headers into one value: `, ` for ordinary
+    /// headers and `; ` for Cookie (`$http_*` semantics).
+    pub fn get_joined(&self, name: &str) -> Option<String> {
+        let sep = if name.eq_ignore_ascii_case("cookie") {
+            "; "
+        } else {
+            ", "
+        };
+        let mut out = String::new();
+        let mut found = false;
+        for (_, v) in self.items.iter().filter(|(k, _)| k == name) {
+            if found {
+                out.push_str(sep);
+            }
+            out.push_str(v);
+            found = true;
+        }
+        if found {
+            Some(out)
+        } else {
+            None
+        }
+    }
+
     pub fn get_all<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
         self.items
             .iter()
@@ -127,6 +151,19 @@ impl Drop for Request {
     fn drop(&mut self) {
         recycle(std::mem::take(&mut self.headers.items));
     }
+}
+
+/// Is this `$host` value usable for building an absolute URL? nginx falls back
+/// to the local socket address when it is not (e.g. a Host of `.`).
+pub fn host_is_usable(host: &str) -> bool {
+    if host.trim_matches('.').is_empty() {
+        return false;
+    }
+    // A bare port (`:8080`) or anything with a slot separator is unusable.
+    if host.starts_with(':') || host.contains('/') {
+        return false;
+    }
+    !host.bytes().any(|b| b <= 0x20)
 }
 
 fn is_absolute_form(target: &str) -> bool {
@@ -255,6 +292,22 @@ fn strip_port(host: &str) -> &str {
         _ => host,
     }
 }
+
+/// Headers nginx refuses to see twice.
+const UNIQUE_HEADERS: &[&str] = &[
+    "host",
+    "if-modified-since",
+    "if-unmodified-since",
+    "if-match",
+    "if-none-match",
+    "content-length",
+    "content-range",
+    "if-range",
+    "transfer-encoding",
+    "expect",
+    "authorization",
+    "proxy-authorization",
+];
 
 fn is_token(b: u8) -> bool {
     matches!(b,
@@ -394,9 +447,12 @@ impl Request {
             return Err(HttpError::new(400, true));
         }
 
-        // Two `Host` headers are a 400, like nginx.
-        if headers.get_all("host").count() > 1 {
-            return Err(HttpError::new(400, true));
+        // nginx rejects a repeated header for anything it treats as unique
+        // (`ngx_http_process_unique_header_line` in the header table).
+        for name in UNIQUE_HEADERS {
+            if headers.get_all(name).count() > 1 {
+                return Err(HttpError::new(400, true));
+            }
         }
 
         // nginx validates the Host header strictly, even for HTTP/1.0:
@@ -583,6 +639,32 @@ mod tests {
         let r = parse("GET / HTTP/1.0\r\nHost: abcd-ef.g02.xyz.:2\r\n\r\n").unwrap();
         assert_eq!(r.host.as_deref(), Some("abcd-ef.g02.xyz"));
         assert!(parse("GET / HTTP/1.0\r\nHost: .\r\n\r\n").is_err());
+    }
+
+    #[test]
+    fn duplicate_unique_headers_rejected() {
+        for h in [
+            "Content-Length",
+            "If-Modified-Since",
+            "If-Unmodified-Since",
+            "If-Match",
+            "If-None-Match",
+            "If-Range",
+            "Authorization",
+            "Content-Range",
+        ] {
+            let req = format!("GET / HTTP/1.0\r\n{h}: a\r\n{h}: b\r\n\r\n");
+            assert!(parse(&req).is_err(), "{h} should be rejected when repeated");
+        }
+        // ...but ordinary headers may repeat
+        assert!(parse("GET / HTTP/1.0\r\nFoo: a\r\nFoo: b\r\n\r\n").is_ok());
+        // Transfer-Encoding and Expect are unique too
+        assert!(parse(
+            "GET / HTTP/1.0\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n"
+        )
+        .is_err());
+        assert!(parse("GET / HTTP/1.0\r\nExpect: 100-continue\r\nExpect: 100-continue\r\n\r\n")
+            .is_err());
     }
 
     #[test]

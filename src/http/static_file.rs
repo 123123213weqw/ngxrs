@@ -56,7 +56,8 @@ pub fn respond_fs(
 
     if meta.is_dir() {
         if !uri.ends_with('/') {
-            let mut location = format!("{uri}/");
+            // nginx escapes the URI when building the redirect target.
+            let mut location = format!("{}/", crate::util::escape_uri(uri.trim_end_matches('/')));
             if !req.raw_target.contains('?') {
                 // no query to preserve
             }

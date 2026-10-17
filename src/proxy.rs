@@ -474,11 +474,12 @@ pub async fn handle(
                         raw.extend_from_slice(v.as_bytes());
                         raw.extend_from_slice(b"\r\n");
                     }
-                    crate::http::apply_add_headers_simple(
+                    crate::http::apply_add_headers_upstream(
                         &mut raw,
                         &loc.headers,
                         entry.status,
                         "HIT",
+                        "",
                     );
                     raw.extend_from_slice(b"Content-Length: ");
                     raw.extend_from_slice(entry.body.len().to_string().as_bytes());
@@ -523,6 +524,10 @@ pub async fn handle(
 
     'candidates: for cand in candidates {
         let key = pool_key_of(&cand);
+        let upstream_addr = match &cand {
+            Chosen::Direct(_, a) => a.to_string(),
+            Chosen::Upstream { addr, .. } => addr.to_string(),
+        };
         // First attempt may reuse a pooled socket; if that socket turns out to
         // be dead, retry the same backend once on a fresh connection.
         for attempt in 0..2 {
@@ -581,6 +586,7 @@ pub async fn handle(
                     key: cache_key.as_deref(),
                     status: cache_status,
                 },
+                &upstream_addr,
             )
             .await;
 
@@ -639,19 +645,6 @@ async fn respond_error(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn split_head(raw: &[u8]) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for line in String::from_utf8_lossy(raw).split("\r\n") {
-        if line.is_empty() {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            out.push((k.trim().to_string(), v.trim().to_string()));
-        }
-    }
-    out
-}
-
 struct CacheCtx<'a> {
     zone: Option<&'a crate::config::CacheZone>,
     key: Option<&'a str>,
@@ -673,6 +666,7 @@ async fn exchange(
     peer_ip: &str,
     pool_key: (usize, u32),
     cache: CacheCtx<'_>,
+    upstream_addr: &str,
 ) -> io::Result<Outcome> {
     // ---- request head ----
     let mut out = Vec::with_capacity(512);
@@ -907,7 +901,7 @@ async fn exchange(
         }
 
         if let (Some(zone), Some(key)) = (cache.zone, cache.key) {
-            let stored_headers: Vec<(String, String)> = split_head(&raw)
+            let stored_headers: Vec<(String, String)> = crate::http::split_head(&raw)
                 .into_iter()
                 .filter(|(k, _)| {
                     !k.eq_ignore_ascii_case("connection")
@@ -929,11 +923,12 @@ async fn exchange(
         }
 
         let mut out_raw = raw;
-        crate::http::apply_add_headers_simple(
+        crate::http::apply_add_headers_upstream(
             &mut out_raw,
             &loc.headers,
             head.status,
             cache.status,
+            upstream_addr,
         );
         write_head(conn, head.status, &out_raw, req.keepalive, tokens).await?;
         conn.write_all(&payload).await?;
@@ -945,7 +940,15 @@ async fn exchange(
     }
 
     let mut raw = raw;
-    crate::http::apply_add_headers_simple(&mut raw, &loc.headers, head.status, cache.status);
+    let upstream_headers = crate::http::split_head(&raw);
+    crate::http::apply_add_headers_full(
+        &mut raw,
+        &loc.headers,
+        head.status,
+        cache.status,
+        upstream_addr,
+        &upstream_headers,
+    );
     write_head(conn, head.status, &raw, req.keepalive, tokens).await?;
 
     let mut sent = 0u64;

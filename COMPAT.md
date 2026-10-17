@@ -187,6 +187,53 @@ HTTP/1.1 keepalive 响应会一直阻塞到 8s 超时并返回 `undef`。**真 n
 | `server_name ~` 不支持 `\Q..\E` 与命名捕获 | 正则服务器名不生效 | 翻译 `\Q..\E`，命名捕获暴露为变量 |
 | 错误状态不关连接 | 405/400 后仍保持 keepalive，客户端等 EOF 会挂 | 按 nginx 的 400/405/413/414/495-497/500/501 强制关闭 |
 
+### 当前 A/B 结果
+
+`bench/nginxtests.sh TEST_LIST="..."` 是逐文件对比；`bench/ntscan.sh` 自动扫一批
+`http_*.t` 并只报告「nginx 过而 ngxrs 不过」的真缺陷。
+
+最近一次全扫（23 个可运行文件）：
+
+| 结果 | 数量 | 说明 |
+|---|---|---|
+| 与 nginx 完全一致 | **16** | 含 location / uri / server_name / method / try_files / error_page / include / absolute_redirect / host 等 |
+| ngxrs 更好 | 1 | `http_host.t` 58/62 vs nginx 54/62 |
+| ngxrs 更差 | 6 | 剩余 20 条断言 |
+| 无法运行（双方都缺模块） | 6 | resolver 等 |
+
+逐文件一致的用例（断言数与 nginx 相同）：`http_location` 16/16、`http_uri` 21/21、
+`http_server_name` 22/22、`http_method` 4/6、`http_try_files` 12/12、
+`http_error_page` 11/11、`http_include` 7/7、`http_absolute_redirect` 25/25。
+
+### 剩余差距（20 条断言）
+
+| 用例 | 差 | 缺什么 |
+|---|---|---|
+| http_headers_multi.t | 4 | `$sent_trailer_*`、非法 `Content-Type` 的 `$content_type`、无 Host 时 `$host` 取 server_name、重复 `Transfer-Encoding` |
+| http_variables.t | 6 | `$limit_rate` 的特殊 set/get handler、`expires`、含 `$upstream_http_*` 的日志格式 |
+| http_keepalive.t | 3 | `keepalive_time` 依赖 nginx `ngx_current_msec` 的缓存计时 |
+| http_header_buffers.t | 4 | keepalive 之后超长请求头/请求行的缓冲行为 |
+| http_keepalive_shutdown.t | 1 | 关闭时的连接处理 |
+
+### 本轮由官方用例发现并修复的缺陷
+
+| 缺陷 | 影响 |
+|---|---|
+| `$http_*` 未合并重复请求头 | 多值头只取第一个 |
+| 缺 `$cookie_*` / `$sent_http_*` / `$upstream_http_*` / `$upstream_cookie_*` / `$remote_user` | 大量变量为空 |
+| `add_header` 只取 args[1] | `always` 被丢弃，值里的空格被截断 |
+| `add_header` 求值顺序错误 | 后面的头看不到前面的，`$sent_http_*` 失效 |
+| `if` 用另一套变量展开（`RwVars`） | `$arg_*` / `$cookie_*` 在 `if` 里恒为空 |
+| 缺 `allow` / `deny` / `limit_except`（access 模块） | 访问控制完全缺失 |
+| 访问控制在 405 之后才执行 | 应 403 的请求返回 405 |
+| server 级 `if` / `set` 未实现 | |
+| `$upstream_addr` 缺失 | |
+| `absolute_redirect` / `server_name_in_redirect` / `port_in_redirect` 未实现 | |
+| `Location` 未做 URI 转义 | 带空格/特殊字符的路径原样输出 |
+| 无 Host / Host 非法时未回退到本地地址 | |
+| 解析阶段 400 未走 error_page | |
+| nginx 的「唯一头」规则未实现（Host/CL/TE/Expect/If-*/Authorization/Content-Range） | 重复头未拒绝 |
+
 ### 当前 A/B 结果（8 个用例文件）
 
 | 用例 | nginx | ngxrs | 备注 |

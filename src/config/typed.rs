@@ -51,6 +51,18 @@ pub struct LocCfg {
     /// `keepalive_time T` — maximum lifetime of a keepalive connection.
     pub keepalive_time: Option<Duration>,
     pub keepalive_disable: KeepaliveDisable,
+    /// `absolute_redirect on|off` (nginx default: on).
+    pub absolute_redirect: bool,
+    /// `server_name_in_redirect on|off` (default: off).
+    pub server_name_in_redirect: bool,
+    /// `port_in_redirect on|off` (default: on).
+    pub port_in_redirect: bool,
+    /// The server's primary name, used by `server_name_in_redirect`.
+    pub server_name: String,
+    /// `allow` / `deny` rules, evaluated in order (first match wins).
+    pub access: Vec<AccessRule>,
+    /// `limit_except METHOD... { allow/deny ... }` blocks.
+    pub limit_except: Vec<LimitExcept>,
     /// Length of the location prefix, used to strip it for `alias`.
     pub prefix_len: usize,
     // ---- gzip ----
@@ -116,6 +128,12 @@ impl LocCfg {
             keepalive_timeout: None,
             keepalive_time: None,
             keepalive_disable: KeepaliveDisable::Msie6,
+            absolute_redirect: true,
+            server_name_in_redirect: false,
+            port_in_redirect: true,
+            server_name: String::new(),
+            access: Vec::new(),
+            limit_except: Vec::new(),
             prefix_len: 0,
             gzip_min_length: 20,
             gzip_comp_level: 1,
@@ -171,6 +189,80 @@ pub enum IfCond {
     Match(String, regex::Regex, bool),
     /// `if (-f $request_filename)` etc.
     FileTest(char, String),
+}
+
+#[derive(Debug, Clone)]
+pub struct LimitExcept {
+    pub methods: Vec<String>,
+    pub rules: Vec<AccessRule>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AccessRule {
+    pub deny: bool,
+    /// `None` means `all`.
+    pub net: Option<Cidr>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Cidr {
+    pub addr: std::net::IpAddr,
+    pub bits: u8,
+}
+
+impl Cidr {
+    pub fn contains(&self, ip: std::net::IpAddr) -> bool {
+        match (self.addr, ip) {
+            (std::net::IpAddr::V4(net), std::net::IpAddr::V4(ip)) => {
+                let bits = self.bits.min(32);
+                if bits == 0 {
+                    return true;
+                }
+                let mask = u32::MAX << (32 - bits as u32);
+                (u32::from(net) & mask) == (u32::from(ip) & mask)
+            }
+            (std::net::IpAddr::V6(net), std::net::IpAddr::V6(ip)) => {
+                let bits = self.bits.min(128);
+                if bits == 0 {
+                    return true;
+                }
+                let mask = u128::MAX << (128 - bits as u32);
+                (u128::from(net) & mask) == (u128::from(ip) & mask)
+            }
+            _ => false,
+        }
+    }
+}
+
+pub fn parse_cidr(s: &str) -> Option<Option<Cidr>> {
+    if s == "all" {
+        return Some(None);
+    }
+    let (addr, bits) = match s.rsplit_once('/') {
+        Some((a, b)) => (a, b.parse::<u8>().ok()?),
+        None => (s, u8::MAX),
+    };
+    let ip: std::net::IpAddr = addr.parse().ok()?;
+    let bits = match ip {
+        std::net::IpAddr::V4(_) if bits == u8::MAX => 32,
+        std::net::IpAddr::V6(_) if bits == u8::MAX => 128,
+        _ => bits,
+    };
+    Some(Some(Cidr { addr: ip, bits }))
+}
+
+/// `ngx_http_access_module`: first matching rule wins, default is allow.
+pub fn access_denied(rules: &[AccessRule], ip: std::net::IpAddr) -> bool {
+    for r in rules {
+        let matches = match &r.net {
+            None => true,
+            Some(c) => c.contains(ip),
+        };
+        if matches {
+            return r.deny;
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,6 +430,9 @@ pub struct Server {
     pub server_tokens: bool,
     pub error_pages: BTreeMap<u16, String>,
     pub access_log_off: bool,
+    /// Server-level `if` blocks, evaluated before location matching.
+    pub ifs: Vec<IfBlock>,
+    pub sets: Vec<(String, String)>,
     pub regex_names: Vec<regex::Regex>,
     /// Regex server names paired with their source text (for diagnostics and
     /// for named-capture handling).
@@ -840,8 +935,9 @@ impl Builder {
                 if d.args.len() < 2 {
                     return Err(sem(&d.file, d.line, "add_header requires at least 2 arguments"));
                 }
+                // The value may contain spaces and a trailing `always`.
                 cfg.headers
-                    .push((d.args[0].clone(), d.args[1].clone()));
+                    .push((d.args[0].clone(), d.args[1..].join(" ")));
             }
             "error_page" => {
                 let mut codes: Vec<u16> = Vec::new();
@@ -983,6 +1079,54 @@ impl Builder {
             "internal" => cfg.internal = true,
             "expires" => {
                 cfg.expires = Some(d.args.first().cloned().unwrap_or_else(|| "off".into()));
+            }
+            "allow" | "deny" => {
+                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "allow/deny requires an address"))?;
+                let net = parse_cidr(v).ok_or_else(|| {
+                    sem(&d.file, d.line, format!("invalid address \"{v}\""))
+                })?;
+                cfg.access.push(AccessRule {
+                    deny: d.name == "deny",
+                    net,
+                });
+            }
+            "limit_except" => {
+                let block = d
+                    .block
+                    .as_ref()
+                    .ok_or_else(|| sem(&d.file, d.line, "limit_except requires a block"))?;
+                let mut le = LimitExcept {
+                    methods: d.args.iter().map(|m| m.to_uppercase()).collect(),
+                    rules: Vec::new(),
+                };
+                for child in block {
+                    if child.name == "allow" || child.name == "deny" {
+                        let v = child.args.first().ok_or_else(|| {
+                            sem(&child.file, child.line, "allow/deny requires an address")
+                        })?;
+                        let net = parse_cidr(v).ok_or_else(|| {
+                            sem(&child.file, child.line, format!("invalid address \"{v}\""))
+                        })?;
+                        le.rules.push(AccessRule {
+                            deny: child.name == "deny",
+                            net,
+                        });
+                    }
+                }
+                cfg.limit_except.push(le);
+            }
+            "absolute_redirect" | "server_name_in_redirect" | "port_in_redirect" => {
+                let v = d.args.first().ok_or_else(|| {
+                    sem(&d.file, d.line, format!("{} requires on|off", d.name))
+                })?;
+                let on = parse_on_off(v).ok_or_else(|| {
+                    sem(&d.file, d.line, format!("invalid {} value \"{v}\"", d.name))
+                })?;
+                match d.name.as_str() {
+                    "absolute_redirect" => cfg.absolute_redirect = on,
+                    "server_name_in_redirect" => cfg.server_name_in_redirect = on,
+                    _ => cfg.port_in_redirect = on,
+                }
             }
             "keepalive_requests" => {
                 let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "keepalive_requests requires a value"))?;
@@ -1248,8 +1392,7 @@ impl Builder {
             "limit_rate" | "limit_rate_after" | "sendfile" | "tcp_nopush" | "tcp_nodelay"
             | "server_tokens" | "default_type"
             | "charset"
-            | "merge_slashes" | "absolute_redirect" | "server_name_in_redirect"
-            | "port_in_redirect" | "log_not_found" | "open_file_cache" | "etag" | "msie_padding" => {
+            | "merge_slashes" | "log_not_found" | "open_file_cache" | "etag" | "msie_padding" => {
                 // Accepted at this scope but not yet plumbed through: handled at
                 // http/server level where relevant, otherwise silently accepted.
                 return Ok(true);
@@ -1342,6 +1485,8 @@ impl Builder {
         let mut keepalive = http_keepalive;
         let mut tokens = http_tokens;
         let mut access_log_off = false;
+        let mut server_ifs: Vec<IfBlock> = Vec::new();
+        let mut server_sets: Vec<(String, String)> = Vec::new();
         let mut ssl = false;
         let mut http2 = false;
         let mut ssl_certificate: Option<PathBuf> = None;
@@ -1375,7 +1520,16 @@ impl Builder {
                     }
                     listens.push((addr, is_default));
                 }
-                "server_name" => names.extend(child.args.iter().cloned()),
+                "server_name" => {
+                    names.extend(child.args.iter().cloned());
+                    default_loc.server_name = child
+                        .args
+                        .iter()
+                        .find(|n| !n.is_empty() && !n.starts_with('~') && !n.starts_with('*'))
+                        .cloned()
+                        .or_else(|| child.args.first().cloned())
+                        .unwrap_or_default();
+                }
                 "location" => {
                     let loc = self.parse_location(child, &default_loc)?;
                     locations.push(loc);
@@ -1444,6 +1598,14 @@ impl Builder {
                 "error_page" => {
                     self.apply_loc(child, &mut default_loc)?;
                 }
+                "if" | "set" => {
+                    // Server-level `if`/`set` run before location selection.
+                    self.apply_loc(child, &mut default_loc)?;
+                    let moved = std::mem::take(&mut default_loc.ifs);
+                    server_ifs.extend(moved);
+                    let moved_sets = std::mem::take(&mut default_loc.sets);
+                    server_sets.extend(moved_sets);
+                }
                 _ => {
                     if !self.apply_loc(child, &mut default_loc)? {
                         self.unknown(child, "server");
@@ -1481,6 +1643,8 @@ impl Builder {
                 keepalive_timeout: keepalive,
                 server_tokens: tokens,
                 access_log_off,
+                ifs: server_ifs,
+                sets: server_sets,
                 regex_names,
                 regex_names_src,
                 ssl,
@@ -1737,7 +1901,7 @@ pub fn build(
                         parse_time(v).ok_or_else(|| sem(&d.file, d.line, "invalid keepalive_timeout"))?;
                 }
             }
-            "keepalive_requests" => {
+"keepalive_requests" => {
                 if let Some(v) = d.args.first() {
                     http.keepalive_requests = v
                         .parse()

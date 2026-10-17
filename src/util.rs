@@ -139,6 +139,44 @@ pub fn is_special_status(status: u16) -> bool {
     )
 }
 
+/// Percent-encode a path for a `Location` header (nginx's
+/// `NGX_ESCAPE_URI`): unreserved and reserved characters are kept, everything
+/// else — including a space — is escaped.
+pub fn escape_uri(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 8);
+    for b in path.bytes() {
+        // nginx's ESCAPE_URI set: everything else (including ? % # \ ^ ` { | })
+        // gets percent-encoded.
+        let keep = b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b':'
+                    | b'@'
+                    | b'/'
+            );
+        if keep {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -468,6 +506,18 @@ mod tests {
             ("/x".to_string(), "".to_string())
         );
         assert!(parse_target("/a%00b").is_err());
+    }
+
+    #[test]
+    fn uri_escaping() {
+        assert_eq!(escape_uri("/dir sp/"), "/dir%20sp/");
+        assert_eq!(escape_uri("/a/b/"), "/a/b/");
+        assert_eq!(escape_uri("/x?a=b"), "/x%3Fa=b");
+        // nginx's ESCAPE_URI set: ? % # \ ^ ` { | } are all escaped
+        assert_eq!(
+            escape_uri("/\"#%<>?\\^`{|}/"),
+            "/%22%23%25%3C%3E%3F%5C%5E%60%7B%7C%7D/"
+        );
     }
 
     #[test]

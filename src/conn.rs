@@ -39,6 +39,7 @@ impl Stream {
         }
     }
 
+
     pub fn is_tls(&self) -> bool {
         matches!(self, Stream::Tls(_))
     }
@@ -139,6 +140,11 @@ impl Conn {
         {
             let _ = on;
         }
+    }
+
+    /// Local address of the underlying socket (works for TLS too).
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.stream.tcp().and_then(|t| t.local_addr().ok())
     }
 
     pub fn set_read_timeout(&self, dur: Duration) -> io::Result<()> {

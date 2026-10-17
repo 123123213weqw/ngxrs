@@ -7,7 +7,7 @@ pub mod typed;
 pub use parser::{ConfigError, Directive};
 pub use typed::{
     AccessLog, CacheZone, Config, FastcgiParam, FastcgiPass, Http, IfBlock, IfCond, LbMethod,
-    KeepaliveDisable, ListenGroup, LocCfg, ScgiPass, UwsgiPass,
+    access_denied, AccessRule, KeepaliveDisable, ListenGroup, LocCfg, ScgiPass, UwsgiPass,
     Match, ProxyPass, ProxyTarget, Rewrite, RewriteFlag, Server,
     Upstream, UpstreamServer,
 };

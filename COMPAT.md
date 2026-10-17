@@ -189,31 +189,47 @@ HTTP/1.1 keepalive 响应会一直阻塞到 8s 超时并返回 `undef`。**真 n
 
 ### 当前 A/B 结果
 
-`bench/nginx_tests.sh` 是逐文件对比；`bench/ntscan.sh` 自动扫 http/proxy/upstream/
-range/fastcgi/scgi/uwsgi/stream 各类用例，只报告「nginx 过而 ngxrs 不过」的真缺陷。
+`bench/nginx_tests.sh` 逐文件对比；`bench/ntscan.sh` 自动扫
+http/proxy/upstream/range/fastcgi/scgi/uwsgi/stream/limit 各类用例，
+只报告「nginx 过而 ngxrs 不过」的真缺陷。
 
-最近一次全扫（27 个可运行文件）：**22 个与 nginx 断言数完全一致**，
-6 个更差；剩余差距 **11 条断言**（第八轮 20 条 / 第九轮 17 条）。
+最近一次全扫（35 个可运行文件）：**27 个与 nginx 断言数完全一致**，
+8 个更差；剩余差距 **21 条断言**（第九轮 33 条 / 第八轮 20 条，覆盖面扩大了
+35% 后仍下降）。
 
 完全一致的用例（断言数与 nginx 相同）：`http_location` 16/16、`http_uri` 21/21、
 `http_server_name` 22/22、`http_method` 4/6、`http_try_files` 12/12、
 `http_error_page` 11/11、`http_include` 7/7、`http_absolute_redirect` 25/25、
 `http_header_buffers` 10/12、`http_expect_100_continue` 5/7、`fastcgi_body` 7/7、
-`http_variables` 9/9、`proxy_available` 4/4、`http_headers_multi` 45/49。
+`http_variables` 9/9、`http_keepalive` 21/21、`proxy_available` 4/4、
+`proxy_bind` 7/7、`limit_req` 8/8、`proxy_cache_lock_age` 6/6、
+`proxy_cache_lock_ssi` 4/4。
 
-### 剩余差距（11 条断言）
+### 剩余差距（21 条断言）
 
 | 用例 | 差 | 缺什么 |
 |---|---|---|
-| proxy_bind.t | 3 | `proxy_bind` 源地址绑定（含 `off`/变量/端口形式） |
-| http_keepalive.t | 3 | `keepalive_time` 依赖 nginx `ngx_current_msec` 的缓存计时 |
-| http_headers_multi.t | 4 | `$sent_trailer_*`、非法 `Content-Type` 的 `$content_type`、无 Host 时 `$host` 取 server_name |
-| http_keepalive_shutdown.t | 1 | 关闭时的连接处理 |
+| proxy_cache_control.t | 11 | 上游 `Cache-Control`/`Expires`/`X-Accel-Expires` 的完整优先级与 `$upstream_cache_status` 细节 |
+| proxy_cache_convert_head.t | 2 | `proxy_cache_convert_head`（HEAD 转 GET 后缓存） |
+| proxy_cache_chunked.t | 1 | chunked 上游响应的缓存 |
+| proxy_cache_lock.t | 1 | lock 超时后并发回源的细节 |
+| http_headers_multi.t | 1 | `$sent_trailer_*`（需要发送 trailer） |
+| http_keepalive_shutdown.t | 1 | 依赖 `limit_req` 的延迟时序 |
+| proxy_cache_bypass.t | 4 | `proxy_cache_bypass` 的多变量求值 |
 
 ### 本轮由官方用例发现并修复的缺陷
 
 | 缺陷 | 影响 |
 |---|---|
+| **`proxy_bind` 完全缺失** | 无法指定回源源地址；现已支持 `off`/地址/`addr:port`/变量（`$remote_addr`/`$remote_port`/`$arg_*`），并沿用 server 级继承 |
+| **`limit_req` / `limit_conn` 完全缺失** | 无任何限流能力；现实现漏桶（`rate`/`burst`/`nodelay`/`delay`）与并发连接计数，相位与 nginx 一致（PREACCESS，早于代理） |
+| **`$request_time` 等变量在代理响应头里不展开** | `add_header` 走的是代理专用替换，只认 3 个变量；现改为完整变量解析器 |
+| **`$remote_port` 缺失** | |
+| **keepalive 空闲超时用 server 级而非 location 级** | 刚服务完的请求其 location 的 `keepalive_timeout` 才决定下一次读 |
+| **关闭时未通知客户端** | 优雅停机期间响应应带 `Connection: close` |
+| **`proxy_cache` 不认上游 `Cache-Control`/`X-Accel-Expires`/`Expires`** | 只认 `proxy_cache_valid`，导致大量上游显式声明可缓存的响应没被缓存 |
+| **close-delimited 上游响应无法缓存** | 要求有 `Content-Length` 才缓存；nginx 会缓冲到 EOF 并补发长度 |
+| **`proxy_cache_lock` 未实现** | 冷启动并发会重复回源 |
 | **配置热重载（SIGHUP）完全缺失** | `nginx -s reload` 无效；现已实现：解析新配置、原子替换 `Arc<Config>`，在跑连接继续用旧快照 |
 | **优雅停机不等在途请求** | SIGQUIT/stop 会打断正在流式输出的响应；现先停 accept 再等 `ACTIVE_CONNS` 归零（30s 上限） |
 | **上游 close-delimited 响应未重分帧** | 无 Content-Length 也无 TE 的上游响应原样转发，客户端无法判断结束；现转为 chunked |

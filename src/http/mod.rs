@@ -1018,6 +1018,28 @@ pub fn apply_add_headers_full(
     upstream_addr: &str,
     upstream_headers: &[(String, String)],
 ) {
+    apply_add_headers_ctx(
+        raw,
+        headers,
+        status,
+        upstream_cache_status,
+        upstream_addr,
+        upstream_headers,
+        None,
+    )
+}
+
+/// Variant that can expand every variable; used when a `ServerVars` is in scope.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_add_headers_ctx(
+    raw: &mut Vec<u8>,
+    headers: &[(String, String)],
+    status: u16,
+    upstream_cache_status: &str,
+    upstream_addr: &str,
+    upstream_headers: &[(String, String)],
+    ctx_vars: Option<&ServerVars<'_>>,
+) {
     let mut sent: Vec<(String, String)> = split_head(raw);
     for (name, value) in headers {
         let (value, always) = match value.rsplit_once(' ') {
@@ -1027,16 +1049,30 @@ pub fn apply_add_headers_full(
         if !add_header_applies(status, always) {
             continue;
         }
-        let mut expanded = value
+        // Upstream variables first: the generic resolver would drop them as
+        // unknown.
+        let mut expanded = expand_upstream_vars(value, upstream_headers)
             .replace("$upstream_cache_status", upstream_cache_status)
             .replace("$upstream_addr", upstream_addr)
             .replace("$status", &status.to_string());
-
-        // `$upstream_http_name` and `$upstream_cookie_name`
-        expanded = expand_upstream_vars(&expanded, upstream_headers);
-        if expanded.is_empty() || expanded.contains('$') && !expanded.contains("$upstream") {
-            // Unsupported variables expand to nothing in nginx; keep it simple
-            // and only emit fully-expanded values.
+        if let Some(v) = ctx_vars {
+            let local = ServerVars {
+                req: v.req,
+                path: v.path,
+                query: v.query,
+                server_name: v.server_name,
+                server_port: v.server_port,
+                peer_ip: v.peer_ip,
+                peer_port: v.peer_port,
+                scheme: v.scheme,
+                document_root: v.document_root,
+                upstream_cache_status,
+                custom: v.custom,
+                connection_requests: v.connection_requests,
+                connection_time: v.connection_time,
+                sent: &sent,
+            };
+            expanded = local.expand(&expanded);
         }
         if expanded.is_empty() {
             continue;
@@ -2222,8 +2258,35 @@ async fn dispatch(
 
     // ---- reverse proxy (streams to the socket, cannot be resolved first) ----
     if loc.proxy_pass.is_some() {
+        let proxy_root = loc.root.to_string_lossy().to_string();
+        let proxy_vars = ServerVars {
+            req,
+            path,
+            query,
+            server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
+            server_port: listen_port,
+            peer_ip: client_ip,
+            peer_port,
+            scheme: "http",
+            document_root: &proxy_root,
+            upstream_cache_status: "",
+            custom: &set_vars,
+            connection_requests: state.requests,
+            connection_time: state.elapsed_secs(),
+            sent: &[],
+        };
         if let Some(o) =
-            crate::proxy::handle(conn, req, path, query, loc, http, server.server_tokens).await?
+            crate::proxy::handle(
+                conn,
+                req,
+                path,
+                query,
+                loc,
+                http,
+                server.server_tokens,
+                &proxy_vars,
+            )
+            .await?
         {
             return Ok(o);
         }

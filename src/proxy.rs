@@ -422,6 +422,7 @@ pub async fn handle(
     loc: &LocCfg,
     http: &Http,
     tokens: bool,
+    vars: &crate::http::ServerVars<'_>,
 ) -> io::Result<Option<Outcome>> {
     let pp = match &loc.proxy_pass {
         Some(p) => p.clone(),
@@ -636,6 +637,7 @@ pub async fn handle(
                     status: cache_status,
                 },
                 &upstream_addr,
+                vars,
             )
             .await;
 
@@ -973,6 +975,7 @@ async fn exchange(
     pool_key: (usize, u32),
     cache: CacheCtx<'_>,
     upstream_addr: &str,
+    vars: &crate::http::ServerVars<'_>,
 ) -> io::Result<Outcome> {
     // ---- request head ----
     let out = build_upstream_head(req, target_uri, body, loc, pp, peer_ip, is_upgrade);
@@ -1143,14 +1146,16 @@ async fn exchange(
 
     let mut raw = raw;
     crate::http::apply_expires(&mut raw, loc);
+    crate::http::apply_expires(&mut raw, loc);
     let upstream_headers = crate::http::split_head(&raw);
-    crate::http::apply_add_headers_full(
+    crate::http::apply_add_headers_ctx(
         &mut raw,
         &loc.headers,
         head.status,
         cache.status,
         upstream_addr,
         &upstream_headers,
+        Some(vars),
     );
     let sent_headers = crate::http::split_head(&raw);
     write_head(conn, head.status, &raw, req.keepalive, tokens).await?;
@@ -1473,6 +1478,7 @@ pub async fn fetch(
             raw.extend_from_slice(b"\r\n");
         }
         let upstream_headers = crate::http::split_head(&head.raw);
+        crate::http::apply_expires(&mut raw, loc);
         crate::http::apply_add_headers_full(
             &mut raw,
             &loc.headers,

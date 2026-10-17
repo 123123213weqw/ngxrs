@@ -167,3 +167,50 @@ fn resolve_prefix(prefix: Option<&Path>, conf_path: &Path) -> PathBuf {
         None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     }
 }
+
+/// `map {}` blocks of the active configuration.
+///
+/// nginx keeps these per-location-module; a single process-wide table is
+/// behaviourally equivalent because only one configuration is live at a time.
+static MAPS: std::sync::OnceLock<std::sync::RwLock<std::sync::Arc<Vec<crate::mapping::MapDef>>>> =
+    std::sync::OnceLock::new();
+
+fn maps_cell() -> &'static std::sync::RwLock<std::sync::Arc<Vec<crate::mapping::MapDef>>> {
+    MAPS.get_or_init(|| std::sync::RwLock::new(std::sync::Arc::new(Vec::new())))
+}
+
+/// Publish the maps of a freshly built configuration.
+pub fn set_maps(m: Vec<crate::mapping::MapDef>) {
+    if let Ok(mut w) = maps_cell().write() {
+        *w = std::sync::Arc::new(m);
+    }
+}
+
+/// Snapshot of the live `map` definitions.
+pub fn maps() -> std::sync::Arc<Vec<crate::mapping::MapDef>> {
+    maps_cell()
+        .read()
+        .map(|r| r.clone())
+        .unwrap_or_else(|e| e.into_inner().clone())
+}
+
+/// `geo {}` blocks of the active configuration.
+static GEOS: std::sync::OnceLock<std::sync::RwLock<std::sync::Arc<Vec<crate::geo::GeoDef>>>> =
+    std::sync::OnceLock::new();
+
+fn geos_cell() -> &'static std::sync::RwLock<std::sync::Arc<Vec<crate::geo::GeoDef>>> {
+    GEOS.get_or_init(|| std::sync::RwLock::new(std::sync::Arc::new(Vec::new())))
+}
+
+pub fn set_geos(g: Vec<crate::geo::GeoDef>) {
+    if let Ok(mut w) = geos_cell().write() {
+        *w = std::sync::Arc::new(g);
+    }
+}
+
+pub fn geos() -> std::sync::Arc<Vec<crate::geo::GeoDef>> {
+    geos_cell()
+        .read()
+        .map(|r| r.clone())
+        .unwrap_or_else(|e| e.into_inner().clone())
+}

@@ -561,6 +561,8 @@ pub struct Http {
     pub default_access_logs: Vec<AccessLog>,
     pub upstreams: Vec<Upstream>,
     pub cache_zones: Vec<CacheZone>,
+    pub maps: Vec<crate::mapping::MapDef>,
+    pub geos: Vec<crate::geo::GeoDef>,
     pub limit_req_zones: Vec<LimitReqZone>,
     pub limit_conn_zones: Vec<LimitConnZone>,
     pub log_formats: HashMap<String, String>,
@@ -2032,6 +2034,8 @@ pub fn build(
         default_loc: LocCfg::new(prefix.to_path_buf()),
         upstreams: Vec::new(),
         cache_zones: Vec::new(),
+        maps: Vec::new(),
+        geos: Vec::new(),
         limit_req_zones: Vec::new(),
         limit_conn_zones: Vec::new(),
         default_access_logs: vec![AccessLog {
@@ -2049,6 +2053,82 @@ pub fn build(
     for d in &http_roots {
         match d.name.as_str() {
             "server" => server_dirs.push(d.clone()),
+            "geo" => {
+                // geo [$source] $result { ... }
+                let (source, var) = match d.args.as_slice() {
+                    [v] => (None, v.trim_start_matches('$').to_string()),
+                    [src, v] => (
+                        Some(src.clone()),
+                        v.trim_start_matches('$').to_string(),
+                    ),
+                    _ => return Err(sem(&d.file, d.line, "geo needs $variable")),
+                };
+                let mut def = crate::geo::GeoDef::new(source, var);
+                for c in d.block.as_deref().unwrap_or(&[]) {
+                    match c.name.as_str() {
+                        "ranges" => def.set_ranges(),
+                        "proxy_recursive" => def.proxy_recursive = true,
+                        "proxy" => {
+                            if let Some(v) = c.args.first() {
+                                def.add_proxy(v);
+                            }
+                        }
+                        "default" => {
+                            if let Some(v) = c.args.first() {
+                                def.set_default(v.clone());
+                            }
+                        }
+                        "delete" => {
+                            if let Some(v) = c.args.first() {
+                                def.delete(v);
+                            }
+                        }
+                        key => {
+                            if let Some(v) = c.args.first() {
+                                def.add(key, v.clone());
+                            }
+                        }
+                    }
+                }
+                http.geos.push(def);
+            }
+            "map" => {
+                // map $source $result { ... }
+                if d.args.len() < 2 {
+                    return Err(sem(&d.file, d.line, "map needs $source and $result"));
+                }
+                let mut def = crate::mapping::MapDef {
+                    source: d.args[0].clone(),
+                    var: d.args[1].trim_start_matches('$').to_string(),
+                    hostnames: false,
+                    volatile: false,
+                    default: None,
+                    entries: Vec::new(),
+                };
+                for c in d.block.as_deref().unwrap_or(&[]) {
+                    match c.name.as_str() {
+                        "hostnames" => def.hostnames = true,
+                        "volatile" => def.volatile = true,
+                        "default" => def.default = c.args.first().cloned(),
+                        _ => {
+                            // `key value;` — the lexer already unescaped `\k`.
+                            if let Some(v) = c.args.first() {
+                                // `\include` escapes a directive-looking key.
+                                let key = c
+                                    .name
+                                    .strip_prefix('\\')
+                                    .unwrap_or(&c.name)
+                                    .to_string();
+                                def.entries.push(crate::mapping::Entry {
+                                    key,
+                                    value: v.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+                http.maps.push(def);
+            }
             "limit_req_zone" | "limit_conn_zone" => {
                 // limit_req_zone KEY zone=NAME:SIZE rate=Nr/s
                 let key = d
@@ -2327,6 +2407,9 @@ pub fn build(
     // nginx defaults to `<prefix>/logs/nginx.pid` and `<prefix>/logs/error.log`.
     let pid = Some(pid.unwrap_or_else(|| prefix.join("logs/nginx.pid")));
     let error_log = Some(error_log.unwrap_or_else(|| prefix.join("logs/error.log")));
+
+    crate::config::set_maps(http.maps.clone());
+    crate::config::set_geos(http.geos.clone());
 
     Ok(Config {
         prefix: prefix.to_path_buf(),

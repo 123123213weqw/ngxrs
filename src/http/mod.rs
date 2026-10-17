@@ -1071,7 +1071,7 @@ pub fn apply_add_headers_ctx(
                 connection_requests: v.connection_requests,
                 connection_time: v.connection_time,
                 sent: &sent,
-            };
+        };
             expanded = local.expand(&expanded);
         }
         if expanded.is_empty() {
@@ -1250,7 +1250,44 @@ pub struct ServerVars<'a> {
     pub sent: &'a [(String, String)],
 }
 
+thread_local! {
+    /// Guards against `map` cycles (`map $a $b` + `map $b $a`).
+    static MAP_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 impl<'a> ServerVars<'a> {
+    /// Resolve a `map`-defined variable, if `name` is one.
+    fn map_var(&self, name: &str) -> Option<String> {
+        let maps = crate::config::maps();
+        let def = maps.iter().find(|m| m.var == name)?;
+        if MAP_DEPTH.with(|d| d.get()) > 16 {
+            return Some(String::new());
+        }
+        let source = self.expand(&def.source);
+        let value = def.lookup(&source)?.to_string();
+        MAP_DEPTH.with(|d| d.set(d.get() + 1));
+        let out = self.expand(&value);
+        MAP_DEPTH.with(|d| d.set(d.get() - 1));
+        Some(out)
+    }
+
+    /// Resolve a `geo`-defined variable, if `name` is one.
+    fn geo_var(&self, name: &str) -> Option<String> {
+        let geos = crate::config::geos();
+        let def = geos.iter().find(|g| g.var == name)?;
+        // The source defaults to `$remote_addr`, which `proxy` may replace
+        // with an X-Forwarded-For entry.
+        let addr = match &def.source {
+            Some(src) => self.expand(src),
+            None => {
+                let xff = self.req.headers.get("x-forwarded-for");
+                def.resolve_addr(self.peer_ip, xff)
+            }
+        };
+        let value = def.lookup(&addr)?.to_string();
+        Some(self.expand(&value))
+    }
+
     pub fn get(&self, name: &str) -> String {
         // `$limit_rate` has its own get handler: the stored string is parsed as
         // a rate, not returned verbatim.
@@ -1260,6 +1297,12 @@ impl<'a> ServerVars<'a> {
         }
         if let Some(v) = self.custom.get(name) {
             return v.clone();
+        }
+        if let Some(v) = self.map_var(name) {
+            return v;
+        }
+        if let Some(v) = self.geo_var(name) {
+            return v;
         }
         match name {
             "host" => self
@@ -1815,7 +1858,7 @@ pub async fn render_resolved_vars(
                 connection_requests: state.requests,
                 connection_time: state.elapsed_secs(),
                 sent: &[],
-            };
+        };
             route(req, path, query, loc, server, http, false, &vars).await
         };
         finalize_response(
@@ -1983,7 +2026,7 @@ async fn finalize_response(
                 connection_requests: state.requests,
                 connection_time: state.elapsed_secs(),
                 sent: &[],
-            };
+        };
             vars.expand(&cur_path)
         };
 
@@ -2015,7 +2058,7 @@ async fn finalize_response(
                 connection_requests: state.requests,
                 connection_time: state.elapsed_secs(),
                 sent: &[],
-            };
+        };
             cur_query = vars.expand(&cur_query);
         }
         cur_loc = server.locate(&cur_path);
@@ -2042,7 +2085,7 @@ async fn finalize_response(
                     connection_requests: state.requests,
                     connection_time: state.elapsed_secs(),
                     sent: &[],
-                };
+        };
                 route(req, &cur_path, &cur_query, l, server, http, true, &vars).await
             }
         };

@@ -11,6 +11,7 @@ mod net;
 mod tls;
 mod proxy;
 mod stream;
+mod uwsgi_scgi;
 mod util;
 
 use std::path::PathBuf;
@@ -22,10 +23,14 @@ pub const COMPAT_VERSION: &str = "1.28.0";
 fn usage() -> String {
     format!(
         "{VERSION} (nginx-compatible)\n\
-         Usage: ngxrs [-c config] [-p prefix] [-t] [-v] [-h]\n\
+         Usage: ngxrs [-c config] [-p prefix] [-t|-T] [-e log] [-g directives] [-s signal] [-v] [-h]\n\
          \x20 -c FILE   configuration file (default: conf/nginx.conf)\n\
-         \x20 -p DIR    prefix path (default: directory of config file)\n\
+         \x20 -p DIR    prefix path\n\
          \x20 -t        test configuration and exit\n\
+         \x20 -T        test, dump configuration and exit\n\
+         \x20 -e FILE   error log file\n\
+         \x20 -g TEXT   extra global directives\n\
+         \x20 -s SIGNAL stop|quit|reload (needs a pid file)\n\
          \x20 -v        show version and exit\n"
     )
 }
@@ -45,12 +50,24 @@ fn real_main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let mut conf: Option<PathBuf> = None;
     let mut prefix: Option<PathBuf> = None;
     let mut test = false;
+    let mut dump = false;
+    let mut error_log: Option<PathBuf> = None;
+    let mut globals: Vec<String> = Vec::new();
+    let mut signal: Option<String> = None;
 
     while let Some(a) = args.next() {
         match a.as_str() {
             "-c" => conf = Some(PathBuf::from(args.next().ok_or("-c requires a file")?)),
             "-p" => prefix = Some(PathBuf::from(args.next().ok_or("-p requires a path")?)),
-            "-t" | "-T" => test = true,
+            "-t" => test = true,
+            "-T" => {
+                test = true;
+                dump = true;
+            }
+            "-e" => error_log = Some(PathBuf::from(args.next().ok_or("-e requires a file")?)),
+            "-g" => globals.push(args.next().ok_or("-g requires a value")?),
+            "-s" => signal = Some(args.next().ok_or("-s requires a signal")?),
+            "-q" => {}
             "-v" | "-V" => {
                 println!("{VERSION}");
                 println!("nginx compatibility target: {COMPAT_VERSION}");
@@ -60,31 +77,65 @@ fn real_main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 print!("{}", usage());
                 return Ok(ExitCode::SUCCESS);
             }
-            "-g" => {
-                let _ = args.next();
-                return Err("-g is not implemented yet".into());
-            }
-            "-s" => {
-                let _ = args.next();
-                return Err("signal control (-s) is not implemented yet".into());
-            }
             other => return Err(format!("invalid option: {other}").into()),
         }
     }
 
     let conf = conf.unwrap_or_else(|| PathBuf::from("conf/nginx.conf"));
-    let cfg = config::load_full(&conf, prefix.as_deref())?;
+
+    if let Some(sig) = signal {
+        return send_signal(&conf, prefix.as_deref(), &sig);
+    }
+
+    let cfg = config::load_global(&conf, prefix.as_deref(), &globals, error_log.as_deref())?;
 
     for w in &cfg.warnings {
         eprintln!("ngxrs: [warn] {w}");
     }
 
     if test {
-        eprintln!("ngxrs: the configuration file {conf:?} syntax is ok");
-        eprintln!("ngxrs: configuration file {conf:?} test is successful");
+        eprintln!(
+            "ngxrs: the configuration file {} syntax is ok",
+            conf.display()
+        );
+        eprintln!(
+            "ngxrs: configuration file {} test is successful",
+            conf.display()
+        );
+        if dump {
+            print!("{}", config::dump(&cfg));
+        }
         return Ok(ExitCode::SUCCESS);
     }
 
     net::serve(cfg)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `-s stop|quit|reload`: nginx reads the pid file and signals that process.
+fn send_signal(conf: &std::path::Path, prefix: Option<&std::path::Path>, sig: &str) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let cfg = config::load_light(conf, prefix)?;
+    let pid_path = cfg
+        .pid
+        .clone()
+        .ok_or("no pid file configured, cannot send signals")?;
+    let text = std::fs::read_to_string(&pid_path)
+        .map_err(|e| format!("cannot read pid file {}: {e}", pid_path.display()))?;
+    let pid: i32 = text
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid pid in {}", pid_path.display()))?;
+
+    let signo = match sig {
+        "stop" => libc::SIGTERM,
+        "quit" => libc::SIGQUIT,
+        "reload" => libc::SIGHUP,
+        "reopen" => libc::SIGUSR1,
+        other => return Err(format!("invalid signal name \"{other}\"").into()),
+    };
+    let rc = unsafe { libc::kill(pid, signo) };
+    if rc != 0 {
+        return Err(format!("kill({pid}) failed: {}", std::io::Error::last_os_error()).into());
+    }
     Ok(ExitCode::SUCCESS)
 }

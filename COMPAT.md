@@ -13,7 +13,12 @@
 | `include` + 通配符 | ✅ | 支持 `*` `?`，按路径排序 |
 | 上下文继承（http → server → location） | 🟡 | 基础字段已继承；`add_header` 目前是累加而非"覆盖" |
 | `-t` 配置自检 | ✅ | |
-| `-s reload/stop`、daemon/fork 模型 | ⬜ | 当前前台单进程多线程 |
+| `-t` / `-T`（含配置 dump） | ✅ | |
+| `-e FILE` / `-g DIRECTIVES` / `-p` / `-c`（相对 prefix 解析） | ✅ | |
+| `-s stop/quit/reload/reopen` | ✅ | 读 pid 文件后发信号；`reload` 目前等同于 SIGHUP 无动作 |
+| `daemon on/off`（fork+setsid、就绪握手、pid 在 listen 之后写） | ✅ | 这是官方测试集能驱动的前提 |
+| SIGQUIT / SIGTERM / SIGINT 优雅停止 | ✅ | |
+| `error_log` 落盘（notice 级） | 🟡 | 已写文件；分级过滤与 debug 细粒度未做 |
 | `worker_processes N/auto` | ✅ | 每 worker 一线程 + 独立 runtime |
 | 两种 accept 策略 | ✅ | `NGXRS_ACCEPT=reuseport`（默认）/ `shared`（单监听+轮询分发） |
 | 未知指令处理 | 🟡 | 记 warning 继续；nginx 是直接报错 |
@@ -78,7 +83,9 @@
 | FastCGI 无 Content-Length 时用 chunked | ✅ | 与 nginx 帧格式逐字节一致 |
 | `fastcgi_connect_timeout` / `fastcgi_read_timeout` | ✅ | |
 | `fastcgi_cache` / `fastcgi_buffers` / `fastcgi_keep_conn` | ⬜ | 已解析未生效 |
-| `uwsgi_pass` / `scgi_pass` / `grpc_pass` | ⬜ | |
+| `uwsgi_pass` / `uwsgi_param` | ✅ | 报文头 `modifier1, size(LE16), modifier2`（按 nginx 源码） |
+| `scgi_pass` / `scgi_param` | ✅ | netstring + NUL 分隔键值对 |
+| `grpc_pass` | ⬜ | |
 
 ## 内容过滤
 
@@ -146,3 +153,18 @@
 3. `server_tokens` 默认值在 http/server 合并时的边界情况。
 4. 访问日志不做 `\x` 转义，UA 含引号会破坏行格式。
 5. 无 `open_file_cache`，高并发小文件下 stat 次数多于 nginx。
+
+
+## nginx-tests 状态（官方 Perl 测试集）
+
+`bench/nginxtests.sh` 用 `TEST_NGINX_BINARY=target/release/ngxrs` 跑 nginx 官方用例。
+框架要求已全部满足：`-p/-c/-e/-g` 参数、相对 prefix 的路径解析、`daemon off/on`、
+listen 之后写 pid、`kill QUIT` 停止、`error.log` 存在。
+
+**已知环境限制**：master 版用例大量使用 `http_host_header()` 等 helper，
+它们只存在于较新的 `Test::Nginx`；本机装的是 0.32（cpanm 最新），
+这类用例返回 `undef`，**与被测服务器无关**。选测时必须避开这些 helper。
+
+**当前实测**（`http_keepalive.t`）：21 项断言里 4 项通过、17 项失败。
+失败集中在 keepalive 细节（`Connection: keep-alive` 回显、`keepalive_requests`
+上限、`keepalive_timeout` 边界）。这是真实差距，不是环境问题，下一步优先修这里。

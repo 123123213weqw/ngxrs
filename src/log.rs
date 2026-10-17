@@ -8,6 +8,41 @@ use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+/// Process-wide error log. nginx writes to `error_log` (or stderr); the
+/// official test suite reads this file, so it must exist and receive lines.
+static ERROR_LOG: std::sync::OnceLock<std::sync::Mutex<std::fs::File>> =
+    std::sync::OnceLock::new();
+
+pub fn init_error_log(path: Option<&Path>) {
+    let Some(path) = path else { return };
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+    if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = ERROR_LOG.set(std::sync::Mutex::new(f));
+    }
+}
+
+/// Write one error-log line, mirroring nginx's `YYYY/MM/DD HH:MM:SS [level] msg`.
+pub fn error_log(level: &str, msg: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let stamp = crate::util::log_time(now);
+    eprintln!("{stamp} [{level}] {msg}");
+    if let Some(log) = ERROR_LOG.get() {
+        if let Ok(mut f) = log.lock() {
+            use std::io::Write;
+            let pid = std::process::id();
+            let _ = writeln!(f, "{stamp} [{level}] {pid}#{pid}: {msg}");
+            let _ = f.flush();
+        }
+    }
+}
+
 pub struct Logger {
     tx: Option<Sender<(PathBuf, String)>>,
     handle: Option<JoinHandle<()>>,

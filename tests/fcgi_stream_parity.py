@@ -138,6 +138,112 @@ def fcgi_responder(port, behaviour):
     threading.Thread(target=loop, daemon=True).start()
 
 
+def _serve(port, handler):
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        srv.bind(("127.0.0.1", port))
+    except OSError:
+        return  # leftover from an earlier run is already serving
+    srv.listen(64)
+
+    def loop():
+        while True:
+            try:
+                c, _ = srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=handler, args=(c,), daemon=True).start()
+
+    threading.Thread(target=loop, daemon=True).start()
+
+
+def uwsgi_responder(port):
+    """Minimal uwsgi responder: 4-byte LE header + key/value packet in."""
+
+    def handle(c):
+        try:
+            hdr = recv_exact(c, 4)
+            if hdr is None:
+                return
+            # modifier1, size (u16 LE), modifier2
+            mod1 = hdr[0]
+            dlen = struct.unpack("<H", hdr[1:3])[0]
+            mod2 = hdr[3]
+            data = recv_exact(c, dlen) or b""
+            params = {}
+            i = 0
+            while i + 2 <= len(data):
+                klen = struct.unpack("<H", data[i:i + 2])[0]
+                i += 2
+                key = data[i:i + klen].decode("latin1")
+                i += klen
+                vlen = struct.unpack("<H", data[i:i + 2])[0]
+                i += 2
+                val = data[i:i + vlen].decode("latin1")
+                i += vlen
+                params[key] = val
+            body = b"uwsgi:%d:%s:%s\n" % (
+                mod1,
+                params.get("REQUEST_METHOD", "?").encode(),
+                params.get("PATH_INFO", "?").encode(),
+            )
+            c.sendall(b"Content-Type: text/plain\r\n\r\n" + body)
+        except OSError:
+            pass
+        _finish(c)
+
+    _serve(port, handle)
+
+
+def scgi_responder(port):
+    """Minimal SCGI responder: netstring length prefix + NUL-terminated pairs."""
+
+    def handle(c):
+        try:
+            buf = b""
+            while b":" not in buf:
+                d = c.recv(1)
+                if not d:
+                    return
+                buf += d
+            nlen = int(buf[:-1])
+            data = recv_exact(c, nlen + 1)  # netstring + comma
+            if data is None:
+                return
+            net = data[:-1]
+            parts = net.split(b"\0")
+            params = {}
+            for j in range(0, len(parts) - 1, 2):
+                params[parts[j].decode()] = parts[j + 1].decode()
+            body = b"scgi:%s:%s\n" % (
+                params.get("REQUEST_METHOD", "?").encode(),
+                params.get("REQUEST_URI", "?").encode(),
+            )
+            c.sendall(b"Content-Type: text/plain\r\n\r\n" + body)
+        except OSError:
+            pass
+        _finish(c)
+
+    _serve(port, handle)
+
+
+def _finish(c):
+    """Half-close and drain: without this, close() on a socket with unread
+    request bytes sends RST and the caller loses the response body."""
+    try:
+        c.shutdown(socket.SHUT_WR)
+        c.settimeout(1.0)
+        while c.recv(4096):
+            pass
+    except OSError:
+        pass
+    try:
+        c.close()
+    except OSError:
+        pass
+
+
 def tcp_echo(port, reuse=True):
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -246,6 +352,8 @@ def main():
     fcgi_responder(19601, "json")
     fcgi_responder(19602, "status")
     fcgi_responder(19603, "body")
+    uwsgi_responder(19620)
+    scgi_responder(19621)
     tcp_echo(19610)
     udp_echo(19611)
     time.sleep(0.6)
@@ -283,6 +391,15 @@ def main():
     record("fcgi-post", 
            http_get(args.nginx, "/fcgi/p.php", body=b"hello", method="POST"),
            http_get(args.ngxrs, "/fcgi/p.php", body=b"hello", method="POST"))
+
+    # uwsgi / scgi
+    for name, path in [("uwsgi-basic", "/uwsgi/app"), ("uwsgi-query", "/uwsgi/app?x=1"),
+                       ("scgi-basic", "/scgi/app"), ("scgi-query", "/scgi/app?y=2")]:
+        record(name, http_get(args.nginx, path), http_get(args.ngxrs, path))
+
+    record("uwsgi-post",
+           http_get(args.nginx, "/uwsgi/app", body=b"hi", method="POST"),
+           http_get(args.ngxrs, "/uwsgi/app", body=b"hi", method="POST"))
 
     # stream TCP
     a = tcp_roundtrip(args.nginx_tcp)

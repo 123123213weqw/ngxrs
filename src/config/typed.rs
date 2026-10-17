@@ -72,6 +72,11 @@ pub struct LocCfg {
     pub fastcgi_split_path_info: Option<regex::Regex>,
     pub fastcgi_connect_timeout: Duration,
     pub fastcgi_read_timeout: Duration,
+    // ---- uwsgi / scgi ----
+    pub uwsgi_pass: Option<UwsgiPass>,
+    pub uwsgi_params: Vec<FastcgiParam>,
+    pub scgi_pass: Option<ScgiPass>,
+    pub scgi_params: Vec<FastcgiParam>,
     // ---- proxy_cache ----
     pub proxy_cache: Option<String>,
     pub proxy_cache_valid: Vec<(Vec<u16>, Duration)>,
@@ -118,6 +123,10 @@ impl LocCfg {
             fastcgi_split_path_info: None,
             fastcgi_connect_timeout: Duration::from_secs(60),
             fastcgi_read_timeout: Duration::from_secs(60),
+            uwsgi_pass: None,
+            uwsgi_params: Vec::new(),
+            scgi_pass: None,
+            scgi_params: Vec::new(),
             proxy_cache: None,
             proxy_cache_valid: Vec::new(),
             proxy_cache_key: None,
@@ -215,6 +224,20 @@ pub fn compile_rewrite(re_src: &str, replacement: &str, flag: RewriteFlag) -> Op
 #[derive(Debug, Clone)]
 pub struct FastcgiPass {
     pub addr: SocketAddr,
+}
+
+#[derive(Debug, Clone)]
+pub struct UwsgiPass {
+    pub addr: SocketAddr,
+    pub connect_timeout: Duration,
+    pub read_timeout: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScgiPass {
+    pub addr: SocketAddr,
+    pub connect_timeout: Duration,
+    pub read_timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -1008,6 +1031,71 @@ impl Builder {
                         .ok_or_else(|| sem(&d.file, d.line, "invalid fastcgi_read_timeout"))?;
                 }
             }
+            "uwsgi_pass" => {
+                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "uwsgi_pass requires an address"))?;
+                let addr = parse_listen(v)
+                    .ok_or_else(|| sem(&d.file, d.line, format!("invalid uwsgi_pass \"{v}\"")))?;
+                cfg.uwsgi_pass = Some(UwsgiPass {
+                    addr,
+                    connect_timeout: Duration::from_secs(60),
+                    read_timeout: Duration::from_secs(60),
+                });
+            }
+            "uwsgi_param" => {
+                if d.args.len() < 2 {
+                    return Err(sem(&d.file, d.line, "uwsgi_param requires a name and a value"));
+                }
+                cfg.uwsgi_params.push(FastcgiParam {
+                    name: d.args[0].clone(),
+                    value: d.args[1..].join(" "),
+                });
+            }
+            "uwsgi_connect_timeout" => {
+                if let (Some(v), Some(pass)) = (d.args.first(), cfg.uwsgi_pass.as_mut()) {
+                    pass.connect_timeout = parse_time(v)
+                        .ok_or_else(|| sem(&d.file, d.line, "invalid uwsgi_connect_timeout"))?;
+                }
+            }
+            "uwsgi_read_timeout" => {
+                if let (Some(v), Some(pass)) = (d.args.first(), cfg.uwsgi_pass.as_mut()) {
+                    pass.read_timeout = parse_time(v)
+                        .ok_or_else(|| sem(&d.file, d.line, "invalid uwsgi_read_timeout"))?;
+                }
+            }
+            "scgi_pass" => {
+                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "scgi_pass requires an address"))?;
+                let addr = parse_listen(v)
+                    .ok_or_else(|| sem(&d.file, d.line, format!("invalid scgi_pass \"{v}\"")))?;
+                cfg.scgi_pass = Some(ScgiPass {
+                    addr,
+                    connect_timeout: Duration::from_secs(60),
+                    read_timeout: Duration::from_secs(60),
+                });
+            }
+            "scgi_param" => {
+                if d.args.len() < 2 {
+                    return Err(sem(&d.file, d.line, "scgi_param requires a name and a value"));
+                }
+                cfg.scgi_params.push(FastcgiParam {
+                    name: d.args[0].clone(),
+                    value: d.args[1..].join(" "),
+                });
+            }
+            "scgi_connect_timeout" | "scgi_read_timeout" | "scgi_send_timeout"
+            | "scgi_buffer_size" | "scgi_buffers" | "scgi_busy_buffers_size"
+            | "scgi_temp_file_write_size" | "scgi_max_temp_file_size"
+            | "scgi_intercept_errors" | "scgi_pass_request_body"
+            | "scgi_pass_request_headers" | "scgi_store" | "scgi_store_access"
+            | "scgi_cache" | "scgi_cache_key" | "scgi_cache_valid"
+            | "uwsgi_send_timeout" | "uwsgi_buffer_size" | "uwsgi_buffers"
+            | "uwsgi_busy_buffers_size" | "uwsgi_temp_file_write_size"
+            | "uwsgi_max_temp_file_size" | "uwsgi_intercept_errors"
+            | "uwsgi_pass_request_body" | "uwsgi_pass_request_headers"
+            | "uwsgi_modifier1" | "uwsgi_modifier2" | "uwsgi_store"
+            | "uwsgi_store_access" | "uwsgi_cache" | "uwsgi_cache_key"
+            | "uwsgi_cache_valid" | "uwsgi_ssl_server_name" | "uwsgi_ssl_verify" => {
+                // Accepted, not yet honoured.
+            }
             "fastcgi_send_timeout" | "fastcgi_buffer_size" | "fastcgi_buffers"
             | "fastcgi_busy_buffers_size" | "fastcgi_temp_file_write_size"
             | "fastcgi_max_temp_file_size" | "fastcgi_intercept_errors"
@@ -1744,6 +1832,25 @@ pub fn build(
         stream,
         warnings: b.warnings,
     })
+}
+
+impl Location {
+    /// nginx syntax for this location's matcher, used by `-T`.
+    pub fn pattern(&self) -> String {
+        match &self.matcher {
+            Match::Exact(s) => format!("= {s}"),
+            Match::Prefix(s) => s.clone(),
+            Match::PrefixNoRegex(s) => format!("^~ {s}"),
+            Match::Regex { src, ci, .. } => {
+                if *ci {
+                    format!("~* {src}")
+                } else {
+                    format!("~ {src}")
+                }
+            }
+            Match::Named(s) => s.clone(),
+        }
+    }
 }
 
 impl Server {

@@ -33,7 +33,80 @@ fn accept_mode() -> &'static str {
     })
 }
 
+/// Pipe used to tell the original process that the daemon wrote its pid file.
+/// Without this handshake the parent can exit before the pid file exists, and
+/// `nginx-tests` treats that as a failed start.
+static READY_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+fn notify_parent_ready() {
+    let fd = READY_FD.swap(-1, Ordering::SeqCst);
+    if fd >= 0 {
+        unsafe {
+            let byte = [1u8];
+            libc::write(fd, byte.as_ptr() as *const libc::c_void, 1);
+            libc::close(fd);
+        }
+    }
+}
+
+/// nginx's `daemon on` default: fork, detach from the session, redirect the
+/// standard descriptors, and let the parent exit once we are ready.
+fn daemonize(pid_path: Option<&std::path::Path>, error_log: Option<&std::path::Path>) -> io::Result<()> {
+    let mut fds = [0i32; 2];
+    let have_pipe = unsafe { libc::pipe(fds.as_mut_ptr()) } == 0;
+
+    unsafe {
+        match libc::fork() {
+            -1 => return Err(io::Error::last_os_error()),
+            0 => {
+                // child: keep going, close the read end
+                if have_pipe {
+                    libc::close(fds[0]);
+                    READY_FD.store(fds[1], Ordering::SeqCst);
+                }
+            }
+            _ => {
+                // parent: wait for readiness so callers can rely on the pid file
+                if have_pipe {
+                    libc::close(fds[1]);
+                    let mut byte = [0u8; 1];
+                    libc::read(fds[0], byte.as_mut_ptr() as *mut libc::c_void, 1);
+                    libc::close(fds[0]);
+                }
+                std::process::exit(0);
+            }
+        }
+        if libc::setsid() == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // Second fork so the daemon can never reacquire a controlling tty.
+        match libc::fork() {
+            -1 => return Err(io::Error::last_os_error()),
+            0 => {}
+            _ => std::process::exit(0),
+        }
+        let devnull = libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDWR);
+        if devnull >= 0 {
+            libc::dup2(devnull, 0);
+            libc::dup2(devnull, 1);
+            if error_log.is_none() {
+                libc::dup2(devnull, 2);
+            }
+            if devnull > 2 {
+                libc::close(devnull);
+            }
+        }
+        let _ = pid_path;
+    }
+    Ok(())
+}
+
 pub fn serve(cfg: Config) -> io::Result<()> {
+    // `daemon on` is nginx's default and what the official test suite expects.
+    if cfg.daemon && std::env::var_os("NGXRS_NO_DAEMON").is_none() {
+        daemonize(cfg.pid.as_deref(), cfg.error_log.as_deref())?;
+    }
+
     let workers = if cfg.worker_processes == 0 {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -43,15 +116,14 @@ pub fn serve(cfg: Config) -> io::Result<()> {
     }
     .max(1);
 
+    crate::log::init_error_log(cfg.error_log.as_deref());
     let logger = Arc::new(Logger::new()?);
     let cfg = Arc::new(cfg);
 
-    if let Some(pid_path) = &cfg.pid {
-        if let Some(parent) = pid_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(pid_path, format!("{}\n", std::process::id()));
-    }
+    // nginx writes the pid file only after its listening sockets exist, and
+    // `nginx-tests` relies on that: the file appearing means "ready to serve".
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    let pid_path = cfg.pid.clone();
 
     // Build one TLS config per listening socket that has `ssl` enabled.
     let mut tls_by_group: Vec<Option<Arc<rustls::ServerConfig>>> =
@@ -99,10 +171,11 @@ pub fn serve(cfg: Config) -> io::Result<()> {
         let groups: Vec<SocketAddr> = cfg.http.groups.iter().map(|g| g.addr).collect();
         {
             let stopping = stopping.clone();
+            let ready = ready_tx.clone();
             threads.push(
                 std::thread::Builder::new()
                     .name("ngxrs-accept".to_string())
-                    .spawn(move || acceptor_main(&groups, senders, stopping))?,
+                    .spawn(move || acceptor_main(&groups, senders, stopping, ready))?,
             );
         }
         for (wid, rx) in receivers.into_iter().enumerate() {
@@ -120,9 +193,10 @@ pub fn serve(cfg: Config) -> io::Result<()> {
             let ctx = ctx.clone();
             let shutdown = shutdown_rx.clone();
             let stopping = stopping.clone();
+            let ready = if wid == 0 { Some(ready_tx.clone()) } else { None };
             let handle = std::thread::Builder::new()
                 .name(format!("ngxrs-w{wid}"))
-                .spawn(move || worker_main(wid, ctx, shutdown, stopping))?;
+                .spawn(move || worker_main(wid, ctx, shutdown, stopping, ready))?;
             threads.push(handle);
         }
     }
@@ -158,6 +232,18 @@ pub fn serve(cfg: Config) -> io::Result<()> {
     let stream_cfg = Arc::new(stream_cfg);
     crate::proxy::init(&cfg.http);
     crate::proxy::init_keepalive(&cfg.http);
+
+    // Wait until the listeners exist (worker 0 signals after binding).
+    let _ = ready_rx.recv_timeout(Duration::from_secs(10));
+
+    if let Some(pid_path) = &pid_path {
+        if let Some(parent) = pid_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(pid_path, format!("{}\n", std::process::id()));
+    }
+    // The original process (daemon parent) is blocked waiting for this.
+    notify_parent_ready();
 
     eprintln!(
         "ngxrs: started {workers} workers, prefix {}",
@@ -228,7 +314,13 @@ fn parse_stream_addr(s: &str) -> Option<SocketAddr> {
     None
 }
 
-fn worker_main(wid: usize, ctx: Arc<Ctx>, shutdown: watch::Receiver<bool>, stopping: Arc<AtomicBool>) {
+fn worker_main(
+    wid: usize,
+    ctx: Arc<Ctx>,
+    shutdown: watch::Receiver<bool>,
+    stopping: Arc<AtomicBool>,
+    ready: Option<std::sync::mpsc::Sender<()>>,
+) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -265,6 +357,9 @@ fn worker_main(wid: usize, ctx: Arc<Ctx>, shutdown: watch::Receiver<bool>, stopp
 
         if wid == 0 && listeners.is_empty() {
             std::process::exit(1);
+        }
+        if let Some(tx) = ready {
+            let _ = tx.send(());
         }
 
         let mut tasks = Vec::new();
@@ -409,9 +504,22 @@ fn block_on_shutdown() {
                     return;
                 }
             };
+            // SIGQUIT is nginx's graceful shutdown; SIGTERM/SIGINT also stop.
+            let quit = signal(SignalKind::quit());
+            let mut quit = match quit {
+                Ok(s) => s,
+                Err(_) => {
+                    tokio::select! {
+                        _ = term.recv() => {}
+                        _ = int.recv() => {}
+                    }
+                    return;
+                }
+            };
             tokio::select! {
                 _ = term.recv() => {}
                 _ = int.recv() => {}
+                _ = quit.recv() => {}
             }
         }
         #[cfg(not(unix))]
@@ -453,6 +561,7 @@ fn acceptor_main(
     groups: &[SocketAddr],
     senders: Vec<mpsc::Sender<Handoff>>,
     stopping: Arc<AtomicBool>,
+    ready: std::sync::mpsc::Sender<()>,
 ) {
     let mut listeners: Vec<(std::net::TcpListener, usize)> = Vec::new();
     for (gi, addr) in groups.iter().enumerate() {
@@ -467,6 +576,8 @@ fn acceptor_main(
             }
         }
     }
+
+    let _ = ready.send(());
 
     let mut pollfds: Vec<libc::pollfd> = listeners
         .iter()

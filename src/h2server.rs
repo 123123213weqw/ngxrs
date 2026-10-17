@@ -57,7 +57,17 @@ where
         let h1 = synthesize_request(&request, authority.as_deref(), &path, &query);
         let head_only = h1.method == Method::Head;
 
-        let resp = crate::http::resolve_response(&h1, &path, &query, server, loc, http).await;
+        let resp = crate::http::resolve_response(
+            &h1,
+            &path,
+            &query,
+            server,
+            loc,
+            http,
+            "127.0.0.1",
+            443,
+        )
+        .await;
 
         let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let mut builder = H2Response::builder().status(status);

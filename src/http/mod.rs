@@ -165,7 +165,10 @@ pub async fn handle_conn(mut conn: Conn, group: &ListenGroup, ctx: &Ctx) {
         // other handler discards it (nginx behaves the same for static
         // content). Draining here for an upstream-backed location would make
         // the module read an already-empty body and block forever.
-        let proxy_target = loc.proxy_pass.is_some() || loc.fastcgi_pass.is_some();
+        let proxy_target = loc.proxy_pass.is_some()
+            || loc.fastcgi_pass.is_some()
+            || loc.uwsgi_pass.is_some()
+            || loc.scgi_pass.is_some();
         if req.chunked {
             if !proxy_target {
                 if req.expect_continue {
@@ -230,6 +233,7 @@ async fn route_content(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn route(
     req: &Request,
     path: &str,
@@ -238,6 +242,7 @@ async fn route(
     server: &Server,
     http: &Http,
     allow_internal: bool,
+    vars: &ServerVars<'_>,
 ) -> Response {
     if !req.method.is_read() {
         return error_response(405, server.server_tokens);
@@ -249,6 +254,8 @@ async fn route(
 
     if let Some((code, body)) = &loc.ret {
         let status = *code;
+        // nginx expands variables in both the URL and the body text.
+        let body = &vars.expand(body);
         let mut resp = if matches!(status, 301 | 302 | 303 | 307 | 308) {
             Response::empty(status).header("Location", body.clone())
         } else if body.is_empty() {
@@ -626,6 +633,118 @@ pub struct AddHeaderVars<'a> {
     pub host: &'a str,
 }
 
+/// Full variable set available to `return`, `add_header`, `rewrite` and the
+/// upstream `*_set_header`/`*_param` directives.
+pub struct ServerVars<'a> {
+    pub req: &'a Request,
+    pub path: &'a str,
+    pub query: &'a str,
+    pub server_name: &'a str,
+    pub server_port: u16,
+    pub peer_ip: &'a str,
+    pub scheme: &'a str,
+    pub document_root: &'a str,
+    pub upstream_cache_status: &'a str,
+    /// Values from `set`, which override the built-ins.
+    pub custom: &'a std::collections::HashMap<String, String>,
+}
+
+impl<'a> ServerVars<'a> {
+    pub fn get(&self, name: &str) -> String {
+        if let Some(v) = self.custom.get(name) {
+            return v.clone();
+        }
+        match name {
+            "host" | "http_host" => self
+                .req
+                .host
+                .as_ref()
+                .map(|h| h.as_str().to_string())
+                .unwrap_or_default(),
+            "uri" | "document_uri" => self.path.to_string(),
+            "request_uri" => self.req.raw_target.clone(),
+            "args" | "query_string" => self.query.to_string(),
+            "is_args" => {
+                if self.query.is_empty() {
+                    String::new()
+                } else {
+                    "?".to_string()
+                }
+            }
+            "request_method" => self.req.method.as_str().to_string(),
+            "scheme" => self.scheme.to_string(),
+            "server_name" => self.server_name.to_string(),
+            "server_port" => self.server_port.to_string(),
+            "server_protocol" => {
+                if self.req.version_minor == 1 {
+                    "HTTP/1.1".to_string()
+                } else {
+                    "HTTP/1.0".to_string()
+                }
+            }
+            "remote_addr" => self.peer_ip.to_string(),
+            "document_root" => self.document_root.to_string(),
+            "request_filename" => format!("{}{}", self.document_root, self.path),
+            "upstream_cache_status" => self.upstream_cache_status.to_string(),
+            "content_length" => self
+                .req
+                .headers
+                .get("content-length")
+                .unwrap_or("")
+                .to_string(),
+            "content_type" => self.req.headers.get("content-type").unwrap_or("").to_string(),
+            "hostname" => "ngxrs".to_string(),
+            "nginx_version" => crate::COMPAT_VERSION.to_string(),
+            _ => {
+                if let Some(h) = name.strip_prefix("http_") {
+                    let key = h.replace('_', "-");
+                    self.req.headers.get(&key).unwrap_or("").to_string()
+                } else {
+                    String::new()
+                }
+            }
+        }
+    }
+
+    /// Expand `$var` / `${var}` references.
+    pub fn expand(&self, spec: &str) -> String {
+        let mut out = String::with_capacity(spec.len() + 8);
+        let b = spec.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] != b'$' {
+                out.push(b[i] as char);
+                i += 1;
+                continue;
+            }
+            // ${name} or $name
+            if i + 1 < b.len() && b[i + 1] == b'{' {
+                if let Some(end) = spec[i + 2..].find('}') {
+                    out.push_str(&self.get(&spec[i + 2..i + 2 + end]));
+                    i += 2 + end + 1;
+                    continue;
+                }
+                out.push('$');
+                i += 1;
+                continue;
+            }
+            let rest = &spec[i + 1..];
+            let n = rest
+                .bytes()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == b'_')
+                .count();
+            if n == 0 {
+                out.push('$');
+                i += 1;
+                continue;
+            }
+            out.push_str(&self.get(&rest[..n]));
+            i += 1 + n;
+        }
+        out
+    }
+}
+
 fn expand_add_header(spec: &str, vars: &AddHeaderVars<'_>) -> String {
     let mut out = String::with_capacity(spec.len() + 8);
     let b = spec.as_bytes();
@@ -669,11 +788,15 @@ pub async fn resolve_response(
     server: &Server,
     loc: &LocCfg,
     http: &Http,
+    peer_ip: &str,
+    server_port: u16,
 ) -> Response {
     let mut cur_path = path.to_string();
     let mut cur_query = query.to_string();
     let mut cur_loc = loc;
     let mut depth = 0usize;
+
+    let custom: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
     // ---- rewrite phase ----
     let mut relocations = 0;
@@ -705,12 +828,25 @@ pub async fn resolve_response(
         }
     }
 
+    let root_str = cur_loc.root.to_string_lossy().to_string();
     let mut resp = if skip_return {
         // `rewrite ... break` bypasses the location's `return`, so the request
         // falls through to the content handler (static file / proxy).
         route_content(req, &cur_path, &cur_query, cur_loc, server, http).await
     } else {
-        route(req, &cur_path, &cur_query, cur_loc, server, http, false).await
+        let vars = ServerVars {
+            req,
+            path: &cur_path,
+            query: &cur_query,
+            server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
+            server_port,
+            peer_ip,
+            scheme: "http",
+            document_root: &root_str,
+            upstream_cache_status: "",
+            custom: &custom,
+        };
+        route(req, &cur_path, &cur_query, cur_loc, server, http, false, &vars).await
     };
 
     while resp.status >= 400 && depth < 10 && !resp.no_error_page {
@@ -733,7 +869,21 @@ pub async fn resolve_response(
         cur_query = q;
         cur_loc = server.locate(&cur_path);
         depth += 1;
-        let redirected = route(req, &cur_path, &cur_query, cur_loc, server, http, true).await;
+        let redirected = {
+            let vars = ServerVars {
+                req,
+                path: &cur_path,
+                query: &cur_query,
+                server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
+                server_port,
+                peer_ip,
+                scheme: "http",
+                document_root: &root_str,
+                upstream_cache_status: "",
+                custom: &custom,
+            };
+            route(req, &cur_path, &cur_query, cur_loc, server, http, true, &vars).await
+        };
         if redirected.status >= 400 {
             resp = error_response(original_status, server.server_tokens);
             break;
@@ -795,6 +945,22 @@ async fn dispatch(
         }
     }
 
+    // ---- uwsgi / scgi ----
+    if loc.uwsgi_pass.is_some() {
+        if let Some(o) =
+            crate::uwsgi_scgi::handle_uwsgi(conn, req, path, query, loc, server.server_tokens).await?
+        {
+            return Ok(o);
+        }
+    }
+    if loc.scgi_pass.is_some() {
+        if let Some(o) =
+            crate::uwsgi_scgi::handle_scgi(conn, req, path, query, loc, server.server_tokens).await?
+        {
+            return Ok(o);
+        }
+    }
+
     // ---- reverse proxy (streams to the socket, cannot be resolved first) ----
     if loc.proxy_pass.is_some() {
         if let Some(o) =
@@ -804,7 +970,18 @@ async fn dispatch(
         }
     }
 
-    let resp = resolve_response(req, path, query, server, loc, http).await;
+    let peer_ip = conn.peer.ip().to_string();
+    let resp = resolve_response(
+        req,
+        path,
+        query,
+        server,
+        loc,
+        http,
+        &peer_ip,
+        listen_port,
+    )
+    .await;
     let status = resp.status;
     if matches!(status, 301 | 302 | 303 | 307 | 308) {
         return write_redirect(conn, req, resp, listen_port, server.server_tokens).await;

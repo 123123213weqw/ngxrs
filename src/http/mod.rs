@@ -230,6 +230,7 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
                     default_server,
                     http,
                     &peer,
+                    conn.peer.port(),
                     group.addr.port(),
                     &[],
                     &custom,
@@ -335,6 +336,9 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
             requests: served,
             started: conn_started,
         };
+        let mut guards_sink: Vec<crate::limit::ConnGuard> = Vec::new();
+        let peer_port = conn.peer.port();
+        let client_ip = conn.peer.ip().to_string();
         // Local address of this connection (nginx uses it when the Host header
         // is missing or unusable).
         let local_ip = conn
@@ -353,10 +357,15 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
             &captures,
             state,
             &local_ip,
+            peer_port,
+            &client_ip,
+            &mut guards_sink,
         )
         .await;
         let elapsed = started.elapsed().unwrap_or_default();
 
+        // `limit_conn` slots are held until the response has been written.
+        drop(guards_sink);
         let (status, bytes, close, sent) = match outcome {
             Ok(o) => (o.status, o.bytes, o.close, o.sent),
             Err(_e) => (499, 0, true, Vec::new()),
@@ -1361,7 +1370,7 @@ pub async fn resolve_response(
     server_port: u16,
 ) -> Response {
     resolve_response_caps(
-        req, path, query, server, loc, http, peer_ip, server_port, &[],
+        req, path, query, server, loc, http, peer_ip, 0, server_port, &[],
     )
     .await
 }
@@ -1484,6 +1493,7 @@ pub async fn resolve_response_caps(
     loc: &LocCfg,
     http: &Http,
     peer_ip: &str,
+    peer_port: u16,
     server_port: u16,
     captures: &[(String, String)],
 ) -> Response {
@@ -1495,6 +1505,7 @@ pub async fn resolve_response_caps(
         loc,
         http,
         peer_ip,
+        peer_port,
         server_port,
         captures,
         ConnState {
@@ -1515,6 +1526,7 @@ pub async fn resolve_response_local(
     loc: &LocCfg,
     http: &Http,
     peer_ip: &str,
+    peer_port: u16,
     server_port: u16,
     captures: &[(String, String)],
     state: ConnState,
@@ -1537,6 +1549,7 @@ pub async fn resolve_response_local(
                 server,
                 http,
                 peer_ip,
+                peer_port,
                 server_port,
                 captures,
                 &custom,
@@ -1551,15 +1564,15 @@ pub async fn resolve_response_local(
         Target::Done(r) => r,
         Target::Loc(p, q, l, skip, set_vars) => {
             return render_resolved_state(
-                req, &p, &q, l, skip, server, http, peer_ip, server_port, captures, state,
-                local_addr,
+                req, &p, &q, l, skip, server, http, peer_ip, peer_port, server_port, captures,
+                state, local_addr,
             )
             .await
         }
     };
     finalize_response(
-        req, &mut resp, path, query, server, http, peer_ip, server_port, captures, &custom, state,
-        local_addr,
+        req, &mut resp, path, query, server, http, peer_ip, peer_port, server_port, captures,
+        &custom, state, local_addr,
     )
     .await
 }
@@ -1573,6 +1586,7 @@ pub async fn resolve_response_state(
     loc: &LocCfg,
     http: &Http,
     peer_ip: &str,
+    peer_port: u16,
     server_port: u16,
     captures: &[(String, String)],
     state: ConnState,
@@ -1602,6 +1616,7 @@ pub async fn resolve_response_state(
                 server,
                 http,
                 peer_ip,
+                peer_port,
                 server_port,
                 captures,
                 &custom,
@@ -1616,8 +1631,8 @@ pub async fn resolve_response_state(
         Target::Done(r) => r,
         Target::Loc(p, q, l, skip, set_vars) => {
             return render_resolved_state(
-                req, &p, &q, l, skip, server, http, peer_ip, server_port, captures, state,
-                local_addr,
+                req, &p, &q, l, skip, server, http, peer_ip, peer_port, server_port, captures,
+                state, local_addr,
             )
             .await;
         }
@@ -1631,6 +1646,7 @@ pub async fn resolve_response_state(
         server,
         http,
         peer_ip,
+        peer_port,
         server_port,
         captures,
         &custom,
@@ -1651,6 +1667,7 @@ pub async fn render_resolved(
     server: &Server,
     http: &Http,
     peer_ip: &str,
+    peer_port: u16,
     server_port: u16,
     captures: &[(String, String)],
 ) -> Response {
@@ -1663,6 +1680,7 @@ pub async fn render_resolved(
         server,
         http,
         peer_ip,
+        peer_port,
         server_port,
         captures,
         ConnState {
@@ -1684,14 +1702,15 @@ pub async fn render_resolved_ctx(
     server: &Server,
     http: &Http,
     peer_ip: &str,
+    peer_port: u16,
     server_port: u16,
     captures: &[(String, String)],
     state: ConnState,
     local_addr: &str,
 ) -> Response {
     render_resolved_state(
-        req, path, query, loc, skip_return, server, http, peer_ip, server_port, captures, state,
-        local_addr,
+        req, path, query, loc, skip_return, server, http, peer_ip, peer_port, server_port,
+        captures, state, local_addr,
     )
     .await
 }
@@ -1706,14 +1725,15 @@ pub async fn render_resolved_state(
     server: &Server,
     http: &Http,
     peer_ip: &str,
+    peer_port: u16,
     server_port: u16,
     captures: &[(String, String)],
     state: ConnState,
     local_addr: &str,
 ) -> Response {
     render_resolved_vars(
-        req, path, query, loc, skip_return, server, http, peer_ip, server_port, captures, state,
-        local_addr, &std::collections::HashMap::new(),
+        req, path, query, loc, skip_return, server, http, peer_ip, peer_port, server_port,
+        captures, state, local_addr, &std::collections::HashMap::new(),
     )
     .await
 }
@@ -1728,6 +1748,7 @@ pub async fn render_resolved_vars(
     server: &Server,
     http: &Http,
     peer_ip: &str,
+    peer_port: u16,
     server_port: u16,
     captures: &[(String, String)],
     state: ConnState,
@@ -1750,7 +1771,7 @@ pub async fn render_resolved_vars(
                 server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
                 server_port,
                 peer_ip,
-                peer_port: 0,
+                peer_port,
                 scheme: "http",
                 document_root: &root_str,
                 upstream_cache_status: "",
@@ -1769,6 +1790,7 @@ pub async fn render_resolved_vars(
             server,
             http,
             peer_ip,
+            peer_port,
             server_port,
             captures,
             &custom,
@@ -1777,6 +1799,92 @@ pub async fn render_resolved_vars(
         )
         .await
     }
+}
+
+/// Expand a limit zone key (`$binary_remote_addr`, `$server_name`, ...).
+fn limit_key(spec: &str, vars: &ServerVars<'_>) -> String {
+    let mut out = String::with_capacity(spec.len() + 8);
+    let b = spec.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'$' {
+            out.push(b[i] as char);
+            i += 1;
+            continue;
+        }
+        let rest = &spec[i + 1..];
+        let n = rest
+            .bytes()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == b'_')
+            .count();
+        if n == 0 {
+            out.push('$');
+            i += 1;
+            continue;
+        }
+        // `$binary_remote_addr` is the packed form; the textual address is an
+        // equivalent map key for our purposes.
+        match &rest[..n] {
+            "binary_remote_addr" => out.push_str(vars.peer_ip),
+            other => out.push_str(&vars.get(other)),
+        }
+        i += 1 + n;
+    }
+    out
+}
+
+/// Apply `limit_req` / `limit_conn`. Returns a response when the request must
+/// be rejected; `limit_conn` slots are pushed into `guards` so they are held
+/// until the response has been written.
+fn check_limits(
+    loc: &LocCfg,
+    http: &Http,
+    vars: &ServerVars<'_>,
+    guards: &mut Vec<crate::limit::ConnGuard>,
+) -> Option<Response> {
+    for lr in &loc.limit_reqs {
+        let Some(zone) = http.limit_req_zones.iter().find(|z| z.name == lr.zone) else {
+            continue;
+        };
+        let key = limit_key(&zone.key, vars);
+        match zone.state.account(&key, lr.burst, lr.nodelay) {
+            None => {
+                crate::log::error_log(
+                    "error",
+                    &format!(
+                        "limiting requests, excess: zone=\"{}\" key=\"{key}\"",
+                        lr.zone
+                    ),
+                );
+                return Some(error_response(loc.limit_req_status, true));
+            }
+            Some(delay) if !delay.is_zero() => {
+                // nginx holds the request for the computed delay. Blocking here
+                // is intentional: the delay is bounded by burst/rate.
+                std::thread::sleep(delay.min(std::time::Duration::from_secs(10)));
+            }
+            _ => {}
+        }
+    }
+
+    for lc in &loc.limit_conns {
+        let Some(zone) = http.limit_conn_zones.iter().find(|z| z.name == lc.zone) else {
+            continue;
+        };
+        let key = limit_key(&zone.key, vars);
+        match zone.state.acquire(&key, lc.limit) {
+            Some(guard) => guards.push(guard),
+            None => {
+                crate::log::error_log(
+                    "error",
+                    &format!("limiting connections by zone \"{}\"", lc.zone),
+                );
+                return Some(error_response(loc.limit_conn_status, true));
+            }
+        }
+    }
+
+    None
 }
 
 /// Apply `error_page`, `add_header` and `gzip` to a response the content phase
@@ -1790,6 +1898,7 @@ async fn finalize_response(
     server: &Server,
     http: &Http,
     peer_ip: &str,
+    peer_port: u16,
     server_port: u16,
     _captures: &[(String, String)],
     custom: &std::collections::HashMap<String, String>,
@@ -1830,7 +1939,7 @@ async fn finalize_response(
                 server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
                 server_port,
                 peer_ip,
-                peer_port: 0,
+                peer_port,
                 scheme: "http",
                 document_root: &root_str,
                 upstream_cache_status: "",
@@ -1862,7 +1971,7 @@ async fn finalize_response(
                 server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
                 server_port,
                 peer_ip,
-                peer_port: 0,
+                peer_port,
                 scheme: "http",
                 document_root: &root_str,
                 upstream_cache_status: "",
@@ -1889,7 +1998,7 @@ async fn finalize_response(
                     server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
                     server_port,
                     peer_ip,
-                    peer_port: 0,
+                    peer_port,
                     scheme: "http",
                     document_root: &root_str,
                     upstream_cache_status: "",
@@ -1936,7 +2045,7 @@ async fn finalize_response(
             server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
             server_port,
             peer_ip,
-            peer_port: 0,
+            peer_port,
             scheme: "http",
             document_root: &root_str,
             upstream_cache_status: "",
@@ -1989,6 +2098,9 @@ async fn dispatch(
     captures: &[(String, String)],
     state: ConnState,
     local_addr: &str,
+    peer_port: u16,
+    client_ip: &str,
+    guards: &mut Vec<crate::limit::ConnGuard>,
 ) -> io::Result<Outcome> {
     let head_only = req.method == Method::Head;
     let keepalive_allowed = keepalive_policy(req, loc, state);
@@ -2020,6 +2132,7 @@ async fn dispatch(
             server,
             http,
             &peer,
+            peer_port,
             listen_port,
             captures,
             &custom,
@@ -2072,6 +2185,41 @@ async fn dispatch(
         }
     }
 
+    // ngx_http_limit_req / limit_conn run in the PREACCESS phase, before any
+    // content handler (including the proxy).
+    {
+        let root = loc.root.to_string_lossy().to_string();
+        let limit_vars = ServerVars {
+            req,
+            path,
+            query,
+            server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
+            server_port: listen_port,
+            peer_ip: client_ip,
+            peer_port,
+            scheme: "http",
+            document_root: &root,
+            upstream_cache_status: "",
+            custom: &set_vars,
+            connection_requests: state.requests,
+            connection_time: state.elapsed_secs(),
+            sent: &[],
+        };
+        if let Some(reject) = check_limits(loc, http, &limit_vars, guards) {
+            let status = reject.status;
+            let sent = split_head(&reject.raw);
+            let bytes =
+                write_response(conn, reject, keepalive_allowed, server.server_tokens, head_only)
+                    .await?;
+            return Ok(Outcome {
+                status,
+                bytes,
+                close: !keepalive_allowed,
+                sent,
+            });
+        }
+    }
+
     // ---- reverse proxy (streams to the socket, cannot be resolved first) ----
     if loc.proxy_pass.is_some() {
         if let Some(o) =
@@ -2091,6 +2239,7 @@ async fn dispatch(
         server,
         http,
         &peer_ip,
+        peer_port,
         listen_port,
         captures,
         state,

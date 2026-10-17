@@ -11,13 +11,27 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, watch};
 
 use crate::config::Config;
 use crate::conn::Conn;
 use crate::http::{self, Ctx};
 use crate::log::Logger;
+
+/// Two accept strategies, chosen with NGXRS_ACCEPT=shared|reuseport.
+/// - reuseport (default): every worker owns a SO_REUSEPORT socket. No locking,
+///   but the kernel's 4-tuple hash can leave workers idle (measured: up to 20%
+///   throughput loss with 1k connections).
+/// - shared: one listener, one acceptor thread, round-robin handoff. Predictable
+///   balance at the cost of one queue hop per connection.
+fn accept_mode() -> &'static str {
+    static MODE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    MODE.get_or_init(|| match std::env::var("NGXRS_ACCEPT").as_deref() {
+        Ok("shared") => "shared",
+        _ => "reuseport",
+    })
+}
 
 pub fn serve(cfg: Config) -> io::Result<()> {
     let workers = if cfg.worker_processes == 0 {
@@ -45,16 +59,46 @@ pub fn serve(cfg: Config) -> io::Result<()> {
     });
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let stopping = Arc::new(AtomicBool::new(false));
-    let mut threads = Vec::with_capacity(workers);
+    let mut threads = Vec::with_capacity(workers + 1);
+    let shared = accept_mode() == "shared";
 
-    for wid in 0..workers {
-        let ctx = ctx.clone();
-        let shutdown = shutdown_rx.clone();
-        let stopping = stopping.clone();
-        let handle = std::thread::Builder::new()
-            .name(format!("ngxrs-w{wid}"))
-            .spawn(move || worker_main(wid, ctx, shutdown, stopping))?;
-        threads.push(handle);
+    if shared {
+        let mut senders = Vec::with_capacity(workers);
+        let mut receivers = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let (tx, rx) = mpsc::channel::<Handoff>(8192);
+            senders.push(tx);
+            receivers.push(rx);
+        }
+        let groups: Vec<SocketAddr> = cfg.http.groups.iter().map(|g| g.addr).collect();
+        {
+            let stopping = stopping.clone();
+            threads.push(
+                std::thread::Builder::new()
+                    .name("ngxrs-accept".to_string())
+                    .spawn(move || acceptor_main(&groups, senders, stopping))?,
+            );
+        }
+        for (wid, rx) in receivers.into_iter().enumerate() {
+            let ctx = ctx.clone();
+            let shutdown = shutdown_rx.clone();
+            let stopping = stopping.clone();
+            threads.push(
+                std::thread::Builder::new()
+                    .name(format!("ngxrs-w{wid}"))
+                    .spawn(move || shared_worker_main(wid, ctx, rx, shutdown, stopping))?,
+            );
+        }
+    } else {
+        for wid in 0..workers {
+            let ctx = ctx.clone();
+            let shutdown = shutdown_rx.clone();
+            let stopping = stopping.clone();
+            let handle = std::thread::Builder::new()
+                .name(format!("ngxrs-w{wid}"))
+                .spawn(move || worker_main(wid, ctx, shutdown, stopping))?;
+            threads.push(handle);
+        }
     }
 
     crate::proxy::init(&cfg.http);
@@ -222,6 +266,149 @@ fn block_on_shutdown() {
         #[cfg(not(unix))]
         {
             let _ = tokio::signal::ctrl_c().await;
+        }
+    });
+}
+
+
+// ---------------------------------------------------------------------------
+// Shared-listener mode
+// ---------------------------------------------------------------------------
+
+struct Handoff {
+    stream: std::net::TcpStream,
+    peer: SocketAddr,
+    group: usize,
+}
+
+fn bind_std(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    sock.set_reuse_address(true)?;
+    if addr.is_ipv6() {
+        sock.set_only_v6(true)?;
+    }
+    sock.set_nonblocking(true)?;
+    sock.bind(&addr.into())?;
+    sock.listen(65535)?;
+    Ok(sock.into())
+}
+
+fn acceptor_main(
+    groups: &[SocketAddr],
+    senders: Vec<mpsc::Sender<Handoff>>,
+    stopping: Arc<AtomicBool>,
+) {
+    let mut listeners: Vec<(std::net::TcpListener, usize)> = Vec::new();
+    for (gi, addr) in groups.iter().enumerate() {
+        match bind_std(*addr) {
+            Ok(l) => {
+                eprintln!("ngxrs: listening on {} (shared)", l.local_addr().unwrap_or(*addr));
+                listeners.push((l, gi));
+            }
+            Err(e) => {
+                eprintln!("ngxrs: cannot bind {addr}: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let mut pollfds: Vec<libc::pollfd> = listeners
+        .iter()
+        .map(|(l, _)| libc::pollfd {
+            fd: std::os::fd::AsRawFd::as_raw_fd(l),
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+
+    let mut next = 0usize;
+    let n = senders.len();
+    while !stopping.load(Ordering::Relaxed) {
+        let rc = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 100) };
+        if rc <= 0 {
+            continue;
+        }
+        for i in 0..listeners.len() {
+            if pollfds[i].revents & libc::POLLIN == 0 {
+                continue;
+            }
+            loop {
+                match listeners[i].0.accept() {
+                    Ok((stream, peer)) => {
+                        if stream.set_nonblocking(true).is_err() {
+                            continue;
+                        }
+                        let h = Handoff {
+                            stream,
+                            peer,
+                            group: listeners[i].1,
+                        };
+                        let mut slot = Some(h);
+                        for _ in 0..n {
+                            let idx = next % n;
+                            next = next.wrapping_add(1);
+                            match senders[idx].try_send(slot.take().expect("slot")) {
+                                Ok(()) => break,
+                                Err(e) => slot = Some(e.into_inner()),
+                            }
+                        }
+                        if let Some(h) = slot {
+                            let _ = senders[0].blocking_send(h);
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+}
+
+fn shared_worker_main(
+    wid: usize,
+    ctx: Arc<Ctx>,
+    mut rx: mpsc::Receiver<Handoff>,
+    mut shutdown: watch::Receiver<bool>,
+    stopping: Arc<AtomicBool>,
+) {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("ngxrs: worker {wid} failed to start runtime: {e}");
+            return;
+        }
+    };
+
+    rt.block_on(async move {
+        loop {
+            if stopping.load(Ordering::Relaxed) {
+                return;
+            }
+            tokio::select! {
+                _ = shutdown.changed() => return,
+                item = rx.recv() => {
+                    let Some(h) = item else { return };
+                    let stream = match TcpStream::from_std(h.stream) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    let _ = stream.set_nodelay(true);
+                    let ctx = ctx.clone();
+                    tokio::spawn(async move {
+                        let conn = Conn::new(stream, h.peer, ctx.config.http.tcp_nopush);
+                        http::handle_conn(conn, &ctx.config.http.groups[h.group], &ctx).await;
+                    });
+                }
+            }
         }
     });
 }

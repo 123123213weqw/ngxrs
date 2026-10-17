@@ -43,6 +43,31 @@ pub struct Headers {
     items: Vec<(InStr, InStr)>,
 }
 
+// Header vectors are recycled per worker thread: a fresh 12-entry Vec per
+// request is ~1.3 KB of allocator traffic at 600k rps.
+thread_local! {
+    static HDR_POOL: std::cell::RefCell<Vec<Vec<(InStr, InStr)>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn hdr_vec() -> Vec<(InStr, InStr)> {
+    HDR_POOL
+        .with(|p| p.borrow_mut().pop())
+        .unwrap_or_else(|| Vec::with_capacity(12))
+}
+
+fn recycle(mut v: Vec<(InStr, InStr)>) {
+    v.clear();
+    if v.capacity() <= 64 {
+        HDR_POOL.with(|p| {
+            let mut p = p.borrow_mut();
+            if p.len() < 32 {
+                p.push(v);
+            }
+        });
+    }
+}
+
 impl Headers {
     pub fn get(&self, name: &str) -> Option<&str> {
         self.items
@@ -92,6 +117,12 @@ pub struct Request {
     pub keepalive: bool,
     pub host: Option<InStr>,
     pub expect_continue: bool,
+}
+
+impl Drop for Request {
+    fn drop(&mut self) {
+        recycle(std::mem::take(&mut self.headers.items));
+    }
 }
 
 fn is_token(b: u8) -> bool {
@@ -157,9 +188,7 @@ impl Request {
             _ => return Err(HttpError::new(400, true)),
         };
 
-        let mut headers = Headers {
-            items: Vec::with_capacity(12),
-        };
+        let mut headers = Headers { items: hdr_vec() };
         for raw in lines {
             if raw.is_empty() {
                 continue;

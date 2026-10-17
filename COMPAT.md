@@ -14,6 +14,8 @@
 | 上下文继承（http → server → location） | 🟡 | 基础字段已继承；`add_header` 目前是累加而非"覆盖" |
 | `-t` 配置自检 | ✅ | |
 | `-s reload/stop`、daemon/fork 模型 | ⬜ | 当前前台单进程多线程 |
+| `worker_processes N/auto` | ✅ | 每 worker 一线程 + 独立 runtime |
+| 两种 accept 策略 | ✅ | `NGXRS_ACCEPT=reuseport`（默认）/ `shared`（单监听+轮询分发） |
 | 未知指令处理 | 🟡 | 记 warning 继续；nginx 是直接报错 |
 
 ## http core

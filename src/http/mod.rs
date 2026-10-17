@@ -96,6 +96,10 @@ pub struct Outcome {
     pub close: bool,
 }
 
+thread_local! {
+    static NO_IDLE_TIMER: bool = std::env::var_os("NGXRS_NO_IDLE_TIMER").is_some();
+}
+
 pub async fn handle_conn(mut conn: Conn, group: &ListenGroup, ctx: &Ctx) {
     let http = &ctx.config.http;
     let first_server = http.server(group.default_server);
@@ -111,11 +115,18 @@ pub async fn handle_conn(mut conn: Conn, group: &ListenGroup, ctx: &Ctx) {
         } else {
             keepalive_timeout
         };
-        idle.as_mut()
-            .reset(tokio::time::Instant::now() + read_timeout);
-        let read = tokio::select! {
-            _ = idle.as_mut() => Err(()),
-            r = conn.read_request(MAX_REQUEST_LINE, MAX_HEADER_BYTES) => Ok(r),
+        // NGXRS_NO_IDLE_TIMER=1 disables the keepalive timeout (measurement only).
+        let read = if NO_IDLE_TIMER.with(|v| *v) {
+            Ok(conn
+                .read_request(MAX_REQUEST_LINE, MAX_HEADER_BYTES)
+                .await)
+        } else {
+            idle.as_mut()
+                .reset(tokio::time::Instant::now() + read_timeout);
+            tokio::select! {
+                _ = idle.as_mut() => Err(()),
+                r = conn.read_request(MAX_REQUEST_LINE, MAX_HEADER_BYTES) => Ok(r),
+            }
         };
 
         let req = match read {
@@ -325,6 +336,12 @@ async fn dispatch(
                     resp = redirected;
                 }
             }
+        }
+
+        // Errors without a body get nginx's generated page (the static handler
+        // returns empty 404/403 responses).
+        if resp.status >= 400 && resp.body.is_empty() {
+            resp = error_response(resp.status, server.server_tokens);
         }
 
         // ---- gzip ----

@@ -51,8 +51,9 @@ PY
 
 write_conf() { # $1=port $2=out
   local port="$1" out="$2"
+  local wp="${WORKER_PROCESSES:-auto}"
   cat > "$out" <<EOF
-worker_processes auto;
+worker_processes $wp;
 daemon off;
 pid $RUN/pid-$port;
 error_log $RUN/error-$port.log warn;
@@ -86,7 +87,9 @@ wait_port() { # $1=port
 }
 
 start_pair() {
-  ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
+  # Enough for worker_connections, but NOT the hard limit: RLIMIT_NOFILE=1M
+  # measurably slows open()/close() (measured: 1.02M -> 0.66M rps).
+  ulimit -n 65536 2>/dev/null || true
   make_fixtures
   write_conf "$PORT_NGINX" "$RUN/nginx.conf"
   write_conf "$PORT_NGXRS" "$RUN/ngxrs.conf"

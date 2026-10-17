@@ -39,7 +39,14 @@ pub fn respond_fs(
     loc: &LocCfg,
     http: &Http,
 ) -> io::Result<Response> {
-    let meta = match std::fs::metadata(fs_path) {
+    // Open first, then fstat: one syscall less than statx+open, and no TOCTOU
+    // window (nginx does the same).
+    let file = match File::open(fs_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Ok(Response::empty(403)),
+        Err(_) => return Ok(Response::empty(404)),
+    };
+    let meta = match file.metadata() {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Ok(Response::empty(403)),
         Err(_) => return Ok(Response::empty(404)),
@@ -65,13 +72,24 @@ pub fn respond_fs(
                 continue;
             }
             let candidate = fs_path.join(index);
-            if candidate.is_file() {
-                let meta = match std::fs::metadata(&candidate) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                return serve_entry(req, &candidate, index, meta.len(), meta_mtime(&meta), loc, http);
-            }
+            let idx_file = match File::open(&candidate) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let meta = match idx_file.metadata() {
+                Ok(m) if m.is_file() => m,
+                Ok(_) => continue,
+                Err(_) => continue,
+            };
+            return serve_entry(
+                req,
+                idx_file,
+                index,
+                meta.len(),
+                meta_mtime(&meta),
+                loc,
+                http,
+            );
         }
 
         if loc.autoindex {
@@ -84,19 +102,11 @@ pub fn respond_fs(
         return Ok(Response::empty(404));
     }
 
-    serve_entry(
-        req,
-        fs_path,
-        fs_path
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .as_deref()
-            .unwrap_or(""),
-        meta.len(),
-        meta_mtime(&meta),
-        loc,
-        http,
-    )
+    let name = fs_path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    serve_entry(req, file, &name, meta.len(), meta_mtime(&meta), loc, http)
 }
 
 fn meta_mtime(meta: &std::fs::Metadata) -> i64 {
@@ -109,7 +119,7 @@ fn meta_mtime(meta: &std::fs::Metadata) -> i64 {
 
 fn serve_entry(
     req: &Request,
-    fs_path: &Path,
+    file: File,
     name_for_mime: &str,
     size: u64,
     mtime: i64,
@@ -194,12 +204,6 @@ fn serve_entry(
             }
         }
     }
-
-    let file = match File::open(fs_path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Ok(Response::empty(403)),
-        Err(_) => return Ok(Response::empty(404)),
-    };
 
     // Pre-render every header line into one buffer: no per-header Strings.
     let mut raw = Vec::with_capacity(256);

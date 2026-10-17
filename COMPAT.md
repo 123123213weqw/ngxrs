@@ -49,6 +49,7 @@
 | `return` | ✅ | 状态码 + 文本/URL |
 | `add_header` | 🟡 | 累加语义（见上） |
 | `error_page` | ⬜ | 已解析未生效 |
+| 405 / 301 / 505 语义 | ✅ | 与 nginx 逐字节对齐（405 错误页、301 绝对 Location + body、505） |
 | `expires` / `gzip` / `charset` | ⬜ | 已解析未生效 |
 
 ## 反向代理 / 上游

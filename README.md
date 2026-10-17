@@ -29,10 +29,20 @@ python3 tests/parity.py         # 差分测试：同一请求分别打 nginx / n
 
 第一阶段：配置解析 + HTTP/1.1 keepalive + 静态文件（sendfile、ETag、Last-Modified、Range、条件请求、index、autoindex、301、try_files、return、add_header、access_log、Host 虚拟主机）。
 
+当前实测（V100，wrk -t8 -c512 -d10s，详见 [BENCH.md](BENCH.md)）：
+
+| 场景 | nginx 1.28 | ngxrs | 相对 |
+|---|---|---|---|
+| 1 KB | 464,628 rps | 438,367 rps | 94.3% |
+| 64 KB | 208,074 rps | 201,040 rps | 96.6%（p99 2.60 ms vs 32.74 ms） |
+| 1 MB | 30,802 rps | 29,849 rps | 96.9% |
+
+`tests/parity.py` 的 19 组协议差分用例与 nginx 全部一致。
+
 完整的功能对等矩阵与差距见 [COMPAT.md](COMPAT.md)。尚未实现的部分（反向代理、TLS、HTTP/2、HTTP/3、gzip、fastcgi、stream、mail、cache 等）按矩阵逐项推进。
 
 ## 设计取舍
 
-- 线程模型：tokio 多线程 runtime + 每监听套接字多 accept 任务；静态文件走 `sendfile(2)`，避免用户态拷贝。
+- 线程模型：每核一个 worker 线程 + 独立 `SO_REUSEPORT` 监听 + current_thread runtime（连接不跨核迁移）；静态文件走 `sendfile(2)`，≤16 KB 的响应合并成一次 write。
 - 配置：自研 nginx 语法解析器（引号、转义、`${var}`、include 通配），不依赖第三方解析库；未知指令记录 warning 而不是直接失败（便于渐进兼容真实配置）。
 - 语义差异会显式记在 COMPAT.md，不做"看起来兼容"的静默降级。

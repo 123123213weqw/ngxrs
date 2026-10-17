@@ -112,6 +112,13 @@ pub struct LocCfg {
     pub proxy_cache: Option<String>,
     pub proxy_cache_valid: Vec<(Vec<u16>, Duration)>,
     /// `proxy_cache_lock on|off`, `proxy_cache_lock_timeout`, `_age`.
+    /// `proxy_cookie_domain` entries. `Some(vec![])` means `off`.
+    pub proxy_cookie_domains: Option<Vec<crate::cookie::CookieRewrite>>,
+    pub proxy_cookie_paths: Option<Vec<crate::cookie::CookieRewrite>>,
+    /// Set once this location declares its own cookie rewrites (nginx replaces,
+    /// not extends, the inherited list).
+    pub cookie_domains_set: bool,
+    pub cookie_paths_set: bool,
     pub proxy_cache_ignore: crate::cache::Ignore,
     /// `proxy_cache_convert_head`, on by default like nginx.
     pub proxy_cache_convert_head: bool,
@@ -183,6 +190,10 @@ impl LocCfg {
             scgi_params: Vec::new(),
             proxy_cache: None,
             proxy_cache_valid: Vec::new(),
+            proxy_cookie_domains: None,
+            proxy_cookie_paths: None,
+            cookie_domains_set: false,
+            cookie_paths_set: false,
             proxy_cache_ignore: crate::cache::Ignore::default(),
             proxy_cache_convert_head: true,
             proxy_cache_lock: false,
@@ -1498,6 +1509,40 @@ impl Builder {
                     }
                 }
             }
+            "proxy_cookie_domain" | "proxy_cookie_path" => {
+                let is_domain = d.name == "proxy_cookie_domain";
+                let (slot, fresh) = if is_domain {
+                    (&mut cfg.proxy_cookie_domains, &mut cfg.cookie_domains_set)
+                } else {
+                    (&mut cfg.proxy_cookie_paths, &mut cfg.cookie_paths_set)
+                };
+                // nginx replaces the inherited list wholesale.
+                if !*fresh {
+                    *slot = Some(Vec::new());
+                    *fresh = true;
+                }
+                let list = slot.get_or_insert_with(Vec::new);
+                match d.args.as_slice() {
+                    [one] if one == "off" => list.clear(),
+                    [from, to] => match crate::cookie::CookieRewrite::parse(from, to, is_domain) {
+                        Some(rw) => list.push(rw),
+                        None => {
+                            return Err(sem(
+                                &d.file,
+                                d.line,
+                                format!("invalid pattern in {}", d.name),
+                            ))
+                        }
+                    },
+                    _ => {
+                        return Err(sem(
+                            &d.file,
+                            d.line,
+                            format!("{} needs 2 arguments", d.name),
+                        ))
+                    }
+                }
+            }
             "proxy_ignore_headers" => {
                 for a in &d.args {
                     match a.as_str() {
@@ -1625,6 +1670,9 @@ impl Builder {
         };
 
         let mut cfg = parent.clone();
+        // Cookie rewrites are replaced, not inherited-into.
+        cfg.cookie_domains_set = false;
+        cfg.cookie_paths_set = false;
         cfg.prefix_len = match &matcher {
             Match::Exact(s) | Match::Prefix(s) | Match::PrefixNoRegex(s) => s.len(),
             _ => 0,

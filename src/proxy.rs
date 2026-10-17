@@ -937,6 +937,17 @@ struct CacheCtx<'a> {
 
 /// Serialize the upstream request head exactly as nginx does.
 #[allow(clippy::too_many_arguments)]
+/// Apply `proxy_cookie_domain` / `proxy_cookie_path` to a response head.
+fn apply_cookie_rules(raw: &mut Vec<u8>, loc: &LocCfg, vars: &crate::http::ServerVars<'_>) {
+    let domains = loc.proxy_cookie_domains.as_deref().unwrap_or(&[]);
+    let paths = loc.proxy_cookie_paths.as_deref().unwrap_or(&[]);
+    if domains.is_empty() && paths.is_empty() {
+        return;
+    }
+    let expand = |s: &str| vars.expand(s);
+    *raw = crate::cookie::rewrite_set_cookie(raw, domains, paths, &expand);
+}
+
 fn build_upstream_head(
     req: &Request,
     target_uri: &str,
@@ -1272,6 +1283,7 @@ async fn exchange(
         }
 
         let mut out_raw = raw;
+        apply_cookie_rules(&mut out_raw, loc, vars);
         crate::http::apply_expires(&mut out_raw, loc);
         crate::http::apply_add_headers_upstream(
             &mut out_raw,
@@ -1318,6 +1330,7 @@ async fn exchange(
         &upstream_headers,
         Some(vars),
     );
+    apply_cookie_rules(&mut raw, loc, vars);
     let sent_headers = crate::http::split_head(&raw);
     write_head(conn, head.status, &raw, req.keepalive, tokens).await?;
 

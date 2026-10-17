@@ -3,6 +3,7 @@ mod config;
 mod conn;
 mod http;
 mod limit;
+mod cookie;
 mod geo;
 mod log;
 mod mapping;

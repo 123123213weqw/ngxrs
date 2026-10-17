@@ -70,8 +70,15 @@
 | `proxy_connect_timeout` / `read_timeout` / `send_timeout` | ✅ | |
 | `proxy_buffering` | 🟡 | 已解析；当前总是流式转发 |
 | 上游失败重试（stale pooled socket） | 🟡 | 仅幂等方法重试同一后端 |
-| `proxy_cache` / `proxy_cache_path` | ⬜ | |
-| `fastcgi_pass` / `uwsgi` / `scgi` / `grpc_pass` | ⬜ | |
+| `proxy_cache` / `proxy_cache_path`（levels/keys_zone/max_size/inactive） | ✅ | 磁盘缓存（原子替换写入），`X-Cache-Status` 走 `add_header $upstream_cache_status` |
+| `proxy_cache_valid` / `proxy_cache_key` / `proxy_cache_bypass` | ✅ | 只缓存 `proxy_cache_valid` 列出的状态码 |
+| 缓存淘汰（max_size / inactive） | 🟡 | max_size 按 mtime 淘汰；`inactive` 只解析未执行定时清理 |
+| `proxy_no_cache` | 🟡 | 已解析，未按变量求值 |
+| `fastcgi_pass` / `fastcgi_param` / `fastcgi_index` / `fastcgi_split_path_info` | ✅ | FastCGI 1.0 记录协议；`$fastcgi_script_name`、`$fastcgi_path_info` 等变量 |
+| FastCGI 无 Content-Length 时用 chunked | ✅ | 与 nginx 帧格式逐字节一致 |
+| `fastcgi_connect_timeout` / `fastcgi_read_timeout` | ✅ | |
+| `fastcgi_cache` / `fastcgi_buffers` / `fastcgi_keep_conn` | ⬜ | 已解析未生效 |
+| `uwsgi_pass` / `scgi_pass` / `grpc_pass` | ⬜ | |
 
 ## 内容过滤
 
@@ -107,14 +114,30 @@
 | `break` | ✅ | 终止本 location 的 rewrite 模块（**包括 `return`**），然后走内容阶段 |
 | `redirect` / `permanent` | ✅ | 302 / 301 + Location，`$is_args` 语义 |
 | 替换串带 `?` 时丢弃原 query | ✅ | |
-| `if` / `set` / `break` 条件块 | ⬜ | 已解析未求值 |
+| `if ($var)` / `if ($a = b)` / `~` / `~*` / `!~` / `!~*` | ✅ | 支持 `$http_*` 等变量 |
+| `if (-f / -d / -e / -x $var)` 文件测试 | ✅ | |
+| `if` 内的 `return` / `rewrite` / `set` | ✅ | `return` 的内容类型按 URI 扩展名 → `default_type` |
+| `set $var value` | ✅ | 变量可被后续 `if` / rewrite 引用 |
 
 ## stream / mail
 
-| 能力 | 状态 |
-|---|---|
-| `stream {}` TCP/UDP 转发 | ⬜（配置段已识别，提示未实现） |
-| `mail {}` | ⬜ |
+| 能力 | 状态 | 备注 |
+|---|---|---|
+| `stream { server { listen ...; proxy_pass ...; } }` | ✅ | TCP 双向代理 |
+| `listen ... udp` | ✅ | UDP 会话按客户端映射上游 socket |
+| stream `upstream {}` + 轮询 | ✅ | |
+| `proxy_timeout` / `proxy_connect_timeout` | 🟡 | 连接超时生效；`proxy_timeout` 解析但未做空闲断开 |
+| stream `return` / `set` / `if` / SSL 终结 | ⬜ | 已解析未执行 |
+| `mail {}` | ⬜ | 仅识别并告警 |
+
+## add_header
+
+| 能力 | 状态 | 备注 |
+|---|---|---|
+| `add_header` 作用于静态响应 | ✅ | |
+| `add_header` 作用于代理 / FastCGI 响应 | ✅ | 默认只对 200/201/204/206/301/302/303/304/307/308 生效 |
+| `always` 后缀 | ✅ | 对所有状态码生效 |
+| `$upstream_cache_status` 变量 | ✅ | MISS / HIT / BYPASS |
 
 ## 已知差异（必须修）
 

@@ -128,6 +128,34 @@ pub fn serve(cfg: Config) -> io::Result<()> {
     }
 
     crate::tls::init_crypto();
+
+    // Resolve `stream {}` backends (names -> upstream blocks) once.
+    let mut stream_cfg = crate::stream::StreamConfig {
+        servers: Vec::new(),
+    };
+    for sc in &cfg.stream.servers {
+        let mut backends = Vec::new();
+        if let Some(pp) = &sc.proxy_pass {
+            if let Some(up) = cfg.stream.upstreams.iter().find(|u| &u.name == pp) {
+                backends = up.backends.clone();
+            } else if let Some(addr) = parse_stream_addr(pp) {
+                backends.push(addr);
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("stream proxy_pass \"{pp}\" is neither an upstream nor host:port"),
+                ));
+            }
+        }
+        stream_cfg.servers.push(crate::stream::StreamServer {
+            listen: sc.listen,
+            udp: sc.udp,
+            backends,
+            proxy_timeout: sc.proxy_timeout,
+            proxy_connect_timeout: sc.proxy_connect_timeout,
+        });
+    }
+    let stream_cfg = Arc::new(stream_cfg);
     crate::proxy::init(&cfg.http);
     crate::proxy::init_keepalive(&cfg.http);
 
@@ -135,6 +163,35 @@ pub fn serve(cfg: Config) -> io::Result<()> {
         "ngxrs: started {workers} workers, prefix {}",
         cfg.prefix.display()
     );
+
+    // nginx runs stream and http side by side; give stream its own thread.
+    // The sender must stay alive for the lifetime of the process: dropping it
+    // makes `changed()` return immediately and the listeners exit at once.
+    let mut stream_thread = None;
+    let mut stream_tx: Option<watch::Sender<bool>> = None;
+    if !stream_cfg.is_empty() {
+        let cfg = stream_cfg.clone();
+        let (tx, rx) = watch::channel(false);
+        stream_tx = Some(tx);
+        stream_thread = Some(
+            std::thread::Builder::new()
+                .name("ngxrs-stream".to_string())
+                .spawn(move || {
+                    let rt = match tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2)
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            eprintln!("ngxrs: stream runtime failed: {e}");
+                            return;
+                        }
+                    };
+                    rt.block_on(crate::stream::serve(cfg, rx));
+                })?,
+        );
+    }
 
     block_on_shutdown();
 
@@ -144,7 +201,31 @@ pub fn serve(cfg: Config) -> io::Result<()> {
     for t in threads {
         let _ = t.join();
     }
+    if let Some(tx) = stream_tx {
+        let _ = tx.send(true);
+    }
+    if let Some(t) = stream_thread {
+        let _ = t.join();
+    }
     Ok(())
+}
+
+/// `host:port` or `port` in stream context (no scheme).
+fn parse_stream_addr(s: &str) -> Option<SocketAddr> {
+    if let Ok(a) = s.parse::<SocketAddr>() {
+        return Some(a);
+    }
+    if let Ok(port) = s.parse::<u16>() {
+        return Some(SocketAddr::from(([127, 0, 0, 1], port)));
+    }
+    if let Some((host, port)) = s.rsplit_once(':') {
+        if let Ok(port) = port.parse::<u16>() {
+            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                return Some(SocketAddr::new(ip, port));
+            }
+        }
+    }
+    None
 }
 
 fn worker_main(wid: usize, ctx: Arc<Ctx>, shutdown: watch::Receiver<bool>, stopping: Arc<AtomicBool>) {

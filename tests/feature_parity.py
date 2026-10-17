@@ -204,6 +204,11 @@ def main():
         ("rewrite-redirect", "/rw/tmp/x", {}),
         ("rewrite-break", "/rw/new/y", {}),
         ("rewrite-none", "/rw/other", {}),
+        ("if-default", "/if/x", {}),
+        ("if-set-pro", "/if/x", {"X-Tier": "pro"}),
+        ("if-else-branch", "/if/x", {"X-Tier": "basic"}),
+        ("if-regex", "/if-re/x", {"User-Agent": "curl/8.0"}),
+        ("if-regex-miss", "/if-re/x", {"User-Agent": "Mozilla/5.0"}),
     ]
 
     rows = []
@@ -239,6 +244,32 @@ def main():
         # backend identity differs only if balancing differs; compare shape
         ignore = ("etag", "last-modified")
         record(name, a, b, ignore=ignore)
+
+    # ---- proxy_cache ----
+    # Clear both caches, then request the same URL three times: MISS, HIT, HIT.
+    import shutil
+    for d in ("cache-nginx", "cache-ngxrs"):
+        shutil.rmtree(os.path.join(ROOT, "bench", "run", d), ignore_errors=True)
+
+    def cache_seq(port, path):
+        return [fetch(port, path)[1].get("x-cache-status", "") for _ in range(3)]
+
+    # nginx uses its own cache dir in the nginx-rendered config; both start cold
+    a_seq = cache_seq(args.nginx, "/cached/echo")
+    b_seq = cache_seq(args.ngxrs, "/cached/echo")
+    problems = []
+    if a_seq[1:] != b_seq[1:]:
+        problems.append(f"sequence {a_seq} != {b_seq}")
+    if b_seq[0] != "MISS" or b_seq[1] != "HIT" or b_seq[2] != "HIT":
+        problems.append(f"ngxrs sequence wrong: {b_seq}")
+    # cached body must be identical to the first (uncached) response
+    a_body = fetch(args.nginx, "/cached/echo")[2]
+    b_body = fetch(args.ngxrs, "/cached/echo")[2]
+    if a_body != b_body:
+        problems.append(f"cached body {a_body[:40]!r} != {b_body[:40]!r}")
+    rows.append(("proxy-cache-hit", ",".join(a_seq), ",".join(b_seq), problems))
+    if problems:
+        failures += 1
 
     # balancing distribution (only meaningful for ngxrs: nginx uses its own)
     dist = {}

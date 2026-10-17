@@ -1,13 +1,16 @@
+mod cache;
 mod config;
 mod conn;
 mod http;
 mod log;
+mod fastcgi;
 mod gzip;
 mod h2server;
 mod instr;
 mod net;
 mod tls;
 mod proxy;
+mod stream;
 mod util;
 
 use std::path::PathBuf;

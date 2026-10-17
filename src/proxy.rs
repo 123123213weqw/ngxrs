@@ -426,6 +426,102 @@ pub async fn handle(
         .map(|u| !u.is_empty())
         .unwrap_or(false);
 
+    // ---- proxy_cache: serve a fresh hit without touching the upstream ----
+    let zone = loc
+        .proxy_cache
+        .as_ref()
+        .and_then(|name| http.cache_zones.iter().find(|z| &z.name == name));
+    let cache_key = zone.map(|_| {
+        let key_spec = loc.proxy_cache_key.as_deref();
+        let scheme = "http";
+        let proxy_host = &pp.host_header;
+        let (uri_only, args_only) = match path.split_once('?') {
+            Some((u, a)) => (u.to_string(), a.to_string()),
+            None => (path.to_string(), query.to_string()),
+        };
+        let host = req.host.as_ref().map(|h| h.as_str()).unwrap_or("");
+        let remote = conn.peer.ip().to_string();
+        match key_spec {
+            Some(spec) => crate::cache::expand_key(
+                spec,
+                scheme,
+                proxy_host,
+                host,
+                &req.raw_target,
+                &uri_only,
+                &args_only,
+                &remote,
+                req.method.as_str(),
+            ),
+            None => crate::cache::default_key(scheme, proxy_host, &req.raw_target),
+        }
+    });
+
+    let bypass = !loc.proxy_cache_bypass.is_empty()
+        && loc
+            .proxy_cache_bypass
+            .iter()
+            .any(|v| !v.is_empty() && !v.starts_with('$'));
+
+    if let (Some(zone), Some(key)) = (zone, cache_key.as_ref()) {
+        if !bypass {
+            if let Some(entry) = crate::cache::load(zone, key) {
+                if entry.is_fresh(crate::cache::now()) {
+                    let mut raw = Vec::with_capacity(entry.body.len() + 256);
+                    for (k, v) in &entry.headers {
+                        raw.extend_from_slice(k.as_bytes());
+                        raw.extend_from_slice(b": ");
+                        raw.extend_from_slice(v.as_bytes());
+                        raw.extend_from_slice(b"\r\n");
+                    }
+                    crate::http::apply_add_headers(
+                        &mut raw,
+                        &loc.headers,
+                        entry.status,
+                        &crate::http::AddHeaderVars {
+                            upstream_cache_status: "HIT",
+                            scheme: "http",
+                            host: req.host.as_ref().map(|h| h.as_str()).unwrap_or(""),
+                        },
+                    );
+                    raw.extend_from_slice(b"Content-Length: ");
+                    raw.extend_from_slice(entry.body.len().to_string().as_bytes());
+                    raw.extend_from_slice(b"\r\n");
+                    let resp = Response {
+                        status: entry.status,
+                        headers: Vec::new(),
+                        raw,
+                        explicit_len: true,
+                        no_error_page: false,
+                        body: crate::http::Body::Bytes(entry.body.clone()),
+                    };
+                    let bytes = crate::http::write_response(
+                        conn,
+                        resp,
+                        req.keepalive,
+                        tokens,
+                        req.method == Method::Head,
+                    )
+                    .await?;
+                    return Ok(Some(Outcome {
+                        status: entry.status,
+                        bytes,
+                        close: false,
+                    }));
+                }
+            }
+        }
+    }
+    let cache_status = if zone.is_some() {
+        if bypass {
+            "BYPASS"
+        } else {
+            "MISS"
+        }
+    } else {
+        ""
+    };
+
     let mut used_pooled = false;
     let mut last_err = None;
 
@@ -472,8 +568,23 @@ pub async fn handle(
             }
 
             let result = exchange(
-                conn, req, &target_uri, &body, loc, &pp, stream, from_pool, tokens, is_upgrade,
-                &peer_ip.to_string(), key,
+                conn,
+                req,
+                &target_uri,
+                &body,
+                loc,
+                &pp,
+                stream,
+                from_pool,
+                tokens,
+                is_upgrade,
+                &peer_ip.to_string(),
+                key,
+                CacheCtx {
+                    zone,
+                    key: cache_key.as_deref(),
+                    status: cache_status,
+                },
             )
             .await;
 
@@ -532,6 +643,26 @@ async fn respond_error(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn split_head(raw: &[u8]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in String::from_utf8_lossy(raw).split("\r\n") {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            out.push((k.trim().to_string(), v.trim().to_string()));
+        }
+    }
+    out
+}
+
+struct CacheCtx<'a> {
+    zone: Option<&'a crate::config::CacheZone>,
+    key: Option<&'a str>,
+    status: &'a str,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn exchange(
     conn: &mut crate::conn::Conn,
     req: &Request,
@@ -545,6 +676,7 @@ async fn exchange(
     is_upgrade: bool,
     peer_ip: &str,
     pool_key: (usize, u32),
+    cache: CacheCtx<'_>,
 ) -> io::Result<Outcome> {
     // ---- request head ----
     let mut out = Vec::with_capacity(512);
@@ -757,6 +889,80 @@ async fn exchange(
         }
     }
 
+    // ---- cacheable (length-delimited) responses are buffered first ----
+    let cacheable = cache.zone.is_some()
+        && cache.key.is_some()
+        && !head.chunked
+        && total_len.is_some()
+        && !is_upgrade
+        && matches!(head.status, 200 | 301 | 302 | 304 | 404);
+    if cacheable {
+        let len = total_len.unwrap_or(0);
+        let mut payload = buf;
+        while (payload.len() as u64) < len {
+            let mut chunk = vec![0u8; (len - payload.len() as u64).min(64 * 1024) as usize];
+            let n = match tokio::time::timeout(loc.proxy_read_timeout, up.read(&mut chunk)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout")),
+            };
+            payload.extend_from_slice(&chunk[..n]);
+        }
+
+        if let (Some(zone), Some(key)) = (cache.zone, cache.key) {
+            let stored_headers: Vec<(String, String)> = split_head(&raw)
+                .into_iter()
+                .filter(|(k, _)| {
+                    !k.eq_ignore_ascii_case("connection")
+                        && !k.eq_ignore_ascii_case("keep-alive")
+                        && !k.eq_ignore_ascii_case("transfer-encoding")
+                        && !k.eq_ignore_ascii_case("x-cache-status")
+                })
+                .collect();
+            if let Some(valid) = crate::cache::validity(loc, head.status) {
+                let entry = crate::cache::Cached {
+                    status: head.status,
+                    headers: stored_headers,
+                    body: payload.clone(),
+                    stored_at: crate::cache::now(),
+                    valid_for: valid.as_secs(),
+                };
+                let _ = crate::cache::store(zone, key, &entry);
+            }
+        }
+
+        let mut out_raw = raw;
+        crate::http::apply_add_headers(
+            &mut out_raw,
+            &loc.headers,
+            head.status,
+            &crate::http::AddHeaderVars {
+                upstream_cache_status: cache.status,
+                scheme: "http",
+                host: req.host.as_ref().map(|h| h.as_str()).unwrap_or(""),
+            },
+        );
+        write_head(conn, head.status, &out_raw, req.keepalive, tokens).await?;
+        conn.write_all(&payload).await?;
+        return Ok(Outcome {
+            status: head.status,
+            bytes: payload.len() as u64,
+            close: false,
+        });
+    }
+
+    let mut raw = raw;
+    crate::http::apply_add_headers(
+        &mut raw,
+        &loc.headers,
+        head.status,
+        &crate::http::AddHeaderVars {
+            upstream_cache_status: cache.status,
+            scheme: "http",
+            host: req.host.as_ref().map(|h| h.as_str()).unwrap_or(""),
+        },
+    );
     write_head(conn, head.status, &raw, req.keepalive, tokens).await?;
 
     let mut sent = 0u64;

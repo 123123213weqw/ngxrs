@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 
-use crate::config::{Config, Http, ListenGroup, LocCfg, RewriteFlag, Server};
+use crate::config::{Config, Http, IfCond, ListenGroup, LocCfg, RewriteFlag, Server};
 use crate::conn::{Conn, RecvError, MAX_HEADER_BYTES, MAX_REQUEST_LINE};
 use crate::log::Logger;
 use crate::util::{self, reason};
@@ -161,9 +161,11 @@ pub async fn handle_conn(mut conn: Conn, group: &ListenGroup, ctx: &Ctx) {
         let server = select_server(http, &group.servers, group.default_server, req.host.as_deref());
         let loc = server.locate(&path);
 
-        // Request body: proxied locations forward it, everything else
-        // discards it (nginx behaves the same for static content).
-        let proxy_target = loc.proxy_pass.is_some();
+        // Request body: upstream modules (proxy, fastcgi) forward it; every
+        // other handler discards it (nginx behaves the same for static
+        // content). Draining here for an upstream-backed location would make
+        // the module read an already-empty body and block forever.
+        let proxy_target = loc.proxy_pass.is_some() || loc.fastcgi_pass.is_some();
         if req.chunked {
             if !proxy_target {
                 if req.expect_continue {
@@ -296,6 +298,94 @@ fn error_response(status: u16, tokens: bool) -> Response {
     )
 }
 
+/// Variables available to `set` / `if` / `rewrite` in the rewrite phase.
+struct RwVars<'a> {
+    req: &'a Request,
+    path: &'a str,
+    query: &'a str,
+    vars: &'a std::collections::HashMap<String, String>,
+}
+
+fn get_var(name: &str, v: &RwVars<'_>) -> String {
+    let bare = name.trim_start_matches('$');
+    if let Some(val) = v.vars.get(bare) {
+        return val.clone();
+    }
+    match bare {
+        "uri" | "document_uri" => v.path.to_string(),
+        "request_uri" => v.req.raw_target.clone(),
+        "args" | "query_string" => v.query.to_string(),
+        "request_method" => v.req.method.as_str().to_string(),
+        "host" | "http_host" => v
+            .req
+            .host
+            .as_ref()
+            .map(|h| h.as_str().to_string())
+            .unwrap_or_default(),
+        "remote_addr" => String::new(),
+        "scheme" => "http".to_string(),
+        "is_args" => {
+            if v.query.is_empty() {
+                String::new()
+            } else {
+                "?".to_string()
+            }
+        }
+        "request_filename" | "document_root" => String::new(),
+        _ => {
+            if let Some(h) = bare.strip_prefix("http_") {
+                let key = h.replace('_', "-");
+                v.req.headers.get(&key).unwrap_or("").to_string()
+            } else {
+                String::new()
+            }
+        }
+    }
+}
+
+fn eval_cond(cond: &IfCond, v: &RwVars<'_>) -> bool {
+    match cond {
+        IfCond::Truthy(var) => {
+            let s = get_var(var, v);
+            !s.is_empty() && s != "0"
+        }
+        IfCond::Equals(var, rhs, eq) => {
+            let lhs = get_var(var, v);
+            let res = lhs == *rhs || lhs == get_var(rhs, v);
+            if *eq {
+                res
+            } else {
+                !res
+            }
+        }
+        IfCond::Match(var, re, negate) => {
+            let lhs = get_var(var, v);
+            let m = re.is_match(&lhs);
+            if *negate {
+                !m
+            } else {
+                m
+            }
+        }
+        IfCond::FileTest(kind, path_expr) => {
+            let p = get_var(path_expr, v);
+            let path = std::path::Path::new(&p);
+            match kind {
+                'f' => path.is_file(),
+                'd' => path.is_dir(),
+                'e' => path.exists(),
+                'x' => {
+                    use std::os::unix::fs::PermissionsExt;
+                    path.metadata()
+                        .map(|m| m.permissions().mode() & 0o111 != 0)
+                        .unwrap_or(false)
+                }
+                _ => false,
+            }
+        }
+    }
+}
+
 /// Apply `rewrite` directives. Returns `Ok(Some(response))` for a redirect /
 /// `return` the rewrite produced, `Ok(None)` with the (possibly new) URI when
 /// processing should continue.
@@ -305,54 +395,146 @@ fn apply_rewrites(
     query: &str,
     loc: &LocCfg,
     server: &Server,
+    default_type: &str,
 ) -> RewriteOutcome {
     let mut uri = path.to_string();
     let mut args = query.to_string();
     let _ = req;
 
-    for rw in &loc.rewrites {
-        if !rw.re.is_match(&uri) {
+    // `set` runs first; the values feed `if` conditions and rewrites.
+    let mut vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (name, value) in &loc.sets {
+        let ctx = RwVars {
+            req,
+            path: &uri,
+            query: &args,
+            vars: &vars,
+        };
+        let expanded = expand_vars(value, &ctx);
+        vars.insert(name.trim_start_matches('$').to_string(), expanded);
+    }
+
+    // `if` blocks
+    for ifb in &loc.ifs {
+        let ctx = RwVars {
+            req,
+            path: &uri,
+            query: &args,
+            vars: &vars,
+        };
+        if !eval_cond(&ifb.cond, &ctx) {
             continue;
         }
-        let caps = match rw.re.captures(&uri) {
-            Some(c) => c,
-            None => continue,
-        };
-        // nginx appends the original args unless the replacement ends in `?`.
-        let mut target = expand_captures(&rw.replacement, &caps);
-        if let Some(q) = target.find('?') {
-            args = target[q + 1..].to_string();
-            target.truncate(q);
-        }
-        if target.starts_with("http://") || target.starts_with("https://") {
-            let code = match rw.flag {
-                RewriteFlag::Permanent => 301,
-                _ => 302,
+        for (name, value) in &ifb.sets {
+            let ctx = RwVars {
+                req,
+                path: &uri,
+                query: &args,
+                vars: &vars,
             };
-            return RewriteOutcome::Respond(Response::empty(code).header("Location", target));
+            let expanded = expand_vars(value, &ctx);
+            vars.insert(name.trim_start_matches('$').to_string(), expanded);
         }
-        match rw.flag {
-            RewriteFlag::Permanent | RewriteFlag::Redirect => {
-                let code = if rw.flag == RewriteFlag::Permanent { 301 } else { 302 };
-                let mut location = target;
-                if !args.is_empty() {
-                    location.push('?');
-                    location.push_str(&args);
-                }
-                return RewriteOutcome::Respond(Response::empty(code).header("Location", location));
+        if let Some((code, body)) = &ifb.ret {
+            let status = *code;
+            let mut resp = if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                Response::empty(status).header("Location", body.clone())
+            } else if body.is_empty() {
+                Response::empty(status)
+            } else {
+                // nginx picks the type from the URI extension, else default_type
+                let ext = match path.rfind('.') {
+                    Some(i) if i + 1 < path.len() => path[i + 1..].to_ascii_lowercase(),
+                    _ => String::new(),
+                };
+                let ctype = default_type_for(ext.as_str(), default_type);
+                Response::bytes(status, &ctype, body.clone().into_bytes())
+            };
+            resp.no_error_page = true;
+            return RewriteOutcome::Respond(resp);
+        }
+        for rw in &ifb.rewrites {
+            if let Some(out) = apply_one(rw, &mut uri, &mut args) {
+                return out;
             }
-            RewriteFlag::Last => return RewriteOutcome::Relocate(target, args),
-            RewriteFlag::Break => return RewriteOutcome::Break(target, args),
-            RewriteFlag::None => {
-                // No flag: nginx continues with the next rewrite directive, so
-                // keep scanning with the substituted URI.
-                uri = target;
-                continue;
-            }
+        }
+    }
+
+    for rw in &loc.rewrites {
+        if let Some(out) = apply_one(rw, &mut uri, &mut args) {
+            return out;
         }
     }
     let _ = server;
     RewriteOutcome::Continue(uri, args)
+}
+
+/// Apply one rewrite rule; `None` means "keep scanning".
+fn apply_one(rw: &crate::config::Rewrite, uri: &mut String, args: &mut String) -> Option<RewriteOutcome> {
+    if !rw.re.is_match(uri) {
+        return None;
+    }
+    let caps = rw.re.captures(uri)?;
+    let mut target = expand_captures(&rw.replacement, &caps);
+    if let Some(q) = target.find('?') {
+        *args = target[q + 1..].to_string();
+        target.truncate(q);
+    }
+    if target.starts_with("http://") || target.starts_with("https://") {
+        let code = match rw.flag {
+            RewriteFlag::Permanent => 301,
+            _ => 302,
+        };
+        return Some(RewriteOutcome::Respond(
+            Response::empty(code).header("Location", target),
+        ));
+    }
+    match rw.flag {
+        RewriteFlag::Permanent | RewriteFlag::Redirect => {
+            let code = if rw.flag == RewriteFlag::Permanent { 301 } else { 302 };
+            let mut location = target;
+            if !args.is_empty() {
+                location.push('?');
+                location.push_str(args);
+            }
+            Some(RewriteOutcome::Respond(
+                Response::empty(code).header("Location", location),
+            ))
+        }
+        RewriteFlag::Last => Some(RewriteOutcome::Relocate(target, args.clone())),
+        RewriteFlag::Break => Some(RewriteOutcome::Break(target, args.clone())),
+        RewriteFlag::None => {
+            *uri = target;
+            None
+        }
+    }
+}
+
+/// Expand `$var` references against the rewrite-phase variable set.
+fn expand_vars(spec: &str, v: &RwVars<'_>) -> String {
+    let mut out = String::with_capacity(spec.len());
+    let b = spec.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'$' {
+            out.push(b[i] as char);
+            i += 1;
+            continue;
+        }
+        let rest = &spec[i + 1..];
+        let n = rest
+            .bytes()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == b'_')
+            .count();
+        if n == 0 {
+            out.push('$');
+            i += 1;
+            continue;
+        }
+        out.push_str(&get_var(&rest[..n], v));
+        i += 1 + n;
+    }
+    out
 }
 
 enum RewriteOutcome {
@@ -387,6 +569,96 @@ fn expand_captures(replacement: &str, caps: &regex::Captures<'_>) -> String {
     out
 }
 
+fn default_type_for(ext: &str, default_type: &str) -> String {
+    const BUILTIN: &[(&str, &str)] = &[
+        ("html", "text/html"),
+        ("htm", "text/html"),
+        ("css", "text/css"),
+        ("js", "application/javascript"),
+        ("json", "application/json"),
+        ("txt", "text/plain"),
+        ("xml", "text/xml"),
+        ("png", "image/png"),
+        ("jpg", "image/jpeg"),
+    ];
+    BUILTIN
+        .iter()
+        .find(|(e, _)| *e == ext)
+        .map(|(_, t)| t.to_string())
+        .unwrap_or_else(|| default_type.to_string())
+}
+
+/// nginx applies `add_header` to these status codes unless `always` is given.
+fn add_header_applies(status: u16, always: bool) -> bool {
+    always
+        || matches!(
+            status,
+            200 | 201 | 204 | 206 | 301 | 302 | 303 | 304 | 307 | 308
+        )
+}
+
+/// Append `add_header` lines to a rendered header block.
+pub fn apply_add_headers(
+    raw: &mut Vec<u8>,
+    headers: &[(String, String)],
+    status: u16,
+    vars: &AddHeaderVars<'_>,
+) {
+    for (name, value) in headers {
+        let (value, always) = match value.rsplit_once(' ') {
+            Some((v, "always")) => (v, true),
+            _ => (value.as_str(), false),
+        };
+        if !add_header_applies(status, always) {
+            continue;
+        }
+        let expanded = expand_add_header(value, vars);
+        raw.extend_from_slice(name.as_bytes());
+        raw.extend_from_slice(b": ");
+        raw.extend_from_slice(expanded.as_bytes());
+        raw.extend_from_slice(b"\r\n");
+    }
+}
+
+pub struct AddHeaderVars<'a> {
+    pub upstream_cache_status: &'a str,
+    pub scheme: &'a str,
+    pub host: &'a str,
+}
+
+fn expand_add_header(spec: &str, vars: &AddHeaderVars<'_>) -> String {
+    let mut out = String::with_capacity(spec.len() + 8);
+    let b = spec.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'$' {
+            out.push(b[i] as char);
+            i += 1;
+            continue;
+        }
+        let rest = &spec[i + 1..];
+        let n = rest
+            .bytes()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == b'_')
+            .count();
+        if n == 0 {
+            out.push('$');
+            i += 1;
+            continue;
+        }
+        let name = &rest[..n];
+        let v = match name {
+            "upstream_cache_status" => vars.upstream_cache_status,
+            "scheme" => vars.scheme,
+            "host" | "http_host" => vars.host,
+            _ => "",
+        };
+        out.push_str(v);
+        i += 1 + n;
+    }
+    out
+}
+
 /// Resolve a request to a `Response` without touching the socket: error_page
 /// internal redirects plus the gzip filter. The HTTP/1 handler writes the
 /// result; the HTTP/2 handler turns it into h2 frames.
@@ -407,7 +679,7 @@ pub async fn resolve_response(
     let mut relocations = 0;
     let mut skip_return = false;
     loop {
-        match apply_rewrites(req, &cur_path, &cur_query, cur_loc, server) {
+        match apply_rewrites(req, &cur_path, &cur_query, cur_loc, server, &http.default_type) {
             RewriteOutcome::Respond(r) => return r,
             RewriteOutcome::Continue(p, q) => {
                 cur_path = p;
@@ -515,6 +787,13 @@ async fn dispatch(
     listen_port: u16,
 ) -> io::Result<Outcome> {
     let head_only = req.method == Method::Head;
+
+    // ---- FastCGI ----
+    if loc.fastcgi_pass.is_some() {
+        if let Some(o) = crate::fastcgi::handle(conn, req, path, query, loc, server.server_tokens).await? {
+            return Ok(o);
+        }
+    }
 
     // ---- reverse proxy (streams to the socket, cannot be resolved first) ----
     if loc.proxy_pass.is_some() {

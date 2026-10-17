@@ -37,7 +37,18 @@ python3 tests/parity.py         # 差分测试：同一请求分别打 nginx / n
 | 64 KB | 208,074 rps | 201,040 rps | 96.6%（p99 2.60 ms vs 32.74 ms） |
 | 1 MB | 30,802 rps | 29,849 rps | 96.9% |
 
-`tests/parity.py` 的 19 组协议差分用例与 nginx 全部一致。
+## 验证套件
+
+```bash
+bash bench/all.sh     # 一键跑全部差分套件（当前 61 项全过）
+bash bench/pair.sh    # 静态/协议 19 项
+bash bench/feature.sh # gzip / error_page / 代理 / 负载均衡 / WebSocket / rewrite / cache / if 25 项
+bash bench/tls.sh     # SNI / TLS1.2-1.3 / HTTP2 8 项
+bash bench/fcgi.sh    # FastCGI + stream TCP/UDP 9 项
+```
+
+已实现模块：配置解析、HTTP/1.1、静态文件、rewrite/if/set、反向代理与负载均衡、
+`proxy_cache`、gzip、error_page、FastCGI、`stream {}` TCP/UDP、TLS+SNI、HTTP/2。
 
 完整的功能对等矩阵与差距见 [COMPAT.md](COMPAT.md)。尚未实现的部分（反向代理、TLS、HTTP/2、HTTP/3、gzip、fastcgi、stream、mail、cache 等）按矩阵逐项推进。
 

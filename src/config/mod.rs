@@ -6,8 +6,9 @@ pub mod typed;
 
 pub use parser::{ConfigError, Directive};
 pub use typed::{
-    AccessLog, Config, Http, LbMethod, ListenGroup, LocCfg, Match, ProxyPass, ProxyTarget, Rewrite,
-    RewriteFlag, Server,
+    AccessLog, CacheZone, Config, FastcgiParam, FastcgiPass, Http, IfBlock, IfCond, LbMethod,
+    ListenGroup, LocCfg,
+    Match, ProxyPass, ProxyTarget, Rewrite, RewriteFlag, Server,
     Upstream, UpstreamServer,
 };
 

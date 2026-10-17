@@ -9,11 +9,12 @@ PORT_NGXRS_FEATURE=19301
 make_fixtures
 
 # both servers get the identical config file, only `listen` differs
-render() { # $1=port $2=out
-  sed -e "s|__ROOT__|$ROOT|g" -e "s/listen 19300/listen $1/" "$ROOT/bench/feature.conf" > "$2"
+render() { # $1=port $2=out $3=cache dir name
+  sed -e "s|__ROOT__|$ROOT|g" -e "s/listen 19300/listen $1/" \
+      -e "s|bench/run/cache |bench/run/$3 |" "$ROOT/bench/feature.conf" > "$2"
 }
-render "$PORT_NGINX_FEATURE" "$RUN/feature-nginx.conf"
-render "$PORT_NGXRS_FEATURE" "$RUN/feature-ngxrs.conf"
+render "$PORT_NGINX_FEATURE" "$RUN/feature-nginx.conf" cache-nginx
+render "$PORT_NGXRS_FEATURE" "$RUN/feature-ngxrs.conf" cache-ngxrs
 
 cleanup() {
   set +e

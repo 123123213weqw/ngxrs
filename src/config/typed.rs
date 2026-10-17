@@ -50,6 +50,10 @@ pub struct LocCfg {
     // ---- reverse proxy ----
     /// `rewrite <regex> <replacement> [flag]` entries, in config order.
     pub rewrites: Vec<Rewrite>,
+    /// `if (<cond>) { ... }` blocks, evaluated in config order with rewrites.
+    pub ifs: Vec<IfBlock>,
+    /// `set $var value;`
+    pub sets: Vec<(String, String)>,
     pub proxy_pass: Option<ProxyPass>,
     /// Set while parsing `proxy_pass http://<name>` so the http level can
     /// resolve the name to an `upstream` index after all blocks are read.
@@ -61,6 +65,19 @@ pub struct LocCfg {
     pub proxy_send_timeout: Duration,
     pub proxy_buffering: bool,
     pub proxy_hide_headers: Vec<String>,
+    // ---- fastcgi ----
+    pub fastcgi_pass: Option<FastcgiPass>,
+    pub fastcgi_params: Vec<FastcgiParam>,
+    pub fastcgi_index: Option<String>,
+    pub fastcgi_split_path_info: Option<regex::Regex>,
+    pub fastcgi_connect_timeout: Duration,
+    pub fastcgi_read_timeout: Duration,
+    // ---- proxy_cache ----
+    pub proxy_cache: Option<String>,
+    pub proxy_cache_valid: Vec<(Vec<u16>, Duration)>,
+    pub proxy_cache_key: Option<String>,
+    pub proxy_no_cache: Vec<String>,
+    pub proxy_cache_bypass: Vec<String>,
 }
 
 impl LocCfg {
@@ -84,6 +101,8 @@ impl LocCfg {
             gzip_types: Vec::new(),
             gzip_vary: false,
             rewrites: Vec::new(),
+            ifs: Vec::new(),
+            sets: Vec::new(),
             proxy_pass: None,
             proxy_upstream_name: None,
             proxy_set_headers: Vec::new(),
@@ -93,8 +112,40 @@ impl LocCfg {
             proxy_send_timeout: Duration::from_secs(60),
             proxy_buffering: true,
             proxy_hide_headers: Vec::new(),
+            fastcgi_pass: None,
+            fastcgi_params: Vec::new(),
+            fastcgi_index: None,
+            fastcgi_split_path_info: None,
+            fastcgi_connect_timeout: Duration::from_secs(60),
+            fastcgi_read_timeout: Duration::from_secs(60),
+            proxy_cache: None,
+            proxy_cache_valid: Vec::new(),
+            proxy_cache_key: None,
+            proxy_no_cache: Vec::new(),
+            proxy_cache_bypass: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct IfBlock {
+    pub cond: IfCond,
+    /// Rewrites, `return`, and nested `set` inside the block.
+    pub rewrites: Vec<Rewrite>,
+    pub ret: Option<(u16, String)>,
+    pub sets: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+pub enum IfCond {
+    /// `if ($var)`
+    Truthy(String),
+    /// `if ($var = value)` / `!=`
+    Equals(String, String, bool),
+    /// `if ($var ~ regex)` / `~*` / `!~` / `!~*`
+    Match(String, regex::Regex, bool),
+    /// `if (-f $request_filename)` etc.
+    FileTest(char, String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +164,44 @@ pub struct Rewrite {
     pub flag: RewriteFlag,
 }
 
+/// Parse `if (<expr>)`. nginx strips the parentheses, so the tokens arrive as
+/// e.g. `["($http_user_agent", "~", "curl)"]`.
+fn parse_if_cond(args: &[String]) -> Option<IfCond> {
+    if args.is_empty() {
+        return None;
+    }
+    let mut toks: Vec<String> = args.to_vec();
+    if let Some(first) = toks.first_mut() {
+        *first = first.trim_start_matches('(').to_string();
+    }
+    if let Some(last) = toks.last_mut() {
+        *last = last.trim_end_matches(')').to_string();
+    }
+    toks.retain(|t| !t.is_empty());
+    if toks.is_empty() {
+        return None;
+    }
+    if toks.len() == 1 {
+        return Some(IfCond::Truthy(toks[0].clone()));
+    }
+    let var = toks[0].clone();
+    let op = toks[1].clone();
+    let rhs = toks.get(2).cloned().unwrap_or_default();
+    match op.as_str() {
+        "=" => Some(IfCond::Equals(var, rhs, true)),
+        "!=" => Some(IfCond::Equals(var, rhs, false)),
+        "~" | "~*" | "!~" | "!~*" => {
+            let ci = op.ends_with('*');
+            let negate = op.starts_with('!');
+            let pattern = if ci { format!("(?i:{rhs})") } else { rhs };
+            let re = regex::Regex::new(&pattern).ok()?;
+            Some(IfCond::Match(var, re, negate))
+        }
+        "-f" | "-d" | "-e" | "-x" => Some(IfCond::FileTest(op.chars().nth(1)?, rhs)),
+        _ => None,
+    }
+}
+
 /// Compile nginx's `$1..$9` replacement syntax into a format we can expand.
 pub fn compile_rewrite(re_src: &str, replacement: &str, flag: RewriteFlag) -> Option<Rewrite> {
     let re = regex::Regex::new(re_src).ok()?;
@@ -121,6 +210,27 @@ pub fn compile_rewrite(re_src: &str, replacement: &str, flag: RewriteFlag) -> Op
         replacement: replacement.to_string(),
         flag,
     })
+}
+
+#[derive(Debug, Clone)]
+pub struct FastcgiPass {
+    pub addr: SocketAddr,
+}
+
+#[derive(Debug, Clone)]
+pub struct FastcgiParam {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CacheZone {
+    pub name: String,
+    /// Directory that holds the cache files.
+    pub path: PathBuf,
+    pub max_size: u64,
+    pub inactive: Duration,
+    pub levels: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -270,6 +380,7 @@ pub struct Http {
     pub default_loc: LocCfg,
     pub default_access_logs: Vec<AccessLog>,
     pub upstreams: Vec<Upstream>,
+    pub cache_zones: Vec<CacheZone>,
     pub log_formats: HashMap<String, String>,
 }
 
@@ -282,7 +393,29 @@ pub struct Config {
     pub pid: Option<PathBuf>,
     pub error_log: Option<PathBuf>,
     pub http: Http,
+    pub stream: StreamSection,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct StreamSection {
+    pub servers: Vec<StreamServerCfg>,
+    pub upstreams: Vec<StreamUpstream>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StreamUpstream {
+    pub name: String,
+    pub backends: Vec<SocketAddr>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StreamServerCfg {
+    pub listen: SocketAddr,
+    pub udp: bool,
+    pub proxy_pass: Option<String>,
+    pub proxy_timeout: Duration,
+    pub proxy_connect_timeout: Duration,
 }
 
 impl Http {
@@ -667,10 +800,82 @@ impl Builder {
                     .ok_or_else(|| sem(&d.file, d.line, format!("invalid regex \"{}\"", d.args[0])))?;
                 cfg.rewrites.push(rw);
             }
-            "set" | "if" | "break" => {
-                // Accepted at this scope; conditional evaluation is not wired
-                // into the rewrite engine yet (see COMPAT.md).
+            "set" => {
+                if d.args.len() < 2 {
+                    return Err(sem(&d.file, d.line, "set requires a variable and a value"));
+                }
+                cfg.sets.push((d.args[0].clone(), d.args[1..].join(" ")));
             }
+            "if" => {
+                let block = d
+                    .block
+                    .as_ref()
+                    .ok_or_else(|| sem(&d.file, d.line, "if requires a block"))?;
+                let mut cond = parse_if_cond(&d.args)
+                    .ok_or_else(|| sem(&d.file, d.line, "unsupported if condition"))?;
+                let mut ifb = IfBlock {
+                    cond: IfCond::Truthy(String::new()),
+                    rewrites: Vec::new(),
+                    ret: None,
+                    sets: Vec::new(),
+                };
+                for child in block {
+                    match child.name.as_str() {
+                        "rewrite" => {
+                            let flag = match child.args.get(2).map(|s| s.as_str()) {
+                                None => RewriteFlag::None,
+                                Some("last") => RewriteFlag::Last,
+                                Some("break") => RewriteFlag::Break,
+                                Some("redirect") => RewriteFlag::Redirect,
+                                Some("permanent") => RewriteFlag::Permanent,
+                                Some(other) => {
+                                    return Err(sem(
+                                        &child.file,
+                                        child.line,
+                                        format!("invalid rewrite flag \"{other}\""),
+                                    ))
+                                }
+                            };
+                            if let Some(rw) = compile_rewrite(
+                                child.args.first().map(|s| s.as_str()).unwrap_or(""),
+                                child.args.get(1).map(|s| s.as_str()).unwrap_or(""),
+                                flag,
+                            ) {
+                                ifb.rewrites.push(rw);
+                            }
+                        }
+                        "return" => {
+                            let code: u16 = child
+                                .args
+                                .first()
+                                .and_then(|c| c.parse().ok())
+                                .ok_or_else(|| {
+                                    sem(&child.file, child.line, "return requires a status")
+                                })?;
+                            ifb.ret = Some((code, child.args.get(1).cloned().unwrap_or_default()));
+                        }
+                        "set" => {
+                            if child.args.len() >= 2 {
+                                ifb.sets
+                                    .push((child.args[0].clone(), child.args[1..].join(" ")));
+                            }
+                        }
+                        "break" => {}
+                        other => {
+                            return Err(sem(
+                                &child.file,
+                                child.line,
+                                format!("directive \"{other}\" is not allowed inside if"),
+                            ))
+                        }
+                    }
+                }
+                ifb.cond = cond;
+                cond = IfCond::Truthy(String::new());
+                let _ = cond;
+                cfg.ifs.push(ifb);
+            }
+            "break" => {}
             "return" => {
                 if d.args.len() < 1 {
                     return Err(sem(&d.file, d.line, "return requires a status code"));
@@ -765,6 +970,82 @@ impl Builder {
                 cfg.proxy_buffering = parse_on_off(v)
                     .ok_or_else(|| sem(&d.file, d.line, format!("invalid proxy_buffering \"{v}\"")))?;
             }
+            "fastcgi_pass" => {
+                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "fastcgi_pass requires an address"))?;
+                let addr = parse_listen(v).ok_or_else(|| {
+                    sem(&d.file, d.line, format!("invalid fastcgi_pass address \"{v}\""))
+                })?;
+                cfg.fastcgi_pass = Some(FastcgiPass { addr });
+            }
+            "fastcgi_param" => {
+                if d.args.len() < 2 {
+                    return Err(sem(&d.file, d.line, "fastcgi_param requires a name and a value"));
+                }
+                cfg.fastcgi_params.push(FastcgiParam {
+                    name: d.args[0].clone(),
+                    value: d.args[1..].join(" "),
+                });
+            }
+            "fastcgi_index" => {
+                cfg.fastcgi_index = d.args.first().cloned();
+            }
+            "fastcgi_split_path_info" => {
+                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "fastcgi_split_path_info requires a regex"))?;
+                cfg.fastcgi_split_path_info = Some(
+                    regex::Regex::new(v)
+                        .map_err(|_| sem(&d.file, d.line, format!("invalid regex \"{v}\"")))?,
+                );
+            }
+            "fastcgi_connect_timeout" => {
+                if let Some(v) = d.args.first() {
+                    cfg.fastcgi_connect_timeout = parse_time(v)
+                        .ok_or_else(|| sem(&d.file, d.line, "invalid fastcgi_connect_timeout"))?;
+                }
+            }
+            "fastcgi_read_timeout" => {
+                if let Some(v) = d.args.first() {
+                    cfg.fastcgi_read_timeout = parse_time(v)
+                        .ok_or_else(|| sem(&d.file, d.line, "invalid fastcgi_read_timeout"))?;
+                }
+            }
+            "fastcgi_send_timeout" | "fastcgi_buffer_size" | "fastcgi_buffers"
+            | "fastcgi_busy_buffers_size" | "fastcgi_temp_file_write_size"
+            | "fastcgi_max_temp_file_size" | "fastcgi_intercept_errors"
+            | "fastcgi_pass_request_body" | "fastcgi_pass_request_headers"
+            | "fastcgi_keep_conn" | "fastcgi_store" | "fastcgi_store_access"
+            | "fastcgi_cache" | "fastcgi_cache_key" | "fastcgi_cache_valid"
+            | "fastcgi_ignore_headers" | "fastcgi_hide_header" => {
+                // Accepted, not yet honoured.
+            }
+            "proxy_cache" => {
+                if let Some(v) = d.args.first() {
+                    if v != "off" {
+                        cfg.proxy_cache = Some(v.clone());
+                    }
+                }
+            }
+            "proxy_cache_valid" => {
+                // proxy_cache_valid [code ...] time;
+                let mut codes = Vec::new();
+                let mut dur = None;
+                for a in &d.args {
+                    match a.parse::<u16>() {
+                        Ok(c) => codes.push(c),
+                        Err(_) => dur = parse_time(a),
+                    }
+                }
+                if codes.is_empty() {
+                    codes = vec![200, 301, 302];
+                }
+                if let Some(dur) = dur {
+                    cfg.proxy_cache_valid.push((codes, dur));
+                }
+            }
+            "proxy_cache_key" => {
+                cfg.proxy_cache_key = d.args.first().cloned();
+            }
+            "proxy_no_cache" => cfg.proxy_no_cache = d.args.clone(),
+            "proxy_cache_bypass" => cfg.proxy_cache_bypass = d.args.clone(),
             "proxy_next_upstream" | "proxy_next_upstream_tries" | "proxy_buffers"
             | "proxy_buffer_size" | "proxy_busy_buffers_size" | "proxy_max_temp_file_size"
             | "proxy_temp_file_write_size" | "proxy_redirect" | "proxy_cache"
@@ -1015,6 +1296,115 @@ impl Builder {
     }
 }
 
+/// Parse the `stream {}` block: upstreams first, then listeners.
+fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, ConfigError> {
+    let mut section = StreamSection::default();
+    let mut server_dirs: Vec<&Directive> = Vec::new();
+
+    for d in dirs {
+        match d.name.as_str() {
+            "upstream" => {
+                let name = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "stream upstream requires a name"))?
+                    .clone();
+                let mut backends = Vec::new();
+                for child in d.block.as_ref().map(|x| x.as_slice()).unwrap_or(&[]) {
+                    if child.name != "server" {
+                        continue;
+                    }
+                    let a = child
+                        .args
+                        .first()
+                        .ok_or_else(|| sem(&child.file, child.line, "server requires an address"))?;
+                    let mut addr = parse_listen(a).ok_or_else(|| {
+                        sem(&child.file, child.line, format!("invalid server address \"{a}\""))
+                    })?;
+                    if !a.contains(':') {
+                        addr = SocketAddr::new(addr.ip(), 80);
+                    }
+                    backends.push(addr);
+                }
+                if backends.is_empty() {
+                    return Err(sem(&d.file, d.line, "stream upstream has no servers"));
+                }
+                section.upstreams.push(StreamUpstream { name, backends });
+            }
+            "server" => server_dirs.push(d),
+            "log_format" | "access_log" | "error_log" | "resolver" | "map" | "geo"
+            | "split_clients" | "limit_conn_zone" | "limit_req_zone" | "variables_hash_max_size"
+            | "variables_hash_bucket_size" | "proxy_protocol" | "preread_buffer_size"
+            | "preread_timeout" | "ssl_certificate" | "ssl_certificate_key" | "ssl_protocols"
+            | "ssl_ciphers" | "ssl_session_cache" | "ssl_session_timeout" | "ssl_dhparam"
+            | "ssl_prefer_server_ciphers" | "ssl_handshake_timeout" | "ssl_ecdh_curve" => {}
+            other => b.warn(d, format!("unknown directive \"{other}\" in stream context; ignored")),
+        }
+    }
+
+    for sd in server_dirs {
+        let mut cfg = StreamServerCfg {
+            listen: SocketAddr::from(([0, 0, 0, 0], 0)),
+            udp: false,
+            proxy_pass: None,
+            proxy_timeout: Duration::from_secs(600),
+            proxy_connect_timeout: Duration::from_secs(60),
+        };
+        let mut have_listen = false;
+        for child in sd.block.as_ref().map(|x| x.as_slice()).unwrap_or(&[]) {
+            match child.name.as_str() {
+                "listen" => {
+                    let a = child
+                        .args
+                        .first()
+                        .ok_or_else(|| sem(&child.file, child.line, "listen requires an address"))?;
+                    cfg.listen = parse_listen(a).ok_or_else(|| {
+                        sem(&child.file, child.line, format!("invalid listen address \"{a}\""))
+                    })?;
+                    if child.args[1..].iter().any(|p| p == "udp") {
+                        cfg.udp = true;
+                    }
+                    have_listen = true;
+                }
+                "proxy_pass" => {
+                    cfg.proxy_pass = child.args.first().cloned();
+                }
+                "proxy_timeout" => {
+                    if let Some(v) = child.args.first() {
+                        cfg.proxy_timeout = parse_time(v)
+                            .ok_or_else(|| sem(&child.file, child.line, "invalid proxy_timeout"))?;
+                    }
+                }
+                "proxy_connect_timeout" => {
+                    if let Some(v) = child.args.first() {
+                        cfg.proxy_connect_timeout = parse_time(v).ok_or_else(|| {
+                            sem(&child.file, child.line, "invalid proxy_connect_timeout")
+                        })?;
+                    }
+                }
+                "return" => {
+                    // Parsed but not executed yet (see COMPAT.md).
+                }
+                "proxy_protocol" | "proxy_buffer_size" | "proxy_responses" | "preread_buffer_size"
+                | "preread_timeout" | "ssl_certificate" | "ssl_certificate_key" | "set"
+                | "if" | "proxy_ssl_server_name" | "proxy_ssl_verify" | "proxy_requests" => {}
+                other => {
+                    return Err(sem(
+                        &child.file,
+                        child.line,
+                        format!("unknown directive \"{other}\" in stream server"),
+                    ))
+                }
+            }
+        }
+        if !have_listen {
+            return Err(sem(&sd.file, sd.line, "stream server has no listen"));
+        }
+        section.servers.push(cfg);
+    }
+    Ok(section)
+}
+
 pub fn build(
     tree: Vec<Directive>,
     prefix: &Path,
@@ -1030,6 +1420,7 @@ pub fn build(
     let mut pid: Option<PathBuf> = None;
     let mut error_log: Option<PathBuf> = None;
     let mut http_roots: Vec<Directive> = Vec::new();
+    let mut stream_dirs: Vec<Directive> = Vec::new();
     let mut saw_http = false;
 
     for d in tree {
@@ -1068,8 +1459,11 @@ pub fn build(
                 saw_http = true;
                 http_roots = d.block.clone().unwrap_or_default();
             }
-            "stream" | "mail" => {
-                b.warn(&d, format!("module \"{}\" is not implemented yet; section ignored", d.name));
+            "stream" => {
+                stream_dirs = d.block.clone().unwrap_or_default();
+            }
+            "mail" => {
+                b.warn(&d, "module \"mail\" is not implemented yet; section ignored");
             }
             other => {
                 b.warn(
@@ -1095,6 +1489,7 @@ pub fn build(
         client_max_body_size: DEFAULT_CLIENT_MAX_BODY,
         default_loc: LocCfg::new(prefix.to_path_buf()),
         upstreams: Vec::new(),
+        cache_zones: Vec::new(),
         default_access_logs: vec![AccessLog {
             path: prefix.join("logs/access.log"),
             format: "combined".to_string(),
@@ -1219,12 +1614,46 @@ pub fn build(
                 upstream_index.insert(up.name.clone(), http.upstreams.len());
                 http.upstreams.push(up);
             }
+            "proxy_cache_path" => {
+                // proxy_cache_path <path> [levels=..] [keys_zone=name:size]
+                //                   [max_size=..] [inactive=..];
+                let path_arg = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "proxy_cache_path requires a path"))?;
+                let mut zone = CacheZone {
+                    name: String::new(),
+                    path: resolve_path(prefix, path_arg),
+                    max_size: 1024 * 1024 * 1024,
+                    inactive: Duration::from_secs(600),
+                    levels: None,
+                };
+                for a in &d.args[1..] {
+                    if let Some(v) = a.strip_prefix("keys_zone=") {
+                        zone.name = v.split(':').next().unwrap_or(v).to_string();
+                    } else if let Some(v) = a.strip_prefix("max_size=") {
+                        if let Some(n) = parse_size(v) {
+                            zone.max_size = n;
+                        }
+                    } else if let Some(v) = a.strip_prefix("inactive=") {
+                        if let Some(t) = parse_time(v) {
+                            zone.inactive = t;
+                        }
+                    } else if let Some(v) = a.strip_prefix("levels=") {
+                        zone.levels = Some(v.to_string());
+                    }
+                }
+                if zone.name.is_empty() {
+                    return Err(sem(&d.file, d.line, "proxy_cache_path requires keys_zone=name:size"));
+                }
+                http.cache_zones.push(zone);
+            }
             "location" | "if" | "map" | "resolver" | "geo" | "split_clients"
             | "limit_req_zone" | "limit_conn_zone" | "proxy_cache_path" | "charset"
             | "log_format_escape" | "types_hash_max_size" | "server_names_hash_bucket_size"
             | "open_file_cache" | "access_log_off" | "default_type_off" => {
                 if d.name == "map" || d.name == "limit_req_zone"
-                    || d.name == "proxy_cache_path" || d.name == "geo" || d.name == "split_clients"
+                    || d.name == "geo" || d.name == "split_clients"
                 {
                     b.warn(d, format!("directive \"{}\" is not implemented yet; ignored", d.name));
                 }
@@ -1302,6 +1731,8 @@ pub fn build(
         return Err(sem(&conf_path, 0, "no server listen sockets configured"));
     }
 
+    let stream = build_stream(&stream_dirs, &mut b)?;
+
     Ok(Config {
         prefix: prefix.to_path_buf(),
         conf_path,
@@ -1310,6 +1741,7 @@ pub fn build(
         pid,
         error_log,
         http,
+        stream,
         warnings: b.warnings,
     })
 }

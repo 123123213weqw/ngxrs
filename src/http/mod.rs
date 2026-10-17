@@ -125,6 +125,11 @@ thread_local! {
 /// this to reach zero (nginx's `worker_shutdown_timeout` behaviour).
 pub static ACTIVE_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Set once a graceful shutdown begins: responses served after that carry
+/// `Connection: close` so clients know the connection is going away.
+pub static SHUTTING_DOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// RAII guard so the counter stays balanced even on early return.
 pub struct ActiveGuard;
 
@@ -161,7 +166,9 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
     let http = &cfg.http;
     let group = &http.groups[group_idx];
     let first_server = http.server(group.default_server);
-    let keepalive_timeout = first_server.keepalive_timeout;
+    // The idle timeout for the next read comes from the location of the
+    // request that was just served (nginx stores it in c->keepalive_timeout).
+    let mut keepalive_timeout = first_server.keepalive_timeout;
     let mut served: u64 = 0;
     let conn_started = std::time::Instant::now();
     // One timer per connection, reset after each request: registering a fresh
@@ -287,6 +294,9 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
         let (server, captures) =
             select_server_ex(http, &group.servers, group.default_server, req.host.as_deref());
         let loc = server.locate(&path);
+        if let Some((t, _)) = loc.keepalive_timeout {
+            keepalive_timeout = t;
+        }
 
         // Request body: upstream modules (proxy, fastcgi) forward it; every
         // other handler discards it (nginx behaves the same for static
@@ -1146,6 +1156,7 @@ pub fn apply_add_headers(
             server_name: vars.server_name,
             server_port: vars.server_port,
             peer_ip: vars.peer_ip,
+            peer_port: vars.peer_port,
             scheme: vars.scheme,
             document_root: vars.document_root,
             upstream_cache_status: vars.upstream_cache_status,
@@ -1182,6 +1193,7 @@ pub struct ServerVars<'a> {
     pub server_name: &'a str,
     pub server_port: u16,
     pub peer_ip: &'a str,
+    pub peer_port: u16,
     pub scheme: &'a str,
     pub document_root: &'a str,
     pub upstream_cache_status: &'a str,
@@ -1205,12 +1217,20 @@ impl<'a> ServerVars<'a> {
             return v.clone();
         }
         match name {
-            "host" | "http_host" => self
+            "host" => self
                 .req
                 .host
                 .as_ref()
                 .map(|h| h.as_str().to_string())
-                .unwrap_or_default(),
+                // No Host header at all: nginx reports the selected server_name.
+                .unwrap_or_else(|| {
+                    if self.req.headers.get("host").is_some() {
+                        String::new()
+                    } else {
+                        self.server_name.trim_start_matches('.').to_string()
+                    }
+                }),
+            "http_host" => self.req.headers.get("host").unwrap_or("").to_string(),
             "uri" | "document_uri" => self.path.to_string(),
             "request_uri" => self.req.raw_target.clone(),
             "args" | "query_string" => self.query.to_string(),
@@ -1233,6 +1253,7 @@ impl<'a> ServerVars<'a> {
                 }
             }
             "remote_addr" => self.peer_ip.to_string(),
+            "remote_port" => self.peer_port.to_string(),
             "remote_user" => self
                 .req
                 .headers
@@ -1251,7 +1272,7 @@ impl<'a> ServerVars<'a> {
                 .get("content-length")
                 .unwrap_or("")
                 .to_string(),
-            "content_type" => self.req.headers.get("content-type").unwrap_or("").to_string(),
+            "content_type" => self.req.headers.get_joined("content-type").unwrap_or_default(),
             "connection_requests" => self.connection_requests.to_string(),
             "connection_time" => self.connection_time.to_string(),
             "hostname" => "ngxrs".to_string(),
@@ -1729,6 +1750,7 @@ pub async fn render_resolved_vars(
                 server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
                 server_port,
                 peer_ip,
+                peer_port: 0,
                 scheme: "http",
                 document_root: &root_str,
                 upstream_cache_status: "",
@@ -1808,6 +1830,7 @@ async fn finalize_response(
                 server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
                 server_port,
                 peer_ip,
+                peer_port: 0,
                 scheme: "http",
                 document_root: &root_str,
                 upstream_cache_status: "",
@@ -1839,6 +1862,7 @@ async fn finalize_response(
                 server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
                 server_port,
                 peer_ip,
+                peer_port: 0,
                 scheme: "http",
                 document_root: &root_str,
                 upstream_cache_status: "",
@@ -1865,6 +1889,7 @@ async fn finalize_response(
                     server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
                     server_port,
                     peer_ip,
+                    peer_port: 0,
                     scheme: "http",
                     document_root: &root_str,
                     upstream_cache_status: "",
@@ -1911,6 +1936,7 @@ async fn finalize_response(
             server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
             server_port,
             peer_ip,
+            peer_port: 0,
             scheme: "http",
             document_root: &root_str,
             upstream_cache_status: "",
@@ -2092,6 +2118,9 @@ async fn dispatch(
 /// `keepalive_time`, `keepalive_timeout 0` and `keepalive_disable` all veto it.
 fn keepalive_policy(req: &Request, loc: &LocCfg, state: ConnState) -> bool {
     if !req.keepalive {
+        return false;
+    }
+    if SHUTTING_DOWN.load(std::sync::atomic::Ordering::Relaxed) {
         return false;
     }
     // nginx answers TRACE with 405 and always closes the connection; other

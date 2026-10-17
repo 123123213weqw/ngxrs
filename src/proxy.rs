@@ -430,8 +430,26 @@ pub async fn handle(
     let _ = http;
 
     let peer_ip = conn.peer.ip();
+    let peer_ip_owned = peer_ip.to_string();
+    let peer_port = conn.peer.port();
     let Some(candidates) = choose(http, loc, &peer_ip) else {
         return Ok(Some(respond_error(conn, 502, tokens, req.keepalive).await?));
+    };
+
+    // `proxy_bind` applies to every candidate connection below.
+    let bind = match resolve_bind(
+        loc,
+        &BindVars {
+            peer_ip: &peer_ip_owned,
+            peer_port,
+            query,
+        },
+    ) {
+        Ok(b) => b,
+        Err(()) => {
+            crate::log::error_log("error", "invalid proxy_bind value");
+            return Ok(Some(respond_error(conn, 500, tokens, req.keepalive).await?));
+        }
     };
 
     // nginx answers `Expect: 100-continue` before reading the body.
@@ -568,7 +586,7 @@ pub async fn handle(
                     let pooled = if want_pool { checkout(key) } else { None };
                     match pooled {
                         Some(s) => (s, true, usize::MAX, 0),
-                        None => match connect_timeout(*addr, loc.proxy_connect_timeout).await {
+                        None => match connect_bound(*addr, bind, loc.proxy_connect_timeout).await {
                             Ok(s) => (s, false, usize::MAX, 0),
                             Err(e) => {
                                 last_err = Some(e);
@@ -585,7 +603,7 @@ pub async fn handle(
                     };
                     match pooled {
                         Some(s) => (s, true, *up, *sidx),
-                        None => match connect_timeout(*addr, loc.proxy_connect_timeout).await {
+                        None => match connect_bound(*addr, bind, loc.proxy_connect_timeout).await {
                             Ok(s) => (s, false, *up, *sidx),
                             Err(e) => {
                                 last_err = Some(e);
@@ -610,7 +628,7 @@ pub async fn handle(
                 from_pool,
                 tokens,
                 is_upgrade,
-                &peer_ip.to_string(),
+                &peer_ip_owned,
                 key,
                 CacheCtx {
                     zone,
@@ -650,14 +668,149 @@ pub async fn handle(
 }
 
 async fn connect_timeout(addr: SocketAddr, dur: Duration) -> io::Result<TcpStream> {
-    match tokio::time::timeout(dur, TcpStream::connect(addr)).await {
-        Ok(Ok(s)) => {
+    connect_bound(addr, None, dur).await
+}
+
+/// Connect, optionally binding the local (source) address first — nginx's
+/// `proxy_bind`.
+async fn connect_bound(
+    addr: SocketAddr,
+    source: Option<SocketAddr>,
+    dur: Duration,
+) -> io::Result<TcpStream> {
+    let Some(src) = source else {
+        return match tokio::time::timeout(dur, TcpStream::connect(addr)).await {
+            Ok(Ok(s)) => {
+                let _ = s.set_nodelay(true);
+                Ok(s)
+            }
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out")),
+        };
+    };
+
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    sock.set_nonblocking(true)?;
+    sock.set_reuse_address(true)?;
+    sock.bind(&src.into())?;
+
+    // socket2 reports an in-progress connect as WouldBlock/EINPROGRESS.
+    let connect = async {
+        loop {
+            match sock.connect(&addr.into()) {
+                Ok(()) => return Ok(()),
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.raw_os_error() == Some(libc::EINPROGRESS) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    };
+    match tokio::time::timeout(dur, connect).await {
+        Ok(Ok(())) => {
+            sock.set_nonblocking(false)?;
+            let std_stream: std::net::TcpStream = sock.into();
+            let s = TcpStream::from_std(std_stream)?;
             let _ = s.set_nodelay(true);
             Ok(s)
         }
         Ok(Err(e)) => Err(e),
         Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out")),
     }
+}
+
+/// Variables `proxy_bind` may reference.
+pub struct BindVars<'a> {
+    pub peer_ip: &'a str,
+    pub peer_port: u16,
+    pub query: &'a str,
+}
+
+/// Resolve `proxy_bind` for one request into an address to bind.
+pub fn resolve_bind(loc: &LocCfg, vars: &BindVars<'_>) -> Result<Option<SocketAddr>, ()> {
+    let Some(spec) = &loc.proxy_bind else {
+        return Ok(None);
+    };
+    let spec = spec.trim();
+    if spec.is_empty() || spec.eq_ignore_ascii_case("off") {
+        return Ok(None);
+    }
+    let expanded = expand_bind(spec, vars);
+    if expanded.is_empty() || expanded.eq_ignore_ascii_case("off") {
+        return Ok(None);
+    }
+    parse_bind_addr(&expanded).map(Some).ok_or(())
+}
+
+fn expand_bind(spec: &str, vars: &BindVars<'_>) -> String {
+    let mut out = String::with_capacity(spec.len() + 16);
+    let b = spec.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'$' {
+            out.push(b[i] as char);
+            i += 1;
+            continue;
+        }
+        let rest = &spec[i + 1..];
+        let n = rest
+            .bytes()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == b'_')
+            .count();
+        if n == 0 {
+            out.push('$');
+            i += 1;
+            continue;
+        }
+        match &rest[..n] {
+            "remote_addr" => out.push_str(vars.peer_ip),
+            "remote_port" => out.push_str(&vars.peer_port.to_string()),
+            name => {
+                if let Some(want) = name.strip_prefix("arg_") {
+                    if let Some((_, v)) = vars
+                        .query
+                        .split('&')
+                        .filter_map(|p| p.split_once('='))
+                        .find(|(k, _)| k.eq_ignore_ascii_case(want))
+                    {
+                        out.push_str(v);
+                    }
+                }
+            }
+        }
+        i += 1 + n;
+    }
+    out
+}
+
+/// `127.0.0.2`, `127.0.0.2:80`, `[::1]:8080`, `[::1]`.
+fn parse_bind_addr(spec: &str) -> Option<SocketAddr> {
+    if let Some(rest) = spec.strip_prefix('[') {
+        let close = rest.find(']')?;
+        let ip: std::net::IpAddr = rest[..close].parse().ok()?;
+        let after = &rest[close + 1..];
+        let port = if after.is_empty() {
+            0
+        } else {
+            after.strip_prefix(':')?.parse().ok()?
+        };
+        return Some(SocketAddr::new(ip, port));
+    }
+    if let Ok(ip) = spec.parse::<std::net::IpAddr>() {
+        return Some(SocketAddr::new(ip, 0));
+    }
+    let (host, port) = spec.rsplit_once(':')?;
+    let ip: std::net::IpAddr = host.parse().ok()?;
+    Some(SocketAddr::new(ip, port.parse().ok()?))
 }
 
 async fn respond_error(
@@ -1236,7 +1389,11 @@ pub async fn fetch(
             Chosen::Direct(_, a) => *a,
             Chosen::Upstream { addr, .. } => *addr,
         };
-        let mut up = match connect_timeout(addr, loc.proxy_connect_timeout).await {
+        let mut up = match connect_bound(addr, resolve_bind(loc, &BindVars {
+            peer_ip,
+            peer_port: 0,
+            query,
+        }).ok().flatten(), loc.proxy_connect_timeout).await {
             Ok(s) => s,
             Err(e) => {
                 last_err = Some(e);

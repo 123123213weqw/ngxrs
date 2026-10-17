@@ -1,0 +1,19 @@
+[package]
+name = "ngxrs"
+version = "0.1.0"
+edition = "2021"
+description = "nginx-compatible high-performance web server"
+license = "BSD-2-Clause"
+
+[dependencies]
+tokio = { version = "1.40", features = ["rt-multi-thread", "net", "io-util", "time", "signal", "sync", "macros"] }
+libc = "0.2"
+memchr = "2.7"
+socket2 = { version = "0.5", features = ["all"] }
+regex = "1.11"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

@@ -30,6 +30,9 @@ pub struct Location {
 pub struct LocCfg {
     pub root: PathBuf,
     pub alias: Option<PathBuf>,
+    /// Prefix length that belongs to the alias itself (a nested location
+    /// inherits the parent's alias *and* the parent's offset).
+    pub alias_prefix_len: usize,
     pub index: Vec<String>,
     pub autoindex: bool,
     pub gzip: bool,
@@ -40,6 +43,14 @@ pub struct LocCfg {
     pub try_files: Vec<String>,
     pub internal: bool,
     pub expires: Option<String>,
+    // ---- keepalive ----
+    /// `keepalive_requests N` at this level (None = inherit).
+    pub keepalive_requests: Option<u64>,
+    /// `keepalive_timeout T [header_time]`; `0` disables keepalive.
+    pub keepalive_timeout: Option<(Duration, Option<u32>)>,
+    /// `keepalive_time T` — maximum lifetime of a keepalive connection.
+    pub keepalive_time: Option<Duration>,
+    pub keepalive_disable: KeepaliveDisable,
     /// Length of the location prefix, used to strip it for `alias`.
     pub prefix_len: usize,
     // ---- gzip ----
@@ -90,6 +101,7 @@ impl LocCfg {
         LocCfg {
             root,
             alias: None,
+            alias_prefix_len: 0,
             index: vec!["index.html".to_string()],
             autoindex: false,
             gzip: false,
@@ -100,6 +112,10 @@ impl LocCfg {
             try_files: Vec::new(),
             internal: false,
             expires: None,
+            keepalive_requests: None,
+            keepalive_timeout: None,
+            keepalive_time: None,
+            keepalive_disable: KeepaliveDisable::Msie6,
             prefix_len: 0,
             gzip_min_length: 20,
             gzip_comp_level: 1,
@@ -155,6 +171,14 @@ pub enum IfCond {
     Match(String, regex::Regex, bool),
     /// `if (-f $request_filename)` etc.
     FileTest(char, String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepaliveDisable {
+    /// nginx's default: keepalive is off for MSIE 6 and older.
+    Msie6,
+    Safari,
+    None,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -789,6 +813,7 @@ impl Builder {
             "alias" => {
                 let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "alias requires a path"))?;
                 cfg.alias = Some(resolve_path(&self.prefix, v));
+                cfg.alias_prefix_len = cfg.prefix_len;
             }
             "index" => {
                 cfg.index = d.args.clone();
@@ -958,6 +983,44 @@ impl Builder {
             "internal" => cfg.internal = true,
             "expires" => {
                 cfg.expires = Some(d.args.first().cloned().unwrap_or_else(|| "off".into()));
+            }
+            "keepalive_requests" => {
+                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "keepalive_requests requires a value"))?;
+                cfg.keepalive_requests = Some(
+                    v.parse::<u64>()
+                        .map_err(|_| sem(&d.file, d.line, "invalid keepalive_requests"))?,
+                );
+            }
+            "keepalive_timeout" => {
+                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "keepalive_timeout requires a value"))?;
+                let timeout = parse_time(v)
+                    .ok_or_else(|| sem(&d.file, d.line, "invalid keepalive_timeout"))?;
+                let header = d
+                    .args
+                    .get(1)
+                    .and_then(|h| h.parse::<u32>().ok());
+                cfg.keepalive_timeout = Some((timeout, header));
+            }
+            "keepalive_time" => {
+                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "keepalive_time requires a value"))?;
+                cfg.keepalive_time = Some(
+                    parse_time(v).ok_or_else(|| sem(&d.file, d.line, "invalid keepalive_time"))?,
+                );
+            }
+            "keepalive_disable" => {
+                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "keepalive_disable requires a value"))?;
+                cfg.keepalive_disable = match v.as_str() {
+                    "msie6" => KeepaliveDisable::Msie6,
+                    "safari" => KeepaliveDisable::Safari,
+                    "none" => KeepaliveDisable::None,
+                    other => {
+                        return Err(sem(
+                            &d.file,
+                            d.line,
+                            format!("invalid keepalive_disable \"{other}\""),
+                        ))
+                    }
+                };
             }
             "gzip_min_length" => {
                 let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "gzip_min_length requires a size"))?;
@@ -1183,7 +1246,7 @@ impl Builder {
                 // Accepted, not yet honoured.
             }
             "limit_rate" | "limit_rate_after" | "sendfile" | "tcp_nopush" | "tcp_nodelay"
-            | "keepalive_timeout" | "keepalive_requests" | "server_tokens" | "default_type"
+            | "server_tokens" | "default_type"
             | "charset"
             | "merge_slashes" | "absolute_redirect" | "server_name_in_redirect"
             | "port_in_redirect" | "log_not_found" | "open_file_cache" | "etag" | "msie_padding" => {
@@ -1344,6 +1407,9 @@ impl Builder {
                     if let Some(v) = child.args.first() {
                         keepalive = parse_time(v)
                             .ok_or_else(|| sem(&child.file, child.line, "invalid keepalive_timeout"))?;
+                        // Locations inherit this, and the second argument is the
+                        // value for the `Keep-Alive: timeout=` header.
+                        self.apply_loc(child, &mut default_loc)?;
                     }
                 }
                 "ssl_certificate" => {
@@ -1897,6 +1963,34 @@ impl Location {
 }
 
 impl Server {
+    /// nginx's `auto_redirect`: a request for `/foo` is answered with a 301 to
+    /// `/foo/` when a location named `/foo/` exists.
+    pub fn auto_redirect(&self, path: &str) -> Option<String> {
+        if path.ends_with('/') {
+            return None;
+        }
+        let mut want = String::with_capacity(path.len() + 1);
+        want.push_str(path);
+        want.push('/');
+        fn has(locs: &[Location], want: &str) -> bool {
+            for l in locs {
+                match &l.matcher {
+                    Match::Prefix(p) | Match::PrefixNoRegex(p) if p == want => return true,
+                    _ => {}
+                }
+                if has(&l.nested, want) {
+                    return true;
+                }
+            }
+            false
+        }
+        if has(&self.locations, &want) {
+            Some(want)
+        } else {
+            None
+        }
+    }
+
     pub fn locate(&self, path: &str) -> &LocCfg {
         match match_list(&self.locations, path) {
             Some(c) => c,

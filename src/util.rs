@@ -93,7 +93,50 @@ pub fn error_page_reason(status: u16) -> &'static str {
 /// Statuses for which nginx drops keepalive (`ngx_http_special_response_handler`
 /// clears `r->keepalive` for these).
 pub fn force_close(status: u16) -> bool {
-    matches!(status, 400 | 405 | 413 | 414 | 495 | 496 | 497 | 500 | 501)
+    // Exactly the list from ngx_http_special_response_handler: 405 is NOT here,
+    // so a 405 keeps the connection alive.
+    matches!(status, 400 | 413 | 414 | 495 | 496 | 497 | 500 | 501)
+}
+
+/// Statuses nginx has an entry for in `ngx_http_special_response.c`; only
+/// these can be intercepted by `error_page` (a `return 418` is passed through).
+pub fn is_special_status(status: u16) -> bool {
+    matches!(
+        status,
+        301 | 302
+            | 303
+            | 307
+            | 308
+            | 400
+            | 401
+            | 402
+            | 403
+            | 404
+            | 405
+            | 406
+            | 408
+            | 409
+            | 410
+            | 411
+            | 412
+            | 413
+            | 414
+            | 415
+            | 416
+            | 421
+            | 429
+            | 494
+            | 495
+            | 496
+            | 497
+            | 500
+            | 501
+            | 502
+            | 503
+            | 504
+            | 505
+            | 507
+    )
 }
 
 pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
@@ -327,17 +370,14 @@ pub fn normalize_path(path: &str, merge_slashes: bool) -> Result<String, ()> {
 
 /// Split a raw request target into a normalized path and a raw query string.
 pub fn parse_target(raw: &str) -> Result<(String, String), ()> {
-    let mut target = raw;
-
-    // absolute-form (http://host/path) is allowed in requests to proxies
-    let lower = target.get(..8).unwrap_or("").to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") {
-        let after = &target[target.find("://").unwrap() + 3..];
-        match after.find('/') {
-            Some(i) => target = &after[i..],
-            None => target = "/",
-        }
-    }
+    // absolute-form (`http://host/path`) is allowed in requests to proxies.
+    // Everything up to the first `/` or `?` is the authority; a query directly
+    // after the host (`http://host?a=1`) still belongs to the request.
+    let rewritten = absolute_form_to_origin(raw);
+    let target: &str = match &rewritten {
+        Some(t) => t,
+        None => raw,
+    };
 
     if !target.starts_with('/') {
         return Err(());
@@ -345,9 +385,10 @@ pub fn parse_target(raw: &str) -> Result<(String, String), ()> {
 
     // A fragment is never part of the request target: nginx drops everything
     // from `#` on (`$uri` and `$args` both exclude it).
-    if let Some(hash) = target.find('#') {
-        target = &target[..hash];
-    }
+    let target = match target.find('#') {
+        Some(hash) => &target[..hash],
+        None => target,
+    };
 
     let (path_raw, query) = match target.find('?') {
         Some(i) => (&target[..i], &target[i + 1..]),
@@ -357,6 +398,24 @@ pub fn parse_target(raw: &str) -> Result<(String, String), ()> {
     let decoded = percent_decode(path_raw)?;
     let path = normalize_path(&decoded, true)?;
     Ok((path, query.to_string()))
+}
+
+/// Turn `http://host[/path][?query]` into an origin-form target, or `None` when
+/// the input is already origin-form.
+fn absolute_form_to_origin(raw: &str) -> Option<String> {
+    let lower = raw.get(..8).unwrap_or("").to_ascii_lowercase();
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
+        return None;
+    }
+    let after = &raw[raw.find("://")? + 3..];
+    Some(match after.find(['/', '?']) {
+        // `host/path...`
+        Some(0) => after.to_string(),
+        // `host?query` — keep the query, the path is `/`
+        Some(i) if after.as_bytes()[i] == b'?' => format!("/{}", &after[i..]),
+        Some(i) => after[i..].to_string(),
+        None => "/".to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -370,6 +429,23 @@ mod tests {
         assert_eq!(normalize_path("/a/b/../c", true).unwrap(), "/a/c");
         assert_eq!(normalize_path("/", true).unwrap(), "/");
         assert!(normalize_path("/../etc/passwd", true).is_err());
+    }
+
+    #[test]
+    fn absolute_form_with_query() {
+        // `http://host?args` must keep the query, not drop it
+        assert_eq!(
+            parse_target("http://localhost?args").unwrap(),
+            ("/".to_string(), "args".to_string())
+        );
+        assert_eq!(
+            parse_target("http://localhost:8080?args#frag").unwrap(),
+            ("/".to_string(), "args".to_string())
+        );
+        assert_eq!(
+            parse_target("http://localhost").unwrap(),
+            ("/".to_string(), "".to_string())
+        );
     }
 
     #[test]

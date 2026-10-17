@@ -249,3 +249,21 @@ mod tests {
         assert!(lex("t.conf", "add_header X \"oops;").is_err());
     }
 }
+
+#[cfg(test)]
+mod empty_quote_tests {
+    use super::*;
+
+    #[test]
+    fn empty_quoted_string_kept() {
+        let toks = lex("t.conf", "server_name \"\";\n").unwrap();
+        let words: Vec<String> = toks
+            .into_iter()
+            .filter_map(|t| match t.tok {
+                Tok::Word(w) => Some(w),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(words, vec!["server_name".to_string(), String::new()]);
+    }
+}

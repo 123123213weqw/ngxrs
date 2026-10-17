@@ -24,7 +24,9 @@ pub fn respond(
 pub fn map_path(uri: &str, loc: &LocCfg) -> PathBuf {
     match &loc.alias {
         Some(alias) => {
-            let cut = loc.prefix_len.min(uri.len());
+            // The offset belongs to the location that declared `alias`; a
+            // nested location inherits both.
+            let cut = loc.alias_prefix_len.min(uri.len());
             let suffix = uri[cut..].trim_start_matches('/');
             alias.join(suffix)
         }

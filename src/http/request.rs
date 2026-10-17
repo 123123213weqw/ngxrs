@@ -129,45 +129,6 @@ impl Drop for Request {
     }
 }
 
-/// Validate a Host header the way nginx does.
-fn validate_host(host: &str) -> Result<(), ()> {
-    if host.is_empty() || host.starts_with(':') {
-        return Err(());
-    }
-    // IPv6 literal: [::1] or [::1]:8080
-    if let Some(rest) = host.strip_prefix('[') {
-        let close = rest.find(']').ok_or(())?;
-        let after = &rest[close + 1..];
-        if after.is_empty() {
-            return Ok(());
-        }
-        return match after.strip_prefix(':') {
-            Some(port) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => Ok(()),
-            _ => Err(()),
-        };
-    }
-    // A host that is only dots (`.` , `..`) is invalid.
-    if host.trim_end_matches('.').is_empty() {
-        return Err(());
-    }
-    match host.rsplit_once(':') {
-        Some((name, port)) => {
-            if name.is_empty() || name.trim_end_matches('.').is_empty() {
-                return Err(());
-            }
-            if port.is_empty() {
-                // `host:` is tolerated by nginx (stray colon), the port is dropped
-                return Ok(());
-            }
-            if !port.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(());
-            }
-            Ok(())
-        }
-        None => Ok(()),
-    }
-}
-
 fn is_absolute_form(target: &str) -> bool {
     let lower = target.get(..8).unwrap_or("").to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
@@ -181,8 +142,89 @@ fn normalize_host(host: &str) -> String {
     trimmed.trim_end_matches('.').to_ascii_lowercase()
 }
 
-/// Extract the authority from an absolute-form request target.
-fn absolute_form_host(target: &str) -> Option<String> {
+/// Validate the host part shared by the Host header and absolute-form.
+///
+/// Follows `ngx_http_validate_host` (path separators and control characters
+/// are rejected, consecutive dots are rejected, one trailing dot is dropped)
+/// plus the request-line parser's IP-literal rules.
+pub fn validate_host_name(host: &str) -> Result<(), ()> {
+    if host.is_empty() {
+        return Err(());
+    }
+    let bytes = host.as_bytes();
+
+    // Reject path separators and control characters anywhere, including inside
+    // an IP literal.
+    for &c in bytes {
+        if c == b'/' || c == b'\\' || c <= 0x20 || c == 0x7f {
+            return Err(());
+        }
+    }
+
+    let host = if host.starts_with('[') {
+        let close = host.find(']').ok_or(())?;
+        // Everything after `]` must be a port, i.e. `:` followed by digits.
+        let after = &host[close + 1..];
+        if !after.is_empty() {
+            let port = after.strip_prefix(':').ok_or(())?;
+            if !port.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(());
+            }
+        }
+        &host[..=close]
+    } else {
+        if host.contains('[') || host.contains(']') {
+            return Err(());
+        }
+        host
+    };
+
+    // Two dots in a row are rejected *before* a trailing dot is dropped, so
+    // `a.b..:` is invalid while `a.b.` is fine.
+    if host.contains("..") {
+        return Err(());
+    }
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() || host.contains("..") {
+        return Err(());
+    }
+    Ok(())
+}
+
+/// Validate a `Host:` header value.
+///
+/// nginx truncates the value at the first `:` and does not check the port, so
+/// `example.com:notaport` is accepted (only the host part is validated).
+fn validate_host_header(host: &str) -> Result<(), ()> {
+    let host_part = if host.starts_with('[') {
+        host
+    } else {
+        match host.split_once(':') {
+            Some((name, _)) => name,
+            None => host,
+        }
+    };
+    validate_host_name(host_part)
+}
+
+/// Validate the authority of an absolute-form request target.
+///
+/// Stricter than the header path: the request-line parser only allows digits in
+/// the port, so `host:1:2` is malformed here even though the header form is not.
+fn validate_authority(authority: &str) -> Result<(), ()> {
+    if !authority.starts_with('[') {
+        if let Some((name, port)) = authority.split_once(':') {
+            if port.contains(':') || !port.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(());
+            }
+            return validate_host_name(name);
+        }
+    }
+    validate_host_name(authority)
+}
+
+/// Raw authority of an absolute-form target (userinfo already dropped).
+fn absolute_form_authority(target: &str) -> Option<&str> {
     let rest = target
         .strip_prefix("http://")
         .or_else(|| target.strip_prefix("https://"))?;
@@ -191,8 +233,12 @@ fn absolute_form_host(target: &str) -> Option<String> {
     if authority.is_empty() {
         return None;
     }
-    // Drop userinfo if present.
-    let authority = authority.rsplit_once('@').map(|(_, a)| a).unwrap_or(authority);
+    Some(authority.rsplit_once('@').map(|(_, a)| a).unwrap_or(authority))
+}
+
+/// Host portion of an absolute-form target, ready for `$host`.
+fn absolute_form_host(target: &str) -> Option<String> {
+    let authority = absolute_form_authority(target)?;
     Some(strip_port(authority).to_string())
 }
 
@@ -348,21 +394,28 @@ impl Request {
             return Err(HttpError::new(400, true));
         }
 
+        // Two `Host` headers are a 400, like nginx.
+        if headers.get_all("host").count() > 1 {
+            return Err(HttpError::new(400, true));
+        }
+
         // nginx validates the Host header strictly, even for HTTP/1.0:
         // an empty value, an empty name, or a stray colon after the port are
         // all 400 (see http_host.t).
         let raw_host = headers.get("host");
         if let Some(h) = raw_host {
-            validate_host(h).map_err(|_| HttpError::new(400, true))?;
+            validate_host_header(h).map_err(|_| HttpError::new(400, true))?;
         } else if version_minor == 1 {
             return Err(HttpError::new(400, true));
         }
 
         // absolute-form (`GET http://host/path`) overrides the Host header for
         // $host, which is what nginx's http_absolute_path tests check.
-        // Absolute-form with an empty authority (`GET http:///` ) is a 400.
-        if is_absolute_form(&target_str) && absolute_form_host(&target_str).is_none() {
-            return Err(HttpError::new(400, true));
+        // Absolute-form: the authority is validated by the request-line rules.
+        if is_absolute_form(&target_str) {
+            let authority = absolute_form_authority(&target_str)
+                .ok_or_else(|| HttpError::new(400, true))?;
+            validate_authority(authority).map_err(|_| HttpError::new(400, true))?;
         }
         let absolute_host = absolute_form_host(&target_str);
         // nginx's $host is normalized: lowercase, port and stray colon removed.
@@ -472,12 +525,30 @@ mod tests {
 
     #[test]
     fn host_validation() {
-        // empty and malformed Host values are 400, like nginx
+        // empty and host-less values are 400, like nginx
         assert!(parse("GET / HTTP/1.0\r\nHost: \r\n\r\n").is_err());
         assert!(parse("GET / HTTP/1.0\r\nHost: :8080\r\n\r\n").is_err());
-        assert!(parse("GET / HTTP/1.0\r\nHost: a:b\r\n\r\n").is_err());
-        // a stray colon with no port is accepted
+        assert!(parse("GET / HTTP/1.0\r\nHost: .\r\n\r\n").is_err());
+        assert!(parse("GET / HTTP/1.0\r\nHost: ..example.com\r\n\r\n").is_err());
+        assert!(parse("GET / HTTP/1.0\r\nHost: example.com/x\r\n\r\n").is_err());
+        assert!(parse("GET http://com.exa-m.45..:/ HTTP/1.0\r\n\r\n").is_err());
+        assert!(parse("GET http://example.com./ HTTP/1.0\r\n\r\n").is_ok());
+        // nginx truncates at ':' and never validates the port
+        assert!(parse("GET / HTTP/1.0\r\nHost: a:b\r\n\r\n").is_ok());
+        assert!(parse("GET / HTTP/1.0\r\nHost: 1.2.3.4:9000:80\r\n\r\n").is_ok());
         assert!(parse("GET / HTTP/1.0\r\nHost: example.com:\r\n\r\n").is_ok());
+        // a second Host header is refused
+        assert!(parse("GET / HTTP/1.0\r\nHost: a\r\nHost: b\r\n\r\n").is_err());
+    }
+
+    #[test]
+    fn absolute_form_authority_is_stricter() {
+        // the request-line parser only allows digits in the port
+        assert!(parse("GET http://1.2.3.4:9000:80/ HTTP/1.0\r\n\r\n").is_err());
+        assert!(parse("GET http://[abcd::ef98:0:7654:321]. HTTP/1.0\r\n\r\n").is_err());
+        assert!(parse("GET http://extra[abcd::ef98]/ HTTP/1.0\r\n\r\n").is_err());
+        assert!(parse("GET http://[abcd::ef98/ HTTP/1.0\r\n\r\n").is_err());
+        assert!(parse("GET http://[abcd::ef98]:80/ HTTP/1.0\r\n\r\n").is_ok());
     }
 
     #[test]

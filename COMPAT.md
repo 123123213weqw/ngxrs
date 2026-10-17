@@ -57,10 +57,10 @@
 | 条件请求 If-Match / If-Unmodified-Since | ✅ | |
 | `sendfile` | ✅ | Linux 走 `sendfile(2)`，非 Linux 回退 read+write |
 | `tcp_nopush` / `tcp_nodelay` | 🟡 | 解析并接受，未细调 |
-| `try_files` | 🟡 | 文件候选 + `=code`；内部重定向到 location 未做 |
+| `try_files`（含末项内部重定向、末尾斜杠目录语义、alias 映射） | ✅ | 与 nginx 12/12 一致 |
 | `return` | ✅ | 状态码 + 文本/URL |
 | `add_header` | 🟡 | 累加语义（见上） |
-| `error_page` | ⬜ | 已解析未生效 |
+| `error_page`（含 `=code`、外部 URL、internal location、非特殊状态码不拦截） | ✅ | |
 | 405 / 301 / 505 语义 | ✅ | 与 nginx 逐字节对齐（405 错误页、301 绝对 Location + body、505） |
 | `expires` / `gzip` / `charset` | ⬜ | 已解析未生效 |
 
@@ -186,6 +186,41 @@ HTTP/1.1 keepalive 响应会一直阻塞到 8s 超时并返回 `undef`。**真 n
 | `server_name` 优先级错误 | 通配符不取最长、`*.a.b` 不吃多级、尾缀通配未实现 | 按 nginx 顺序重写匹配 |
 | `server_name ~` 不支持 `\Q..\E` 与命名捕获 | 正则服务器名不生效 | 翻译 `\Q..\E`，命名捕获暴露为变量 |
 | 错误状态不关连接 | 405/400 后仍保持 keepalive，客户端等 EOF 会挂 | 按 nginx 的 400/405/413/414/495-497/500/501 强制关闭 |
+
+### 当前 A/B 结果（8 个用例文件）
+
+| 用例 | nginx | ngxrs | 备注 |
+|---|---|---|---|
+| http_location.t | 16/16 | **16/16** | |
+| http_uri.t | 21/21 | **21/21** | |
+| http_server_name.t | 22/22 | **22/22** | |
+| http_method.t | 4/6 | **4/6** | |
+| http_try_files.t | 12/12 | **12/12** | |
+| http_error_page.t | 11/11 | **11/11** | |
+| http_host.t | 54/62 | **58/62** | 我们多过 4 项 |
+| http_keepalive.t | 21/23 | 18/23 | 剩 `keepalive_time` 的计时语义 |
+
+合计断言：nginx 161 / ngxrs 162；6 个文件完全一致，1 个更好，1 个更差。
+
+### 本轮由官方用例发现并修复的缺陷
+
+| 缺陷 | 影响 |
+|---|---|
+| `try_files` 语义整体错误 | 末项未做内部重定向、末尾斜杠未剥离、未区分文件/目录、alias 位置映射错误 |
+| `alias` 偏移属于嵌套 location 而非声明它的 location | 嵌套 alias 全部指向错目录 |
+| `error_page` 不支持外部重定向目标（`http://…`） | `error_page 302 http://…` 被当成文件路径 |
+| `error_page` 目标中的 `$arg_*` 与查询串未展开 | `?$arg_a` 原样发出 |
+| 497 隐含 302 未实现 | |
+| 错误页内部重定向后未跑 rewrite | `rewrite ^ http://…` 型错误页失效 |
+| 错误页产生的 3xx 被原状态覆盖 | 目录 auto-redirect 变成 302 |
+| `error_page` 对非「特殊状态码」（如 418）也生效 | 与 nginx 不符 |
+| 缺 `auto_redirect`（`location /a/` 时 `/a` → 301） | |
+| `Keep-Alive: timeout=N` 响应头缺失 | |
+| `keepalive_requests` / `keepalive_timeout` 无 location 级覆盖 | |
+| `keepalive_time` / `keepalive_disable` / `$connection_requests` / `$connection_time` 缺失 | |
+| 405 被当作强制关连接 | POST/PUT 的 405 应保持 keepalive |
+| `$server_name` 未去掉前导点、空值 `add_header` 未省略 | |
+| dispatch 二次解析目标导致 rewrite 后 location 错配 | `rewrite … break` 语义回退 |
 
 ### 当前 A/B 结果（4 个用例文件）
 

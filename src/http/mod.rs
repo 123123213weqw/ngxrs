@@ -98,6 +98,20 @@ pub struct Outcome {
     pub close: bool,
 }
 
+/// Per-connection counters that nginx exposes as `$connection_requests` and
+/// `$connection_time`, and that drive `keepalive_requests` / `keepalive_time`.
+#[derive(Clone, Copy)]
+pub struct ConnState {
+    pub requests: u64,
+    pub started: std::time::Instant,
+}
+
+impl ConnState {
+    pub fn elapsed_secs(&self) -> u64 {
+        self.started.elapsed().as_secs()
+    }
+}
+
 thread_local! {
     static NO_IDLE_TIMER: bool = std::env::var_os("NGXRS_NO_IDLE_TIMER").is_some();
 }
@@ -107,6 +121,7 @@ pub async fn handle_conn(mut conn: Conn, group: &ListenGroup, ctx: &Ctx) {
     let first_server = http.server(group.default_server);
     let keepalive_timeout = first_server.keepalive_timeout;
     let mut served: u64 = 0;
+    let conn_started = std::time::Instant::now();
     // One timer per connection, reset after each request: registering a fresh
     // timer per request costs more than the request itself at 400k rps.
     let mut idle = Box::pin(tokio::time::sleep(keepalive_timeout));
@@ -195,6 +210,10 @@ pub async fn handle_conn(mut conn: Conn, group: &ListenGroup, ctx: &Ctx) {
         }
 
         let started = SystemTime::now();
+        let state = ConnState {
+            requests: served,
+            started: conn_started,
+        };
         let outcome = dispatch(
             &mut conn,
             &req,
@@ -205,6 +224,7 @@ pub async fn handle_conn(mut conn: Conn, group: &ListenGroup, ctx: &Ctx) {
             http,
             group.addr.port(),
             &captures,
+            state,
         )
         .await;
         let elapsed = started.elapsed().unwrap_or_default();
@@ -260,6 +280,16 @@ async fn route(
         return error_response(405, server.server_tokens);
     }
 
+    // A location named `/foo/` makes `/foo` redirect to `/foo/`.
+    if let Some(location) = server.auto_redirect(path) {
+        let mut target = location;
+        if !query.is_empty() {
+            target.push('?');
+            target.push_str(query);
+        }
+        return Response::empty(301).header("Location", target);
+    }
+
     if loc.internal && !allow_internal {
         return error_response(404, server.server_tokens);
     }
@@ -288,12 +318,6 @@ async fn route(
         };
         resp.no_error_page = true;
         return resp;
-    }
-
-    if !loc.try_files.is_empty() {
-        if let Some(resp) = try_files_sync(req, path, loc, server, http) {
-            return resp;
-        }
     }
 
     match static_file::respond(req, path, query, loc, http) {
@@ -634,6 +658,9 @@ pub fn apply_add_headers_simple(
             continue;
         }
         let expanded = value.replace("$upstream_cache_status", upstream_cache_status);
+        if expanded.is_empty() {
+            continue;
+        }
         raw.extend_from_slice(name.as_bytes());
         raw.extend_from_slice(b": ");
         raw.extend_from_slice(expanded.as_bytes());
@@ -656,6 +683,10 @@ pub fn apply_add_headers(
             continue;
         }
         let expanded = vars.expand(value);
+        // nginx drops the header when the value expands to nothing.
+        if expanded.is_empty() {
+            continue;
+        }
         raw.extend_from_slice(name.as_bytes());
         raw.extend_from_slice(b": ");
         raw.extend_from_slice(expanded.as_bytes());
@@ -683,6 +714,8 @@ pub struct ServerVars<'a> {
     pub upstream_cache_status: &'a str,
     /// Values from `set`, which override the built-ins.
     pub custom: &'a std::collections::HashMap<String, String>,
+    pub connection_requests: u64,
+    pub connection_time: u64,
 }
 
 impl<'a> ServerVars<'a> {
@@ -729,12 +762,22 @@ impl<'a> ServerVars<'a> {
                 .unwrap_or("")
                 .to_string(),
             "content_type" => self.req.headers.get("content-type").unwrap_or("").to_string(),
+            "connection_requests" => self.connection_requests.to_string(),
+            "connection_time" => self.connection_time.to_string(),
             "hostname" => "ngxrs".to_string(),
             "nginx_version" => crate::COMPAT_VERSION.to_string(),
             _ => {
                 if let Some(h) = name.strip_prefix("http_") {
                     let key = h.replace('_', "-");
                     self.req.headers.get(&key).unwrap_or("").to_string()
+                } else if let Some(want) = name.strip_prefix("arg_") {
+                    // $arg_name looks the key up in the query string.
+                    self.query
+                        .split('&')
+                        .filter_map(|pair| pair.split_once('='))
+                        .find(|(k, _)| k.eq_ignore_ascii_case(want))
+                        .map(|(_, v)| v.to_string())
+                        .unwrap_or_default()
                 } else {
                     String::new()
                 }
@@ -801,6 +844,77 @@ pub async fn resolve_response(
     .await
 }
 
+/// Result of the rewrite + try_files phase: either a final location, or a
+/// response produced without consulting any content handler.
+pub enum Target<'a> {
+    /// Path, query, location, and whether `rewrite ... break` skipped `return`.
+    Loc(String, String, &'a LocCfg, bool),
+    Done(Response),
+}
+
+/// Apply `rewrite`, `if`/`set` and `try_files` to find the target location.
+pub fn resolve_target<'a>(
+    req: &Request,
+    path: &str,
+    query: &str,
+    server: &'a Server,
+    loc: &'a LocCfg,
+    http: &Http,
+) -> Target<'a> {
+    let mut cur_path = path.to_string();
+    let mut cur_query = query.to_string();
+    let mut cur_loc = loc;
+    let mut relocations = 0usize;
+    let mut skip_return = false;
+
+    loop {
+        match apply_rewrites(req, &cur_path, &cur_query, cur_loc, server, &http.default_type) {
+            RewriteOutcome::Respond(r) => return Target::Done(r),
+            RewriteOutcome::Continue(p, q) => {
+                cur_path = p;
+                cur_query = q;
+                break;
+            }
+            RewriteOutcome::Break(p, q) => {
+                cur_path = p;
+                cur_query = q;
+                skip_return = true;
+                break;
+            }
+            RewriteOutcome::Relocate(p, q) => {
+                cur_path = p;
+                cur_query = q;
+                cur_loc = server.locate(&cur_path);
+                relocations += 1;
+                if relocations > 10 {
+                    return Target::Done(error_response(500, server.server_tokens));
+                }
+            }
+        }
+    }
+
+    if !cur_loc.try_files.is_empty() && !skip_return {
+        match try_files_action(req, &cur_path, cur_loc) {
+            Some(TryFilesAction::Serve(uri)) => cur_path = uri,
+            Some(TryFilesAction::Redirect(uri)) => {
+                let (p, q) = match uri.split_once('?') {
+                    Some((p, q)) => (p.to_string(), q.to_string()),
+                    None => (uri, String::new()),
+                };
+                cur_path = p;
+                cur_query = q;
+                cur_loc = server.locate(&cur_path);
+            }
+            Some(TryFilesAction::Status(code)) => {
+                return Target::Done(error_response(code, server.server_tokens))
+            }
+            None => {}
+        }
+    }
+
+    Target::Loc(cur_path, cur_query, cur_loc, skip_return)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn resolve_response_caps(
     req: &Request,
@@ -813,6 +927,37 @@ pub async fn resolve_response_caps(
     server_port: u16,
     captures: &[(String, String)],
 ) -> Response {
+    resolve_response_state(
+        req,
+        path,
+        query,
+        server,
+        loc,
+        http,
+        peer_ip,
+        server_port,
+        captures,
+        ConnState {
+            requests: 0,
+            started: std::time::Instant::now(),
+        },
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_response_state(
+    req: &Request,
+    path: &str,
+    query: &str,
+    server: &Server,
+    loc: &LocCfg,
+    http: &Http,
+    peer_ip: &str,
+    server_port: u16,
+    captures: &[(String, String)],
+    state: ConnState,
+) -> Response {
     let mut cur_path = path.to_string();
     let mut cur_query = query.to_string();
     let mut cur_loc = loc;
@@ -824,58 +969,144 @@ pub async fn resolve_response_caps(
         custom.insert(k.clone(), v.clone());
     }
 
-    // ---- rewrite phase ----
-    let mut relocations = 0;
-    let mut skip_return = false;
-    loop {
-        match apply_rewrites(req, &cur_path, &cur_query, cur_loc, server, &http.default_type) {
-            RewriteOutcome::Respond(r) => return r,
-            RewriteOutcome::Continue(p, q) => {
-                cur_path = p;
-                cur_query = q;
-                break;
-            }
-            RewriteOutcome::Break(p, q) => {
-                cur_path = p;
-                cur_query = q;
-                // Skip `return` for this location, like nginx.
-                skip_return = true;
-                break;
-            }
-            RewriteOutcome::Relocate(p, q) => {
-                cur_path = p;
-                cur_query = q;
-                cur_loc = server.locate(&cur_path);
-                relocations += 1;
-                if relocations > 10 {
-                    return error_response(500, server.server_tokens);
-                }
-            }
+    let mut resp = match resolve_target(req, path, query, server, loc, http) {
+        Target::Done(r) => r,
+        Target::Loc(p, q, l, skip) => {
+            return render_resolved_state(
+                req, &p, &q, l, skip, server, http, peer_ip, server_port, captures, state,
+            )
+            .await;
         }
-    }
-
-    let root_str = cur_loc.root.to_string_lossy().to_string();
-    let mut resp = if skip_return {
-        // `rewrite ... break` bypasses the location's `return`, so the request
-        // falls through to the content handler (static file / proxy).
-        route_content(req, &cur_path, &cur_query, cur_loc, server, http).await
-    } else {
-        let vars = ServerVars {
-            req,
-            path: &cur_path,
-            query: &cur_query,
-            server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
-            server_port,
-            peer_ip,
-            scheme: "http",
-            document_root: &root_str,
-            upstream_cache_status: "",
-            custom: &custom,
-        };
-        route(req, &cur_path, &cur_query, cur_loc, server, http, false, &vars).await
     };
+    let _ = &mut resp;
+    finalize_response(
+        req,
+        &mut resp,
+        path,
+        query,
+        server,
+        http,
+        peer_ip,
+        server_port,
+        captures,
+        &custom,
+        state,
+    )
+    .await
+}
 
-    while resp.status >= 400 && depth < 10 && !resp.no_error_page {
+/// Render an already-resolved target (rewrite/try_files done).
+#[allow(clippy::too_many_arguments)]
+pub async fn render_resolved(
+    req: &Request,
+    path: &str,
+    query: &str,
+    loc: &LocCfg,
+    skip_return: bool,
+    server: &Server,
+    http: &Http,
+    peer_ip: &str,
+    server_port: u16,
+    captures: &[(String, String)],
+) -> Response {
+    render_resolved_state(
+        req,
+        path,
+        query,
+        loc,
+        skip_return,
+        server,
+        http,
+        peer_ip,
+        server_port,
+        captures,
+        ConnState {
+            requests: 0,
+            started: std::time::Instant::now(),
+        },
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn render_resolved_state(
+    req: &Request,
+    path: &str,
+    query: &str,
+    loc: &LocCfg,
+    skip_return: bool,
+    server: &Server,
+    http: &Http,
+    peer_ip: &str,
+    server_port: u16,
+    captures: &[(String, String)],
+    state: ConnState,
+) -> Response {
+    let mut custom: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (k, v) in captures {
+        custom.insert(k.clone(), v.clone());
+    }
+    {
+        let mut resp = if skip_return {
+            route_content(req, path, query, loc, server, http).await
+        } else {
+            let root_str = loc.root.to_string_lossy().to_string();
+            let vars = ServerVars {
+                req,
+                path,
+                query,
+                server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
+                server_port,
+                peer_ip,
+                scheme: "http",
+                document_root: &root_str,
+                upstream_cache_status: "",
+                custom: &custom,
+                connection_requests: state.requests,
+                connection_time: state.elapsed_secs(),
+            };
+            route(req, path, query, loc, server, http, false, &vars).await
+        };
+        finalize_response(
+            req,
+            &mut resp,
+            path,
+            query,
+            server,
+            http,
+            peer_ip,
+            server_port,
+            captures,
+            &custom,
+            state,
+        )
+        .await
+    }
+}
+
+/// Apply `error_page`, `add_header` and `gzip` to a response the content phase
+/// produced (including ones from `return` / `rewrite`).
+#[allow(clippy::too_many_arguments)]
+async fn finalize_response(
+    req: &Request,
+    resp: &mut Response,
+    path: &str,
+    query: &str,
+    server: &Server,
+    http: &Http,
+    peer_ip: &str,
+    server_port: u16,
+    _captures: &[(String, String)],
+    custom: &std::collections::HashMap<String, String>,
+    state: ConnState,
+) -> Response {
+    let mut cur_path = path.to_string();
+    let mut cur_query = query.to_string();
+    let mut cur_loc = server.locate(&cur_path);
+    let mut depth = 0usize;
+    let root_str = cur_loc.root.to_string_lossy().to_string();
+
+    while depth < 10 && util::is_special_status(resp.status) && resp.status >= 300 {
         let Some(target) = cur_loc.error_pages.get(&resp.status).cloned() else {
             break;
         };
@@ -893,9 +1124,9 @@ pub async fn resolve_response_caps(
         };
         cur_path = p;
         cur_query = q;
-        cur_loc = server.locate(&cur_path);
         depth += 1;
-        let redirected = {
+
+        let expanded = {
             let vars = ServerVars {
                 req,
                 path: &cur_path,
@@ -906,29 +1137,92 @@ pub async fn resolve_response_caps(
                 scheme: "http",
                 document_root: &root_str,
                 upstream_cache_status: "",
-                custom: &custom,
+                custom,
+                connection_requests: state.requests,
+                connection_time: state.elapsed_secs(),
             };
-            route(req, &cur_path, &cur_query, cur_loc, server, http, true, &vars).await
+            vars.expand(&cur_path)
         };
-        if redirected.status >= 400 {
-            resp = error_response(original_status, server.server_tokens);
+
+        // `error_page 302 http://example.com/` is an external redirect.
+        if expanded.starts_with("http://") || expanded.starts_with("https://") {
+            let mut location = expanded;
+            if !cur_query.is_empty() {
+                location.push(if location.contains('?') { '&' } else { '?' });
+                location.push_str(&cur_query);
+            }
+            *resp = Response::empty(new_status.unwrap_or(302)).header("Location", location);
             break;
         }
-        let mut redirected = redirected;
-        redirected.status = new_status.unwrap_or(original_status);
-        resp = redirected;
+
+        cur_path = expanded;
+        if !cur_query.is_empty() {
+            let vars = ServerVars {
+                req,
+                path: &cur_path,
+                query: query,
+                server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
+                server_port,
+                peer_ip,
+                scheme: "http",
+                document_root: &root_str,
+                upstream_cache_status: "",
+                custom,
+                connection_requests: state.requests,
+                connection_time: state.elapsed_secs(),
+            };
+            cur_query = vars.expand(&cur_query);
+        }
+        cur_loc = server.locate(&cur_path);
+
+        // The error page target runs the full rewrite phase too, so a
+        // `rewrite ^ http://...` inside it produces the redirect.
+        let redirected = match resolve_target(req, &cur_path, &cur_query, server, cur_loc, http) {
+            Target::Done(r) => r,
+            Target::Loc(p, q, l, _skip) => {
+                cur_path = p;
+                cur_query = q;
+                let vars = ServerVars {
+                    req,
+                    path: &cur_path,
+                    query: &cur_query,
+                    server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
+                    server_port,
+                    peer_ip,
+                    scheme: "http",
+                    document_root: &root_str,
+                    upstream_cache_status: "",
+                    custom,
+                    connection_requests: state.requests,
+                    connection_time: state.elapsed_secs(),
+                };
+                route(req, &cur_path, &cur_query, l, server, http, true, &vars).await
+            }
+        };
+        if redirected.status >= 400 && redirected.body.is_empty() {
+            *resp = error_response(original_status, server.server_tokens);
+            break;
+        }
+        // A redirect generated while serving the error page (directory
+        // auto-redirect, `rewrite ... permanent`, ...) keeps its own status;
+        // otherwise the original error status is preserved.
+        let redirected_status = redirected.status;
+        *resp = redirected;
+        resp.status = match new_status {
+            Some(code) => code,
+            None if (300..400).contains(&redirected_status) => redirected_status,
+            None => original_status,
+        };
     }
 
     if resp.status >= 400 && resp.body.is_empty() {
-        resp = error_response(resp.status, server.server_tokens);
+        *resp = error_response(resp.status, server.server_tokens);
     }
 
-    let mut resp = crate::gzip::maybe_compress(req, resp, cur_loc, http);
+    let mut out = crate::gzip::maybe_compress(req, std::mem::replace(resp, Response::empty(200)), cur_loc, http);
 
-    // `add_header` applies to every response nginx would attach it to, not just
-    // static files (http_uri.t checks it on a `return 204`).
     if !cur_loc.headers.is_empty() {
-        let v = ServerVars {
+        let vars = ServerVars {
             req,
             path: &cur_path,
             query: &cur_query,
@@ -936,14 +1230,16 @@ pub async fn resolve_response_caps(
             server_port,
             peer_ip,
             scheme: "http",
-            document_root: &cur_loc.root.to_string_lossy(),
+            document_root: &root_str,
             upstream_cache_status: "",
-            custom: &custom,
+            custom,
+            connection_requests: state.requests,
+            connection_time: state.elapsed_secs(),
         };
-        apply_add_headers(&mut resp.raw, &cur_loc.headers, resp.status, &v);
+        apply_add_headers(&mut out.raw, &cur_loc.headers, out.status, &vars);
     }
 
-    resp
+    out
 }
 
 /// Read a whole response body into memory (HTTP/2 needs the length up front
@@ -982,8 +1278,53 @@ async fn dispatch(
     http: &Http,
     listen_port: u16,
     captures: &[(String, String)],
+    state: ConnState,
 ) -> io::Result<Outcome> {
     let head_only = req.method == Method::Head;
+    let keepalive_allowed = keepalive_policy(req, loc, state);
+    let ka_header = loc.keepalive_timeout.and_then(|(_, h)| h);
+
+    // Rewrite/try_files may point at a different location; resolve it before
+    // choosing a content handler so `/x -> /fallback` can reach a proxy.
+    let (resolved_path, resolved_query, resolved_loc, skip_return, pre) =
+        match resolve_target(req, path, query, server, loc, http) {
+            Target::Done(r) => (path.to_string(), query.to_string(), loc, false, Some(r)),
+            Target::Loc(p, q, l, skip) => (p, q, l, skip, None),
+        };
+    let (path, query, loc) = (resolved_path.as_str(), resolved_query.as_str(), resolved_loc);
+
+    // A response produced by `return`/`rewrite` still goes through error_page.
+    if let Some(mut r) = pre {
+        let mut custom: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for (k, v) in captures {
+            custom.insert(k.clone(), v.clone());
+        }
+        let root = loc.root.to_string_lossy().to_string();
+        let _ = root;
+        let peer = conn.peer.ip().to_string();
+        let resp = finalize_response(
+            req, &mut r, path, query, server, http, &peer, listen_port, captures, &custom, state,
+        )
+        .await;
+        let status = resp.status;
+        if matches!(status, 301 | 302 | 303 | 307 | 308) {
+            return write_redirect(conn, req, resp, listen_port, server.server_tokens).await;
+        }
+        let bytes = write_response_ka(
+            conn,
+            resp,
+            keepalive_allowed,
+            server.server_tokens,
+            head_only,
+            ka_header,
+        )
+        .await?;
+        return Ok(Outcome {
+            status,
+            bytes,
+            close: !keepalive_allowed,
+        });
+    }
 
     // ---- FastCGI ----
     if loc.fastcgi_pass.is_some() {
@@ -1018,20 +1359,85 @@ async fn dispatch(
     }
 
     let peer_ip = conn.peer.ip().to_string();
-    let resp = resolve_response_caps(
-        req, path, query, server, loc, http, &peer_ip, listen_port, captures,
+    let resp = render_resolved(
+        req,
+        path,
+        query,
+        loc,
+        skip_return,
+        server,
+        http,
+        &peer_ip,
+        listen_port,
+        captures,
     )
     .await;
     let status = resp.status;
     if matches!(status, 301 | 302 | 303 | 307 | 308) {
         return write_redirect(conn, req, resp, listen_port, server.server_tokens).await;
     }
-    let bytes = write_response(conn, resp, req.keepalive, server.server_tokens, head_only).await?;
+    let bytes =
+        write_response_ka(conn, resp, keepalive_allowed, server.server_tokens, head_only, ka_header)
+            .await?;
     Ok(Outcome {
         status,
         bytes,
-        close: false,
+        close: !keepalive_allowed,
     })
+}
+
+/// nginx's keepalive decision for one request: `keepalive_requests`,
+/// `keepalive_time`, `keepalive_timeout 0` and `keepalive_disable` all veto it.
+fn keepalive_policy(req: &Request, loc: &LocCfg, state: ConnState) -> bool {
+    if !req.keepalive {
+        return false;
+    }
+    // nginx answers TRACE with 405 and always closes the connection; other
+    // disallowed methods (POST/PUT to static content) keep it alive.
+    if req.method == Method::Trace {
+        return false;
+    }
+    if let Some((timeout, _)) = loc.keepalive_timeout {
+        if timeout.is_zero() {
+            return false;
+        }
+    }
+    if let Some(n) = loc.keepalive_requests {
+        if state.requests >= n {
+            return false;
+        }
+    }
+    if let Some(t) = loc.keepalive_time {
+        if state.started.elapsed() >= t {
+            return false;
+        }
+    }
+    let ua = req.headers.get("user-agent").unwrap_or("");
+    match loc.keepalive_disable {
+        crate::config::KeepaliveDisable::None => {}
+        crate::config::KeepaliveDisable::Msie6 => {
+            // nginx's user-agent parser flags MSIE 6 and older (it looks for
+            // "MSIE " anywhere) and then refuses keepalive for non-GET.
+            if req.method != Method::Get {
+                if let Some(idx) = ua.to_ascii_lowercase().find("msie ") {
+                    let rest = &ua[idx + 5..];
+                    let major: String =
+                        rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if let Ok(v) = major.parse::<u32>() {
+                        if v <= 6 {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        crate::config::KeepaliveDisable::Safari => {
+            if ua.contains("Safari/") && ua.contains("Mac OS X") {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 async fn write_redirect(
@@ -1077,10 +1483,25 @@ async fn write_redirect(
         _ => error_body(status, tokens),
     };
 
-    let mut out_raw = raw;
-    out_raw.extend_from_slice(b"Content-Type: text/html\r\nContent-Length: ");
-    out_raw.extend_from_slice(body.len().to_string().as_bytes());
-    out_raw.extend_from_slice(b"\r\nLocation: ");
+    let mut out_raw = Vec::with_capacity(raw.len() + 160);
+    let text = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+    if !text.contains("content-type:") {
+        out_raw.extend_from_slice(b"Content-Type: text/html\r\n");
+    }
+    if !text.contains("content-length:") {
+        out_raw.extend_from_slice(b"Content-Length: ");
+        out_raw.extend_from_slice(body.len().to_string().as_bytes());
+        out_raw.extend_from_slice(b"\r\n");
+    }
+    // nginx replaces any Location the error page produced.
+    for line in String::from_utf8_lossy(&raw).split("\r\n") {
+        if line.is_empty() || line.to_ascii_lowercase().starts_with("location:") {
+            continue;
+        }
+        out_raw.extend_from_slice(line.as_bytes());
+        out_raw.extend_from_slice(b"\r\n");
+    }
+    out_raw.extend_from_slice(b"Location: ");
     out_raw.extend_from_slice(absolute.as_bytes());
     out_raw.extend_from_slice(b"\r\n");
     let _ = explicit_len;
@@ -1101,33 +1522,59 @@ async fn write_redirect(
     })
 }
 
-fn try_files_sync(
-    req: &Request,
-    path: &str,
-    loc: &LocCfg,
-    server: &Server,
-    http: &Http,
-) -> Option<Response> {
+/// What a `try_files` chain decided, mirroring `ngx_http_try_files_handler`.
+enum TryFilesAction {
+    /// A candidate matched: serve this URI using the current location's
+    /// root/alias (nginx sets `r->uri` and returns NGX_DECLINED).
+    Serve(String),
+    /// The last argument is a URI: internal redirect (new location search).
+    Redirect(String),
+    /// The last argument is `=code`.
+    Status(u16),
+}
+
+/// Resolve `try_files` for one request. `None` means "no directive here".
+fn try_files_action(req: &Request, path: &str, loc: &LocCfg) -> Option<TryFilesAction> {
     let n = loc.try_files.len();
     for (i, cand) in loc.try_files.iter().enumerate() {
         let last = i + 1 == n;
-        if let Some(code) = cand.strip_prefix('=') {
-            if let Ok(status) = code.parse::<u16>() {
-                return Some(error_response(status, server.server_tokens));
+
+        // The last argument is never tested on disk: `=code` or a URI.
+        if last {
+            if let Some(code) = cand.strip_prefix('=') {
+                return code.parse::<u16>().ok().map(TryFilesAction::Status);
             }
+            let expanded = cand
+                .replace("$uri", path)
+                .replace("$request_uri", &req.raw_target)
+                .replace("$args", "");
+            return Some(TryFilesAction::Redirect(expanded));
+        }
+
+        // nginx strips a trailing `/` and remembers that a directory is wanted.
+        let (name, want_dir) = match cand.strip_suffix('/') {
+            Some(stripped) => (stripped, true),
+            None => (cand.as_str(), false),
+        };
+        let uri = name
+            .replace("$uri", path)
+            .replace("$request_uri", &req.raw_target)
+            .replace("$args", "");
+        if uri.is_empty() {
             continue;
         }
-        let expanded = cand.replace("$uri", path);
-        let rel = expanded.trim_start_matches('/');
-        let fs_path = loc.root.join(rel);
-        let is_dir_hint = expanded.ends_with('/');
-        if fs_path.exists() && (!is_dir_hint || fs_path.is_dir()) {
-            if let Ok(resp) = static_file::respond_fs(req, &fs_path, path, loc, http) {
-                return Some(resp);
-            }
-        }
-        if last {
-            return Some(error_response(404, server.server_tokens));
+        let uri = if uri.starts_with('/') {
+            uri
+        } else {
+            format!("/{uri}")
+        };
+
+        let fs_path = static_file::map_path(&uri, loc);
+        let meta = std::fs::metadata(&fs_path).ok();
+        match (meta, want_dir) {
+            (Some(m), true) if m.is_dir() => return Some(TryFilesAction::Serve(uri)),
+            (Some(m), false) if m.is_file() => return Some(TryFilesAction::Serve(uri)),
+            _ => continue,
         }
     }
     None
@@ -1228,6 +1675,17 @@ pub async fn write_response(
     tokens: bool,
     head_only: bool,
 ) -> io::Result<u64> {
+    write_response_ka(conn, resp, keepalive, tokens, head_only, None).await
+}
+
+pub async fn write_response_ka(
+    conn: &mut Conn,
+    resp: Response,
+    keepalive: bool,
+    tokens: bool,
+    head_only: bool,
+    keepalive_header: Option<u32>,
+) -> io::Result<u64> {
     let Response {
         status,
         headers,
@@ -1281,7 +1739,17 @@ pub async fn write_response(
     let keepalive = keepalive && !util::force_close(status);
     out.extend_from_slice(b"Connection: ");
     out.extend_from_slice(if keepalive { b"keep-alive" } else { b"close" });
-    out.extend_from_slice(b"\r\n\r\n");
+    out.extend_from_slice(b"\r\n");
+    // nginx sends `Keep-Alive: timeout=N` when the second keepalive_timeout
+    // argument is set and the connection is being kept alive.
+    if keepalive {
+        if let Some(secs) = keepalive_header {
+            out.extend_from_slice(b"Keep-Alive: timeout=");
+            out.extend_from_slice(secs.to_string().as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+    out.extend_from_slice(b"\r\n");
 
     if head_only {
         let r = conn.write_all(&out).await;
@@ -1374,7 +1842,8 @@ pub async fn write_head(
     let keepalive = keepalive && !util::force_close(status);
     out.extend_from_slice(b"Connection: ");
     out.extend_from_slice(if keepalive { b"keep-alive" } else { b"close" });
-    out.extend_from_slice(b"\r\n\r\n");
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(b"\r\n");
     let r = conn.write_all(&out).await;
     out.clear();
     conn.out = out;
@@ -1390,15 +1859,12 @@ pub fn select_server_ex<'a>(
     host: Option<&str>,
 ) -> (&'a Server, Vec<(String, String)>) {
     let Some(raw_host) = host else {
-        return (http.server(default_server), Vec::new());
+        return (select_server(http, servers, default_server, None), Vec::new());
     };
     let lowered = raw_host.to_ascii_lowercase();
     let host = strip_host_port(&lowered);
 
-    let (server, _) = {
-        let s = select_server(http, servers, default_server, Some(raw_host));
-        (s, ())
-    };
+    let server = select_server(http, servers, default_server, Some(raw_host));
 
     // Recover named captures when the winner was chosen by regex.
     let mut caps = Vec::new();
@@ -1444,6 +1910,14 @@ pub fn select_server<'a>(
     host: Option<&str>,
 ) -> &'a Server {
     let Some(raw_host) = host else {
+        // A request without a Host header (legal in HTTP/1.0) has an empty
+        // server name, which `server_name ""` matches — nginx does the same.
+        for &idx in servers {
+            let s = http.server(idx);
+            if s.names.iter().any(|n| n.is_empty()) {
+                return s;
+            }
+        }
         return http.server(default_server);
     };
     let lowered = raw_host.to_ascii_lowercase();

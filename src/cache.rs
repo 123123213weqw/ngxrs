@@ -29,7 +29,9 @@ pub struct Cached {
 
 impl Cached {
     pub fn is_fresh(&self, now: i64) -> bool {
-        self.valid_for == 0 || now - self.stored_at < self.valid_for as i64
+        // `valid_for == 0` means "stored but already stale" (an `@N`
+        // X-Accel-Expires in the past), which nginx reports as EXPIRED.
+        now - self.stored_at < self.valid_for as i64
     }
 }
 
@@ -141,68 +143,116 @@ pub fn validity(loc: &LocCfg, status: u16) -> Option<Duration> {
     None
 }
 
-/// How long a response may be cached, following nginx's precedence:
-/// `proxy_cache_valid` → `X-Accel-Expires` → `Cache-Control: max-age` →
-/// `Expires`. `Set-Cookie` and `no-cache`/`no-store` make it uncacheable.
-pub fn ttl(loc: &LocCfg, status: u16, headers: &[(String, String)]) -> Option<Duration> {
-    let find = |name: &str| {
+/// `proxy_ignore_headers` bit set.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Ignore {
+    pub cache_control: bool,
+    pub expires: bool,
+    pub x_accel_expires: bool,
+    pub set_cookie: bool,
+}
+
+/// How long a response may be cached.
+///
+/// Verified against nginx 1.28: the precedence is strictly
+/// `X-Accel-Expires` > `Cache-Control` > `Expires`, independent of the order
+/// the headers appear in. `Set-Cookie` blocks caching outright.
+///
+/// Returns `None` when the response must not be cached. A `Some(Duration::ZERO)`
+/// means "cache it, but it is already stale" (`@1` style `X-Accel-Expires`).
+pub fn ttl(loc: &LocCfg, status: u16, headers: &[(String, String)], ignore: Ignore) -> Option<Duration> {
+    // All occurrences of one header, trimmed, in order.
+    let all = |name: &str| -> Vec<String> {
         headers
             .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .filter(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.trim().to_string())
+            .collect()
     };
 
-    // Set-Cookie prevents caching unless something above explicitly allows it.
-    let has_set_cookie = headers
-        .iter()
-        .any(|(k, _)| k.eq_ignore_ascii_case("set-cookie"));
-
-    // X-Accel-Expires wins over the standard headers.
-    if let Some(v) = find("x-accel-expires") {
-        if v == "0" {
-            return None;
-        }
-        if let Ok(secs) = v.parse::<u64>() {
-            return Some(Duration::from_secs(secs));
-        }
-    }
-
-    if let Some(cc) = find("cache-control") {
-        let lower = cc.to_ascii_lowercase();
-        if lower.contains("no-cache") || lower.contains("no-store") || lower.contains("private") {
-            return None;
-        }
-        for part in lower.split(',') {
-            let part = part.trim();
-            if let Some(v) = part.strip_prefix("s-maxage=").or_else(|| part.strip_prefix("max-age="))
-            {
-                if let Ok(secs) = v.trim().parse::<u64>() {
-                    return Some(Duration::from_secs(secs));
-                }
-            }
-        }
-    }
-
-    if let Some(exp) = find("expires") {
-        if let Some(at) = crate::util::parse_http_date(&exp) {
-            let now = now() as i64;
-            if at <= now {
-                return None;
-            }
-            return Some(Duration::from_secs((at - now) as u64));
-        }
-    }
-
-    // Fall back to the configured validity (nginx checks this first, but a
-    // response with explicit headers above already decided).
-    if let Some(d) = validity(loc, status) {
-        return Some(d);
-    }
-
-    if has_set_cookie {
+    // Set-Cookie wins over everything.
+    if !ignore.set_cookie && !all("set-cookie").is_empty() {
         return None;
     }
-    None
+
+    // ---- 1. X-Accel-Expires ----
+    if !ignore.x_accel_expires {
+        // The first occurrence is the one nginx honours.
+        if let Some(v) = all("x-accel-expires").first() {
+            if let Some(rest) = v.strip_prefix('@') {
+                // Absolute unix time; a past value is stored but already stale.
+                let at: i64 = match rest.parse() {
+                    Ok(n) => n,
+                    Err(_) => return None,
+                };
+                let now = now() as i64;
+                return Some(if at > now {
+                    Duration::from_secs((at - now) as u64)
+                } else {
+                    Duration::ZERO
+                });
+            }
+            let secs: i64 = match v.parse() {
+                Ok(n) => n,
+                Err(_) => return None,
+            };
+            if secs <= 0 {
+                return None;
+            }
+            return Some(Duration::from_secs(secs as u64));
+        }
+    }
+
+    // ---- 2. Cache-Control ----
+    if !ignore.cache_control {
+        let values = all("cache-control");
+        if !values.is_empty() {
+            let joined = values.join(",");
+            let lower = joined.to_ascii_lowercase();
+            for part in lower.split(',') {
+                let part = part.trim();
+                if part == "no-cache" || part == "no-store" || part == "private" {
+                    return None;
+                }
+            }
+            let mut best: Option<u64> = None;
+            for part in lower.split(',') {
+                let part = part.trim();
+                let v = part
+                    .strip_prefix("s-maxage=")
+                    .or_else(|| part.strip_prefix("max-age="));
+                if let Some(v) = v {
+                    if let Ok(n) = v.trim().parse::<u64>() {
+                        best = Some(best.map_or(n, |b: u64| b.max(n)));
+                    }
+                }
+            }
+            if let Some(n) = best {
+                return Some(Duration::from_secs(n));
+            }
+            // Other Cache-Control values do not determine cacheability.
+        }
+    }
+
+    // ---- 3. Expires ----
+    if !ignore.expires {
+        if let Some(v) = all("expires").first() {
+            match crate::util::parse_http_date(v) {
+                Some(at) => {
+                    let now = now() as i64;
+                    return Some(if at > now {
+                        Duration::from_secs((at - now) as u64)
+                    } else {
+                        Duration::ZERO
+                    });
+                }
+                None => return None,
+            }
+        }
+    }
+
+    // ---- 4. proxy_cache_valid ----
+    validity(loc, status)
 }
 
 pub fn load(zone: &CacheZone, key: &str) -> Option<Cached> {

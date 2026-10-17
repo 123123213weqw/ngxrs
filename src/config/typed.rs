@@ -112,6 +112,9 @@ pub struct LocCfg {
     pub proxy_cache: Option<String>,
     pub proxy_cache_valid: Vec<(Vec<u16>, Duration)>,
     /// `proxy_cache_lock on|off`, `proxy_cache_lock_timeout`, `_age`.
+    pub proxy_cache_ignore: crate::cache::Ignore,
+    /// `proxy_cache_convert_head`, on by default like nginx.
+    pub proxy_cache_convert_head: bool,
     pub proxy_cache_lock: bool,
     pub proxy_cache_lock_timeout: Duration,
     pub proxy_cache_lock_age: Duration,
@@ -180,6 +183,8 @@ impl LocCfg {
             scgi_params: Vec::new(),
             proxy_cache: None,
             proxy_cache_valid: Vec::new(),
+            proxy_cache_ignore: crate::cache::Ignore::default(),
+            proxy_cache_convert_head: true,
             proxy_cache_lock: false,
             proxy_cache_lock_timeout: Duration::from_secs(5),
             proxy_cache_lock_age: Duration::from_secs(5),
@@ -1491,6 +1496,17 @@ impl Builder {
                     }
                 }
             }
+            "proxy_ignore_headers" => {
+                for a in &d.args {
+                    match a.as_str() {
+                        "Cache-Control" => cfg.proxy_cache_ignore.cache_control = true,
+                        "Expires" => cfg.proxy_cache_ignore.expires = true,
+                        "X-Accel-Expires" => cfg.proxy_cache_ignore.x_accel_expires = true,
+                        "Set-Cookie" => cfg.proxy_cache_ignore.set_cookie = true,
+                        _ => {}
+                    }
+                }
+            }
             "proxy_cache_lock" => {
                 cfg.proxy_cache_lock = d
                     .args
@@ -1507,7 +1523,11 @@ impl Builder {
                     }
                 }
             }
-            "proxy_cache_convert_head" | "proxy_cache_revalidate"
+            "proxy_cache_convert_head" => {
+                cfg.proxy_cache_convert_head =
+                    d.args.first().map(|v| v != "off").unwrap_or(true);
+            }
+            "proxy_cache_revalidate"
             | "proxy_cache_background_update" | "proxy_cache_use_stale"
             | "proxy_cache_methods" | "proxy_cache_min_uses" => {
                 // Accepted; behavioural parity for these is not implemented.
@@ -1516,13 +1536,21 @@ impl Builder {
                 // proxy_cache_valid [code ...] time;
                 let mut codes = Vec::new();
                 let mut dur = None;
+                let mut any = false;
                 for a in &d.args {
+                    if a == "any" {
+                        any = true;
+                        continue;
+                    }
                     match a.parse::<u16>() {
                         Ok(c) => codes.push(c),
                         Err(_) => dur = parse_time(a),
                     }
                 }
-                if codes.is_empty() {
+                if any {
+                    // `any` matches every status.
+                    codes = (0u16..=999).collect();
+                } else if codes.is_empty() {
                     codes = vec![200, 301, 302];
                 }
                 if let Some(dur) = dur {

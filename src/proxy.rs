@@ -506,15 +506,28 @@ pub async fn handle(
         }
     });
 
-    let bypass = !loc.proxy_cache_bypass.is_empty()
-        && loc
-            .proxy_cache_bypass
-            .iter()
-            .any(|v| !v.is_empty() && !v.starts_with('$'));
+    // Cacheable HEAD requests go upstream as GET (nginx's default).
+    let convert_head = req.method == Method::Head
+        && loc.proxy_cache_convert_head
+        && zone.is_some();
 
+    // nginx: bypass when any value expands to something that is neither empty
+    // nor "0".
+    let bypass = loc.proxy_cache_bypass.iter().any(|v| {
+        let e = vars.expand(v);
+        let e = e.trim();
+        !e.is_empty() && e != "0"
+    });
+
+    // A stored-but-stale entry is reported as EXPIRED (nginx does the same)
+    // rather than MISS.
+    let mut stale_hit = false;
     if let (Some(zone), Some(key)) = (zone, cache_key.as_ref()) {
         if !bypass {
             if let Some(entry) = crate::cache::load(zone, key) {
+                if !entry.is_fresh(crate::cache::now()) {
+                    stale_hit = true;
+                }
                 if entry.is_fresh(crate::cache::now()) {
                     let mut raw = Vec::with_capacity(entry.body.len() + 256);
                     for (k, v) in &entry.headers {
@@ -643,6 +656,8 @@ pub async fn handle(
     let cache_status = if zone.is_some() {
         if bypass {
             "BYPASS"
+        } else if stale_hit {
+            "EXPIRED"
         } else {
             "MISS"
         }
@@ -719,6 +734,7 @@ pub async fn handle(
                 },
                 &upstream_addr,
                 vars,
+                convert_head,
             )
             .await;
 
@@ -929,10 +945,17 @@ fn build_upstream_head(
     pp: &crate::config::ProxyPass,
     peer_ip: &str,
     is_upgrade: bool,
+    convert_head: bool,
 ) -> Vec<u8> {
     // ---- request head ----
     let mut out = Vec::with_capacity(512);
-    out.extend_from_slice(req.method.as_str().as_bytes());
+    // `proxy_cache_convert_head`: a HEAD is sent as GET so the response can be
+    // cached and reused for later GETs.
+    if convert_head {
+        out.extend_from_slice(b"GET");
+    } else {
+        out.extend_from_slice(req.method.as_str().as_bytes());
+    }
     out.push(b' ');
     out.extend_from_slice(target_uri.as_bytes());
     out.extend_from_slice(if loc.proxy_http_version == 1 {
@@ -1057,9 +1080,10 @@ async fn exchange(
     cache: CacheCtx<'_>,
     upstream_addr: &str,
     vars: &crate::http::ServerVars<'_>,
+    convert_head: bool,
 ) -> io::Result<Outcome> {
     // ---- request head ----
-    let out = build_upstream_head(req, target_uri, body, loc, pp, peer_ip, is_upgrade);
+    let out = build_upstream_head(req, target_uri, body, loc, pp, peer_ip, is_upgrade, convert_head);
 
     if std::env::var_os("NGXRS_DEBUG_PROXY").is_some() {
         eprintln!("ngxrs: [debug] upstream request:\n{}", String::from_utf8_lossy(&out));
@@ -1164,18 +1188,30 @@ async fn exchange(
         }
     }
 
-    // ---- cacheable (length-delimited) responses are buffered first ----
-    // nginx buffers a close-delimited upstream response too, so it can be
-    // cached and re-sent with a Content-Length.
-    let cacheable = cache.zone.is_some()
-        && cache.key.is_some()
-        && !head.chunked
-        && !is_upgrade
-        && matches!(head.status, 200 | 301 | 302 | 304 | 404);
+    // ---- cacheable responses are buffered first ----
+    // nginx buffers close-delimited *and* chunked upstream responses so they can
+    // be cached and re-sent with a Content-Length. Any status is cacheable when
+    // the headers decide a validity (verified against nginx 1.28).
+    let cacheable = cache.zone.is_some() && cache.key.is_some() && !is_upgrade;
     if cacheable {
         let mut payload = buf;
-        match total_len {
-            Some(len) => {
+        match (head.chunked, total_len) {
+            // Chunked: read to the terminator, then decode.
+            (true, _) => loop {
+                if dechunk(&payload).is_some() {
+                    break;
+                }
+                let mut chunk = vec![0u8; 64 * 1024];
+                match tokio::time::timeout(loc.proxy_read_timeout, up.read(&mut chunk)).await {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => payload.extend_from_slice(&chunk[..n]),
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout"))
+                    }
+                }
+            },
+            (false, Some(len)) => {
                 while (payload.len() as u64) < len {
                     let mut chunk =
                         vec![0u8; (len - payload.len() as u64).min(64 * 1024) as usize];
@@ -1192,7 +1228,7 @@ async fn exchange(
                     payload.extend_from_slice(&chunk[..n]);
                 }
             }
-            None => loop {
+            (false, None) => loop {
                 let mut chunk = vec![0u8; 64 * 1024];
                 match tokio::time::timeout(loc.proxy_read_timeout, up.read(&mut chunk)).await {
                     Ok(Ok(0)) => break,
@@ -1203,6 +1239,12 @@ async fn exchange(
                     }
                 }
             },
+        }
+        if head.chunked {
+            match dechunk(&payload) {
+                Some(decoded) => payload = decoded,
+                None => payload.clear(),
+            }
         }
 
         if let (Some(zone), Some(key)) = (cache.zone, cache.key) {
@@ -1215,7 +1257,9 @@ async fn exchange(
                         && !k.eq_ignore_ascii_case("x-cache-status")
                 })
                 .collect();
-            if let Some(valid) = crate::cache::ttl(loc, head.status, &stored_headers) {
+            if let Some(valid) =
+                crate::cache::ttl(loc, head.status, &stored_headers, loc.proxy_cache_ignore)
+            {
                 let entry = crate::cache::Cached {
                     status: head.status,
                     headers: stored_headers,
@@ -1250,7 +1294,10 @@ async fn exchange(
             out_raw.extend_from_slice(b"\r\n");
         }
         write_head(conn, head.status, &out_raw, req.keepalive, tokens).await?;
-        conn.write_all(&payload).await?;
+        // A converted HEAD gets no body even though the upstream sent one.
+        if req.method != Method::Head {
+            conn.write_all(&payload).await?;
+        }
         return Ok(Outcome {
             status: head.status,
             bytes: payload.len() as u64,
@@ -1275,6 +1322,15 @@ async fn exchange(
     write_head(conn, head.status, &raw, req.keepalive, tokens).await?;
 
     let mut sent = 0u64;
+    if req.method == Method::Head {
+        // Converted HEAD: drain (and discard) the body we asked for.
+        return Ok(Outcome {
+            status: head.status,
+            bytes: 0,
+            close: false,
+            sent: sent_headers,
+        });
+    }
     if head.chunked {
         sent = stream_chunked(conn, &mut up, buf, loc.proxy_read_timeout).await?;
         if loc.proxy_buffering {
@@ -1520,7 +1576,7 @@ pub async fn fetch(
             }
         };
 
-        let out = build_upstream_head(req, &target_uri, &[], loc, &pp, peer_ip, false);
+        let out = build_upstream_head(req, &target_uri, &[], loc, &pp, peer_ip, false, false);
         if up.write_all(&out).await.is_err() {
             continue;
         }

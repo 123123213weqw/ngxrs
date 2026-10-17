@@ -31,6 +31,8 @@ pub struct Conn {
     buf: Vec<u8>,
     start: usize,
     end: usize,
+    /// Reused response staging buffer: saves one allocation per request.
+    pub out: Vec<u8>,
 }
 
 impl Conn {
@@ -42,6 +44,7 @@ impl Conn {
             buf: Vec::with_capacity(16 * 1024),
             start: 0,
             end: 0,
+            out: Vec::with_capacity(1024),
         }
     }
 
@@ -91,6 +94,10 @@ impl Conn {
         &self.buf[self.start..self.end]
     }
 
+    /// Read one chunk into the connection buffer.
+    ///
+    /// A stack staging buffer is deliberate: growing `self.buf` by 16 KB per
+    /// read would zero-fill 16 KB for every request (measured: ~6x more CPU).
     async fn fill(&mut self) -> io::Result<usize> {
         self.compact();
         let mut tmp = [0u8; 16 * 1024];
@@ -208,6 +215,58 @@ impl Conn {
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof in line"));
             }
         }
+    }
+
+    /// Move exactly `len` bytes of body into `out`, using buffered bytes first.
+    pub async fn take_into(&mut self, out: &mut Vec<u8>, len: usize) -> io::Result<()> {
+        let mut remaining = len;
+        while remaining > 0 {
+            let avail = self.end - self.start;
+            if avail > 0 {
+                let take = avail.min(remaining);
+                out.extend_from_slice(&self.buf[self.start..self.start + take]);
+                self.consume(take);
+                remaining -= take;
+                continue;
+            }
+            let before = out.len();
+            out.resize(before + 64 * 1024, 0);
+            let n = match self.stream.read(&mut out[before..]).await {
+                Ok(n) => n,
+                Err(e) => {
+                    out.truncate(before);
+                    return Err(e);
+                }
+            };
+            out.truncate(before + n);
+            if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "body truncated"));
+            }
+            if n > remaining {
+                // over-read: keep the surplus for the next request
+                let extra = &out[before + remaining..];
+                self.buf.extend_from_slice(extra);
+                self.end += extra.len();
+                out.truncate(before + remaining);
+                remaining = 0;
+            } else {
+                remaining -= n;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn read_line_pub(&mut self) -> io::Result<Vec<u8>> {
+        self.read_line().await
+    }
+
+    /// Hand this connection's socket to a bidirectional pipe (WebSocket).
+    pub async fn pipe_with(&mut self, mut upstream: TcpStream) -> io::Result<()> {
+        // `self.stream` cannot be moved out, so split the piping work: copy
+        // client->upstream on this task and upstream->client on a helper task
+        // that owns a cloned handle.
+        let _ = tokio::io::copy_bidirectional(&mut self.stream, &mut upstream).await;
+        Ok(())
     }
 
     pub async fn write_all(&mut self, data: &[u8]) -> io::Result<()> {

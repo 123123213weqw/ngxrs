@@ -34,6 +34,15 @@ for name, size in [("1k.txt", 1024), ("64k.bin", 64 * 1024), ("1m.bin", 1024 * 1
     if not os.path.exists(path) or os.path.getsize(path) != size:
         with open(path, "wb") as f:
             f.write(b"0123456789abcdef" * (size // 16) + b"x" * (size % 16))
+extra = [("404.html", "<h1>custom not found</h1>\n"), ("50x.html", "<h1>custom 50x</h1>\n"),
+         ("gzip/data.json", '{"items":[%s]}' % ",".join('{"id":%d,"name":"item-%d"}' % (i, i) for i in range(200))),
+         ("plain/data.json", '{"items":[%s]}' % ",".join('{"id":%d,"name":"item-%d"}' % (i, i) for i in range(200))),
+         ("gzip/tiny.txt", "hi\n"), ("plain/tiny.txt", "hi\n")]
+for name, body in extra:
+    path = os.path.join(www, name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(body)
 for name, body in [("index.html", "<h1>ngxrs bench</h1>\n"), ("sub/index.html", "<h1>sub</h1>\n")]:
     with open(os.path.join(www, name), "w") as f:
         f.write(body)

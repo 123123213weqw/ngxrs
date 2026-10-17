@@ -1,5 +1,6 @@
 //! HTTP/1.x request head parser.
 
+use crate::instr::InStr;
 use crate::util::reason;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,7 +14,7 @@ pub enum Method {
     Patch,
     Trace,
     Connect,
-    Other(String),
+    Other(InStr),
 }
 
 impl Method {
@@ -28,7 +29,7 @@ impl Method {
             Method::Patch => "PATCH",
             Method::Trace => "TRACE",
             Method::Connect => "CONNECT",
-            Method::Other(s) => s,
+            Method::Other(s) => s.as_str(),
         }
     }
 
@@ -39,7 +40,7 @@ impl Method {
 
 #[derive(Debug, Default)]
 pub struct Headers {
-    items: Vec<(String, String)>,
+    items: Vec<(InStr, InStr)>,
 }
 
 impl Headers {
@@ -89,7 +90,7 @@ pub struct Request {
     pub body_len: u64,
     pub chunked: bool,
     pub keepalive: bool,
-    pub host: Option<String>,
+    pub host: Option<InStr>,
     pub expect_continue: bool,
 }
 
@@ -139,7 +140,7 @@ impl Request {
             b"PATCH" => Method::Patch,
             b"TRACE" => Method::Trace,
             b"CONNECT" => Method::Connect,
-            other => Method::Other(String::from_utf8_lossy(other).to_string()),
+            other => Method::Other(InStr::new(&String::from_utf8_lossy(other))),
         };
 
         let version_minor = match v {
@@ -156,7 +157,9 @@ impl Request {
             _ => return Err(HttpError::new(400, true)),
         };
 
-        let mut headers = Headers::default();
+        let mut headers = Headers {
+            items: Vec::with_capacity(12),
+        };
         for raw in lines {
             if raw.is_empty() {
                 continue;
@@ -180,9 +183,25 @@ impl Request {
             if value.iter().any(|b| *b == 0 || *b == b'\r' || *b == b'\n') {
                 return Err(HttpError::new(400, true));
             }
+            // Lowercase in place: header names are ASCII tokens.
+            let mut lowered = [0u8; 48];
+            let lname: &str = if name.len() <= lowered.len() {
+                for (i, b) in name.iter().enumerate() {
+                    lowered[i] = b.to_ascii_lowercase();
+                }
+                // SAFETY: header names are ASCII tokens (checked above).
+                unsafe { std::str::from_utf8_unchecked(&lowered[..name.len()]) }
+            } else {
+                ""
+            };
+            let lname = if lname.is_empty() && !name.is_empty() {
+                String::from_utf8_lossy(name).to_ascii_lowercase()
+            } else {
+                lname.to_string()
+            };
             headers.items.push((
-                String::from_utf8_lossy(name).to_ascii_lowercase(),
-                String::from_utf8_lossy(value).to_string(),
+                InStr::new(&lname),
+                InStr::new(&String::from_utf8_lossy(value)),
             ));
         }
 
@@ -213,7 +232,7 @@ impl Request {
             return Err(HttpError::new(400, true));
         }
 
-        let host = headers.get("host").map(|s| s.to_string());
+        let host = headers.get("host").map(InStr::new);
         if host.is_none() && version_minor == 1 {
             return Err(HttpError::new(400, true));
         }

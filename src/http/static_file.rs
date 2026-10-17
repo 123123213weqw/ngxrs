@@ -8,7 +8,7 @@ use std::time::UNIX_EPOCH;
 use crate::config::{Http, LocCfg};
 use crate::http::request::Request;
 use crate::http::{error_body, Body, Response};
-use crate::util::{http_date, parse_http_date};
+use crate::util::{http_date, parse_http_date, push_http_date};
 
 pub fn respond(
     req: &Request,
@@ -153,14 +153,13 @@ fn serve_entry(
     let mime = http
         .mime
         .get(extension(name_for_mime).as_str())
-        .unwrap_or(http.default_type.as_str())
-        .to_string();
+        .unwrap_or(http.default_type.as_str());
 
     // ---- range --------------------------------------------------------
     let mut status = 200u16;
     let mut offset = 0u64;
     let mut len = size;
-    let mut content_range: Option<String> = None;
+    let mut content_range: Option<(u64, u64)> = None;
 
     if let Some(range) = req.headers.get("range") {
         let if_range_ok = match req.headers.get("if-range") {
@@ -179,19 +178,17 @@ fn serve_entry(
                     status = 206;
                     offset = start;
                     len = end - start + 1;
-                    content_range = Some(format!("bytes {start}-{end}/{size}"));
+                    content_range = Some((start, end));
                 }
                 RangeSpec::Unsatisfiable => {
                     let body = error_body(416, http.server_tokens);
-                    return Ok(Response {
-                        status: 416,
-                        headers: vec![
-                            ("Content-Type".to_string(), "text/html".to_string()),
-                            ("Content-Length".to_string(), body.len().to_string()),
-                            ("Content-Range".to_string(), format!("bytes */{size}")),
-                        ],
-                        body: Body::Bytes(body),
-                    });
+                    let mut raw = Vec::with_capacity(160);
+                    raw.extend_from_slice(b"Content-Type: text/html\r\nContent-Length: ");
+                    raw.extend_from_slice(body.len().to_string().as_bytes());
+                    raw.extend_from_slice(b"\r\nContent-Range: bytes */");
+                    raw.extend_from_slice(size.to_string().as_bytes());
+                    raw.extend_from_slice(b"\r\n");
+                    return Ok(Response::raw(416, raw, Body::Bytes(body)));
                 }
                 RangeSpec::Ignore => {}
             }
@@ -204,18 +201,31 @@ fn serve_entry(
         Err(_) => return Ok(Response::empty(404)),
     };
 
-    let mut headers: Vec<(String, String)> = vec![
-        ("Content-Type".to_string(), mime),
-        ("Content-Length".to_string(), len.to_string()),
-        ("Last-Modified".to_string(), last_modified),
-        ("ETag".to_string(), etag),
-    ];
+    // Pre-render every header line into one buffer: no per-header Strings.
+    let mut raw = Vec::with_capacity(256);
+    raw.extend_from_slice(b"Content-Type: ");
+    raw.extend_from_slice(mime.as_bytes());
+    raw.extend_from_slice(b"\r\nContent-Length: ");
+    raw.extend_from_slice(len.to_string().as_bytes());
+    raw.extend_from_slice(b"\r\nLast-Modified: ");
+    push_http_date(&mut raw, mtime);
+    raw.extend_from_slice(b"\r\nETag: ");
+    raw.extend_from_slice(etag.as_bytes());
+    raw.extend_from_slice(b"\r\n");
     if status == 200 {
-        headers.push(("Accept-Ranges".to_string(), "bytes".to_string()));
+        raw.extend_from_slice(b"Accept-Ranges: bytes\r\n");
     }
-    if let Some(cr) = content_range {
-        headers.push(("Content-Range".to_string(), cr));
+    if let Some((start, end)) = content_range {
+        raw.extend_from_slice(b"Content-Range: bytes ");
+        raw.extend_from_slice(start.to_string().as_bytes());
+        raw.push(b'-');
+        raw.extend_from_slice(end.to_string().as_bytes());
+        raw.push(b'/');
+        raw.extend_from_slice(size.to_string().as_bytes());
+        raw.extend_from_slice(b"\r\n");
     }
+
+    let mut headers: Vec<(String, String)> = Vec::with_capacity(loc.headers.len());
     for (k, v) in &loc.headers {
         headers.push((k.clone(), v.clone()));
     }
@@ -223,6 +233,9 @@ fn serve_entry(
     Ok(Response {
         status,
         headers,
+        raw,
+        no_error_page: false,
+            explicit_len: true,
         body: Body::File { file, offset, len },
     })
 }

@@ -61,22 +61,54 @@ pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146097 + doe - 719468
 }
 
+/// Inverse of [`days_from_civil`] (Howard Hinnant's algorithm).
+pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+#[inline]
+fn push_2(out: &mut Vec<u8>, v: u32) {
+    out.push(b'0' + (v / 10) as u8);
+    out.push(b'0' + (v % 10) as u8);
+}
+
+/// Format an IMF-fixdate directly into `out` without allocating.
+pub fn push_http_date(out: &mut Vec<u8>, ts: i64) {
+    let days = ts.div_euclid(86400);
+    let secs = ts.rem_euclid(86400);
+    let (y, m, d) = civil_from_days(days);
+    // 1970-01-01 was a Thursday (weekday index 4 with Sunday = 0)
+    let wd = (days.rem_euclid(7) + 4) % 7;
+    out.extend_from_slice(WEEKDAYS[wd as usize].as_bytes());
+    out.extend_from_slice(b", ");
+    push_2(out, d);
+    out.push(b' ');
+    out.extend_from_slice(MONTHS[(m - 1) as usize].as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(&y.to_string().as_bytes());
+    out.push(b' ');
+    push_2(out, (secs / 3600) as u32);
+    out.push(b':');
+    push_2(out, ((secs % 3600) / 60) as u32);
+    out.push(b':');
+    push_2(out, (secs % 60) as u32);
+    out.extend_from_slice(b" GMT");
+}
+
 pub fn http_date(ts: i64) -> String {
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let t = ts as libc::time_t;
-    unsafe {
-        libc::gmtime_r(&t, &mut tm);
-    }
-    format!(
-        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
-        WEEKDAYS[tm.tm_wday.clamp(0, 6) as usize],
-        tm.tm_mday,
-        MONTHS[tm.tm_mon.clamp(0, 11) as usize],
-        tm.tm_year + 1900,
-        tm.tm_hour,
-        tm.tm_min,
-        tm.tm_sec
-    )
+    let mut out = Vec::with_capacity(29);
+    push_http_date(&mut out, ts);
+    // SAFETY: only ASCII digits/latin letters plus fixed punctuation.
+    String::from_utf8(out).unwrap_or_default()
 }
 
 /// Append a `Date:` value, reusing a per-thread cache for the current second
@@ -84,16 +116,17 @@ pub fn http_date(ts: i64) -> String {
 pub fn write_date_header(out: &mut Vec<u8>, now: i64) {
     use std::cell::RefCell;
     thread_local! {
-        static CACHE: RefCell<(i64, String)> = const { RefCell::new((0, String::new())) };
+        static CACHE: RefCell<(i64, Vec<u8>)> = const { RefCell::new((0, Vec::new())) };
     }
     CACHE.with(|c| {
         let mut c = c.borrow_mut();
         if c.0 != now {
-            c.1 = http_date(now);
+            c.1.clear();
+            push_http_date(&mut c.1, now);
             c.0 = now;
         }
         out.extend_from_slice(b"Date: ");
-        out.extend_from_slice(c.1.as_bytes());
+        out.extend_from_slice(&c.1);
         out.extend_from_slice(b"\r\n");
     });
 }

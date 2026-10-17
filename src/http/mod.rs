@@ -8,7 +8,6 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::time::timeout;
 
 use crate::config::{Config, Http, ListenGroup, LocCfg, Server};
 use crate::conn::{Conn, RecvError, MAX_HEADER_BYTES, MAX_REQUEST_LINE};
@@ -30,7 +29,15 @@ pub enum Body {
 
 pub struct Response {
     pub status: u16,
+    /// Dynamic headers that still need `Name: value` rendering.
     pub headers: Vec<(String, String)>,
+    /// Pre-rendered header lines (already `Name: value\r\n`). Keeps the hot
+    /// static path free of per-header `String` allocations.
+    pub raw: Vec<u8>,
+    /// True when `raw` already carries Content-Length.
+    pub explicit_len: bool,
+    /// Set for `return` responses: nginx does not run error_page on those.
+    pub no_error_page: bool,
     pub body: Body,
 }
 
@@ -45,6 +52,9 @@ impl Response {
         Response {
             status,
             headers: Vec::new(),
+            raw: Vec::new(),
+            explicit_len: false,
+            no_error_page: false,
             body: Body::Empty,
         }
     }
@@ -53,7 +63,22 @@ impl Response {
         Response {
             status,
             headers: vec![("Content-Type".to_string(), ctype.to_string())],
+            raw: Vec::new(),
+            explicit_len: false,
+            no_error_page: false,
             body: Body::Bytes(body),
+        }
+    }
+
+    /// Fast constructor: `raw` already contains Content-Type/Content-Length.
+    pub fn raw(status: u16, raw: Vec<u8>, body: Body) -> Self {
+        Response {
+            status,
+            headers: Vec::new(),
+            raw,
+            explicit_len: true,
+            no_error_page: false,
+            body,
         }
     }
 
@@ -76,6 +101,9 @@ pub async fn handle_conn(mut conn: Conn, group: &ListenGroup, ctx: &Ctx) {
     let first_server = http.server(group.default_server);
     let keepalive_timeout = first_server.keepalive_timeout;
     let mut served: u64 = 0;
+    // One timer per connection, reset after each request: registering a fresh
+    // timer per request costs more than the request itself at 400k rps.
+    let mut idle = Box::pin(tokio::time::sleep(keepalive_timeout));
 
     loop {
         let read_timeout = if served == 0 {
@@ -83,11 +111,12 @@ pub async fn handle_conn(mut conn: Conn, group: &ListenGroup, ctx: &Ctx) {
         } else {
             keepalive_timeout
         };
-        let read = timeout(
-            read_timeout,
-            conn.read_request(MAX_REQUEST_LINE, MAX_HEADER_BYTES),
-        )
-        .await;
+        idle.as_mut()
+            .reset(tokio::time::Instant::now() + read_timeout);
+        let read = tokio::select! {
+            _ = idle.as_mut() => Err(()),
+            r = conn.read_request(MAX_REQUEST_LINE, MAX_HEADER_BYTES) => Ok(r),
+        };
 
         let req = match read {
             Err(_elapsed) => {
@@ -119,28 +148,30 @@ pub async fn handle_conn(mut conn: Conn, group: &ListenGroup, ctx: &Ctx) {
         let server = select_server(http, group, req.host.as_deref());
         let loc = server.locate(&path);
 
-        // Request body handling (static server discards it, like nginx).
+        // Request body: proxied locations forward it, everything else
+        // discards it (nginx behaves the same for static content).
+        let proxy_target = loc.proxy_pass.is_some();
         if req.chunked {
-            if loc.client_max_body_size != u64::MAX && req.body_len > loc.client_max_body_size {
-                let _ = send_error(&mut conn, 413, server.server_tokens, false, false).await;
-                break;
-            }
-            if req.expect_continue {
-                let _ = conn.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
-            }
-            if conn.drain_chunked().await.is_err() {
-                break;
+            if !proxy_target {
+                if req.expect_continue {
+                    let _ = conn.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
+                }
+                if conn.drain_chunked().await.is_err() {
+                    break;
+                }
             }
         } else if req.body_len > 0 {
             if loc.client_max_body_size != u64::MAX && req.body_len > loc.client_max_body_size {
                 let _ = send_error(&mut conn, 413, server.server_tokens, false, false).await;
                 break;
             }
-            if req.expect_continue {
-                let _ = conn.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
-            }
-            if conn.drain_body(req.body_len).await.is_err() {
-                break;
+            if !proxy_target {
+                if req.expect_continue {
+                    let _ = conn.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
+                }
+                if conn.drain_body(req.body_len).await.is_err() {
+                    break;
+                }
             }
         }
 
@@ -163,6 +194,77 @@ pub async fn handle_conn(mut conn: Conn, group: &ListenGroup, ctx: &Ctx) {
     conn.shutdown().await;
 }
 
+/// Resolve a request to a `Response` without writing anything. Kept separate
+/// from the writer so `error_page` internal redirects can re-route cheaply.
+async fn route(
+    req: &Request,
+    path: &str,
+    query: &str,
+    loc: &LocCfg,
+    server: &Server,
+    http: &Http,
+    allow_internal: bool,
+) -> Response {
+    if !req.method.is_read() {
+        return error_response(405, server.server_tokens);
+    }
+
+    if loc.internal && !allow_internal {
+        return error_response(404, server.server_tokens);
+    }
+
+    if let Some((code, body)) = &loc.ret {
+        let status = *code;
+        let mut resp = if matches!(status, 301 | 302 | 303 | 307 | 308) {
+            Response::empty(status).header("Location", body.clone())
+        } else if body.is_empty() {
+            Response::empty(status)
+        } else {
+            // nginx picks the content type from the URI extension, falling
+            // back to default_type (not text/plain).
+            let ext = match path.rfind('.') {
+                Some(i) if i + 1 < path.len() => path[i + 1..].to_ascii_lowercase(),
+                _ => String::new(),
+            };
+            let ctype = http
+                .mime
+                .get(&ext)
+                .unwrap_or(http.default_type.as_str())
+                .to_string();
+            Response::bytes(status, &ctype, body.clone().into_bytes())
+        };
+        resp.no_error_page = true;
+        return resp;
+    }
+
+    if !loc.try_files.is_empty() {
+        if let Some(resp) = try_files_sync(req, path, loc, server, http) {
+            return resp;
+        }
+    }
+
+    match static_file::respond(req, path, query, loc, http) {
+        Ok(r) => r,
+        Err(_) => error_response(404, server.server_tokens),
+    }
+}
+
+fn error_response(status: u16, tokens: bool) -> Response {
+    let body = error_body(status, tokens);
+    Response::raw(
+        status,
+        {
+            let mut raw = Vec::with_capacity(96);
+            raw.extend_from_slice(b"Content-Type: text/html\r\nContent-Length: ");
+            raw.extend_from_slice(body.len().to_string().as_bytes());
+            raw.extend_from_slice(b"\r\n");
+            raw
+        },
+        Body::Bytes(body),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     conn: &mut Conn,
     req: &Request,
@@ -174,81 +276,75 @@ async fn dispatch(
     listen_port: u16,
 ) -> io::Result<Outcome> {
     let head_only = req.method == Method::Head;
+    let mut cur_path = path.to_string();
+    let mut cur_query = query.to_string();
+    let mut cur_loc = loc;
+    let mut depth = 0usize;
 
-    if !req.method.is_read() {
-        let body = error_body(405, server.server_tokens);
-        let resp = Response {
-            status: 405,
-            headers: vec![
-                ("Content-Type".to_string(), "text/html".to_string()),
-                ("Content-Length".to_string(), body.len().to_string()),
-            ],
-            body: Body::Bytes(body),
-        };
-        let bytes = write_response(conn, resp, req.keepalive, server.server_tokens, head_only).await?;
-        return Ok(Outcome {
-            status: 405,
-            bytes,
-            close: false,
-        });
-    }
-
-    if loc.internal {
-        return send_error_into(conn, 404, server.server_tokens, req.keepalive, head_only).await;
-    }
-
-    if let Some((code, body)) = &loc.ret {
-        let status = *code;
-        let mut resp;
-        if matches!(status, 301 | 302 | 303 | 307 | 308) {
-            resp = Response::empty(status).header("Location", body.clone());
-            resp = resp.header("Content-Length", "0");
-        } else if body.is_empty() {
-            resp = Response::empty(status).header("Content-Length", "0");
-        } else {
-            let mut r = Response::bytes(status, "text/plain", body.clone().into_bytes());
-            r.headers.push(("Content-Length".into(), body.len().to_string()));
-            resp = r;
+    loop {
+        // ---- reverse proxy ----
+        if cur_loc.proxy_pass.is_some() {
+            if let Some(o) =
+                crate::proxy::handle(conn, req, &cur_path, &cur_query, cur_loc, http, server.server_tokens)
+                    .await?
+            {
+                return Ok(o);
+            }
         }
-        let bytes = write_response(conn, resp, req.keepalive, server.server_tokens, head_only).await?;
+
+        let mut resp = route(req, &cur_path, &cur_query, cur_loc, server, http, false).await;
+
+        // ---- error_page: internal redirect, keeping the original status ----
+        if resp.status >= 400 && depth < 10 && !resp.no_error_page {
+            if let Some(target) = cur_loc.error_pages.get(&resp.status).cloned() {
+                let (new_status, uri) = match target.strip_prefix('=') {
+                    Some(rest) => match rest.split_once(char::is_whitespace) {
+                        Some((code, uri)) => (code.parse::<u16>().ok(), uri.trim().to_string()),
+                        None => (None, rest.trim().to_string()),
+                    },
+                    None => (None, target.clone()),
+                };
+                let (p, q) = match uri.split_once('?') {
+                    Some((p, q)) => (p.to_string(), q.to_string()),
+                    None => (uri.clone(), String::new()),
+                };
+                let original_status = resp.status;
+                cur_path = p;
+                cur_query = q;
+                cur_loc = server.locate(&cur_path);
+                depth += 1;
+                let mut redirected =
+                    route(req, &cur_path, &cur_query, cur_loc, server, http, true).await;
+                if redirected.status >= 400 {
+                    // The error page itself failed: fall back to the generic
+                    // body with the original status (nginx does the same).
+                    resp = error_response(original_status, server.server_tokens);
+                } else {
+                    // nginx keeps the original error status unless `=code` is set.
+                    redirected.status = new_status.unwrap_or(original_status);
+                    resp = redirected;
+                }
+            }
+        }
+
+        // ---- gzip ----
+        resp = crate::gzip::maybe_compress(req, resp, cur_loc, http);
+
+        let status = resp.status;
+        let keepalive = req.keepalive;
+        if matches!(status, 301 | 302 | 303 | 307 | 308) {
+            return write_redirect(conn, req, resp, listen_port, server.server_tokens).await;
+        }
+        let bytes =
+            write_response(conn, resp, keepalive, server.server_tokens, head_only).await?;
         return Ok(Outcome {
             status,
             bytes,
             close: false,
         });
     }
-
-    if !loc.try_files.is_empty() {
-        if let Some(outcome) = try_files(conn, req, path, loc, server, http).await? {
-            return Ok(outcome);
-        }
-    }
-
-    let resp = match static_file::respond(req, path, query, loc, http) {
-        Ok(r) => r,
-        Err(_) => Response::empty(404),
-    };
-
-    let status = resp.status;
-    let _ = query;
-
-    if matches!(status, 301 | 302 | 303 | 307 | 308) {
-        return write_redirect(conn, req, resp, listen_port, server.server_tokens).await;
-    }
-
-    if status >= 400 && resp.body.is_empty() {
-        return send_error_into(conn, status, server.server_tokens, req.keepalive, head_only).await;
-    }
-    let bytes = write_response(conn, resp, req.keepalive, server.server_tokens, head_only).await?;
-    Ok(Outcome {
-        status,
-        bytes,
-        close: false,
-    })
 }
 
-/// nginx answers directory redirects with an absolute Location and a small
-/// HTML body; mirror that (absolute_redirect / port_in_redirect defaults).
 async fn write_redirect(
     conn: &mut Conn,
     req: &Request,
@@ -257,7 +353,13 @@ async fn write_redirect(
     tokens: bool,
 ) -> io::Result<Outcome> {
     let status = resp.status;
-    let mut headers = resp.headers;
+    let Response {
+        headers,
+        raw,
+        body,
+        explicit_len,
+        ..
+    } = resp;
     let location = headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("location"))
@@ -265,10 +367,13 @@ async fn write_redirect(
         .unwrap_or_default();
 
     let absolute = if location.starts_with('/') {
-        let host = req.host.clone().unwrap_or_default();
-        let host_has_port = host.rsplit_once(':').map(|(_, p)| p.parse::<u16>().is_ok()).unwrap_or(false);
+        let host = req.host.as_ref().map(|h| h.as_str()).unwrap_or("");
+        let host_has_port = host
+            .rsplit_once(':')
+            .map(|(_, p)| p.parse::<u16>().is_ok())
+            .unwrap_or(false);
         let host = if host_has_port || listen_port == 80 {
-            host
+            host.to_string()
         } else {
             format!("{host}:{listen_port}")
         };
@@ -277,28 +382,29 @@ async fn write_redirect(
         location
     };
 
-    headers.retain(|(k, _)| {
-        !k.eq_ignore_ascii_case("location")
-            && !k.eq_ignore_ascii_case("content-length")
-            && !k.eq_ignore_ascii_case("content-type")
-    });
-    headers.push(("Location".to_string(), absolute));
-    let body = error_body(status, tokens);
-    headers.push(("Content-Type".to_string(), "text/html".to_string()));
-    headers.push(("Content-Length".to_string(), body.len().to_string()));
+    // nginx answers redirects with a small HTML body describing the status.
+    let body = match body {
+        Body::Bytes(b) if !b.is_empty() => b,
+        _ => error_body(status, tokens),
+    };
 
-    let bytes = write_response(
-        conn,
-        Response {
-            status,
-            headers,
-            body: Body::Bytes(body),
-        },
-        req.keepalive,
-        tokens,
-        req.method == Method::Head,
-    )
-    .await?;
+    let mut out_raw = raw;
+    out_raw.extend_from_slice(b"Content-Type: text/html\r\nContent-Length: ");
+    out_raw.extend_from_slice(body.len().to_string().as_bytes());
+    out_raw.extend_from_slice(b"\r\nLocation: ");
+    out_raw.extend_from_slice(absolute.as_bytes());
+    out_raw.extend_from_slice(b"\r\n");
+    let _ = explicit_len;
+
+    let resp = Response {
+        status,
+        headers: Vec::new(),
+        raw: out_raw,
+        explicit_len: true,
+        no_error_page: false,
+        body: Body::Bytes(body),
+    };
+    let bytes = write_response(conn, resp, req.keepalive, tokens, req.method == Method::Head).await?;
     Ok(Outcome {
         status,
         bytes,
@@ -306,41 +412,36 @@ async fn write_redirect(
     })
 }
 
-async fn try_files(
-    conn: &mut Conn,
+fn try_files_sync(
     req: &Request,
     path: &str,
     loc: &LocCfg,
     server: &Server,
     http: &Http,
-) -> io::Result<Option<Outcome>> {
+) -> Option<Response> {
     let n = loc.try_files.len();
     for (i, cand) in loc.try_files.iter().enumerate() {
         let last = i + 1 == n;
         if let Some(code) = cand.strip_prefix('=') {
             if let Ok(status) = code.parse::<u16>() {
-                let o = send_error_into(conn, status, server.server_tokens, req.keepalive, req.method == Method::Head).await?;
-                return Ok(Some(o));
+                return Some(error_response(status, server.server_tokens));
             }
             continue;
         }
-        let expanded = cand.replace("$uri", path).replace("$uri/", path);
+        let expanded = cand.replace("$uri", path);
         let rel = expanded.trim_start_matches('/');
         let fs_path = loc.root.join(rel);
         let is_dir_hint = expanded.ends_with('/');
         if fs_path.exists() && (!is_dir_hint || fs_path.is_dir()) {
-            let resp = static_file::respond_fs(req, &fs_path, path, loc, http)?;
-            let status = resp.status;
-            let head_only = req.method == Method::Head;
-            let bytes = write_response(conn, resp, req.keepalive, server.server_tokens, head_only).await?;
-            return Ok(Some(Outcome { status, bytes, close: false }));
+            if let Ok(resp) = static_file::respond_fs(req, &fs_path, path, loc, http) {
+                return Some(resp);
+            }
         }
         if last {
-            let o = send_error_into(conn, 404, server.server_tokens, req.keepalive, req.method == Method::Head).await?;
-            return Ok(Some(o));
+            return Some(error_response(404, server.server_tokens));
         }
     }
-    Ok(None)
+    None
 }
 
 async fn send_error_into(
@@ -368,10 +469,16 @@ pub async fn send_error(
     let body = error_body(status, tokens);
     let resp = Response {
         status,
-        headers: vec![
-            ("Content-Type".to_string(), "text/html".to_string()),
-            ("Content-Length".to_string(), body.len().to_string()),
-        ],
+        headers: Vec::new(),
+        raw: {
+            let mut raw = Vec::with_capacity(96);
+            raw.extend_from_slice(b"Content-Type: text/html\r\nContent-Length: ");
+            raw.extend_from_slice(body.len().to_string().as_bytes());
+            raw.extend_from_slice(b"\r\n");
+            raw
+        },
+        no_error_page: false,
+            explicit_len: true,
         body: Body::Bytes(body),
     };
     write_response(conn, resp, keepalive, tokens, head_only).await
@@ -390,6 +497,41 @@ pub fn error_body(status: u16, tokens: bool) -> Vec<u8> {
     .into_bytes()
 }
 
+#[inline]
+fn push_status_line(out: &mut Vec<u8>, status: u16) {
+    match status {
+        200 => out.extend_from_slice(b"HTTP/1.1 200 OK\r\n"),
+        201 => out.extend_from_slice(b"HTTP/1.1 201 Created\r\n"),
+        204 => out.extend_from_slice(b"HTTP/1.1 204 No Content\r\n"),
+        206 => out.extend_from_slice(b"HTTP/1.1 206 Partial Content\r\n"),
+        301 => out.extend_from_slice(b"HTTP/1.1 301 Moved Permanently\r\n"),
+        302 => out.extend_from_slice(b"HTTP/1.1 302 Moved Temporarily\r\n"),
+        304 => out.extend_from_slice(b"HTTP/1.1 304 Not Modified\r\n"),
+        400 => out.extend_from_slice(b"HTTP/1.1 400 Bad Request\r\n"),
+        403 => out.extend_from_slice(b"HTTP/1.1 403 Forbidden\r\n"),
+        404 => out.extend_from_slice(b"HTTP/1.1 404 Not Found\r\n"),
+        405 => out.extend_from_slice(b"HTTP/1.1 405 Not Allowed\r\n"),
+        408 => out.extend_from_slice(b"HTTP/1.1 408 Request Time-out\r\n"),
+        413 => out.extend_from_slice(b"HTTP/1.1 413 Request Entity Too Large\r\n"),
+        414 => out.extend_from_slice(b"HTTP/1.1 414 Request-URI Too Large\r\n"),
+        416 => out.extend_from_slice(b"HTTP/1.1 416 Requested Range Not Satisfiable\r\n"),
+        429 => out.extend_from_slice(b"HTTP/1.1 429 Too Many Requests\r\n"),
+        499 => out.extend_from_slice(b"HTTP/1.1 499 Client Closed Request\r\n"),
+        500 => out.extend_from_slice(b"HTTP/1.1 500 Internal Server Error\r\n"),
+        502 => out.extend_from_slice(b"HTTP/1.1 502 Bad Gateway\r\n"),
+        503 => out.extend_from_slice(b"HTTP/1.1 503 Service Temporarily Unavailable\r\n"),
+        504 => out.extend_from_slice(b"HTTP/1.1 504 Gateway Time-out\r\n"),
+        505 => out.extend_from_slice(b"HTTP/1.1 505 HTTP Version Not Supported\r\n"),
+        _ => {
+            out.extend_from_slice(b"HTTP/1.1 ");
+            out.extend_from_slice(status.to_string().as_bytes());
+            out.push(b' ');
+            out.extend_from_slice(reason(status).as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+}
+
 pub async fn write_response(
     conn: &mut Conn,
     resp: Response,
@@ -397,39 +539,48 @@ pub async fn write_response(
     tokens: bool,
     head_only: bool,
 ) -> io::Result<u64> {
-    let mut headers = resp.headers;
-    let known = |name: &str, headers: &[(String, String)]| {
-        headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name))
-    };
+    let Response {
+        status,
+        headers,
+        raw,
+        explicit_len,
+        no_error_page: _,
+        body,
+    } = resp;
 
-    let body_len = match &resp.body {
+    let body_len = match &body {
         Body::Empty => 0,
         Body::Bytes(b) => b.len() as u64,
         Body::File { len, .. } => *len,
     };
 
-    let mut out = Vec::with_capacity(512);
-    out.extend_from_slice(b"HTTP/1.1 ");
-    out.extend_from_slice(resp.status.to_string().as_bytes());
-    out.push(b' ');
-    out.extend_from_slice(reason(resp.status).as_bytes());
-    out.extend_from_slice(b"\r\n");
+    // Reuse the connection's staging buffer instead of allocating per request.
+    let mut out = std::mem::take(&mut conn.out);
+    out.clear();
+
+    push_status_line(&mut out, status);
     out.extend_from_slice(if tokens {
         b"Server: nginx/1.28.0\r\n"
     } else {
         b"Server: nginx\r\n"
     });
-
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
     util::write_date_header(&mut out, now);
 
-    if !known("Content-Length", &headers) && !matches!(resp.status, 204 | 304) {
-        headers.push(("Content-Length".to_string(), body_len.to_string()));
+    let has_cl = explicit_len
+        || headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-length"));
+    if !has_cl && !matches!(status, 204 | 304) {
+        out.extend_from_slice(b"Content-Length: ");
+        out.extend_from_slice(body_len.to_string().as_bytes());
+        out.extend_from_slice(b"\r\n");
     }
 
+    out.extend_from_slice(&raw);
     for (k, v) in &headers {
         out.extend_from_slice(k.as_bytes());
         out.extend_from_slice(b": ");
@@ -441,38 +592,43 @@ pub async fn write_response(
     out.extend_from_slice(b"\r\n\r\n");
 
     if head_only {
-        conn.write_all(&out).await?;
-        return Ok(0);
+        let r = conn.write_all(&out).await;
+        conn.out = out;
+        return r.map(|_| 0);
     }
 
-    match resp.body {
-        Body::Empty => {
-            conn.write_all(&out).await?;
-            Ok(0)
-        }
+    let result = match body {
+        Body::Empty => conn.write_all(&out).await.map(|_| 0),
         Body::Bytes(b) => {
             out.extend_from_slice(&b);
-            conn.write_all(&out).await?;
-            Ok(b.len() as u64)
+            conn.write_all(&out).await.map(|_| b.len() as u64)
         }
-        // Small files: one write beats header+sendfile (two segments on the
-        // wire, two syscalls). Large files stay zero-copy.
+        // Small files: one write beats header+sendfile (two syscalls, two
+        // segments). Large files stay zero-copy.
         Body::File { file, offset, len } if len <= SMALL_FILE_WRITE => {
             use std::os::unix::fs::FileExt;
             let start = out.len();
             out.resize(start + len as usize, 0);
             let mut read_total = 0usize;
+            let mut err = None;
             while read_total < len as usize {
                 match file.read_at(&mut out[start + read_total..], offset + read_total as u64) {
                     Ok(0) => break,
                     Ok(n) => read_total += n,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        err = Some(e);
+                        break;
+                    }
                 }
             }
-            out.truncate(start + read_total);
-            conn.write_all(&out).await?;
-            Ok(read_total as u64)
+            match err {
+                Some(e) => Err(e),
+                None => {
+                    out.truncate(start + read_total);
+                    conn.write_all(&out).await.map(|_| read_total as u64)
+                }
+            }
         }
         Body::File { file, offset, len } => {
             if conn.tcp_nopush {
@@ -480,17 +636,54 @@ pub async fn write_response(
                 let w = conn.write_all(&out).await;
                 if w.is_err() {
                     conn.set_cork(false);
-                    return w.map(|_| 0);
+                    w.map(|_| 0)
+                } else {
+                    let sent = conn.send_file(&file, offset, len).await;
+                    conn.set_cork(false);
+                    sent
                 }
-                let sent = conn.send_file(&file, offset, len).await;
-                conn.set_cork(false);
-                sent
+            } else if let Err(e) = conn.write_all(&out).await {
+                Err(e)
             } else {
-                conn.write_all(&out).await?;
                 conn.send_file(&file, offset, len).await
             }
         }
-    }
+    };
+
+    out.clear();
+    conn.out = out;
+    result
+}
+
+/// Write a response head only (used by the proxy, which streams its own body).
+pub async fn write_head(
+    conn: &mut Conn,
+    status: u16,
+    raw: &[u8],
+    keepalive: bool,
+    tokens: bool,
+) -> io::Result<()> {
+    let mut out = std::mem::take(&mut conn.out);
+    out.clear();
+    push_status_line(&mut out, status);
+    out.extend_from_slice(if tokens {
+        b"Server: nginx/1.28.0\r\n"
+    } else {
+        b"Server: nginx\r\n"
+    });
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    util::write_date_header(&mut out, now);
+    out.extend_from_slice(raw);
+    out.extend_from_slice(b"Connection: ");
+    out.extend_from_slice(if keepalive { b"keep-alive" } else { b"close" });
+    out.extend_from_slice(b"\r\n\r\n");
+    let r = conn.write_all(&out).await;
+    out.clear();
+    conn.out = out;
+    r
 }
 
 pub fn select_server<'a>(http: &'a Http, group: &ListenGroup, host: Option<&str>) -> &'a Server {

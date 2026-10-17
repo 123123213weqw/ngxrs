@@ -2,7 +2,10 @@ mod config;
 mod conn;
 mod http;
 mod log;
+mod gzip;
+mod instr;
 mod net;
+mod proxy;
 mod util;
 
 use std::path::PathBuf;

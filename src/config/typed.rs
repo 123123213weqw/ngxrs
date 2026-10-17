@@ -42,6 +42,23 @@ pub struct LocCfg {
     pub expires: Option<String>,
     /// Length of the location prefix, used to strip it for `alias`.
     pub prefix_len: usize,
+    // ---- gzip ----
+    pub gzip_min_length: u64,
+    pub gzip_comp_level: u32,
+    pub gzip_types: Vec<String>,
+    pub gzip_vary: bool,
+    // ---- reverse proxy ----
+    pub proxy_pass: Option<ProxyPass>,
+    /// Set while parsing `proxy_pass http://<name>` so the http level can
+    /// resolve the name to an `upstream` index after all blocks are read.
+    pub proxy_upstream_name: Option<String>,
+    pub proxy_set_headers: Vec<(String, String)>,
+    pub proxy_http_version: u8,
+    pub proxy_connect_timeout: Duration,
+    pub proxy_read_timeout: Duration,
+    pub proxy_send_timeout: Duration,
+    pub proxy_buffering: bool,
+    pub proxy_hide_headers: Vec<String>,
 }
 
 impl LocCfg {
@@ -60,8 +77,62 @@ impl LocCfg {
             internal: false,
             expires: None,
             prefix_len: 0,
+            gzip_min_length: 20,
+            gzip_comp_level: 1,
+            gzip_types: Vec::new(),
+            gzip_vary: false,
+            proxy_pass: None,
+            proxy_upstream_name: None,
+            proxy_set_headers: Vec::new(),
+            proxy_http_version: 1,
+            proxy_connect_timeout: Duration::from_secs(60),
+            proxy_read_timeout: Duration::from_secs(60),
+            proxy_send_timeout: Duration::from_secs(60),
+            proxy_buffering: true,
+            proxy_hide_headers: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub enum ProxyTarget {
+    /// `proxy_pass http://127.0.0.1:8080` or with an explicit host name.
+    Addr(SocketAddr),
+    /// Reference to an `upstream {}` block.
+    Upstream(usize),
+}
+
+#[derive(Debug, Clone)]
+pub struct ProxyPass {
+    pub target: ProxyTarget,
+    /// URI prefix to substitute for the matched location prefix (may be empty).
+    pub uri: Option<String>,
+    pub host_header: String,
+    pub https: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpstreamServer {
+    pub addr: SocketAddr,
+    pub weight: u32,
+    pub backup: bool,
+    pub down: bool,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LbMethod {
+    RoundRobin,
+    LeastConn,
+    IpHash,
+}
+
+#[derive(Debug, Clone)]
+pub struct Upstream {
+    pub name: String,
+    pub servers: Vec<UpstreamServer>,
+    pub method: LbMethod,
+    pub keepalive: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -162,6 +233,7 @@ pub struct Http {
     pub client_max_body_size: u64,
     pub default_loc: LocCfg,
     pub default_access_logs: Vec<AccessLog>,
+    pub upstreams: Vec<Upstream>,
     pub log_formats: HashMap<String, String>,
 }
 
@@ -237,6 +309,179 @@ fn resolve_path(prefix: &Path, p: &str) -> PathBuf {
     } else {
         prefix.join(pb)
     }
+}
+
+/// `http://host[:port][/uri]` -> ProxyPass. Upstream names are resolved later.
+pub fn parse_proxy_pass(url: &str) -> Option<ProxyPass> {
+    let (scheme, rest) = if let Some(r) = url.strip_prefix("http://") {
+        (false, r)
+    } else if let Some(r) = url.strip_prefix("https://") {
+        (true, r)
+    } else {
+        return None;
+    };
+    let (authority, uri) = match rest.find('/') {
+        Some(i) => (&rest[..i], Some(rest[i..].to_string())),
+        None => (rest, None),
+    };
+    if authority.is_empty() {
+        return None;
+    }
+
+    let target = match parse_listen(authority) {
+        Some(addr) => ProxyTarget::Addr(addr),
+        None => ProxyTarget::Upstream(usize::MAX),
+    };
+    // A bare port or host:port defaults to port 80 when only a host is given.
+    let target = match target {
+        ProxyTarget::Addr(a) if !authority.contains(':') => {
+            ProxyTarget::Addr(SocketAddr::new(a.ip(), 80))
+        }
+        other => other,
+    };
+    // nginx's $proxy_host is the authority exactly as written in proxy_pass.
+    let host_header = authority.to_string();
+
+    Some(ProxyPass {
+        target,
+        uri,
+        host_header,
+        https: scheme,
+    })
+}
+
+pub fn proxy_upstream_name(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let authority = match rest.find('/') {
+        Some(i) => &rest[..i],
+        None => rest,
+    };
+    if authority.is_empty() || parse_listen(authority).is_some() {
+        return None;
+    }
+    Some(authority.to_string())
+}
+
+fn parse_upstream(d: &Directive) -> Result<Upstream, ConfigError> {
+    let name = d
+        .args
+        .first()
+        .ok_or_else(|| sem(&d.file, d.line, "upstream requires a name"))?
+        .clone();
+    let mut up = Upstream {
+        name,
+        servers: Vec::new(),
+        method: LbMethod::RoundRobin,
+        keepalive: 0,
+    };
+
+    for child in d.block.as_ref().map(|b| b.as_slice()).unwrap_or(&[]) {
+        match child.name.as_str() {
+            "server" => {
+                let addr_arg = child
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&child.file, child.line, "server requires an address"))?;
+                let mut addr = parse_listen(addr_arg).ok_or_else(|| {
+                    sem(&child.file, child.line, format!("invalid server address \"{addr_arg}\""))
+                })?;
+                // upstream "host:port" without an IP is resolved later; here we
+                // accept IPv4/IPv6 literals and fall back to 127.0.0.1.
+                if !addr_arg.contains(':') {
+                    addr = SocketAddr::new(addr.ip(), 80);
+                }
+                let mut srv = UpstreamServer {
+                    addr,
+                    weight: 1,
+                    backup: false,
+                    down: false,
+                    name: addr_arg.clone(),
+                };
+                for p in &child.args[1..] {
+                    if p == "backup" {
+                        srv.backup = true;
+                    } else if p == "down" {
+                        srv.down = true;
+                    } else if let Some(w) = p.strip_prefix("weight=") {
+                        srv.weight = w.parse().unwrap_or(1).max(1);
+                    }
+                }
+                up.servers.push(srv);
+            }
+            "least_conn" => up.method = LbMethod::LeastConn,
+            "ip_hash" => up.method = LbMethod::IpHash,
+            "keepalive" => {
+                up.keepalive = child
+                    .args
+                    .first()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+            }
+            "keepalive_requests" | "keepalive_timeout" | "zone" | "hash" | "queue" | "resolver" => {}
+            other => {
+                return Err(sem(
+                    &child.file,
+                    child.line,
+                    format!("unknown directive \"{other}\" in upstream"),
+                ))
+            }
+        }
+    }
+
+    if up.servers.is_empty() {
+        return Err(sem(&d.file, d.line, "upstream has no servers"));
+    }
+    Ok(up)
+}
+
+/// Patch every location's `proxy_pass http://<name>` to the upstream index.
+fn resolve_proxy_upstreams(http: &mut Http) -> Result<(), ConfigError> {
+    let lookup: HashMap<String, usize> = http
+        .upstreams
+        .iter()
+        .enumerate()
+        .map(|(i, u)| (u.name.clone(), i))
+        .collect();
+
+    fn fix(cfg: &mut LocCfg, lookup: &HashMap<String, usize>) -> Result<(), ConfigError> {
+        if let (Some(name), Some(pp)) = (cfg.proxy_upstream_name.clone(), cfg.proxy_pass.as_mut()) {
+            match lookup.get(&name) {
+                Some(&idx) => {
+                    pp.target = ProxyTarget::Upstream(idx);
+                    pp.host_header = name.clone();
+                    if std::env::var_os("NGXRS_DEBUG_CONFIG").is_some() {
+                        eprintln!("ngxrs: resolved proxy_pass {name} -> upstream #{idx}");
+                    }
+                }
+                None => {
+                    return Err(ConfigError::Semantic {
+                        file: PathBuf::from("<config>"),
+                        line: 0,
+                        msg: format!("proxy_pass refers to unknown upstream \"{name}\""),
+                    })
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn walk(locs: &mut [Location], lookup: &HashMap<String, usize>) -> Result<(), ConfigError> {
+        for l in locs {
+            fix(&mut l.cfg, lookup)?;
+            walk(&mut l.nested, lookup)?;
+        }
+        Ok(())
+    }
+
+    fix(&mut http.default_loc, &lookup)?;
+    for s in &mut http.servers {
+        fix(&mut s.default_loc, &lookup)?;
+        walk(&mut s.locations, &lookup)?;
+    }
+    let _ = http;
+    Ok(())
 }
 
 fn parse_listen(s: &str) -> Option<SocketAddr> {
@@ -344,18 +589,24 @@ impl Builder {
             "error_page" => {
                 let mut codes: Vec<u16> = Vec::new();
                 let mut uri: Option<String> = None;
+                let mut override_status: Option<String> = None;
                 for a in &d.args {
                     if a.starts_with('=') {
-                        continue;
-                    }
-                    match a.parse::<u16>() {
-                        Ok(c) => codes.push(c),
-                        Err(_) => uri = Some(a.clone()),
+                        // `error_page 404 =200 /empty.gif`
+                        override_status = Some(a.clone());
+                    } else if let Ok(c) = a.parse::<u16>() {
+                        codes.push(c);
+                    } else {
+                        uri = Some(a.clone());
                     }
                 }
                 let uri = uri.ok_or_else(|| sem(&d.file, d.line, "error_page requires a URI"))?;
+                let stored = match override_status {
+                    Some(o) => format!("{o} {uri}"),
+                    None => uri,
+                };
                 for c in codes {
-                    cfg.error_pages.insert(c, uri.clone());
+                    cfg.error_pages.insert(c, stored.clone());
                 }
             }
             "return" => {
@@ -378,9 +629,91 @@ impl Builder {
             "expires" => {
                 cfg.expires = Some(d.args.first().cloned().unwrap_or_else(|| "off".into()));
             }
+            "gzip_min_length" => {
+                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "gzip_min_length requires a size"))?;
+                cfg.gzip_min_length = parse_size(v)
+                    .ok_or_else(|| sem(&d.file, d.line, format!("invalid size \"{v}\"")))?;
+            }
+            "gzip_comp_level" => {
+                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "gzip_comp_level requires a level"))?;
+                cfg.gzip_comp_level = v
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|l| (1..=9).contains(l))
+                    .ok_or_else(|| sem(&d.file, d.line, format!("invalid gzip level \"{v}\"")))?;
+            }
+            "gzip_types" => {
+                cfg.gzip_types = d.args.clone();
+            }
+            "gzip_vary" => {
+                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "gzip_vary requires on|off"))?;
+                cfg.gzip_vary = parse_on_off(v)
+                    .ok_or_else(|| sem(&d.file, d.line, format!("invalid gzip_vary value \"{v}\"")))?;
+            }
+            "proxy_pass" => {
+                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "proxy_pass requires a URL"))?;
+                cfg.proxy_pass = Some(parse_proxy_pass(v).ok_or_else(|| {
+                    sem(&d.file, d.line, format!("invalid proxy_pass URL \"{v}\""))
+                })?);
+                cfg.proxy_pass.as_mut().unwrap().target = cfg
+                    .proxy_pass
+                    .as_ref()
+                    .unwrap()
+                    .target
+                    .clone();
+                if let Some(name) = proxy_upstream_name(v) {
+                    cfg.proxy_upstream_name = Some(name);
+                }
+            }
+            "proxy_set_header" => {
+                if d.args.len() < 2 {
+                    return Err(sem(&d.file, d.line, "proxy_set_header requires 2 arguments"));
+                }
+                cfg.proxy_set_headers
+                    .push((d.args[0].clone(), d.args[1..].join(" ")));
+            }
+            "proxy_http_version" => {
+                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "proxy_http_version requires a value"))?;
+                cfg.proxy_http_version = match v.as_str() {
+                    "1.0" => 0,
+                    "1.1" => 1,
+                    _ => return Err(sem(&d.file, d.line, format!("invalid proxy_http_version \"{v}\""))),
+                };
+            }
+            "proxy_connect_timeout" => {
+                if let Some(v) = d.args.first() {
+                    cfg.proxy_connect_timeout = parse_time(v)
+                        .ok_or_else(|| sem(&d.file, d.line, "invalid proxy_connect_timeout"))?;
+                }
+            }
+            "proxy_read_timeout" => {
+                if let Some(v) = d.args.first() {
+                    cfg.proxy_read_timeout = parse_time(v)
+                        .ok_or_else(|| sem(&d.file, d.line, "invalid proxy_read_timeout"))?;
+                }
+            }
+            "proxy_send_timeout" => {
+                if let Some(v) = d.args.first() {
+                    cfg.proxy_send_timeout = parse_time(v)
+                        .ok_or_else(|| sem(&d.file, d.line, "invalid proxy_send_timeout"))?;
+                }
+            }
+            "proxy_buffering" => {
+                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "proxy_buffering requires on|off"))?;
+                cfg.proxy_buffering = parse_on_off(v)
+                    .ok_or_else(|| sem(&d.file, d.line, format!("invalid proxy_buffering \"{v}\"")))?;
+            }
+            "proxy_next_upstream" | "proxy_next_upstream_tries" | "proxy_buffers"
+            | "proxy_buffer_size" | "proxy_busy_buffers_size" | "proxy_max_temp_file_size"
+            | "proxy_temp_file_write_size" | "proxy_redirect" | "proxy_cache"
+            | "proxy_cache_valid" | "proxy_cache_key" | "proxy_cache_bypass" | "proxy_no_cache"
+            | "proxy_intercept_errors" | "proxy_pass_request_body" | "proxy_pass_request_headers"
+            | "proxy_ssl_server_name" | "proxy_ssl_verify" => {
+                // Accepted, not yet honoured.
+            }
             "limit_rate" | "limit_rate_after" | "sendfile" | "tcp_nopush" | "tcp_nodelay"
             | "keepalive_timeout" | "keepalive_requests" | "server_tokens" | "default_type"
-            | "gzip_types" | "gzip_min_length" | "gzip_comp_level" | "gzip_vary" | "charset"
+            | "charset"
             | "merge_slashes" | "absolute_redirect" | "server_name_in_redirect"
             | "port_in_redirect" | "log_not_found" | "open_file_cache" | "etag" | "msie_padding" => {
                 // Accepted at this scope but not yet plumbed through: handled at
@@ -475,7 +808,6 @@ impl Builder {
         let mut keepalive = http_keepalive;
         let mut tokens = http_tokens;
         let mut access_log_off = false;
-        let mut error_pages = std::mem::take(&mut default_loc.error_pages);
 
         for child in block {
             match child.name.as_str() {
@@ -543,9 +875,7 @@ impl Builder {
                     }
                 }
                 "error_page" => {
-                    if self.apply_loc(child, &mut default_loc)? {
-                        error_pages = std::mem::take(&mut default_loc.error_pages);
-                    }
+                    self.apply_loc(child, &mut default_loc)?;
                 }
                 _ => {
                     if !self.apply_loc(child, &mut default_loc)? {
@@ -555,7 +885,6 @@ impl Builder {
             }
         }
 
-        default_loc.error_pages = error_pages.clone();
 
         let mut regex_names = Vec::new();
         for n in &names {
@@ -576,12 +905,12 @@ impl Builder {
             Server {
                 idx: index,
                 names,
+                error_pages: default_loc.error_pages.clone(),
                 default_loc,
                 locations,
                 access_logs,
                 keepalive_timeout: keepalive,
                 server_tokens: tokens,
-                error_pages,
                 access_log_off,
                 regex_names,
             },
@@ -669,6 +998,7 @@ pub fn build(
         server_tokens: true,
         client_max_body_size: DEFAULT_CLIENT_MAX_BODY,
         default_loc: LocCfg::new(prefix.to_path_buf()),
+        upstreams: Vec::new(),
         default_access_logs: vec![AccessLog {
             path: prefix.join("logs/access.log"),
             format: "combined".to_string(),
@@ -679,6 +1009,7 @@ pub fn build(
     // ---- http-level: globals first, then servers -------------------------
     let mut server_dirs: Vec<Directive> = Vec::new();
     let mut http_access_log_set = false;
+    let mut upstream_index: HashMap<String, usize> = HashMap::new();
 
     for d in &http_roots {
         match d.name.as_str() {
@@ -729,6 +1060,10 @@ pub fn build(
                 let v = d.args.first().cloned().unwrap_or_default();
                 http.gzip = parse_on_off(&v)
                     .ok_or_else(|| sem(&d.file, d.line, "invalid gzip value"))?;
+                b.apply_loc(d, &mut http.default_loc)?;
+            }
+            "gzip_min_length" | "gzip_comp_level" | "gzip_types" | "gzip_vary" => {
+                b.apply_loc(d, &mut http.default_loc)?;
             }
             "server_tokens" => {
                 let v = d.args.first().cloned().unwrap_or_default();
@@ -778,12 +1113,21 @@ pub fn build(
             "root" | "index" | "autoindex" | "add_header" | "error_page" | "expires" => {
                 b.apply_loc(d, &mut http.default_loc)?;
             }
-            "location" | "if" | "map" | "upstream" | "resolver" | "geo" | "split_clients"
+            "upstream" => {
+                let mut up = parse_upstream(d)?;
+                if http.upstreams.iter().any(|u| u.name == up.name) {
+                    return Err(sem(&d.file, d.line, format!("duplicate upstream \"{}\"", up.name)));
+                }
+                // preserve declaration order for stable round-robin indices
+                up.name = up.name.clone();
+                upstream_index.insert(up.name.clone(), http.upstreams.len());
+                http.upstreams.push(up);
+            }
+            "location" | "if" | "map" | "resolver" | "geo" | "split_clients"
             | "limit_req_zone" | "limit_conn_zone" | "proxy_cache_path" | "charset"
-            | "gzip_types" | "gzip_min_length" | "gzip_comp_level" | "gzip_vary"
             | "log_format_escape" | "types_hash_max_size" | "server_names_hash_bucket_size"
             | "open_file_cache" | "access_log_off" | "default_type_off" => {
-                if d.name == "upstream" || d.name == "map" || d.name == "limit_req_zone"
+                if d.name == "map" || d.name == "limit_req_zone"
                     || d.name == "proxy_cache_path" || d.name == "geo" || d.name == "split_clients"
                 {
                     b.warn(d, format!("directive \"{}\" is not implemented yet; ignored", d.name));
@@ -824,6 +1168,8 @@ pub fn build(
             }
         }
     }
+
+    resolve_proxy_upstreams(&mut http)?;
 
     for (idx, listens) in listens_by_server {
         for (addr, is_default) in listens {

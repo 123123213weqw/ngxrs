@@ -5,7 +5,10 @@ pub mod parser;
 pub mod typed;
 
 pub use parser::{ConfigError, Directive};
-pub use typed::{AccessLog, Config, Http, ListenGroup, LocCfg, Match, Server};
+pub use typed::{
+    AccessLog, Config, Http, LbMethod, ListenGroup, LocCfg, Match, ProxyPass, ProxyTarget, Server,
+    Upstream, UpstreamServer,
+};
 
 use std::path::{Path, PathBuf};
 

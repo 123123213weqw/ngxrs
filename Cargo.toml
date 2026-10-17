@@ -11,6 +11,7 @@ libc = "0.2"
 memchr = "2.7"
 socket2 = { version = "0.5", features = ["all"] }
 regex = "1.11"
+flate2 = "1.0"
 
 [profile.release]
 opt-level = 3

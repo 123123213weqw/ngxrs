@@ -57,6 +57,9 @@ pub fn serve(cfg: Config) -> io::Result<()> {
         threads.push(handle);
     }
 
+    crate::proxy::init(&cfg.http);
+    crate::proxy::init_keepalive(&cfg.http);
+
     eprintln!(
         "ngxrs: started {workers} workers, prefix {}",
         cfg.prefix.display()

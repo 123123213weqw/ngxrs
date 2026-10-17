@@ -1,0 +1,223 @@
+//! `gzip` response filter: Accept-Encoding negotiation, Content-Length rewrite,
+//! and a per-worker cache of compressed bodies keyed by (path, mtime, size).
+
+use std::collections::HashMap;
+use std::io::{Read, Write};
+
+use flate2::write::GzEncoder;
+use flate2::Compression;
+
+use crate::config::{Http, LocCfg};
+use crate::http::request::Request;
+use crate::http::{Body, Response};
+
+/// Bodies above this size are streamed uncompressed (in-memory compression of
+/// huge files would cost more than it saves).
+const MAX_INLINE: u64 = 8 * 1024 * 1024;
+const CACHE_ENTRIES: usize = 128;
+const CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+thread_local! {
+    static CACHE: std::cell::RefCell<Cache> = std::cell::RefCell::new(Cache::default());
+}
+
+#[derive(Default)]
+struct Cache {
+    map: HashMap<(String, i64, u64, u32), std::sync::Arc<Vec<u8>>>,
+    total: usize,
+}
+
+fn cache_get(key: &(String, i64, u64, u32)) -> Option<std::sync::Arc<Vec<u8>>> {
+    CACHE.with(|c| c.borrow().map.get(key).cloned())
+}
+
+fn cache_put(key: (String, i64, u64, u32), value: std::sync::Arc<Vec<u8>>) {
+    CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.map.len() >= CACHE_ENTRIES || c.total + value.len() > CACHE_BYTES {
+            c.map.clear();
+            c.total = 0;
+        }
+        c.total += value.len();
+        c.map.insert(key, value);
+    });
+}
+
+fn accepts_gzip(req: &Request) -> bool {
+    let Some(ae) = req.headers.get("accept-encoding") else {
+        return false;
+    };
+    for part in ae.split(',') {
+        let mut bits = part.trim().split(';');
+        let coding = bits.next().unwrap_or("").trim();
+        if !coding.eq_ignore_ascii_case("gzip") && coding != "*" {
+            continue;
+        }
+        let mut q = 1.0f32;
+        for p in bits {
+            if let Some(v) = p.trim().strip_prefix("q=") {
+                q = v.parse().unwrap_or(1.0);
+            }
+        }
+        if q > 0.0 {
+            return true;
+        }
+    }
+    false
+}
+
+fn compressible(ctype: &str, loc: &LocCfg) -> bool {
+    let base = ctype.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    if base == "text/html" {
+        return true;
+    }
+    loc.gzip_types
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case(&base) || t == "*")
+}
+
+fn find_header(raw: &[u8], name: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i + name.len() < raw.len() {
+        if raw[i..].starts_with(name)
+            && (i == 0 || raw[i - 1] == b'\n')
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn header_value<'a>(raw: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    let start = find_header(raw, name)?;
+    let rest = &raw[start + name.len()..];
+    let end = memchr::memchr(b'\r', rest)?;
+    Some(&rest[..end])
+}
+
+fn drop_header(raw: &mut Vec<u8>, name: &[u8]) {
+    while let Some(pos) = find_header(raw, name) {
+        let end = memchr::memchr(b'\n', &raw[pos..]).map(|e| pos + e + 1).unwrap_or(raw.len());
+        raw.drain(pos..end);
+    }
+}
+
+pub fn maybe_compress(req: &Request, resp: Response, loc: &LocCfg, http: &Http) -> Response {
+    if !loc.gzip || resp.status != 200 {
+        return resp;
+    }
+    if !accepts_gzip(req) {
+        return resp;
+    }
+    if req.headers.get("range").is_some() {
+        return resp;
+    }
+    if find_header(&resp.raw, b"Content-Encoding:").is_some() {
+        return resp;
+    }
+    let ctype = header_value(&resp.raw, b"Content-Type:")
+        .map(|v| String::from_utf8_lossy(v).trim().to_string())
+        .unwrap_or_else(|| http.default_type.clone());
+    if !compressible(&ctype, loc) {
+        return resp;
+    }
+
+    let level = loc.gzip_comp_level.clamp(1, 9) as u32;
+    let min_len = loc.gzip_min_length;
+
+    let (mut raw, body) = (resp.raw, resp.body);
+    let compressed: Option<Vec<u8>> = match &body {
+        Body::Bytes(b) => {
+            if b.len() as u64 >= min_len {
+                Some(gz(b, level))
+            } else {
+                None
+            }
+        }
+        Body::File { file, offset, len } => {
+            if *len >= min_len && *len <= MAX_INLINE {
+                let etag = header_value(&raw, b"ETag:")
+                    .map(|v| String::from_utf8_lossy(v).trim().to_string())
+                    .unwrap_or_default();
+                let last_modified = header_value(&raw, b"Last-Modified:")
+                    .map(|v| String::from_utf8_lossy(v).trim().to_string())
+                    .unwrap_or_default();
+                let key = (format!("{etag}|{last_modified}"), 0, *len, level);
+                if let Some(hit) = cache_get(&key) {
+                    Some(hit.as_ref().clone())
+                } else {
+                    use std::os::unix::fs::FileExt;
+                    let mut buf = vec![0u8; *len as usize];
+                    let mut read = 0usize;
+                    while read < buf.len() {
+                        match file.read_at(&mut buf[read..], offset + read as u64) {
+                            Ok(0) => break,
+                            Ok(n) => read += n,
+                            Err(_) => break,
+                        }
+                    }
+                    if read == 0 {
+                        None
+                    } else {
+                        let out = std::sync::Arc::new(gz(&buf[..read], level));
+                        cache_put(key, out.clone());
+                        Some(out.as_ref().clone())
+                    }
+                }
+            } else {
+                None
+            }
+        }
+        Body::Empty => None,
+    };
+
+    let Some(payload) = compressed else {
+        return Response {
+            status: resp.status,
+            headers: resp.headers,
+            raw,
+            explicit_len: resp.explicit_len,
+            no_error_page: resp.no_error_page,
+            body,
+        };
+    };
+
+    drop_header(&mut raw, b"Content-Length:");
+    drop_header(&mut raw, b"ETag:");
+    drop_header(&mut raw, b"Accept-Ranges:");
+    raw.extend_from_slice(b"Content-Encoding: gzip\r\nContent-Length: ");
+    raw.extend_from_slice(payload.len().to_string().as_bytes());
+    raw.extend_from_slice(b"\r\n");
+    if loc.gzip_vary {
+        raw.extend_from_slice(b"Vary: Accept-Encoding\r\n");
+    }
+
+    Response {
+        status: resp.status,
+        headers: resp.headers,
+        raw,
+        explicit_len: true,
+        no_error_page: resp.no_error_page,
+        body: Body::Bytes(payload),
+    }
+}
+
+fn gz(data: &[u8], level: u32) -> Vec<u8> {
+    let mut enc = GzEncoder::new(Vec::with_capacity(data.len() / 3 + 32), Compression::new(level));
+    if enc.write_all(data).is_err() {
+        return Vec::new();
+    }
+    match enc.finish() {
+        Ok(v) => v,
+        Err(_) => Vec::new(),
+    }
+}
+
+#[allow(dead_code)]
+fn gunzip(data: &[u8]) -> Option<Vec<u8>> {
+    let mut d = flate2::read::GzDecoder::new(data);
+    let mut out = Vec::new();
+    d.read_to_end(&mut out).ok()?;
+    Some(out)
+}

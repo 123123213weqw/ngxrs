@@ -119,6 +119,9 @@ pub struct LocCfg {
     /// not extends, the inherited list).
     pub cookie_domains_set: bool,
     pub cookie_paths_set: bool,
+    /// `proxy_cookie_flags` entries. `Some(vec![])` means `off`.
+    pub proxy_cookie_flags: Option<Vec<crate::cookie::CookieFlags>>,
+    pub cookie_flags_set: bool,
     pub proxy_cache_ignore: crate::cache::Ignore,
     /// `proxy_cache_convert_head`, on by default like nginx.
     pub proxy_cache_convert_head: bool,
@@ -194,6 +197,8 @@ impl LocCfg {
             proxy_cookie_paths: None,
             cookie_domains_set: false,
             cookie_paths_set: false,
+            proxy_cookie_flags: None,
+            cookie_flags_set: false,
             proxy_cache_ignore: crate::cache::Ignore::default(),
             proxy_cache_convert_head: true,
             proxy_cache_lock: false,
@@ -1509,6 +1514,27 @@ impl Builder {
                     }
                 }
             }
+            "proxy_cookie_flags" => {
+                if !cfg.cookie_flags_set {
+                    cfg.proxy_cookie_flags = Some(Vec::new());
+                    cfg.cookie_flags_set = true;
+                }
+                let list = cfg.proxy_cookie_flags.get_or_insert_with(Vec::new);
+                if d.args.len() == 1 && d.args[0] == "off" {
+                    list.clear();
+                } else if let Some((name, rest)) = d.args.split_first() {
+                    match crate::cookie::CookieFlags::parse(name, rest.to_vec()) {
+                        Some(f) => list.push(f),
+                        None => {
+                            return Err(sem(
+                                &d.file,
+                                d.line,
+                                "invalid pattern in proxy_cookie_flags",
+                            ))
+                        }
+                    }
+                }
+            }
             "proxy_cookie_domain" | "proxy_cookie_path" => {
                 let is_domain = d.name == "proxy_cookie_domain";
                 let (slot, fresh) = if is_domain {
@@ -1673,6 +1699,7 @@ impl Builder {
         // Cookie rewrites are replaced, not inherited-into.
         cfg.cookie_domains_set = false;
         cfg.cookie_paths_set = false;
+        cfg.cookie_flags_set = false;
         cfg.prefix_len = match &matcher {
             Match::Exact(s) | Match::Prefix(s) | Match::PrefixNoRegex(s) => s.len(),
             _ => 0,

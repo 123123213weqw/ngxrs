@@ -941,11 +941,12 @@ struct CacheCtx<'a> {
 fn apply_cookie_rules(raw: &mut Vec<u8>, loc: &LocCfg, vars: &crate::http::ServerVars<'_>) {
     let domains = loc.proxy_cookie_domains.as_deref().unwrap_or(&[]);
     let paths = loc.proxy_cookie_paths.as_deref().unwrap_or(&[]);
-    if domains.is_empty() && paths.is_empty() {
+    let flags = loc.proxy_cookie_flags.as_deref().unwrap_or(&[]);
+    if domains.is_empty() && paths.is_empty() && flags.is_empty() {
         return;
     }
     let expand = |s: &str| vars.expand(s);
-    *raw = crate::cookie::rewrite_set_cookie(raw, domains, paths, &expand);
+    *raw = crate::cookie::rewrite_set_cookie(raw, domains, paths, flags, &expand);
 }
 
 fn build_upstream_head(

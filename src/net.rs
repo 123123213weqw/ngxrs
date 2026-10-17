@@ -151,11 +151,12 @@ pub fn serve(cfg: Config) -> io::Result<()> {
     }
 
     let ctx = Arc::new(Ctx {
-        config: cfg.clone(),
+        config: std::sync::RwLock::new(cfg.clone()),
         logger,
         tls: Arc::new(tls_by_group),
     });
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (shutdown_tx, _shutdown_rx_probe) = watch::channel(false);
+    let shutdown_rx = _shutdown_rx_probe.clone();
     let stopping = Arc::new(AtomicBool::new(false));
     let mut threads = Vec::with_capacity(workers + 1);
     let shared = accept_mode() == "shared";
@@ -279,13 +280,31 @@ pub fn serve(cfg: Config) -> io::Result<()> {
         );
     }
 
-    block_on_shutdown();
+    let reloader = Arc::new(Reloader {
+        ctx: ctx.clone(),
+        conf: cfg.conf_path.clone(),
+        prefix: cfg.prefix.clone(),
+    });
+    block_on_shutdown(Some(reloader));
 
     eprintln!("ngxrs: shutting down");
+    // Stop accepting first, then let in-flight requests finish (nginx's
+    // graceful shutdown). Bounded so a stuck client cannot block exit.
     stopping.store(true, Ordering::SeqCst);
     let _ = shutdown_tx.send(true);
     for t in threads {
         let _ = t.join();
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while crate::http::ACTIVE_CONNS.load(Ordering::Relaxed) > 0
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let left = crate::http::ACTIVE_CONNS.load(Ordering::Relaxed);
+    if left > 0 {
+        eprintln!("ngxrs: {left} connection(s) still active after 30s, exiting anyway");
     }
     if let Some(tx) = stream_tx {
         let _ = tx.send(true);
@@ -333,8 +352,9 @@ fn worker_main(
     };
 
     rt.block_on(async move {
+        let cfg = ctx.cfg();
         let mut listeners: Vec<(Arc<TcpListener>, usize)> = Vec::new();
-        for (gi, group) in ctx.config.http.groups.iter().enumerate() {
+        for (gi, group) in cfg.http.groups.iter().enumerate() {
             match bind(group.addr, true) {
                 Ok(l) => {
                     if wid == 0 {
@@ -373,6 +393,16 @@ fn worker_main(
         }
         for t in tasks {
             let _ = t.await;
+        }
+
+        // Graceful shutdown: the accept loops have stopped, but requests that
+        // are already in flight keep running. Dropping the runtime here would
+        // cancel them mid-response, so wait for the counter to drain.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while crate::http::ACTIVE_CONNS.load(Ordering::Relaxed) > 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     });
 }
@@ -418,19 +448,21 @@ async fn accept_loop(
                         let _ = stream.set_nodelay(true);
                         let ctx = ctx.clone();
                         tokio::spawn(async move {
+                            // Snapshot once: a reload swaps the Arc, and this
+                            // connection keeps the configuration it started on.
+                            let cfg = ctx.cfg();
                             let tls = ctx.tls.get(group_idx).cloned().flatten();
                             match tls {
                                 None => {
                                     let conn = Conn::new(
                                         Stream::Plain(stream),
                                         peer,
-                                        ctx.config.http.tcp_nopush,
+                                        cfg.http.tcp_nopush,
                                     );
-                                    let group = &ctx.config.http.groups[group_idx];
-                                    http::handle_conn(conn, group, &ctx).await;
+                                    http::handle_conn(conn, cfg, group_idx, &ctx).await;
                                 }
-                                Some(cfg) => {
-                                    let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+                                Some(tls_cfg) => {
+                                    let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
                                     let tls_stream = match tokio::time::timeout(
                                         Duration::from_secs(10),
                                         acceptor.accept(stream),
@@ -442,14 +474,14 @@ async fn accept_loop(
                                         _ => return,
                                     };
                                     if tls_stream.get_ref().1.alpn_protocol() == Some(b"h2") {
-                                        let group = &ctx.config.http.groups[group_idx];
+                                        let group = &cfg.http.groups[group_idx];
                                         let _ = peer;
                                         crate::h2server::serve(
                                             tls_stream,
                                             &group.servers,
                                             group.default_server,
-                                            &ctx.config.http,
-                                            group_uses_tokens(&ctx, group_idx),
+                                            &cfg.http,
+                                            cfg.http.server(group.default_server).server_tokens,
                                         )
                                         .await;
                                         return;
@@ -457,10 +489,9 @@ async fn accept_loop(
                                     let conn = Conn::new(
                                         Stream::Tls(Box::new(tls_stream)),
                                         peer,
-                                        ctx.config.http.tcp_nopush,
+                                        cfg.http.tcp_nopush,
                                     );
-                                    let group = &ctx.config.http.groups[group_idx];
-                                    http::handle_conn(conn, group, &ctx).await;
+                                    http::handle_conn(conn, cfg, group_idx, &ctx).await;
                                 }
                             }
                         });
@@ -475,7 +506,41 @@ async fn accept_loop(
     }
 }
 
-fn block_on_shutdown() {
+/// What a SIGHUP needs in order to re-read the configuration.
+struct Reloader {
+    ctx: Arc<Ctx>,
+    conf: std::path::PathBuf,
+    prefix: std::path::PathBuf,
+}
+
+impl Reloader {
+    /// Re-parse the configuration and install it. Listeners are left alone:
+    /// nginx also keeps listening sockets across a reload unless `listen`
+    /// changed, and rebuilding them here would drop live connections.
+    fn reload(&self) {
+        crate::log::error_log("notice", "reconfiguring");
+        match crate::config::load_full(&self.conf, Some(&self.prefix)) {
+            Ok(mut new_cfg) => {
+                // Keep the original pid/daemon settings even if the file
+                // changed its mind: we are already running.
+                let old = self.ctx.cfg();
+                new_cfg.pid = old.pid.clone();
+                new_cfg.daemon = old.daemon;
+                self.ctx.set_cfg(Arc::new(new_cfg));
+                crate::log::error_log("notice", "reconfiguring done");
+            }
+            Err(e) => {
+                // nginx keeps the old configuration and logs the failure.
+                crate::log::error_log(
+                    "emerg",
+                    &format!("reconfiguring failed, keeping old config: {e}"),
+                );
+            }
+        }
+    }
+}
+
+fn block_on_shutdown(reloader: Option<Arc<Reloader>>) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -516,10 +581,27 @@ fn block_on_shutdown() {
                     return;
                 }
             };
-            tokio::select! {
-                _ = term.recv() => {}
-                _ = int.recv() => {}
-                _ = quit.recv() => {}
+            // SIGHUP reloads the configuration (`nginx -s reload`).
+            let mut hup = signal(SignalKind::hangup()).ok();
+            loop {
+                tokio::select! {
+                    _ = term.recv() => return,
+                    _ = int.recv() => return,
+                    _ = quit.recv() => return,
+                    _ = async {
+                        match hup.as_mut() {
+                            Some(h) => {
+                                h.recv().await;
+                            }
+                            // No SIGHUP support: never resolve.
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {
+                        if let Some(r) = &reloader {
+                            r.reload();
+                        }
+                    }
+                }
             }
         }
         #[cfg(not(unix))]
@@ -666,19 +748,19 @@ fn shared_worker_main(
                     let _ = stream.set_nodelay(true);
                     let ctx = ctx.clone();
                     tokio::spawn(async move {
+                        let cfg = ctx.cfg();
                         let tls = ctx.tls.get(h.group).cloned().flatten();
                         match tls {
                             None => {
                                 let conn = Conn::new(
                                     Stream::Plain(stream),
                                     h.peer,
-                                    ctx.config.http.tcp_nopush,
+                                    cfg.http.tcp_nopush,
                                 );
-                                let group = &ctx.config.http.groups[h.group];
-                                http::handle_conn(conn, group, &ctx).await;
+                                http::handle_conn(conn, cfg, h.group, &ctx).await;
                             }
-                            Some(cfg) => {
-                                let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+                            Some(tls_cfg) => {
+                                let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
                                 let tls_stream = match tokio::time::timeout(
                                     Duration::from_secs(10),
                                     acceptor.accept(stream),
@@ -689,13 +771,13 @@ fn shared_worker_main(
                                     _ => return,
                                 };
                                 if tls_stream.get_ref().1.alpn_protocol() == Some(b"h2") {
-                                    let group = &ctx.config.http.groups[h.group];
+                                    let group = &cfg.http.groups[h.group];
                                     crate::h2server::serve(
                                         tls_stream,
                                         &group.servers,
                                         group.default_server,
-                                        &ctx.config.http,
-                                        group_uses_tokens(&ctx, h.group),
+                                        &cfg.http,
+                                        cfg.http.server(group.default_server).server_tokens,
                                     )
                                     .await;
                                     return;
@@ -703,10 +785,9 @@ fn shared_worker_main(
                                 let conn = Conn::new(
                                     Stream::Tls(Box::new(tls_stream)),
                                     h.peer,
-                                    ctx.config.http.tcp_nopush,
+                                    cfg.http.tcp_nopush,
                                 );
-                                let group = &ctx.config.http.groups[h.group];
-                                http::handle_conn(conn, group, &ctx).await;
+                                http::handle_conn(conn, cfg, h.group, &ctx).await;
                             }
                         }
                     });
@@ -717,7 +798,4 @@ fn shared_worker_main(
 }
 
 
-fn group_uses_tokens(ctx: &Ctx, group: usize) -> bool {
-    let g = &ctx.config.http.groups[group];
-    ctx.config.http.server(g.default_server).server_tokens
-}
+

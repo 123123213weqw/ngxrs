@@ -2094,6 +2094,10 @@ pub fn build(
 
     let stream = build_stream(&stream_dirs, &mut b)?;
 
+    // nginx defaults to `<prefix>/logs/nginx.pid` and `<prefix>/logs/error.log`.
+    let pid = Some(pid.unwrap_or_else(|| prefix.join("logs/nginx.pid")));
+    let error_log = Some(error_log.unwrap_or_else(|| prefix.join("logs/error.log")));
+
     Ok(Config {
         prefix: prefix.to_path_buf(),
         conf_path,

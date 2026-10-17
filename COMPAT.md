@@ -192,22 +192,21 @@ HTTP/1.1 keepalive 响应会一直阻塞到 8s 超时并返回 `undef`。**真 n
 `bench/nginx_tests.sh` 是逐文件对比；`bench/ntscan.sh` 自动扫 http/proxy/upstream/
 range/fastcgi/scgi/uwsgi/stream 各类用例，只报告「nginx 过而 ngxrs 不过」的真缺陷。
 
-最近一次全扫（27 个可运行文件）：**20 个与 nginx 断言数完全一致**，1 个更好，
-6 个更差；剩余差距 **19 条断言**（上一轮 25 条）。
+最近一次全扫（27 个可运行文件）：**22 个与 nginx 断言数完全一致**，
+6 个更差；剩余差距 **11 条断言**（第八轮 20 条 / 第九轮 17 条）。
 
 完全一致的用例（断言数与 nginx 相同）：`http_location` 16/16、`http_uri` 21/21、
 `http_server_name` 22/22、`http_method` 4/6、`http_try_files` 12/12、
 `http_error_page` 11/11、`http_include` 7/7、`http_absolute_redirect` 25/25、
-`http_header_buffers` 10/12、`http_expect_100_continue` 5/7、`fastcgi_body` 7/7。
+`http_header_buffers` 10/12、`http_expect_100_continue` 5/7、`fastcgi_body` 7/7、
+`http_variables` 9/9、`proxy_available` 4/4、`http_headers_multi` 45/49。
 
-### 剩余差距（19 条断言）
+### 剩余差距（11 条断言）
 
 | 用例 | 差 | 缺什么 |
 |---|---|---|
-| http_variables.t | 6 | `$limit_rate` 的特殊 set/get handler、`expires`、含 `$upstream_http_*` 的日志 |
-| proxy_bind.t | 3 | `proxy_bind` 源地址绑定 |
+| proxy_bind.t | 3 | `proxy_bind` 源地址绑定（含 `off`/变量/端口形式） |
 | http_keepalive.t | 3 | `keepalive_time` 依赖 nginx `ngx_current_msec` 的缓存计时 |
-| proxy_available.t | 2 | 需要配置 reload（SIGHUP 重读） |
 | http_headers_multi.t | 4 | `$sent_trailer_*`、非法 `Content-Type` 的 `$content_type`、无 Host 时 `$host` 取 server_name |
 | http_keepalive_shutdown.t | 1 | 关闭时的连接处理 |
 
@@ -215,6 +214,17 @@ range/fastcgi/scgi/uwsgi/stream 各类用例，只报告「nginx 过而 ngxrs �
 
 | 缺陷 | 影响 |
 |---|---|
+| **配置热重载（SIGHUP）完全缺失** | `nginx -s reload` 无效；现已实现：解析新配置、原子替换 `Arc<Config>`，在跑连接继续用旧快照 |
+| **优雅停机不等在途请求** | SIGQUIT/stop 会打断正在流式输出的响应；现先停 accept 再等 `ACTIVE_CONNS` 归零（30s 上限） |
+| **上游 close-delimited 响应未重分帧** | 无 Content-Length 也无 TE 的上游响应原样转发，客户端无法判断结束；现转为 chunked |
+| **上游响应不认 LF-only 行结束符** | 简单后端（Perl heredoc）用 LF，我们找不到头就 502 |
+| `set` 变量传不到 `add_header` | `set $limit_rate 40k; add_header X-Rate $limit_rate;` 取不到值 |
+| `$limit_rate` 未按速率解析 | 返回 `40k` 而不是 `40960`；非法值应为 `0` |
+| access_log 缺 `$uri` / `$sent_http_*` | 变量为空；重复响应头未逗号合并 |
+| access_log 缺「变量未命中写 `-`」 | nginx 对 not-found 变量输出 `-` |
+| 请求目标非法时不写 access log | |
+| `expires` 未实现 | `epoch`/`max`/相对时间，且必须**替换**上游的 `Cache-Control` |
+| ssl/`log_format` 之外的：nginx 默认 pid 与 error_log 路径 | 现默认 `<prefix>/logs/{nginx.pid,error.log}` |
 | **keepalive 连接缓冲未清空** | `consume` 只把 start/end 归零，`buf` 仍留着上一个请求的字节；下一个请求会重新解析到旧数据（`http_header_buffers.t` 6/12 → 10/12） |
 | HTTP/2 上的反向代理返回 502 | 新增 socket-free 的 `proxy::fetch`，h2 请求现在能代理 |
 | `Expect: 100-continue` 从未响应 | 客户端等 100 才发 body，直接挂住；现按 RFC 只对 HTTP/1.1 发送 |

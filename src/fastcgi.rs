@@ -450,6 +450,7 @@ pub async fn handle(
         status,
         bytes,
         close: false,
+        sent: Vec::new(),
     }))
 }
 
@@ -472,6 +473,7 @@ async fn respond(conn: &mut Conn, status: u16, tokens: bool, keepalive: bool) ->
         status,
         bytes,
         close: false,
+        sent: Vec::new(),
     })
 }
 

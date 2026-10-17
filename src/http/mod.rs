@@ -17,7 +17,10 @@ use crate::util::{self, reason};
 use request::{Method, Request};
 
 pub struct Ctx {
-    pub config: Arc<Config>,
+    /// Swappable configuration. `SIGHUP` replaces the `Arc`; connections that
+    /// are already running keep the snapshot they started with (nginx's
+    /// old-worker/new-worker behaviour).
+    pub config: std::sync::RwLock<Arc<Config>>,
     pub logger: Arc<Logger>,
     /// One TLS configuration per listen group (`None` for plain HTTP).
     pub tls: Arc<Vec<Option<Arc<rustls::ServerConfig>>>>,
@@ -96,6 +99,8 @@ pub struct Outcome {
     pub status: u16,
     pub bytes: u64,
     pub close: bool,
+    /// Response headers as sent, for `$sent_http_*` in the access log.
+    pub sent: Vec<(String, String)>,
 }
 
 /// Per-connection counters that nginx exposes as `$connection_requests` and
@@ -116,8 +121,45 @@ thread_local! {
     static NO_IDLE_TIMER: bool = std::env::var_os("NGXRS_NO_IDLE_TIMER").is_some();
 }
 
-pub async fn handle_conn(mut conn: Conn, group: &ListenGroup, ctx: &Ctx) {
-    let http = &ctx.config.http;
+/// Number of connections currently being served. Graceful shutdown waits for
+/// this to reach zero (nginx's `worker_shutdown_timeout` behaviour).
+pub static ACTIVE_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// RAII guard so the counter stays balanced even on early return.
+pub struct ActiveGuard;
+
+impl ActiveGuard {
+    pub fn enter() -> Self {
+        ACTIVE_CONNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ActiveGuard
+    }
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        ACTIVE_CONNS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Ctx {
+    /// Cheap snapshot of the current configuration.
+    pub fn cfg(&self) -> Arc<Config> {
+        self.config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Install a new configuration (SIGHUP).
+    pub fn set_cfg(&self, new: Arc<Config>) {
+        *self.config.write().unwrap_or_else(|e| e.into_inner()) = new;
+    }
+}
+
+pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx: &Ctx) {
+    let _active = ActiveGuard::enter();
+    let http = &cfg.http;
+    let group = &http.groups[group_idx];
     let first_server = http.server(group.default_server);
     let keepalive_timeout = first_server.keepalive_timeout;
     let mut served: u64 = 0;
@@ -223,6 +265,21 @@ pub async fn handle_conn(mut conn: Conn, group: &ListenGroup, ctx: &Ctx) {
             Err(_) => {
                 let tokens = http.server(group.default_server).server_tokens;
                 let _ = send_error(&mut conn, 400, tokens, false, false).await;
+                // nginx still writes an access-log line, with `$uri` empty.
+                let srv = http.server(group.default_server);
+                log_access(
+                    ctx,
+                    group,
+                    srv,
+                    &req,
+                    "",
+                    "",
+                    400,
+                    0,
+                    std::time::Duration::ZERO,
+                    conn.peer,
+                    &[],
+                );
                 break;
             }
         };
@@ -290,12 +347,14 @@ pub async fn handle_conn(mut conn: Conn, group: &ListenGroup, ctx: &Ctx) {
         .await;
         let elapsed = started.elapsed().unwrap_or_default();
 
-        let (status, bytes, close) = match outcome {
-            Ok(o) => (o.status, o.bytes, o.close),
-            Err(_e) => (499, 0, true),
+        let (status, bytes, close, sent) = match outcome {
+            Ok(o) => (o.status, o.bytes, o.close, o.sent),
+            Err(_e) => (499, 0, true, Vec::new()),
         };
 
-        log_access(ctx, group, server, &req, &path, &query, status, bytes, elapsed, conn.peer);
+        log_access(
+            ctx, group, server, &req, &path, &query, status, bytes, elapsed, conn.peer, &sent,
+        );
 
         if close || !req.keepalive || util::force_close(status) || served >= http.keepalive_requests {
             break;
@@ -555,6 +614,21 @@ fn apply_rewrites_parts(
     server: &Server,
     default_type: &str,
 ) -> RewriteOutcome {
+    apply_rewrites_full(req, path, query, sets, ifs, rewrites, server, default_type).0
+}
+
+/// Same, but also returns the variables `set` produced.
+#[allow(clippy::too_many_arguments)]
+fn apply_rewrites_full(
+    req: &Request,
+    path: &str,
+    query: &str,
+    sets: &[(String, String)],
+    ifs: &[crate::config::IfBlock],
+    rewrites: &[crate::config::Rewrite],
+    server: &Server,
+    default_type: &str,
+) -> (RewriteOutcome, std::collections::HashMap<String, String>) {
     let mut uri = path.to_string();
     let mut args = query.to_string();
     let _ = req;
@@ -609,22 +683,22 @@ fn apply_rewrites_parts(
                 Response::bytes(status, &ctype, body.clone().into_bytes())
             };
             resp.no_error_page = true;
-            return RewriteOutcome::Respond(resp);
+            return (RewriteOutcome::Respond(resp), vars);
         }
         for rw in &ifb.rewrites {
             if let Some(out) = apply_one(rw, &mut uri, &mut args) {
-                return out;
+                return (out, vars);
             }
         }
     }
 
     for rw in rewrites {
         if let Some(out) = apply_one(rw, &mut uri, &mut args) {
-            return out;
+            return (out, vars);
         }
     }
     let _ = server;
-    RewriteOutcome::Continue(uri, args)
+    (RewriteOutcome::Continue(uri, args), vars)
 }
 
 /// Apply one rewrite rule; `None` means "keep scanning".
@@ -739,6 +813,101 @@ pub fn split_head(raw: &[u8]) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// Apply the `expires` directive to a rendered header block.
+pub fn apply_expires(raw: &mut Vec<u8>, loc: &LocCfg) {
+    let Some(spec) = &loc.expires else { return };
+    let spec = spec.trim();
+    let (expires_value, cache_control): (String, Option<CacheControl>) = match spec {
+        "off" => (String::new(), None),
+        "epoch" => (
+            "Thu, 01 Jan 1970 00:00:01 GMT".to_string(),
+            Some(CacheControl::Fixed("no-cache")),
+        ),
+        "max" => (
+            "Thu, 31 Dec 2037 23:55:55 GMT".to_string(),
+            Some(CacheControl::Fixed("max-age=315360000")),
+        ),
+        other => {
+            let (neg, body) = match other.strip_prefix('-') {
+                Some(rest) => (true, rest),
+                None => (false, other),
+            };
+            match crate::config::parse_time(body) {
+                Some(d) => {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    let secs = d.as_secs() as i64;
+                    let at = if neg { now - secs } else { now + secs };
+                    let max_age = if neg { 0 } else { secs };
+                    (util::http_date(at), Some(CacheControl::MaxAge(max_age)))
+                }
+                None => (String::new(), None),
+            }
+        }
+    };
+    // nginx's expires *replaces* any Cache-Control the upstream produced.
+    if cache_control.is_some() || !expires_value.is_empty() {
+        let text = String::from_utf8_lossy(raw).to_string();
+        let kept: Vec<&str> = text
+            .split("\r\n")
+            .filter(|line| {
+                !line.is_empty()
+                    && !line.to_ascii_lowercase().starts_with("cache-control:")
+                    && !(cache_control.is_some()
+                        && line.to_ascii_lowercase().starts_with("expires:"))
+            })
+            .collect();
+        let mut rebuilt = Vec::with_capacity(raw.len());
+        for line in kept {
+            rebuilt.extend_from_slice(line.as_bytes());
+            rebuilt.extend_from_slice(b"\r\n");
+        }
+        *raw = rebuilt;
+    }
+
+    if !expires_value.is_empty() {
+        raw.extend_from_slice(b"Expires: ");
+        raw.extend_from_slice(expires_value.as_bytes());
+        raw.extend_from_slice(b"\r\n");
+    }
+    match cache_control {
+        Some(CacheControl::Fixed(v)) => {
+            raw.extend_from_slice(b"Cache-Control: ");
+            raw.extend_from_slice(v.as_bytes());
+            raw.extend_from_slice(b"\r\n");
+        }
+        Some(CacheControl::MaxAge(n)) => {
+            raw.extend_from_slice(b"Cache-Control: max-age=");
+            raw.extend_from_slice(n.to_string().as_bytes());
+            raw.extend_from_slice(b"\r\n");
+        }
+        None => {}
+    }
+}
+
+/// `Cache-Control` value produced by `expires`.
+enum CacheControl {
+    Fixed(&'static str),
+    MaxAge(i64),
+}
+
+/// Parse a nginx rate/size string: `40k` -> 40960, `1m` -> 1048576, junk -> 0.
+fn parse_rate(spec: &str) -> u64 {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return 0;
+    }
+    let (digits, mult) = match spec.as_bytes().last() {
+        Some(b'k') | Some(b'K') => (&spec[..spec.len() - 1], 1024u64),
+        Some(b'm') | Some(b'M') => (&spec[..spec.len() - 1], 1024 * 1024),
+        Some(b'g') | Some(b'G') => (&spec[..spec.len() - 1], 1024 * 1024 * 1024),
+        _ => (spec, 1),
+    };
+    digits.trim().parse::<u64>().map(|n| n * mult).unwrap_or(0)
 }
 
 /// Decode the user part of an HTTP Basic credential.
@@ -1026,6 +1195,12 @@ pub struct ServerVars<'a> {
 
 impl<'a> ServerVars<'a> {
     pub fn get(&self, name: &str) -> String {
+        // `$limit_rate` has its own get handler: the stored string is parsed as
+        // a rate, not returned verbatim.
+        if name == "limit_rate" {
+            let raw = self.custom.get(name).cloned().unwrap_or_default();
+            return parse_rate(&raw).to_string();
+        }
         if let Some(v) = self.custom.get(name) {
             return v.clone();
         }
@@ -1173,8 +1348,9 @@ pub async fn resolve_response(
 /// Result of the rewrite + try_files phase: either a final location, or a
 /// response produced without consulting any content handler.
 pub enum Target<'a> {
-    /// Path, query, location, and whether `rewrite ... break` skipped `return`.
-    Loc(String, String, &'a LocCfg, bool),
+    /// Path, query, location, whether `rewrite ... break` skipped `return`,
+    /// and the variables produced by `set`.
+    Loc(String, String, &'a LocCfg, bool, std::collections::HashMap<String, String>),
     Done(Response),
 }
 
@@ -1218,8 +1394,20 @@ pub fn resolve_target<'a>(
         }
     }
 
+    let mut vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     loop {
-        match apply_rewrites(req, &cur_path, &cur_query, cur_loc, server, &http.default_type) {
+        let (outcome, phase_vars) = apply_rewrites_full(
+            req,
+            &cur_path,
+            &cur_query,
+            &cur_loc.sets,
+            &cur_loc.ifs,
+            &cur_loc.rewrites,
+            server,
+            &http.default_type,
+        );
+        vars.extend(phase_vars);
+        match outcome {
             RewriteOutcome::Respond(r) => return Target::Done(r),
             RewriteOutcome::Continue(p, q) => {
                 cur_path = p;
@@ -1263,7 +1451,7 @@ pub fn resolve_target<'a>(
         }
     }
 
-    Target::Loc(cur_path, cur_query, cur_loc, skip_return)
+    Target::Loc(cur_path, cur_query, cur_loc, skip_return, vars)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1340,7 +1528,7 @@ pub async fn resolve_response_local(
 
     let mut resp = match resolve_target(req, path, query, server, loc, http) {
         Target::Done(r) => r,
-        Target::Loc(p, q, l, skip) => {
+        Target::Loc(p, q, l, skip, set_vars) => {
             return render_resolved_state(
                 req, &p, &q, l, skip, server, http, peer_ip, server_port, captures, state,
                 local_addr,
@@ -1405,7 +1593,7 @@ pub async fn resolve_response_state(
 
     let mut resp = match resolve_target(req, path, query, server, loc, http) {
         Target::Done(r) => r,
-        Target::Loc(p, q, l, skip) => {
+        Target::Loc(p, q, l, skip, set_vars) => {
             return render_resolved_state(
                 req, &p, &q, l, skip, server, http, peer_ip, server_port, captures, state,
                 local_addr,
@@ -1502,7 +1690,30 @@ pub async fn render_resolved_state(
     state: ConnState,
     local_addr: &str,
 ) -> Response {
-    let mut custom: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    render_resolved_vars(
+        req, path, query, loc, skip_return, server, http, peer_ip, server_port, captures, state,
+        local_addr, &std::collections::HashMap::new(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn render_resolved_vars(
+    req: &Request,
+    path: &str,
+    query: &str,
+    loc: &LocCfg,
+    skip_return: bool,
+    server: &Server,
+    http: &Http,
+    peer_ip: &str,
+    server_port: u16,
+    captures: &[(String, String)],
+    state: ConnState,
+    local_addr: &str,
+    set_vars: &std::collections::HashMap<String, String>,
+) -> Response {
+    let mut custom: std::collections::HashMap<String, String> = set_vars.clone();
     for (k, v) in captures {
         custom.insert(k.clone(), v.clone());
     }
@@ -1644,7 +1855,7 @@ async fn finalize_response(
         // `rewrite ^ http://...` inside it produces the redirect.
         let redirected = match resolve_target(req, &cur_path, &cur_query, server, cur_loc, http) {
             Target::Done(r) => r,
-            Target::Loc(p, q, l, _skip) => {
+            Target::Loc(p, q, l, _skip, _set_vars) => {
                 cur_path = p;
                 cur_query = q;
                 let vars = ServerVars {
@@ -1686,6 +1897,8 @@ async fn finalize_response(
     }
 
     let mut out = crate::gzip::maybe_compress(req, std::mem::replace(resp, Response::empty(200)), cur_loc, http);
+
+    apply_expires(&mut out.raw, cur_loc);
 
     if !cur_loc.headers.is_empty() {
         // `$sent_http_*` sees the headers produced so far (nginx evaluates
@@ -1757,16 +1970,16 @@ async fn dispatch(
 
     // Rewrite/try_files may point at a different location; resolve it before
     // choosing a content handler so `/x -> /fallback` can reach a proxy.
-    let (resolved_path, resolved_query, resolved_loc, skip_return, pre) =
+    let (resolved_path, resolved_query, resolved_loc, skip_return, pre, set_vars) =
         match resolve_target(req, path, query, server, loc, http) {
-            Target::Done(r) => (path.to_string(), query.to_string(), loc, false, Some(r)),
-            Target::Loc(p, q, l, skip) => (p, q, l, skip, None),
+            Target::Done(r) => (path.to_string(), query.to_string(), loc, false, Some(r), Default::default()),
+            Target::Loc(p, q, l, skip, set_vars) => (p, q, l, skip, None, set_vars),
         };
     let (path, query, loc) = (resolved_path.as_str(), resolved_query.as_str(), resolved_loc);
 
     // A response produced by `return`/`rewrite` still goes through error_page.
     if let Some(mut r) = pre {
-        let mut custom: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut custom: std::collections::HashMap<String, String> = set_vars.clone();
         for (k, v) in captures {
             custom.insert(k.clone(), v.clone());
         }
@@ -1792,6 +2005,7 @@ async fn dispatch(
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
             return write_redirect(conn, req, resp, loc, listen_port, server.server_tokens, local_addr).await;
         }
+        let sent = split_head(&resp.raw);
         let bytes = write_response_ka(
             conn,
             resp,
@@ -1805,6 +2019,7 @@ async fn dispatch(
             status,
             bytes,
             close: !keepalive_allowed,
+            sent,
         });
     }
 
@@ -1841,7 +2056,7 @@ async fn dispatch(
     }
 
     let peer_ip = conn.peer.ip().to_string();
-    let resp = render_resolved_ctx(
+    let resp = render_resolved_vars(
         req,
         path,
         query,
@@ -1854,12 +2069,14 @@ async fn dispatch(
         captures,
         state,
         local_addr,
+        &set_vars,
     )
     .await;
     let status = resp.status;
     if matches!(status, 301 | 302 | 303 | 307 | 308) {
         return write_redirect(conn, req, resp, loc, listen_port, server.server_tokens, local_addr).await;
     }
+    let sent = split_head(&resp.raw);
     let bytes =
         write_response_ka(conn, resp, keepalive_allowed, server.server_tokens, head_only, ka_header)
             .await?;
@@ -1867,6 +2084,7 @@ async fn dispatch(
         status,
         bytes,
         close: !keepalive_allowed,
+        sent,
     })
 }
 
@@ -2027,6 +2245,7 @@ async fn write_redirect(
         status,
         bytes,
         close: false,
+        sent: Vec::new(),
     })
 }
 
@@ -2100,6 +2319,7 @@ async fn send_error_into(
         status,
         bytes,
         close: false,
+        sent: Vec::new(),
     })
 }
 
@@ -2534,6 +2754,7 @@ fn log_access(
     bytes: u64,
     _elapsed: Duration,
     peer: std::net::SocketAddr,
+    sent: &[(String, String)],
 ) {
     if server.access_logs.is_empty() {
         return;
@@ -2562,7 +2783,25 @@ fn log_access(
     let server_name = server.names.first().map(|s| s.as_str()).unwrap_or("");
     let peer = peer.ip().to_string();
 
-    let vars: &[(&str, &str)] = &[
+    // `$sent_http_*` values, resolved up front so the slice can borrow them.
+    // Repeated headers are comma-joined, like nginx's `$sent_http_*`.
+    let mut sent_map: Vec<(String, String)> = Vec::new();
+    for (k, v) in sent {
+        let name = format!("sent_http_{}", k.to_ascii_lowercase().replace('-', "_"));
+        match sent_map.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, existing)) => {
+                existing.push_str(", ");
+                existing.push_str(v);
+            }
+            None => sent_map.push((name, v.clone())),
+        }
+    }
+    let sent_refs: Vec<(&str, &str)> = sent_map
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    let mut vars: Vec<(&str, &str)> = vec![
         ("remote_addr", &peer),
         ("remote_port", "0"),
         ("remote_user", "-"),
@@ -2571,6 +2810,7 @@ fn log_access(
         ("request_uri", &req.raw_target),
         ("request_method", req.method.as_str()),
         ("document_uri", path),
+        ("uri", path),
         ("args", query),
         ("status", &status_s),
         ("body_bytes_sent", &bytes_s),
@@ -2581,6 +2821,9 @@ fn log_access(
         ("server_port", &port_s),
         ("scheme", "http"),
     ];
+    vars.extend(sent_refs);
+
+    let vars = &vars[..];
 
     for log in &server.access_logs {
         let line = expand_log(&log.format, vars, now);
@@ -2611,6 +2854,17 @@ fn expand_log(fmt: &str, vars: &[(&str, &str)], now: i64) -> String {
             if matched {
                 continue;
             }
+            // nginx logs "-" for a variable it cannot resolve.
+            let rest = &fmt[i + 1..];
+            let n = rest
+                .bytes()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == b'_')
+                .count();
+            if n > 0 {
+                out.push('-');
+                i += 1 + n;
+                continue;
+            }
         }
         out.push(bytes[i] as char);
         i += 1;
@@ -2621,6 +2875,15 @@ fn expand_log(fmt: &str, vars: &[(&str, &str)], now: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_parsing() {
+        assert_eq!(parse_rate("40k"), 40960);
+        assert_eq!(parse_rate("1m"), 1048576);
+        assert_eq!(parse_rate("512"), 512);
+        assert_eq!(parse_rate(""), 0);
+        assert_eq!(parse_rate("nonsense"), 0);
+    }
 
     #[test]
     fn log_expansion() {

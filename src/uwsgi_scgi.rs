@@ -329,6 +329,7 @@ async fn run(
         status,
         bytes,
         close: false,
+        sent: Vec::new(),
     }))
 }
 
@@ -362,6 +363,7 @@ async fn error_out(conn: &mut Conn, status: u16, tokens: bool, keepalive: bool) 
         status,
         bytes,
         close: false,
+        sent: Vec::new(),
     })
 }
 

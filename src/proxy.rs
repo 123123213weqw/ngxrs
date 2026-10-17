@@ -302,8 +302,32 @@ struct Head {
     upgrade: Option<(String, String)>,
 }
 
+/// Locate the end of an upstream response head, tolerating LF-only line
+/// endings (nginx accepts them, and simple backends emit them).
+fn find_head_end(buf: &[u8]) -> Option<usize> {
+    let mut i = 0usize;
+    let mut line_start = 0usize;
+    while i < buf.len() {
+        if buf[i] != b'\n' {
+            i += 1;
+            continue;
+        }
+        let mut line_end = i;
+        if line_end > line_start && buf[line_end - 1] == b'\r' {
+            line_end -= 1;
+        }
+        let empty = line_end == line_start;
+        i += 1;
+        if empty && line_start > 0 {
+            return Some(i);
+        }
+        line_start = i;
+    }
+    None
+}
+
 fn parse_upstream_head(buf: &[u8]) -> Option<Head> {
-    let end = memchr::memmem::find(buf, b"\r\n\r\n")?;
+    let end = find_head_end(buf)?;
     let head = &buf[..end];
     let mut lines = head.split(|b| *b == b'\n');
     let status_line = lines.next()?;
@@ -510,6 +534,7 @@ pub async fn handle(
                         status: entry.status,
                         bytes,
                         close: false,
+                        sent: Vec::new(),
                     }));
                 }
             }
@@ -647,6 +672,7 @@ async fn respond_error(
         status,
         bytes,
         close: false,
+        sent: Vec::new(),
     })
 }
 
@@ -822,11 +848,10 @@ async fn exchange(
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
     let mut deadline = Instant::now() + loc.proxy_read_timeout;
     let head = loop {
-        if let Some(pos) = memchr::memmem::find(&buf, b"\r\n\r\n") {
-            let h = parse_upstream_head(&buf[..pos + 4])
+        if let Some(pos) = find_head_end(&buf) {
+            let h = parse_upstream_head(&buf[..pos])
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad upstream response"))?;
-            let rest = buf.split_off(pos + 4);
-            buf = rest;
+            buf = buf.split_off(pos);
             break h;
         }
         if buf.len() > 64 * 1024 {
@@ -880,6 +905,7 @@ async fn exchange(
             status: 101,
             bytes: 0,
             close: true,
+            sent: Vec::new(),
         });
     }
 
@@ -958,10 +984,12 @@ async fn exchange(
             status: head.status,
             bytes: payload.len() as u64,
             close: false,
+            sent: Vec::new(),
         });
     }
 
     let mut raw = raw;
+    crate::http::apply_expires(&mut raw, loc);
     let upstream_headers = crate::http::split_head(&raw);
     crate::http::apply_add_headers_full(
         &mut raw,
@@ -971,6 +999,7 @@ async fn exchange(
         upstream_addr,
         &upstream_headers,
     );
+    let sent_headers = crate::http::split_head(&raw);
     write_head(conn, head.status, &raw, req.keepalive, tokens).await?;
 
     let mut sent = 0u64;
@@ -1008,10 +1037,18 @@ async fn exchange(
             remaining -= n as u64;
         }
     } else {
-        // no length: read until EOF
+        // The upstream signals the end by closing (no Content-Length). The
+        // client cannot know where the body ends unless we re-frame it, so
+        // emit chunked — which is what nginx does here.
+        conn.write_all(b"Transfer-Encoding: chunked\r\n").await?;
+
         if !buf.is_empty() {
-            conn.write_all(&buf).await?;
+            let mut framed = Vec::with_capacity(buf.len() + 16);
+            framed.extend_from_slice(format!("{:x}\r\n", buf.len()).as_bytes());
+            framed.extend_from_slice(&buf);
+            framed.extend_from_slice(b"\r\n");
             sent += buf.len() as u64;
+            conn.write_all(&framed).await?;
         }
         let mut chunk = [0u8; 64 * 1024];
         loop {
@@ -1021,9 +1058,14 @@ async fn exchange(
                 Ok(Err(e)) => return Err(e),
                 Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout")),
             };
-            conn.write_all(&chunk[..n]).await?;
+            let mut framed = Vec::with_capacity(n + 16);
+            framed.extend_from_slice(format!("{n:x}\r\n").as_bytes());
+            framed.extend_from_slice(&chunk[..n]);
+            framed.extend_from_slice(b"\r\n");
             sent += n as u64;
+            conn.write_all(&framed).await?;
         }
+        conn.write_all(b"0\r\n\r\n").await?;
     }
 
     // ---- connection reuse ----
@@ -1046,6 +1088,7 @@ async fn exchange(
         status: head.status,
         bytes: sent,
         close: false,
+        sent: sent_headers,
     })
 }
 
@@ -1225,7 +1268,7 @@ pub async fn fetch(
             };
             buf.extend_from_slice(&chunk[..n]);
             if head_end.is_none() {
-                head_end = memchr::memmem::find(&buf, b"\r\n\r\n").map(|i| i + 4);
+                head_end = find_head_end(&buf);
             }
             if let Some(h) = head_end {
                 if let Some(head) = parse_upstream_head(&buf[..h]) {

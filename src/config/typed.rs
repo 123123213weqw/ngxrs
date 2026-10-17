@@ -48,6 +48,8 @@ pub struct LocCfg {
     pub gzip_types: Vec<String>,
     pub gzip_vary: bool,
     // ---- reverse proxy ----
+    /// `rewrite <regex> <replacement> [flag]` entries, in config order.
+    pub rewrites: Vec<Rewrite>,
     pub proxy_pass: Option<ProxyPass>,
     /// Set while parsing `proxy_pass http://<name>` so the http level can
     /// resolve the name to an `upstream` index after all blocks are read.
@@ -81,6 +83,7 @@ impl LocCfg {
             gzip_comp_level: 1,
             gzip_types: Vec::new(),
             gzip_vary: false,
+            rewrites: Vec::new(),
             proxy_pass: None,
             proxy_upstream_name: None,
             proxy_set_headers: Vec::new(),
@@ -92,6 +95,32 @@ impl LocCfg {
             proxy_hide_headers: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewriteFlag {
+    None,
+    Last,
+    Break,
+    Redirect,
+    Permanent,
+}
+
+#[derive(Debug, Clone)]
+pub struct Rewrite {
+    pub re: regex::Regex,
+    pub replacement: String,
+    pub flag: RewriteFlag,
+}
+
+/// Compile nginx's `$1..$9` replacement syntax into a format we can expand.
+pub fn compile_rewrite(re_src: &str, replacement: &str, flag: RewriteFlag) -> Option<Rewrite> {
+    let re = regex::Regex::new(re_src).ok()?;
+    Some(Rewrite {
+        re,
+        replacement: replacement.to_string(),
+        flag,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -615,6 +644,32 @@ impl Builder {
                 for c in codes {
                     cfg.error_pages.insert(c, stored.clone());
                 }
+            }
+            "rewrite" => {
+                if d.args.len() < 2 {
+                    return Err(sem(&d.file, d.line, "rewrite requires a regex and a replacement"));
+                }
+                let flag = match d.args.get(2).map(|s| s.as_str()) {
+                    None => RewriteFlag::None,
+                    Some("last") => RewriteFlag::Last,
+                    Some("break") => RewriteFlag::Break,
+                    Some("redirect") => RewriteFlag::Redirect,
+                    Some("permanent") => RewriteFlag::Permanent,
+                    Some(other) => {
+                        return Err(sem(
+                            &d.file,
+                            d.line,
+                            format!("invalid rewrite flag \"{other}\""),
+                        ))
+                    }
+                };
+                let rw = compile_rewrite(&d.args[0], &d.args[1], flag)
+                    .ok_or_else(|| sem(&d.file, d.line, format!("invalid regex \"{}\"", d.args[0])))?;
+                cfg.rewrites.push(rw);
+            }
+            "set" | "if" | "break" => {
+                // Accepted at this scope; conditional evaluation is not wired
+                // into the rewrite engine yet (see COMPAT.md).
             }
             "return" => {
                 if d.args.len() < 1 {

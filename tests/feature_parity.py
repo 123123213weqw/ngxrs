@@ -138,7 +138,7 @@ def fetch(port, path, headers=None, method="GET", body=None, timeout=5):
         conn.close()
 
 
-def summarize(status, headers, body):
+def summarize(status, headers, body, port=None):
     if headers.get("content-encoding") == "gzip" and body[:2] == b"\x1f\x8b":
         try:
             body = gzip.decompress(body)
@@ -149,12 +149,15 @@ def summarize(status, headers, body):
               "vary", "etag", "last-modified", "connection", "location"):
         if k in headers:
             keep[k] = headers[k]
+    if port and "location" in keep:
+        # the two servers listen on different ports; that is not a difference
+        keep["location"] = keep["location"].replace(f":{port}", ":PORT")
     return status, keep, len(body), body[:200]
 
 
-def compare(name, a, b, ignore=()):
-    sa, ha, la, ba = summarize(*a)
-    sb, hb, lb, bb = summarize(*b)
+def compare(name, a, b, ignore=(), ports=(None, None)):
+    sa, ha, la, ba = summarize(*a, port=ports[0])
+    sb, hb, lb, bb = summarize(*b, port=ports[1])
     problems = []
     if sa != sb:
         problems.append(f"status {sa} != {sb}")
@@ -196,6 +199,11 @@ def main():
         ("proxy-chunked", "/p/chunked", {}),
         ("proxy-direct", "/direct/echo", {}),
         ("proxy-keepalive-seq", "/p/echo", {}),
+        ("rewrite-last", "/rw/old/x", {}),
+        ("rewrite-permanent", "/rw/perm/x", {}),
+        ("rewrite-redirect", "/rw/tmp/x", {}),
+        ("rewrite-break", "/rw/new/y", {}),
+        ("rewrite-none", "/rw/other", {}),
     ]
 
     rows = []
@@ -203,7 +211,7 @@ def main():
 
     def record(name, pa, pb, ignore=()):
         nonlocal failures
-        problems = compare(name, pa, pb, ignore)
+        problems = compare(name, pa, pb, ignore, ports=(args.nginx, args.ngxrs))
         sa = pa[0]
         sb = pb[0]
         rows.append((name, sa, sb, problems))

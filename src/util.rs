@@ -51,6 +51,45 @@ pub fn reason(status: u16) -> &'static str {
     }
 }
 
+/// Status text used inside nginx's generated error pages. This is NOT always
+/// the status line reason (e.g. 302's line says "Moved Temporarily" but its
+/// error page says "Found"); both tables are copied from nginx 1.28.
+pub fn error_page_reason(status: u16) -> &'static str {
+    match status {
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        400 => "Bad Request",
+        401 => "Authorization Required",
+        402 => "Payment Required",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Not Allowed",
+        406 => "Not Acceptable",
+        408 => "Request Time-out",
+        409 => "Conflict",
+        410 => "Gone",
+        411 => "Length Required",
+        412 => "Precondition Failed",
+        413 => "Request Entity Too Large",
+        414 => "Request-URI Too Large",
+        415 => "Unsupported Media Type",
+        416 => "Requested Range Not Satisfiable",
+        421 => "Misdirected Request",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        502 => "Bad Gateway",
+        503 => "Service Temporarily Unavailable",
+        504 => "Gateway Time-out",
+        505 => "HTTP Version Not Supported",
+        507 => "Insufficient Storage",
+        other => reason(other),
+    }
+}
+
 pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;

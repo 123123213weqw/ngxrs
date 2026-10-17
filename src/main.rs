@@ -3,6 +3,7 @@ mod conn;
 mod http;
 mod log;
 mod gzip;
+mod h2server;
 mod instr;
 mod net;
 mod tls;

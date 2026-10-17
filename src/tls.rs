@@ -141,8 +141,13 @@ pub fn build_config(http: &Http, server_idxs: &[usize]) -> io::Result<Arc<Server
         .with_no_client_auth()
         .with_cert_resolver(resolver);
 
-    // nginx defaults for `ssl_protocols`: TLSv1.2 TLSv1.3.
-    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    // nginx advertises h2 only when `listen ... http2` is set.
+    let http2 = server_idxs.iter().any(|&i| http.server(i).http2);
+    cfg.alpn_protocols = if http2 {
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+    } else {
+        vec![b"http/1.1".to_vec()]
+    };
     Ok(Arc::new(cfg))
 }
 

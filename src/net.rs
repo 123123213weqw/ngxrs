@@ -243,24 +243,50 @@ async fn accept_loop(
                         let ctx = ctx.clone();
                         tokio::spawn(async move {
                             let tls = ctx.tls.get(group_idx).cloned().flatten();
-                            let stream = match tls {
-                                None => Stream::Plain(stream),
+                            match tls {
+                                None => {
+                                    let conn = Conn::new(
+                                        Stream::Plain(stream),
+                                        peer,
+                                        ctx.config.http.tcp_nopush,
+                                    );
+                                    let group = &ctx.config.http.groups[group_idx];
+                                    http::handle_conn(conn, group, &ctx).await;
+                                }
                                 Some(cfg) => {
                                     let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
-                                    match tokio::time::timeout(
+                                    let tls_stream = match tokio::time::timeout(
                                         Duration::from_secs(10),
                                         acceptor.accept(stream),
                                     )
                                     .await
                                     {
-                                        Ok(Ok(s)) => Stream::Tls(Box::new(s)),
+                                        Ok(Ok(s)) => s,
                                         // nginx logs and drops failed handshakes
                                         _ => return,
+                                    };
+                                    if tls_stream.get_ref().1.alpn_protocol() == Some(b"h2") {
+                                        let group = &ctx.config.http.groups[group_idx];
+                                        let _ = peer;
+                                        crate::h2server::serve(
+                                            tls_stream,
+                                            &group.servers,
+                                            group.default_server,
+                                            &ctx.config.http,
+                                            group_uses_tokens(&ctx, group_idx),
+                                        )
+                                        .await;
+                                        return;
                                     }
+                                    let conn = Conn::new(
+                                        Stream::Tls(Box::new(tls_stream)),
+                                        peer,
+                                        ctx.config.http.tcp_nopush,
+                                    );
+                                    let group = &ctx.config.http.groups[group_idx];
+                                    http::handle_conn(conn, group, &ctx).await;
                                 }
-                            };
-                            let conn = Conn::new(stream, peer, ctx.config.http.tcp_nopush);
-                            http::handle_conn(conn, &ctx.config.http.groups[group_idx], &ctx).await;
+                            }
                         });
                     }
                     Err(e) => match e.kind() {
@@ -449,26 +475,57 @@ fn shared_worker_main(
                     let ctx = ctx.clone();
                     tokio::spawn(async move {
                         let tls = ctx.tls.get(h.group).cloned().flatten();
-                        let stream = match tls {
-                            None => Stream::Plain(stream),
+                        match tls {
+                            None => {
+                                let conn = Conn::new(
+                                    Stream::Plain(stream),
+                                    h.peer,
+                                    ctx.config.http.tcp_nopush,
+                                );
+                                let group = &ctx.config.http.groups[h.group];
+                                http::handle_conn(conn, group, &ctx).await;
+                            }
                             Some(cfg) => {
                                 let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
-                                match tokio::time::timeout(
+                                let tls_stream = match tokio::time::timeout(
                                     Duration::from_secs(10),
                                     acceptor.accept(stream),
                                 )
                                 .await
                                 {
-                                    Ok(Ok(s)) => Stream::Tls(Box::new(s)),
+                                    Ok(Ok(s)) => s,
                                     _ => return,
+                                };
+                                if tls_stream.get_ref().1.alpn_protocol() == Some(b"h2") {
+                                    let group = &ctx.config.http.groups[h.group];
+                                    crate::h2server::serve(
+                                        tls_stream,
+                                        &group.servers,
+                                        group.default_server,
+                                        &ctx.config.http,
+                                        group_uses_tokens(&ctx, h.group),
+                                    )
+                                    .await;
+                                    return;
                                 }
+                                let conn = Conn::new(
+                                    Stream::Tls(Box::new(tls_stream)),
+                                    h.peer,
+                                    ctx.config.http.tcp_nopush,
+                                );
+                                let group = &ctx.config.http.groups[h.group];
+                                http::handle_conn(conn, group, &ctx).await;
                             }
-                        };
-                        let conn = Conn::new(stream, h.peer, ctx.config.http.tcp_nopush);
-                        http::handle_conn(conn, &ctx.config.http.groups[h.group], &ctx).await;
+                        }
                     });
                 }
             }
         }
     });
+}
+
+
+fn group_uses_tokens(ctx: &Ctx, group: usize) -> bool {
+    let g = &ctx.config.http.groups[group];
+    ctx.config.http.server(g.default_server).server_tokens
 }

@@ -86,12 +86,28 @@
 
 ## 安全 / 协议
 
-| 能力 | 状态 |
-|---|---|
-| TLS（证书、SNI、会话复用） | ⬜ |
-| HTTP/2 | ⬜ |
-| HTTP/3 (QUIC) | ⬜ |
-| `limit_req` / `limit_conn` / 访问控制 | ⬜ |
+| 能力 | 状态 | 备注 |
+|---|---|---|
+| `listen ... ssl` + `ssl_certificate` / `ssl_certificate_key` | ✅ | rustls（ring provider） |
+| SNI 选证（精确名 / `*.通配` / 默认回落） | ✅ | 与 nginx 同序，通配只匹配一级标签 |
+| TLS 1.2 / 1.3 | ✅ | 1.3 默认优先 |
+| `ssl_protocols` / `ssl_ciphers` / `ssl_session_cache` 等 | 🟡 | 已解析；实际参数由 rustls 的安全默认值决定 |
+| ALPN（h2 / http/1.1） | ✅ | 仅在 `listen ... http2` 时广告 h2 |
+| HTTP/2（多路复用、`:authority` 选虚拟主机、头部规范化） | ✅ | 复用 http/1 的路由表，静态/return/error_page/gzip 行为一致 |
+| HTTP/2 上的反向代理 | ⬜ | 目前 proxy 需要 socket 写入；h2 请求走 proxy 会返回 502 |
+| HTTP/3 (QUIC) | ⬜ | 未开始 |
+| `limit_req` / `limit_conn` / `access` 访问控制 | ⬜ | |
+
+## rewrite
+
+| 能力 | 状态 | 备注 |
+|---|---|---|
+| `rewrite <re> <replacement>;` | ✅ | `$1..$9`、无 flag 时继续匹配后续 rewrite |
+| `last` | ✅ | 重新搜索 location 并从新 location 的 rewrite 模块重新开始 |
+| `break` | ✅ | 终止本 location 的 rewrite 模块（**包括 `return`**），然后走内容阶段 |
+| `redirect` / `permanent` | ✅ | 302 / 301 + Location，`$is_args` 语义 |
+| 替换串带 `?` 时丢弃原 query | ✅ | |
+| `if` / `set` / `break` 条件块 | ⬜ | 已解析未求值 |
 
 ## stream / mail
 

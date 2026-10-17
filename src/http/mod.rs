@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 
-use crate::config::{Config, Http, ListenGroup, LocCfg, Server};
+use crate::config::{Config, Http, ListenGroup, LocCfg, RewriteFlag, Server};
 use crate::conn::{Conn, RecvError, MAX_HEADER_BYTES, MAX_REQUEST_LINE};
 use crate::log::Logger;
 use crate::util::{self, reason};
@@ -158,7 +158,7 @@ pub async fn handle_conn(mut conn: Conn, group: &ListenGroup, ctx: &Ctx) {
             }
         };
 
-        let server = select_server(http, group, req.host.as_deref());
+        let server = select_server(http, &group.servers, group.default_server, req.host.as_deref());
         let loc = server.locate(&path);
 
         // Request body: proxied locations forward it, everything else
@@ -209,6 +209,25 @@ pub async fn handle_conn(mut conn: Conn, group: &ListenGroup, ctx: &Ctx) {
 
 /// Resolve a request to a `Response` without writing anything. Kept separate
 /// from the writer so `error_page` internal redirects can re-route cheaply.
+/// Content phase only: static files / autoindex / 404. Used after
+/// `rewrite ... break`, which skips the location's `return` and `try_files`.
+async fn route_content(
+    req: &Request,
+    path: &str,
+    query: &str,
+    loc: &LocCfg,
+    server: &Server,
+    http: &Http,
+) -> Response {
+    if !req.method.is_read() {
+        return error_response(405, server.server_tokens);
+    }
+    match static_file::respond(req, path, query, loc, http) {
+        Ok(r) => r,
+        Err(_) => error_response(404, server.server_tokens),
+    }
+}
+
 async fn route(
     req: &Request,
     path: &str,
@@ -277,6 +296,213 @@ fn error_response(status: u16, tokens: bool) -> Response {
     )
 }
 
+/// Apply `rewrite` directives. Returns `Ok(Some(response))` for a redirect /
+/// `return` the rewrite produced, `Ok(None)` with the (possibly new) URI when
+/// processing should continue.
+fn apply_rewrites(
+    req: &Request,
+    path: &str,
+    query: &str,
+    loc: &LocCfg,
+    server: &Server,
+) -> RewriteOutcome {
+    let mut uri = path.to_string();
+    let mut args = query.to_string();
+    let _ = req;
+
+    for rw in &loc.rewrites {
+        if !rw.re.is_match(&uri) {
+            continue;
+        }
+        let caps = match rw.re.captures(&uri) {
+            Some(c) => c,
+            None => continue,
+        };
+        // nginx appends the original args unless the replacement ends in `?`.
+        let mut target = expand_captures(&rw.replacement, &caps);
+        if let Some(q) = target.find('?') {
+            args = target[q + 1..].to_string();
+            target.truncate(q);
+        }
+        if target.starts_with("http://") || target.starts_with("https://") {
+            let code = match rw.flag {
+                RewriteFlag::Permanent => 301,
+                _ => 302,
+            };
+            return RewriteOutcome::Respond(Response::empty(code).header("Location", target));
+        }
+        match rw.flag {
+            RewriteFlag::Permanent | RewriteFlag::Redirect => {
+                let code = if rw.flag == RewriteFlag::Permanent { 301 } else { 302 };
+                let mut location = target;
+                if !args.is_empty() {
+                    location.push('?');
+                    location.push_str(&args);
+                }
+                return RewriteOutcome::Respond(Response::empty(code).header("Location", location));
+            }
+            RewriteFlag::Last => return RewriteOutcome::Relocate(target, args),
+            RewriteFlag::Break => return RewriteOutcome::Break(target, args),
+            RewriteFlag::None => {
+                // No flag: nginx continues with the next rewrite directive, so
+                // keep scanning with the substituted URI.
+                uri = target;
+                continue;
+            }
+        }
+    }
+    let _ = server;
+    RewriteOutcome::Continue(uri, args)
+}
+
+enum RewriteOutcome {
+    /// No rewrite matched: keep the URI and let `return`/content run.
+    Continue(String, String),
+    /// `rewrite ... last`: restart location search, then run the rewrite
+    /// module (including `return`) of the new location from scratch.
+    Relocate(String, String),
+    /// `rewrite ... break` or a plain rewrite: nginx stops executing the
+    /// remaining rewrite-module directives for this location — `return`
+    /// included — and serves content with the new URI.
+    Break(String, String),
+    Respond(Response),
+}
+
+fn expand_captures(replacement: &str, caps: &regex::Captures<'_>) -> String {
+    let mut out = String::with_capacity(replacement.len());
+    let b = replacement.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'$' && i + 1 < b.len() && b[i + 1].is_ascii_digit() {
+            let n = (b[i + 1] - b'0') as usize;
+            if let Some(m) = caps.get(n) {
+                out.push_str(m.as_str());
+            }
+            i += 2;
+            continue;
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Resolve a request to a `Response` without touching the socket: error_page
+/// internal redirects plus the gzip filter. The HTTP/1 handler writes the
+/// result; the HTTP/2 handler turns it into h2 frames.
+pub async fn resolve_response(
+    req: &Request,
+    path: &str,
+    query: &str,
+    server: &Server,
+    loc: &LocCfg,
+    http: &Http,
+) -> Response {
+    let mut cur_path = path.to_string();
+    let mut cur_query = query.to_string();
+    let mut cur_loc = loc;
+    let mut depth = 0usize;
+
+    // ---- rewrite phase ----
+    let mut relocations = 0;
+    let mut skip_return = false;
+    loop {
+        match apply_rewrites(req, &cur_path, &cur_query, cur_loc, server) {
+            RewriteOutcome::Respond(r) => return r,
+            RewriteOutcome::Continue(p, q) => {
+                cur_path = p;
+                cur_query = q;
+                break;
+            }
+            RewriteOutcome::Break(p, q) => {
+                cur_path = p;
+                cur_query = q;
+                // Skip `return` for this location, like nginx.
+                skip_return = true;
+                break;
+            }
+            RewriteOutcome::Relocate(p, q) => {
+                cur_path = p;
+                cur_query = q;
+                cur_loc = server.locate(&cur_path);
+                relocations += 1;
+                if relocations > 10 {
+                    return error_response(500, server.server_tokens);
+                }
+            }
+        }
+    }
+
+    let mut resp = if skip_return {
+        // `rewrite ... break` bypasses the location's `return`, so the request
+        // falls through to the content handler (static file / proxy).
+        route_content(req, &cur_path, &cur_query, cur_loc, server, http).await
+    } else {
+        route(req, &cur_path, &cur_query, cur_loc, server, http, false).await
+    };
+
+    while resp.status >= 400 && depth < 10 && !resp.no_error_page {
+        let Some(target) = cur_loc.error_pages.get(&resp.status).cloned() else {
+            break;
+        };
+        let (new_status, uri) = match target.strip_prefix('=') {
+            Some(rest) => match rest.split_once(char::is_whitespace) {
+                Some((code, uri)) => (code.parse::<u16>().ok(), uri.trim().to_string()),
+                None => (None, rest.trim().to_string()),
+            },
+            None => (None, target.clone()),
+        };
+        let original_status = resp.status;
+        let (p, q) = match uri.split_once('?') {
+            Some((p, q)) => (p.to_string(), q.to_string()),
+            None => (uri.clone(), String::new()),
+        };
+        cur_path = p;
+        cur_query = q;
+        cur_loc = server.locate(&cur_path);
+        depth += 1;
+        let redirected = route(req, &cur_path, &cur_query, cur_loc, server, http, true).await;
+        if redirected.status >= 400 {
+            resp = error_response(original_status, server.server_tokens);
+            break;
+        }
+        let mut redirected = redirected;
+        redirected.status = new_status.unwrap_or(original_status);
+        resp = redirected;
+    }
+
+    if resp.status >= 400 && resp.body.is_empty() {
+        resp = error_response(resp.status, server.server_tokens);
+    }
+
+    crate::gzip::maybe_compress(req, resp, cur_loc, http)
+}
+
+/// Read a whole response body into memory (HTTP/2 needs the length up front
+/// unless it streams, which we do not need for static content).
+pub async fn body_bytes(body: Body) -> io::Result<Vec<u8>> {
+    match body {
+        Body::Empty => Ok(Vec::new()),
+        Body::Bytes(b) => Ok(b),
+        Body::File { file, offset, len } => {
+            use std::os::unix::fs::FileExt;
+            let mut out = vec![0u8; len as usize];
+            let mut read = 0usize;
+            while read < out.len() {
+                match file.read_at(&mut out[read..], offset + read as u64) {
+                    Ok(0) => break,
+                    Ok(n) => read += n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            out.truncate(read);
+            Ok(out)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
     conn: &mut Conn,
@@ -289,79 +515,27 @@ async fn dispatch(
     listen_port: u16,
 ) -> io::Result<Outcome> {
     let head_only = req.method == Method::Head;
-    let mut cur_path = path.to_string();
-    let mut cur_query = query.to_string();
-    let mut cur_loc = loc;
-    let mut depth = 0usize;
 
-    loop {
-        // ---- reverse proxy ----
-        if cur_loc.proxy_pass.is_some() {
-            if let Some(o) =
-                crate::proxy::handle(conn, req, &cur_path, &cur_query, cur_loc, http, server.server_tokens)
-                    .await?
-            {
-                return Ok(o);
-            }
+    // ---- reverse proxy (streams to the socket, cannot be resolved first) ----
+    if loc.proxy_pass.is_some() {
+        if let Some(o) =
+            crate::proxy::handle(conn, req, path, query, loc, http, server.server_tokens).await?
+        {
+            return Ok(o);
         }
-
-        let mut resp = route(req, &cur_path, &cur_query, cur_loc, server, http, false).await;
-
-        // ---- error_page: internal redirect, keeping the original status ----
-        if resp.status >= 400 && depth < 10 && !resp.no_error_page {
-            if let Some(target) = cur_loc.error_pages.get(&resp.status).cloned() {
-                let (new_status, uri) = match target.strip_prefix('=') {
-                    Some(rest) => match rest.split_once(char::is_whitespace) {
-                        Some((code, uri)) => (code.parse::<u16>().ok(), uri.trim().to_string()),
-                        None => (None, rest.trim().to_string()),
-                    },
-                    None => (None, target.clone()),
-                };
-                let (p, q) = match uri.split_once('?') {
-                    Some((p, q)) => (p.to_string(), q.to_string()),
-                    None => (uri.clone(), String::new()),
-                };
-                let original_status = resp.status;
-                cur_path = p;
-                cur_query = q;
-                cur_loc = server.locate(&cur_path);
-                depth += 1;
-                let mut redirected =
-                    route(req, &cur_path, &cur_query, cur_loc, server, http, true).await;
-                if redirected.status >= 400 {
-                    // The error page itself failed: fall back to the generic
-                    // body with the original status (nginx does the same).
-                    resp = error_response(original_status, server.server_tokens);
-                } else {
-                    // nginx keeps the original error status unless `=code` is set.
-                    redirected.status = new_status.unwrap_or(original_status);
-                    resp = redirected;
-                }
-            }
-        }
-
-        // Errors without a body get nginx's generated page (the static handler
-        // returns empty 404/403 responses).
-        if resp.status >= 400 && resp.body.is_empty() {
-            resp = error_response(resp.status, server.server_tokens);
-        }
-
-        // ---- gzip ----
-        resp = crate::gzip::maybe_compress(req, resp, cur_loc, http);
-
-        let status = resp.status;
-        let keepalive = req.keepalive;
-        if matches!(status, 301 | 302 | 303 | 307 | 308) {
-            return write_redirect(conn, req, resp, listen_port, server.server_tokens).await;
-        }
-        let bytes =
-            write_response(conn, resp, keepalive, server.server_tokens, head_only).await?;
-        return Ok(Outcome {
-            status,
-            bytes,
-            close: false,
-        });
     }
+
+    let resp = resolve_response(req, path, query, server, loc, http).await;
+    let status = resp.status;
+    if matches!(status, 301 | 302 | 303 | 307 | 308) {
+        return write_redirect(conn, req, resp, listen_port, server.server_tokens).await;
+    }
+    let bytes = write_response(conn, resp, req.keepalive, server.server_tokens, head_only).await?;
+    Ok(Outcome {
+        status,
+        bytes,
+        close: false,
+    })
 }
 
 async fn write_redirect(
@@ -504,7 +678,7 @@ pub async fn send_error(
 }
 
 pub fn error_body(status: u16, tokens: bool) -> Vec<u8> {
-    let reason = reason(status);
+    let reason = crate::util::error_page_reason(status);
     let signature = if tokens {
         format!("nginx/{}", crate::COMPAT_VERSION)
     } else {
@@ -705,7 +879,12 @@ pub async fn write_head(
     r
 }
 
-pub fn select_server<'a>(http: &'a Http, group: &ListenGroup, host: Option<&str>) -> &'a Server {
+pub fn select_server<'a>(
+    http: &'a Http,
+    servers: &[usize],
+    default_server: usize,
+    host: Option<&str>,
+) -> &'a Server {
     let host = host.map(|h| {
         // strip :port, including bracketed IPv6
         if h.starts_with('[') {
@@ -723,7 +902,7 @@ pub fn select_server<'a>(http: &'a Http, group: &ListenGroup, host: Option<&str>
 
     if let Some(h) = host {
         let lower = h.to_ascii_lowercase();
-        for &idx in &group.servers {
+        for &idx in servers {
             let s = http.server(idx);
             for n in &s.names {
                 if n.eq_ignore_ascii_case(&lower) {
@@ -731,7 +910,7 @@ pub fn select_server<'a>(http: &'a Http, group: &ListenGroup, host: Option<&str>
                 }
             }
         }
-        for &idx in &group.servers {
+        for &idx in servers {
             let s = http.server(idx);
             for n in &s.names {
                 if let Some(suffix) = n.strip_prefix("*.") {
@@ -747,7 +926,7 @@ pub fn select_server<'a>(http: &'a Http, group: &ListenGroup, host: Option<&str>
                 }
             }
         }
-        for &idx in &group.servers {
+        for &idx in servers {
             let s = http.server(idx);
             for re in &s.regex_names {
                 if re.is_match(&lower) {
@@ -757,7 +936,7 @@ pub fn select_server<'a>(http: &'a Http, group: &ListenGroup, host: Option<&str>
         }
     }
 
-    http.server(group.default_server)
+    http.server(default_server)
 }
 
 #[allow(clippy::too_many_arguments)]

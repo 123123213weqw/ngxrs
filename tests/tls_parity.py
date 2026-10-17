@@ -69,6 +69,53 @@ def cert_cn(der):
     return out.stdout.strip()
 
 
+def h2_request(port, sni, path="/who"):
+    """HTTP/2 over TLS using the stdlib-free hyper-h2 client if available,
+    else a minimal hand-written client is not practical: skip gracefully."""
+    try:
+        import h2.connection  # type: ignore
+        import h2.events  # type: ignore
+    except ImportError:
+        return None
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.set_alpn_protocols(["h2"])
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
+        with ctx.wrap_socket(raw, server_hostname=sni) as s:
+            if s.selected_alpn_protocol() != "h2":
+                return ("no-h2", b"", None, None, None)
+            c = h2.connection.H2Connection()
+            c.initiate_connection()
+            s.sendall(c.data_to_send())
+            c.send_headers(
+                1,
+                [(":method", "GET"), (":path", path), (":scheme", "https"), (":authority", sni)],
+                end_stream=True,
+            )
+            s.sendall(c.data_to_send())
+            body = b""
+            status = ""
+            while True:
+                data = s.recv(65536)
+                if not data:
+                    break
+                events = c.receive_data(data)
+                for ev in events:
+                    if isinstance(ev, h2.events.ResponseReceived):
+                        for k, v in ev.headers:
+                            if k == b":status":
+                                status = v.decode()
+                    elif isinstance(ev, h2.events.DataReceived):
+                        body += ev.data
+                        c.acknowledge_received_data(ev.flow_controlled_length, ev.stream_id)
+                    elif isinstance(ev, h2.events.StreamEnded):
+                        s.sendall(c.data_to_send())
+                        return (status, body, None, None, "h2")
+                s.sendall(c.data_to_send())
+    return (status, body, None, None, "h2")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--nginx", type=int, default=19443)
@@ -120,6 +167,25 @@ def main():
             record(f"proto:{label}", a, b)
         except ssl.SSLError as e:
             rows.append((f"proto:{label}", "-", "-", "-", [f"ssl error {e}"]))
+            failures += 1
+
+    # HTTP/2 over ALPN
+    a = h2_request(args.nginx, "default.example")
+    b = h2_request(args.ngxrs, "default.example")
+    if a is None or b is None:
+        rows.append(("h2:skip", "-", "-", "-", ["python h2 package not installed"]))
+    elif a[0] == "no-h2" or b[0] == "no-h2":
+        rows.append(("h2:alpn", a[0], b[0], "-", [] if a[0] == b[0] else [f"{a[0]} != {b[0]}"]))
+        if a[0] != b[0]:
+            failures += 1
+    else:
+        problems = []
+        if a[0] != b[0]:
+            problems.append(f"status {a[0]} != {b[0]}")
+        if a[1] != b[1]:
+            problems.append(f"body {a[1][:40]!r} != {b[1][:40]!r}")
+        rows.append(("h2:get", a[0], b[0], "h2", problems))
+        if problems:
             failures += 1
 
     # static file over TLS

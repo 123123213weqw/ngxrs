@@ -69,6 +69,10 @@ fn recycle(mut v: Vec<(InStr, InStr)>) {
 }
 
 impl Headers {
+    pub fn push(&mut self, name: InStr, value: InStr) {
+        self.items.push((name, value));
+    }
+
     pub fn get(&self, name: &str) -> Option<&str> {
         self.items
             .iter()

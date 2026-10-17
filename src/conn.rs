@@ -377,9 +377,34 @@ impl Conn {
     }
 }
 
+/// Locate the end of the request head.
+///
+/// Accepts CRLF and bare-LF line endings (nginx accepts both). Leading empty
+/// lines are tolerated, as nginx does.
 fn find_header_end(buf: &[u8]) -> Option<usize> {
-    // tolerate leading CRLF(s) before the request line
-    memchr::memmem::find(buf, b"\r\n\r\n").map(|p| p + 4)
+    let mut i = 0usize;
+    let mut line_start = 0usize;
+    while i < buf.len() {
+        if buf[i] != b'\n' {
+            i += 1;
+            continue;
+        }
+        let mut line_end = i;
+        if line_end > line_start && buf[line_end - 1] == b'\r' {
+            line_end -= 1;
+        }
+        let empty = line_end == line_start;
+        i += 1;
+        if empty {
+            // An empty line before the request line is permitted; the head
+            // ends at the first empty line that follows it.
+            if line_start > 0 {
+                return Some(i);
+            }
+        }
+        line_start = i;
+    }
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -449,4 +474,35 @@ async fn send_file_impl(stream: &mut TcpStream, file: &File, offset: u64, len: u
         total += n as u64;
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_header_end;
+
+    fn end(buf: &[u8]) -> Option<usize> {
+        find_header_end(buf)
+    }
+
+    #[test]
+    fn crlf_head() {
+        assert_eq!(end(b"GET / HTTP/1.1\r\nHost: a\r\n\r\nBODY"), Some(27));
+    }
+
+    #[test]
+    fn lf_head() {
+        let buf = b"GET / HTTP/1.1\nHost: a\n\nBODY";
+        assert_eq!(end(buf), Some(24));
+    }
+
+    #[test]
+    fn incomplete_head() {
+        assert_eq!(end(b"GET / HTTP/1.1\r\nHost: a\r\n"), None);
+    }
+
+    #[test]
+    fn leading_crlf_is_skipped() {
+        let buf = b"\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n";
+        assert_eq!(end(buf), Some(buf.len()));
+    }
 }

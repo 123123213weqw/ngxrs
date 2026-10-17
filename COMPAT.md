@@ -35,6 +35,11 @@
 | 请求体丢弃 / `client_max_body_size` | ✅ | 超限 413；chunked 可丢弃 |
 | `100-continue` | ✅ | |
 | 请求行/头大小限制 | 🟡 | 8 KB 行 / 32 KB 头；nginx 是 `large_client_header_buffers` 4×8k |
+| LF-only 行结束符 | ✅ | 与 nginx 一致（官方用例依赖这一点） |
+| `Host` 校验（空值 / 端口 / 尾点 / 大小写规范化） | ✅ | |
+| absolute-form 请求目标（`GET http://host/p`） | ✅ | 主机取自 URI，空 authority → 400 |
+| `#fragment` 丢弃 | ✅ | `$uri` / `$args` 都不含 fragment |
+| 错误状态后强制关闭连接（400/405/413/414/495-497/500/501） | ✅ | |
 | 访问日志（`log_format`、combined） | 🟡 | 变量替换已支持常用集合；转义尚未做 |
 | 错误日志分级/落盘 | ⬜ | 仅 stderr |
 | `server_tokens` | ✅ | on → `nginx/1.28.0`，off → `nginx` |
@@ -157,14 +162,38 @@
 
 ## nginx-tests 状态（官方 Perl 测试集）
 
-`bench/nginxtests.sh` 用 `TEST_NGINX_BINARY=target/release/ngxrs` 跑 nginx 官方用例。
-框架要求已全部满足：`-p/-c/-e/-g` 参数、相对 prefix 的路径解析、`daemon off/on`、
-listen 之后写 pid、`kill QUIT` 停止、`error.log` 存在。
+`bench/nginxtests.sh` 对**同一组用例分别跑 nginx 和 ngxrs**，再逐条断言对比。
 
-**已知环境限制**：master 版用例大量使用 `http_host_header()` 等 helper，
-它们只存在于较新的 `Test::Nginx`；本机装的是 0.32（cpanm 最新），
-这类用例返回 `undef`，**与被测服务器无关**。选测时必须避开这些 helper。
+绝对通过率在这里没有意义：master 分支的用例按较新的 `Test::Nginx` 编写，
+而 CPAN 上最新只有 0.32/0.33，其 `http()`→`http_end()` 是 slurp 读法，
+HTTP/1.1 keepalive 响应会一直阻塞到 8s 超时并返回 `undef`。**真 nginx 跑同一套也得同样的失败。**
+所以脚本只报告两个数字：nginx 通过但我们失败的断言数（真缺陷），以及反之。
 
-**当前实测**（`http_keepalive.t`）：21 项断言里 4 项通过、17 项失败。
-失败集中在 keepalive 细节（`Connection: keep-alive` 回显、`keepalive_requests`
-上限、`keepalive_timeout` 边界）。这是真实差距，不是环境问题，下一步优先修这里。
+> 上一轮我写「http_keepalive.t 4/21，失败集中在 keepalive 细节，是真实差距」——**这个结论是错的**。
+> 那批失败全部来自上述框架版本问题；用 nginx 做对照后，两者的逐文件数字完全相同。
+> 本轮已改为 A/B 对比，并把此前被误判为"环境问题"的几个真实缺陷揪了出来（见下）。
+
+### 本轮由官方用例发现的真实缺陷（已修）
+
+| 缺陷 | 影响 | 修复 |
+|---|---|---|
+| 只接受 CRLF 行结束符 | 发 LF-only 请求的客户端永远读不到响应 | `find_header_end` / `split_lines` 同时接受 LF 与 CRLF |
+| `$host` 未规范化 | 大写、带端口、尾点的主机名全部不匹配 | 小写、去端口、去尾点；`.` 单独出现视为非法 |
+| absolute-form 未取 URI 主机 | `GET http://l/` 时 `$host` 取错 | 绝对形式优先于 Host 头；空 authority → 400 |
+| `#fragment` 未丢弃 | `$uri` / `$args` 里混入 fragment | 解析 target 时先按 `#` 截断 |
+| `Host` 校验缺失 | 空值 / `:port` / 非数字端口未返回 400 | 按 nginx 规则校验 |
+| `add_header` 只对静态生效 | `return`、FastCGI、代理响应都缺头 | 移到响应解析出口统一应用 |
+| `server_name` 优先级错误 | 通配符不取最长、`*.a.b` 不吃多级、尾缀通配未实现 | 按 nginx 顺序重写匹配 |
+| `server_name ~` 不支持 `\Q..\E` 与命名捕获 | 正则服务器名不生效 | 翻译 `\Q..\E`，命名捕获暴露为变量 |
+| 错误状态不关连接 | 405/400 后仍保持 keepalive，客户端等 EOF 会挂 | 按 nginx 的 400/405/413/414/495-497/500/501 强制关闭 |
+
+### 当前 A/B 结果（4 个用例文件）
+
+| 用例 | nginx | ngxrs | 备注 |
+|---|---|---|---|
+| http_server_name.t | 22/22 | **21/22** | 仅剩 `server_name ""` 空名匹配 |
+| http_method.t | 4/6 | **4/6** | 完全一致 |
+| http_uri.t | 21/21 | 17/21 | 待查 |
+| http_host.t | 54/62 | 42/62 | 待查 |
+
+合计断言：nginx 101 / ngxrs 84。

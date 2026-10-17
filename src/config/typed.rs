@@ -315,6 +315,9 @@ pub struct Server {
     pub error_pages: BTreeMap<u16, String>,
     pub access_log_off: bool,
     pub regex_names: Vec<regex::Regex>,
+    /// Regex server names paired with their source text (for diagnostics and
+    /// for named-capture handling).
+    pub regex_names_src: Vec<(regex::Regex, String)>,
     // ---- TLS ----
     pub ssl: bool,
     pub ssl_certificate: Option<PathBuf>,
@@ -712,13 +715,50 @@ fn parse_listen(s: &str) -> Option<SocketAddr> {
     None
 }
 
+/// Translate the PCRE bits nginx accepts but Rust's regex does not: `\Q...\E`
+/// quoting. Everything else maps directly.
+fn translate_pcre(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(start) = rest.find("\\Q") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find("\\E") {
+            Some(end) => {
+                out.push_str(&regex::escape(&after[..end]));
+                rest = &after[end + 2..];
+            }
+            None => {
+                out.push_str(&regex::escape(after));
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn build_regex(src: &str, ci: bool) -> Option<regex::Regex> {
+    let translated = translate_pcre(src);
     let pattern = if ci {
-        format!("(?i:{src})")
+        format!("(?i:{translated})")
     } else {
-        src.to_string()
+        translated
     };
     regex::Regex::new(&pattern).ok()
+}
+
+#[cfg(test)]
+mod regex_tests {
+    use super::translate_pcre;
+
+    #[test]
+    fn q_quote_is_escaped() {
+        let out = translate_pcre("^(?P<name>[a-z]+)\\.example\\.com$");
+        assert_eq!(out, "^(?P<name>[a-z]+)\\.example\\.com$");
+        let quoted = translate_pcre("^\\Qfoo.bar\\E$");
+        assert_eq!(quoted, "^foo\\.bar$");
+    }
 }
 
 struct Builder {
@@ -1348,10 +1388,12 @@ impl Builder {
 
 
         let mut regex_names = Vec::new();
+        let mut regex_names_src = Vec::new();
         for n in &names {
             if let Some(re) = n.strip_prefix('~') {
                 if let Some(r) = build_regex(re, true) {
-                    regex_names.push(r);
+                    regex_names.push(r.clone());
+                    regex_names_src.push((r, re.to_string()));
                 } else {
                     self.warn(d, format!("invalid server_name regex \"{n}\""));
                 }
@@ -1374,6 +1416,7 @@ impl Builder {
                 server_tokens: tokens,
                 access_log_off,
                 regex_names,
+                regex_names_src,
                 ssl,
                 ssl_certificate,
                 ssl_certificate_key,

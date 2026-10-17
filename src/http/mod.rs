@@ -158,7 +158,8 @@ pub async fn handle_conn(mut conn: Conn, group: &ListenGroup, ctx: &Ctx) {
             }
         };
 
-        let server = select_server(http, &group.servers, group.default_server, req.host.as_deref());
+        let (server, captures) =
+            select_server_ex(http, &group.servers, group.default_server, req.host.as_deref());
         let loc = server.locate(&path);
 
         // Request body: upstream modules (proxy, fastcgi) forward it; every
@@ -194,7 +195,18 @@ pub async fn handle_conn(mut conn: Conn, group: &ListenGroup, ctx: &Ctx) {
         }
 
         let started = SystemTime::now();
-        let outcome = dispatch(&mut conn, &req, &path, &query, server, loc, http, group.addr.port()).await;
+        let outcome = dispatch(
+            &mut conn,
+            &req,
+            &path,
+            &query,
+            server,
+            loc,
+            http,
+            group.addr.port(),
+            &captures,
+        )
+        .await;
         let elapsed = started.elapsed().unwrap_or_default();
 
         let (status, bytes, close) = match outcome {
@@ -204,7 +216,7 @@ pub async fn handle_conn(mut conn: Conn, group: &ListenGroup, ctx: &Ctx) {
 
         log_access(ctx, group, server, &req, &path, &query, status, bytes, elapsed, conn.peer);
 
-        if close || !req.keepalive || served >= http.keepalive_requests {
+        if close || !req.keepalive || util::force_close(status) || served >= http.keepalive_requests {
             break;
         }
     }
@@ -605,11 +617,13 @@ fn add_header_applies(status: u16, always: bool) -> bool {
 }
 
 /// Append `add_header` lines to a rendered header block.
-pub fn apply_add_headers(
+/// Minimal variant for callers that only know the cache status (the proxy
+/// paths already hold the rendered response and no `ServerVars`).
+pub fn apply_add_headers_simple(
     raw: &mut Vec<u8>,
     headers: &[(String, String)],
     status: u16,
-    vars: &AddHeaderVars<'_>,
+    upstream_cache_status: &str,
 ) {
     for (name, value) in headers {
         let (value, always) = match value.rsplit_once(' ') {
@@ -619,7 +633,29 @@ pub fn apply_add_headers(
         if !add_header_applies(status, always) {
             continue;
         }
-        let expanded = expand_add_header(value, vars);
+        let expanded = value.replace("$upstream_cache_status", upstream_cache_status);
+        raw.extend_from_slice(name.as_bytes());
+        raw.extend_from_slice(b": ");
+        raw.extend_from_slice(expanded.as_bytes());
+        raw.extend_from_slice(b"\r\n");
+    }
+}
+
+pub fn apply_add_headers(
+    raw: &mut Vec<u8>,
+    headers: &[(String, String)],
+    status: u16,
+    vars: &ServerVars<'_>,
+) {
+    for (name, value) in headers {
+        let (value, always) = match value.rsplit_once(' ') {
+            Some((v, "always")) => (v, true),
+            _ => (value.as_str(), false),
+        };
+        if !add_header_applies(status, always) {
+            continue;
+        }
+        let expanded = vars.expand(value);
         raw.extend_from_slice(name.as_bytes());
         raw.extend_from_slice(b": ");
         raw.extend_from_slice(expanded.as_bytes());
@@ -673,7 +709,7 @@ impl<'a> ServerVars<'a> {
             }
             "request_method" => self.req.method.as_str().to_string(),
             "scheme" => self.scheme.to_string(),
-            "server_name" => self.server_name.to_string(),
+            "server_name" => self.server_name.trim_start_matches('.').to_string(),
             "server_port" => self.server_port.to_string(),
             "server_protocol" => {
                 if self.req.version_minor == 1 {
@@ -745,42 +781,10 @@ impl<'a> ServerVars<'a> {
     }
 }
 
-fn expand_add_header(spec: &str, vars: &AddHeaderVars<'_>) -> String {
-    let mut out = String::with_capacity(spec.len() + 8);
-    let b = spec.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] != b'$' {
-            out.push(b[i] as char);
-            i += 1;
-            continue;
-        }
-        let rest = &spec[i + 1..];
-        let n = rest
-            .bytes()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == b'_')
-            .count();
-        if n == 0 {
-            out.push('$');
-            i += 1;
-            continue;
-        }
-        let name = &rest[..n];
-        let v = match name {
-            "upstream_cache_status" => vars.upstream_cache_status,
-            "scheme" => vars.scheme,
-            "host" | "http_host" => vars.host,
-            _ => "",
-        };
-        out.push_str(v);
-        i += 1 + n;
-    }
-    out
-}
-
 /// Resolve a request to a `Response` without touching the socket: error_page
 /// internal redirects plus the gzip filter. The HTTP/1 handler writes the
 /// result; the HTTP/2 handler turns it into h2 frames.
+#[allow(clippy::too_many_arguments)]
 pub async fn resolve_response(
     req: &Request,
     path: &str,
@@ -791,12 +795,34 @@ pub async fn resolve_response(
     peer_ip: &str,
     server_port: u16,
 ) -> Response {
+    resolve_response_caps(
+        req, path, query, server, loc, http, peer_ip, server_port, &[],
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_response_caps(
+    req: &Request,
+    path: &str,
+    query: &str,
+    server: &Server,
+    loc: &LocCfg,
+    http: &Http,
+    peer_ip: &str,
+    server_port: u16,
+    captures: &[(String, String)],
+) -> Response {
     let mut cur_path = path.to_string();
     let mut cur_query = query.to_string();
     let mut cur_loc = loc;
     let mut depth = 0usize;
 
-    let custom: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // Named captures from `server_name ~regex` are ordinary variables.
+    let mut custom: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (k, v) in captures {
+        custom.insert(k.clone(), v.clone());
+    }
 
     // ---- rewrite phase ----
     let mut relocations = 0;
@@ -897,7 +923,27 @@ pub async fn resolve_response(
         resp = error_response(resp.status, server.server_tokens);
     }
 
-    crate::gzip::maybe_compress(req, resp, cur_loc, http)
+    let mut resp = crate::gzip::maybe_compress(req, resp, cur_loc, http);
+
+    // `add_header` applies to every response nginx would attach it to, not just
+    // static files (http_uri.t checks it on a `return 204`).
+    if !cur_loc.headers.is_empty() {
+        let v = ServerVars {
+            req,
+            path: &cur_path,
+            query: &cur_query,
+            server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
+            server_port,
+            peer_ip,
+            scheme: "http",
+            document_root: &cur_loc.root.to_string_lossy(),
+            upstream_cache_status: "",
+            custom: &custom,
+        };
+        apply_add_headers(&mut resp.raw, &cur_loc.headers, resp.status, &v);
+    }
+
+    resp
 }
 
 /// Read a whole response body into memory (HTTP/2 needs the length up front
@@ -935,6 +981,7 @@ async fn dispatch(
     loc: &LocCfg,
     http: &Http,
     listen_port: u16,
+    captures: &[(String, String)],
 ) -> io::Result<Outcome> {
     let head_only = req.method == Method::Head;
 
@@ -971,15 +1018,8 @@ async fn dispatch(
     }
 
     let peer_ip = conn.peer.ip().to_string();
-    let resp = resolve_response(
-        req,
-        path,
-        query,
-        server,
-        loc,
-        http,
-        &peer_ip,
-        listen_port,
+    let resp = resolve_response_caps(
+        req, path, query, server, loc, http, &peer_ip, listen_port, captures,
     )
     .await;
     let status = resp.status;
@@ -1236,6 +1276,9 @@ pub async fn write_response(
         out.extend_from_slice(v.as_bytes());
         out.extend_from_slice(b"\r\n");
     }
+    // nginx force-closes after certain error statuses so clients that wait for
+    // EOF (including its own test suite) are not left hanging.
+    let keepalive = keepalive && !util::force_close(status);
     out.extend_from_slice(b"Connection: ");
     out.extend_from_slice(if keepalive { b"keep-alive" } else { b"close" });
     out.extend_from_slice(b"\r\n\r\n");
@@ -1326,6 +1369,9 @@ pub async fn write_head(
         .as_secs() as i64;
     util::write_date_header(&mut out, now);
     out.extend_from_slice(raw);
+    // nginx force-closes after certain error statuses so clients that wait for
+    // EOF (including its own test suite) are not left hanging.
+    let keepalive = keepalive && !util::force_close(status);
     out.extend_from_slice(b"Connection: ");
     out.extend_from_slice(if keepalive { b"keep-alive" } else { b"close" });
     out.extend_from_slice(b"\r\n\r\n");
@@ -1335,64 +1381,163 @@ pub async fn write_head(
     r
 }
 
+/// Same as [`select_server`] but also returns the named captures of a matching
+/// `server_name ~regex`, which nginx exposes as `$name` variables.
+pub fn select_server_ex<'a>(
+    http: &'a Http,
+    servers: &[usize],
+    default_server: usize,
+    host: Option<&str>,
+) -> (&'a Server, Vec<(String, String)>) {
+    let Some(raw_host) = host else {
+        return (http.server(default_server), Vec::new());
+    };
+    let lowered = raw_host.to_ascii_lowercase();
+    let host = strip_host_port(&lowered);
+
+    let (server, _) = {
+        let s = select_server(http, servers, default_server, Some(raw_host));
+        (s, ())
+    };
+
+    // Recover named captures when the winner was chosen by regex.
+    let mut caps = Vec::new();
+    let chosen = server.idx;
+    let mut regex_winner = false;
+    for &idx in servers {
+        if idx != chosen {
+            continue;
+        }
+        let srv = http.server(idx);
+        for (re, src) in &srv.regex_names_src {
+            if let Some(c) = re.captures(host) {
+                if !srv.names.iter().any(|n| n.eq_ignore_ascii_case(host)) {
+                    regex_winner = true;
+                }
+                for name in re.capture_names().flatten() {
+                    if let Some(m) = c.name(name) {
+                        caps.push((name.to_string(), m.as_str().to_string()));
+                    }
+                }
+                let _ = src;
+                break;
+            }
+        }
+        break;
+    }
+    if !regex_winner {
+        caps.clear();
+    }
+    (server, caps)
+}
+
+/// nginx's server_name lookup order (ngx_http_core_find_server):
+/// 1. exact name
+/// 2. longest wildcard starting with `*`, then the longest ending with `*`
+/// 3. `.example.com` also matches the bare `example.com`
+/// 4. first matching regex, in configuration order
+/// 5. the default server
 pub fn select_server<'a>(
     http: &'a Http,
     servers: &[usize],
     default_server: usize,
     host: Option<&str>,
 ) -> &'a Server {
-    let host = host.map(|h| {
-        // strip :port, including bracketed IPv6
-        if h.starts_with('[') {
-            match h.find(']') {
-                Some(i) => &h[..=i],
-                None => h,
-            }
-        } else {
-            match h.rfind(':') {
-                Some(i) if h[i + 1..].chars().all(|c| c.is_ascii_digit()) => &h[..i],
-                _ => h,
-            }
-        }
-    });
+    let Some(raw_host) = host else {
+        return http.server(default_server);
+    };
+    let lowered = raw_host.to_ascii_lowercase();
+    let host = strip_host_port(&lowered);
 
-    if let Some(h) = host {
-        let lower = h.to_ascii_lowercase();
-        for &idx in servers {
-            let s = http.server(idx);
-            for n in &s.names {
-                if n.eq_ignore_ascii_case(&lower) {
-                    return s;
+    // 1. exact
+    for &idx in servers {
+        let s = http.server(idx);
+        if s.names.iter().any(|n| n.eq_ignore_ascii_case(host)) {
+            return s;
+        }
+    }
+
+    // 2. wildcards: the longest matching pattern wins
+    let mut best: Option<(usize, &'a Server)> = None;
+    for &idx in servers {
+        let s = http.server(idx);
+        for n in &s.names {
+            let n_lower = n.to_ascii_lowercase();
+            if let Some(suffix) = n_lower.strip_prefix("*.") {
+                // `*.example.com` matches `x.example.com` (never `example.com`)
+                if host.len() > suffix.len()
+                    && host.ends_with(suffix)
+                    && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+                {
+                    if best.map_or(true, |(len, _)| suffix.len() > len) {
+                        best = Some((suffix.len(), s));
+                    }
+                }
+            } else if let Some(rest) = n_lower.strip_prefix('.') {
+                // `.example.com` is shorthand for `example.com` + `*.example.com`
+                if host.ends_with(rest)
+                    && (host.len() == rest.len()
+                        || host.as_bytes()[host.len() - rest.len() - 1] == b'.')
+                {
+                    if best.map_or(true, |(len, _)| rest.len() > len) {
+                        best = Some((rest.len(), s));
+                    }
+                }
+            } else if let Some(prefix) = n_lower.strip_suffix(".*") {
+                // `www.example.*` matches `www.example.com`
+                if host.len() > prefix.len()
+                    && host.starts_with(prefix)
+                    && host.as_bytes()[prefix.len()] == b'.'
+                {
+                    if best.map_or(true, |(len, _)| prefix.len() > len) {
+                        best = Some((prefix.len(), s));
+                    }
                 }
             }
         }
-        for &idx in servers {
-            let s = http.server(idx);
-            for n in &s.names {
-                if let Some(suffix) = n.strip_prefix("*.") {
-                    if lower.ends_with(&format!(".{}", suffix.to_ascii_lowercase()))
-                        || lower == suffix.to_ascii_lowercase()
-                    {
-                        return s;
-                    }
-                } else if let Some(suffix) = n.strip_prefix('.') {
-                    if lower.ends_with(&format!(".{}", suffix.to_ascii_lowercase())) {
-                        return s;
-                    }
-                }
-            }
-        }
-        for &idx in servers {
-            let s = http.server(idx);
-            for re in &s.regex_names {
-                if re.is_match(&lower) {
+    }
+    if let Some((_, s)) = best {
+        return s;
+    }
+
+    // 3. `.example.com` also matches `example.com` itself
+    for &idx in servers {
+        let s = http.server(idx);
+        for n in &s.names {
+            if let Some(rest) = n.strip_prefix('.') {
+                if host.eq_ignore_ascii_case(rest) {
                     return s;
                 }
             }
         }
     }
 
+    // 4. regex, in configuration order
+    for &idx in servers {
+        let s = http.server(idx);
+        for re in &s.regex_names {
+            if re.is_match(host) {
+                return s;
+            }
+        }
+    }
+
+    // 5. default
     http.server(default_server)
+}
+
+/// Drop `:port` (and the brackets of an IPv6 literal) from a host value.
+fn strip_host_port(host: &str) -> &str {
+    if host.starts_with('[') {
+        return match host.find(']') {
+            Some(i) => &host[..=i],
+            None => host,
+        };
+    }
+    match host.rsplit_once(':') {
+        Some((name, port)) if !name.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => host,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

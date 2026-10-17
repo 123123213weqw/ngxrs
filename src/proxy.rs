@@ -474,15 +474,11 @@ pub async fn handle(
                         raw.extend_from_slice(v.as_bytes());
                         raw.extend_from_slice(b"\r\n");
                     }
-                    crate::http::apply_add_headers(
+                    crate::http::apply_add_headers_simple(
                         &mut raw,
                         &loc.headers,
                         entry.status,
-                        &crate::http::AddHeaderVars {
-                            upstream_cache_status: "HIT",
-                            scheme: "http",
-                            host: req.host.as_ref().map(|h| h.as_str()).unwrap_or(""),
-                        },
+                        "HIT",
                     );
                     raw.extend_from_slice(b"Content-Length: ");
                     raw.extend_from_slice(entry.body.len().to_string().as_bytes());
@@ -933,15 +929,11 @@ async fn exchange(
         }
 
         let mut out_raw = raw;
-        crate::http::apply_add_headers(
+        crate::http::apply_add_headers_simple(
             &mut out_raw,
             &loc.headers,
             head.status,
-            &crate::http::AddHeaderVars {
-                upstream_cache_status: cache.status,
-                scheme: "http",
-                host: req.host.as_ref().map(|h| h.as_str()).unwrap_or(""),
-            },
+            cache.status,
         );
         write_head(conn, head.status, &out_raw, req.keepalive, tokens).await?;
         conn.write_all(&payload).await?;
@@ -953,16 +945,7 @@ async fn exchange(
     }
 
     let mut raw = raw;
-    crate::http::apply_add_headers(
-        &mut raw,
-        &loc.headers,
-        head.status,
-        &crate::http::AddHeaderVars {
-            upstream_cache_status: cache.status,
-            scheme: "http",
-            host: req.host.as_ref().map(|h| h.as_str()).unwrap_or(""),
-        },
-    );
+    crate::http::apply_add_headers_simple(&mut raw, &loc.headers, head.status, cache.status);
     write_head(conn, head.status, &raw, req.keepalive, tokens).await?;
 
     let mut sent = 0u64;

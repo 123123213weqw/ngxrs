@@ -129,6 +129,87 @@ impl Drop for Request {
     }
 }
 
+/// Validate a Host header the way nginx does.
+fn validate_host(host: &str) -> Result<(), ()> {
+    if host.is_empty() || host.starts_with(':') {
+        return Err(());
+    }
+    // IPv6 literal: [::1] or [::1]:8080
+    if let Some(rest) = host.strip_prefix('[') {
+        let close = rest.find(']').ok_or(())?;
+        let after = &rest[close + 1..];
+        if after.is_empty() {
+            return Ok(());
+        }
+        return match after.strip_prefix(':') {
+            Some(port) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => Ok(()),
+            _ => Err(()),
+        };
+    }
+    // A host that is only dots (`.` , `..`) is invalid.
+    if host.trim_end_matches('.').is_empty() {
+        return Err(());
+    }
+    match host.rsplit_once(':') {
+        Some((name, port)) => {
+            if name.is_empty() || name.trim_end_matches('.').is_empty() {
+                return Err(());
+            }
+            if port.is_empty() {
+                // `host:` is tolerated by nginx (stray colon), the port is dropped
+                return Ok(());
+            }
+            if !port.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(());
+            }
+            Ok(())
+        }
+        None => Ok(()),
+    }
+}
+
+fn is_absolute_form(target: &str) -> bool {
+    let lower = target.get(..8).unwrap_or("").to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// Lowercase, strip the port, a stray colon and trailing dots — nginx's
+/// `$host` value (`www.example.com.:80` becomes `www.example.com`).
+fn normalize_host(host: &str) -> String {
+    let no_port = strip_port(host);
+    let trimmed = no_port.strip_suffix(':').unwrap_or(no_port);
+    trimmed.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Extract the authority from an absolute-form request target.
+fn absolute_form_host(target: &str) -> Option<String> {
+    let rest = target
+        .strip_prefix("http://")
+        .or_else(|| target.strip_prefix("https://"))?;
+    let end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    if authority.is_empty() {
+        return None;
+    }
+    // Drop userinfo if present.
+    let authority = authority.rsplit_once('@').map(|(_, a)| a).unwrap_or(authority);
+    Some(strip_port(authority).to_string())
+}
+
+/// `example.com:80` -> `example.com`, `[::1]:80` -> `[::1]`.
+fn strip_port(host: &str) -> &str {
+    if host.starts_with('[') {
+        return match host.find(']') {
+            Some(i) => &host[..=i],
+            None => host,
+        };
+    }
+    match host.rsplit_once(':') {
+        Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => host,
+    }
+}
+
 fn is_token(b: u8) -> bool {
     matches!(b,
         b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_'
@@ -141,7 +222,7 @@ impl Request {
             return Err(HttpError::new(400, true));
         }
 
-        let mut lines = split_crlf(head);
+        let mut lines = split_lines(head);
         let request_line = lines.next().ok_or_else(|| HttpError::new(400, true))?;
         if request_line.len() > max_line {
             return Err(HttpError::new(414, true));
@@ -177,6 +258,8 @@ impl Request {
             b"CONNECT" => Method::Connect,
             other => Method::Other(InStr::new(&String::from_utf8_lossy(other))),
         };
+
+        let target_str = String::from_utf8_lossy(t).to_string();
 
         let version_minor = match v {
             b"HTTP/1.1" => 1,
@@ -265,10 +348,29 @@ impl Request {
             return Err(HttpError::new(400, true));
         }
 
-        let host = headers.get("host").map(InStr::new);
-        if host.is_none() && version_minor == 1 {
+        // nginx validates the Host header strictly, even for HTTP/1.0:
+        // an empty value, an empty name, or a stray colon after the port are
+        // all 400 (see http_host.t).
+        let raw_host = headers.get("host");
+        if let Some(h) = raw_host {
+            validate_host(h).map_err(|_| HttpError::new(400, true))?;
+        } else if version_minor == 1 {
             return Err(HttpError::new(400, true));
         }
+
+        // absolute-form (`GET http://host/path`) overrides the Host header for
+        // $host, which is what nginx's http_absolute_path tests check.
+        // Absolute-form with an empty authority (`GET http:///` ) is a 400.
+        if is_absolute_form(&target_str) && absolute_form_host(&target_str).is_none() {
+            return Err(HttpError::new(400, true));
+        }
+        let absolute_host = absolute_form_host(&target_str);
+        // nginx's $host is normalized: lowercase, port and stray colon removed.
+        let host = match (&absolute_host, raw_host) {
+            (Some(a), _) => Some(InStr::new(&normalize_host(a))),
+            (None, Some(h)) => Some(InStr::new(&normalize_host(h))),
+            (None, None) => None,
+        };
 
         let mut keepalive = version_minor == 1;
         if let Some(conn) = headers.get("connection") {
@@ -289,7 +391,7 @@ impl Request {
 
         Ok(Request {
             method,
-            raw_target: String::from_utf8_lossy(t).to_string(),
+            raw_target: target_str,
             version_minor,
             headers,
             body_len,
@@ -301,20 +403,31 @@ impl Request {
     }
 }
 
-fn split_crlf(buf: &[u8]) -> impl Iterator<Item = &[u8]> {
+/// Split on `\n` and drop a trailing `\r`.
+///
+/// nginx accepts bare LF as a line terminator (`ngx_http_parse_request_line`
+/// treats it the same as CRLF), and several clients — including the official
+/// test suite — send LF-only requests.
+fn split_lines(buf: &[u8]) -> impl Iterator<Item = &[u8]> {
     let mut rest = buf;
     std::iter::from_fn(move || {
         if rest.is_empty() {
             return None;
         }
-        match memchr::memmem::find(rest, b"\r\n") {
+        match memchr::memchr(b'\n', rest) {
             Some(i) => {
-                let line = &rest[..i];
-                rest = &rest[i + 2..];
+                let mut line = &rest[..i];
+                if line.last() == Some(&b'\r') {
+                    line = &line[..line.len() - 1];
+                }
+                rest = &rest[i + 1..];
                 Some(line)
             }
             None => {
-                let line = rest;
+                let mut line = rest;
+                if line.last() == Some(&b'\r') {
+                    line = &line[..line.len() - 1];
+                }
                 rest = &[];
                 Some(line)
             }
@@ -355,6 +468,66 @@ mod tests {
     #[test]
     fn missing_host_is_400() {
         assert!(parse("GET / HTTP/1.1\r\n\r\n").is_err());
+    }
+
+    #[test]
+    fn host_validation() {
+        // empty and malformed Host values are 400, like nginx
+        assert!(parse("GET / HTTP/1.0\r\nHost: \r\n\r\n").is_err());
+        assert!(parse("GET / HTTP/1.0\r\nHost: :8080\r\n\r\n").is_err());
+        assert!(parse("GET / HTTP/1.0\r\nHost: a:b\r\n\r\n").is_err());
+        // a stray colon with no port is accepted
+        assert!(parse("GET / HTTP/1.0\r\nHost: example.com:\r\n\r\n").is_ok());
+    }
+
+    #[test]
+    fn absolute_form_host_wins() {
+        let r = parse("GET http://l/ HTTP/1.0\r\nHost: localhost\r\n\r\n").unwrap();
+        assert_eq!(r.host.as_deref(), Some("l"));
+    }
+
+    #[test]
+    fn empty_absolute_authority_is_400() {
+        assert!(parse("GET http:/// HTTP/1.0\r\nHost: localhost\r\n\r\n").is_err());
+    }
+
+    #[test]
+    fn host_is_normalized() {
+        // lowercase, port removed, stray colon removed
+        let r = parse("GET / HTTP/1.0\r\nHost: L\r\n\r\n").unwrap();
+        assert_eq!(r.host.as_deref(), Some("l"));
+        let r = parse("GET / HTTP/1.0\r\nHost: Example.COM:8080\r\n\r\n").unwrap();
+        assert_eq!(r.host.as_deref(), Some("example.com"));
+        let r = parse("GET / HTTP/1.0\r\nHost: abcd-ef.g02.xyz:\r\n\r\n").unwrap();
+        assert_eq!(r.host.as_deref(), Some("abcd-ef.g02.xyz"));
+        let r = parse("GET / HTTP/1.0\r\nHost: 123.40.56.78:\r\n\r\n").unwrap();
+        assert_eq!(r.host.as_deref(), Some("123.40.56.78"));
+    }
+
+    #[test]
+    fn trailing_dot_is_stripped() {
+        // nginx drops the trailing dot, and a host of only dots is a 400
+        let r = parse("GET / HTTP/1.0\r\nHost: www.abcd-ef.g02.xyz.\r\n\r\n").unwrap();
+        assert_eq!(r.host.as_deref(), Some("www.abcd-ef.g02.xyz"));
+        let r = parse("GET / HTTP/1.0\r\nHost: abcd-ef.g02.xyz.:2\r\n\r\n").unwrap();
+        assert_eq!(r.host.as_deref(), Some("abcd-ef.g02.xyz"));
+        assert!(parse("GET / HTTP/1.0\r\nHost: .\r\n\r\n").is_err());
+    }
+
+    #[test]
+    fn bare_lf_line_endings() {
+        // nginx accepts LF-only requests; several clients send them.
+        let head = b"GET / HTTP/1.1\nHost: example.com\n\n";
+        let r = Request::parse(head, 8192, 32768).unwrap();
+        assert_eq!(r.raw_target, "/");
+        assert_eq!(r.host.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn mixed_line_endings() {
+        let head = b"GET /x HTTP/1.1\r\nHost: a\nX-Test: 1\r\n\n";
+        let r = Request::parse(head, 8192, 32768).unwrap();
+        assert_eq!(r.headers.get("x-test"), Some("1"));
     }
 
     #[test]

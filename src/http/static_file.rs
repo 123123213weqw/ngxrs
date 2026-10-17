@@ -229,14 +229,9 @@ fn serve_entry(
         raw.extend_from_slice(b"\r\n");
     }
 
-    let mut headers: Vec<(String, String)> = Vec::with_capacity(loc.headers.len());
-    for (k, v) in &loc.headers {
-        headers.push((k.clone(), v.clone()));
-    }
-
     Ok(Response {
         status,
-        headers,
+        headers: Vec::new(),
         raw,
         no_error_page: false,
             explicit_len: true,
@@ -363,10 +358,7 @@ fn autoindex(dir: &Path, uri: &str, loc: &LocCfg, http: &Http) -> io::Result<Res
     }
     html.push_str("</pre><hr></body>\r\n</html>\r\n");
 
-    let mut resp = Response::bytes(200, "text/html", html.into_bytes());
-    for (k, v) in &loc.headers {
-        resp.headers.push((k.clone(), v.clone()));
-    }
+    let resp = Response::bytes(200, "text/html", html.into_bytes());
     let _ = http;
     Ok(resp)
 }

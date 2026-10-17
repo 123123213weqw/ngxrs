@@ -90,6 +90,12 @@ pub fn error_page_reason(status: u16) -> &'static str {
     }
 }
 
+/// Statuses for which nginx drops keepalive (`ngx_http_special_response_handler`
+/// clears `r->keepalive` for these).
+pub fn force_close(status: u16) -> bool {
+    matches!(status, 400 | 405 | 413 | 414 | 495 | 496 | 497 | 500 | 501)
+}
+
 pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -337,6 +343,12 @@ pub fn parse_target(raw: &str) -> Result<(String, String), ()> {
         return Err(());
     }
 
+    // A fragment is never part of the request target: nginx drops everything
+    // from `#` on (`$uri` and `$args` both exclude it).
+    if let Some(hash) = target.find('#') {
+        target = &target[..hash];
+    }
+
     let (path_raw, query) = match target.find('?') {
         Some(i) => (&target[..i], &target[i + 1..]),
         None => (target, ""),
@@ -358,6 +370,18 @@ mod tests {
         assert_eq!(normalize_path("/a/b/../c", true).unwrap(), "/a/c");
         assert_eq!(normalize_path("/", true).unwrap(), "/");
         assert!(normalize_path("/../etc/passwd", true).is_err());
+    }
+
+    #[test]
+    fn fragment_is_dropped() {
+        assert_eq!(
+            parse_target("/foo/bar/.#frag").unwrap(),
+            ("/foo/bar/".to_string(), "".to_string())
+        );
+        assert_eq!(
+            parse_target("/x?a=1#frag").unwrap(),
+            ("/x".to_string(), "a=1".to_string())
+        );
     }
 
     #[test]

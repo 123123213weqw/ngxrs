@@ -138,7 +138,70 @@ pub fn validity(loc: &LocCfg, status: u16) -> Option<Duration> {
             return Some(*dur);
         }
     }
-    // nginx: only codes listed in proxy_cache_valid are cached.
+    None
+}
+
+/// How long a response may be cached, following nginx's precedence:
+/// `proxy_cache_valid` → `X-Accel-Expires` → `Cache-Control: max-age` →
+/// `Expires`. `Set-Cookie` and `no-cache`/`no-store` make it uncacheable.
+pub fn ttl(loc: &LocCfg, status: u16, headers: &[(String, String)]) -> Option<Duration> {
+    let find = |name: &str| {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.trim().to_string())
+    };
+
+    // Set-Cookie prevents caching unless something above explicitly allows it.
+    let has_set_cookie = headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("set-cookie"));
+
+    // X-Accel-Expires wins over the standard headers.
+    if let Some(v) = find("x-accel-expires") {
+        if v == "0" {
+            return None;
+        }
+        if let Ok(secs) = v.parse::<u64>() {
+            return Some(Duration::from_secs(secs));
+        }
+    }
+
+    if let Some(cc) = find("cache-control") {
+        let lower = cc.to_ascii_lowercase();
+        if lower.contains("no-cache") || lower.contains("no-store") || lower.contains("private") {
+            return None;
+        }
+        for part in lower.split(',') {
+            let part = part.trim();
+            if let Some(v) = part.strip_prefix("s-maxage=").or_else(|| part.strip_prefix("max-age="))
+            {
+                if let Ok(secs) = v.trim().parse::<u64>() {
+                    return Some(Duration::from_secs(secs));
+                }
+            }
+        }
+    }
+
+    if let Some(exp) = find("expires") {
+        if let Some(at) = crate::util::parse_http_date(&exp) {
+            let now = now() as i64;
+            if at <= now {
+                return None;
+            }
+            return Some(Duration::from_secs((at - now) as u64));
+        }
+    }
+
+    // Fall back to the configured validity (nginx checks this first, but a
+    // response with explicit headers above already decided).
+    if let Some(d) = validity(loc, status) {
+        return Some(d);
+    }
+
+    if has_set_cookie {
+        return None;
+    }
     None
 }
 

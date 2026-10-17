@@ -559,6 +559,87 @@ pub async fn handle(
             }
         }
     }
+    // `proxy_cache_lock`: only the first request for a key may populate the
+    // cache. Latecomers wait for it to land, then serve the fresh entry.
+    // RAII: releases the lock on every exit path.
+    struct CacheLock(std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>, String);
+    impl Drop for CacheLock {
+        fn drop(&mut self) {
+            let mut set = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            set.remove(&self.1);
+        }
+    }
+
+    let mut _cache_lock_held: Option<CacheLock> = None;
+    if let (Some(z), Some(key), true) = (zone, cache_key.as_ref(), loc.proxy_cache_lock) {
+        let deadline = Instant::now() + loc.proxy_cache_lock_timeout;
+        loop {
+            // Someone else may have filled the entry while we waited.
+            if let Some(entry) = crate::cache::load(z, key) {
+                if entry.is_fresh(crate::cache::now()) {
+                    let mut raw = Vec::with_capacity(entry.body.len() + 256);
+                    for (k, v) in &entry.headers {
+                        raw.extend_from_slice(k.as_bytes());
+                        raw.extend_from_slice(b": ");
+                        raw.extend_from_slice(v.as_bytes());
+                        raw.extend_from_slice(b"\r\n");
+                    }
+                    crate::http::apply_add_headers_upstream(
+                        &mut raw,
+                        &loc.headers,
+                        entry.status,
+                        "HIT",
+                        "",
+                    );
+                    raw.extend_from_slice(b"Content-Length: ");
+                    raw.extend_from_slice(entry.body.len().to_string().as_bytes());
+                    raw.extend_from_slice(b"\r\n");
+                    let resp = Response {
+                        status: entry.status,
+                        headers: Vec::new(),
+                        raw,
+                        explicit_len: true,
+                        no_error_page: false,
+                        body: Body::Bytes(entry.body),
+                    };
+                    let bytes = crate::http::write_response(
+                        conn,
+                        resp,
+                        req.keepalive,
+                        tokens,
+                        req.method == Method::Head,
+                    )
+                    .await?;
+                    return Ok(Some(Outcome {
+                        status: entry.status,
+                        bytes,
+                        close: false,
+                        sent: Vec::new(),
+                    }));
+                }
+            }
+
+            let taken = {
+                let mut set = z.lock.lock().unwrap_or_else(|e| e.into_inner());
+                if set.contains(key) {
+                    false
+                } else {
+                    set.insert(key.clone());
+                    true
+                }
+            };
+            if taken {
+                _cache_lock_held = Some(CacheLock(z.lock.clone(), key.clone()));
+                break;
+            }
+            if Instant::now() >= deadline {
+                // nginx stops waiting and goes to the upstream itself.
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     let cache_status = if zone.is_some() {
         if bypass {
             "BYPASS"
@@ -1084,24 +1165,44 @@ async fn exchange(
     }
 
     // ---- cacheable (length-delimited) responses are buffered first ----
+    // nginx buffers a close-delimited upstream response too, so it can be
+    // cached and re-sent with a Content-Length.
     let cacheable = cache.zone.is_some()
         && cache.key.is_some()
         && !head.chunked
-        && total_len.is_some()
         && !is_upgrade
         && matches!(head.status, 200 | 301 | 302 | 304 | 404);
     if cacheable {
-        let len = total_len.unwrap_or(0);
         let mut payload = buf;
-        while (payload.len() as u64) < len {
-            let mut chunk = vec![0u8; (len - payload.len() as u64).min(64 * 1024) as usize];
-            let n = match tokio::time::timeout(loc.proxy_read_timeout, up.read(&mut chunk)).await {
-                Ok(Ok(0)) => break,
-                Ok(Ok(n)) => n,
-                Ok(Err(e)) => return Err(e),
-                Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout")),
-            };
-            payload.extend_from_slice(&chunk[..n]);
+        match total_len {
+            Some(len) => {
+                while (payload.len() as u64) < len {
+                    let mut chunk =
+                        vec![0u8; (len - payload.len() as u64).min(64 * 1024) as usize];
+                    let n =
+                        match tokio::time::timeout(loc.proxy_read_timeout, up.read(&mut chunk)).await
+                        {
+                            Ok(Ok(0)) => break,
+                            Ok(Ok(n)) => n,
+                            Ok(Err(e)) => return Err(e),
+                            Err(_) => {
+                                return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout"))
+                            }
+                        };
+                    payload.extend_from_slice(&chunk[..n]);
+                }
+            }
+            None => loop {
+                let mut chunk = vec![0u8; 64 * 1024];
+                match tokio::time::timeout(loc.proxy_read_timeout, up.read(&mut chunk)).await {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => payload.extend_from_slice(&chunk[..n]),
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout"))
+                    }
+                }
+            },
         }
 
         if let (Some(zone), Some(key)) = (cache.zone, cache.key) {
@@ -1114,7 +1215,7 @@ async fn exchange(
                         && !k.eq_ignore_ascii_case("x-cache-status")
                 })
                 .collect();
-            if let Some(valid) = crate::cache::validity(loc, head.status) {
+            if let Some(valid) = crate::cache::ttl(loc, head.status, &stored_headers) {
                 let entry = crate::cache::Cached {
                     status: head.status,
                     headers: stored_headers,
@@ -1127,6 +1228,7 @@ async fn exchange(
         }
 
         let mut out_raw = raw;
+        crate::http::apply_expires(&mut out_raw, loc);
         crate::http::apply_add_headers_upstream(
             &mut out_raw,
             &loc.headers,
@@ -1134,6 +1236,19 @@ async fn exchange(
             cache.status,
             upstream_addr,
         );
+        // A close-delimited upstream response has no length; since we buffered
+        // it we can now send one.
+        if !crate::http::split_head(&out_raw)
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+            && !crate::http::split_head(&out_raw)
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding"))
+        {
+            out_raw.extend_from_slice(b"Content-Length: ");
+            out_raw.extend_from_slice(payload.len().to_string().as_bytes());
+            out_raw.extend_from_slice(b"\r\n");
+        }
         write_head(conn, head.status, &out_raw, req.keepalive, tokens).await?;
         conn.write_all(&payload).await?;
         return Ok(Outcome {
@@ -1145,7 +1260,6 @@ async fn exchange(
     }
 
     let mut raw = raw;
-    crate::http::apply_expires(&mut raw, loc);
     crate::http::apply_expires(&mut raw, loc);
     let upstream_headers = crate::http::split_head(&raw);
     crate::http::apply_add_headers_ctx(

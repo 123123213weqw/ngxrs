@@ -111,6 +111,10 @@ pub struct LocCfg {
     // ---- proxy_cache ----
     pub proxy_cache: Option<String>,
     pub proxy_cache_valid: Vec<(Vec<u16>, Duration)>,
+    /// `proxy_cache_lock on|off`, `proxy_cache_lock_timeout`, `_age`.
+    pub proxy_cache_lock: bool,
+    pub proxy_cache_lock_timeout: Duration,
+    pub proxy_cache_lock_age: Duration,
     pub proxy_cache_key: Option<String>,
     pub proxy_no_cache: Vec<String>,
     pub proxy_cache_bypass: Vec<String>,
@@ -176,6 +180,9 @@ impl LocCfg {
             scgi_params: Vec::new(),
             proxy_cache: None,
             proxy_cache_valid: Vec::new(),
+            proxy_cache_lock: false,
+            proxy_cache_lock_timeout: Duration::from_secs(5),
+            proxy_cache_lock_age: Duration::from_secs(5),
             proxy_cache_key: None,
             proxy_no_cache: Vec::new(),
             proxy_cache_bypass: Vec::new(),
@@ -391,6 +398,8 @@ pub struct CacheZone {
     pub max_size: u64,
     pub inactive: Duration,
     pub levels: Option<String>,
+    /// `proxy_cache_lock`: only one request may populate a key at a time.
+    pub lock: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1482,6 +1491,27 @@ impl Builder {
                     }
                 }
             }
+            "proxy_cache_lock" => {
+                cfg.proxy_cache_lock = d
+                    .args
+                    .first()
+                    .map(|v| v == "on")
+                    .unwrap_or(false);
+            }
+            "proxy_cache_lock_timeout" | "proxy_cache_lock_age" => {
+                if let Some(t) = d.args.first().and_then(|v| parse_time(v)) {
+                    if d.name == "proxy_cache_lock_timeout" {
+                        cfg.proxy_cache_lock_timeout = t;
+                    } else {
+                        cfg.proxy_cache_lock_age = t;
+                    }
+                }
+            }
+            "proxy_cache_convert_head" | "proxy_cache_revalidate"
+            | "proxy_cache_background_update" | "proxy_cache_use_stale"
+            | "proxy_cache_methods" | "proxy_cache_min_uses" => {
+                // Accepted; behavioural parity for these is not implemented.
+            }
             "proxy_cache_valid" => {
                 // proxy_cache_valid [code ...] time;
                 let mut codes = Vec::new();
@@ -2152,6 +2182,9 @@ pub fn build(
                     .first()
                     .ok_or_else(|| sem(&d.file, d.line, "proxy_cache_path requires a path"))?;
                 let mut zone = CacheZone {
+                    lock: std::sync::Arc::new(std::sync::Mutex::new(
+                        std::collections::HashSet::new(),
+                    )),
                     name: String::new(),
                     path: resolve_path(prefix, path_arg),
                     max_size: 1024 * 1024 * 1024,

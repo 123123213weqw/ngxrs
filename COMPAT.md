@@ -54,10 +54,33 @@
 
 ## 反向代理 / 上游
 
-| 能力 | 状态 |
-|---|---|
-| `proxy_pass`、upstream、负载均衡、keepalive、WebSocket、proxy_cache | ⬜ |
-| `fastcgi_pass` / `uwsgi` / `scgi` / `grpc_pass` | ⬜ |
+| 能力 | 状态 | 备注 |
+|---|---|---|
+| `proxy_pass http://host[:port][/uri]` | ✅ | URI 前缀替换、`$` 变量 |
+| `upstream {}` + 多 server | ✅ | `weight` / `backup` / `down` 解析 |
+| 负载均衡 rr / least_conn / ip_hash | ✅ | ip_hash 按 IPv4 前三段 |
+| upstream `keepalive N` + 连接池 | ✅ | 池按 (upstream, server) 键，避免串后端 |
+| `proxy_http_version` 1.0 / 1.1 | ✅ | |
+| `proxy_set_header`（含 `$http_*`、`$remote_addr`、`$proxy_add_x_forwarded_for`） | ✅ | |
+| WebSocket（101 + 双向管道） | ✅ | |
+| 请求体转发（Content-Length / chunked 解块） | ✅ | |
+| 响应体流式转发（定长 / chunked / 无长度） | ✅ | chunked 原样透传 |
+| `proxy_connect_timeout` / `read_timeout` / `send_timeout` | ✅ | |
+| `proxy_buffering` | 🟡 | 已解析；当前总是流式转发 |
+| 上游失败重试（stale pooled socket） | 🟡 | 仅幂等方法重试同一后端 |
+| `proxy_cache` / `proxy_cache_path` | ⬜ | |
+| `fastcgi_pass` / `uwsgi` / `scgi` / `grpc_pass` | ⬜ | |
+
+## 内容过滤
+
+| 能力 | 状态 | 备注 |
+|---|---|---|
+| `gzip on` | ✅ | Accept-Encoding 协商、q=0 拒绝 |
+| `gzip_min_length` / `gzip_comp_level` / `gzip_types` / `gzip_vary` | ✅ | |
+| 压缩结果缓存 | ✅ | 按 ETag+长度，每 worker 128 条上限 |
+| 与 nginx 的差异 | 🟡 | nginx 流式压缩用 chunked，我们用 Content-Length；解码后内容一致 |
+| `gunzip` / `gzip_static` / `brotli` | ⬜ | |
+| `error_page`（含 `=code`、internal location、error_page 的 no-trigger 语义） | ✅ | 与 nginx 逐字节一致 |
 
 ## 安全 / 协议
 

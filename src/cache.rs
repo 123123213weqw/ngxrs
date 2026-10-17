@@ -28,6 +28,16 @@ pub struct Cached {
 }
 
 impl Cached {
+    /// `c->valid_sec + c->updating_sec >= now` — may a stale copy be served?
+    ///
+    /// `updating_sec` comes from `Cache-Control: stale-while-revalidate`, which
+    /// is derived from the stored headers so it never drifts out of sync with
+    /// the on-disk format.
+    pub fn may_serve_stale(&self, now: i64) -> bool {
+        let swr = stale_while_revalidate(&self.headers) as i64;
+        swr > 0 && self.stored_at + self.valid_for as i64 + swr >= now
+    }
+
     pub fn is_fresh(&self, now: i64) -> bool {
         // `valid_for == 0` means "stored but already stale" (an `@N`
         // X-Accel-Expires in the past), which nginx reports as EXPIRED.
@@ -141,6 +151,22 @@ pub fn validity(loc: &LocCfg, status: u16) -> Option<Duration> {
         }
     }
     None
+}
+
+/// `Cache-Control: stale-while-revalidate=N` (nginx's `updating_sec`).
+pub fn stale_while_revalidate(headers: &[(String, String)]) -> u64 {
+    headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("cache-control"))
+        .flat_map(|(_, v)| v.split(','))
+        .find_map(|part| {
+            let part = part.trim();
+            let n = part
+                .strip_prefix("stale-while-revalidate=")
+                .or_else(|| part.strip_prefix("Stale-While-Revalidate="))?;
+            n.trim().parse::<u64>().ok()
+        })
+        .unwrap_or(0)
 }
 
 /// `proxy_ignore_headers` bit set.
@@ -372,3 +398,4 @@ fn collect(dir: &Path, out: &mut Vec<(i64, u64, PathBuf)>, total: &mut u64, dept
 pub fn now() -> i64 {
     now_secs()
 }
+

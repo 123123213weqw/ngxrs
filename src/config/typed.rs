@@ -125,6 +125,8 @@ pub struct LocCfg {
     pub proxy_cache_ignore: crate::cache::Ignore,
     /// `proxy_cache_convert_head`, on by default like nginx.
     pub proxy_cache_convert_head: bool,
+    /// `proxy_cache_background_update`: serve a stale entry while refreshing.
+    pub proxy_cache_background_update: bool,
     pub proxy_cache_lock: bool,
     pub proxy_cache_lock_timeout: Duration,
     pub proxy_cache_lock_age: Duration,
@@ -201,6 +203,7 @@ impl LocCfg {
             cookie_flags_set: false,
             proxy_cache_ignore: crate::cache::Ignore::default(),
             proxy_cache_convert_head: true,
+            proxy_cache_background_update: false,
             proxy_cache_lock: false,
             proxy_cache_lock_timeout: Duration::from_secs(5),
             proxy_cache_lock_age: Duration::from_secs(5),
@@ -1600,8 +1603,11 @@ impl Builder {
                 cfg.proxy_cache_convert_head =
                     d.args.first().map(|v| v != "off").unwrap_or(true);
             }
-            "proxy_cache_revalidate"
-            | "proxy_cache_background_update" | "proxy_cache_use_stale"
+            "proxy_cache_background_update" => {
+                cfg.proxy_cache_background_update =
+                    d.args.first().map(|v| v != "off").unwrap_or(true);
+            }
+            "proxy_cache_revalidate" | "proxy_cache_use_stale"
             | "proxy_cache_methods" | "proxy_cache_min_uses" => {
                 // Accepted; behavioural parity for these is not implemented.
             }

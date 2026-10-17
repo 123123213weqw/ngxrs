@@ -339,6 +339,11 @@ fn parse_upstream_head(buf: &[u8]) -> Option<Head> {
     let mut raw = Vec::with_capacity(head.len());
     let mut chunked = false;
     let mut content_length = None;
+    // nginx's upstream header validation: duplicates and CL/TE conflicts make
+    // the whole response invalid (502), not just the offending line.
+    let mut seen_cl = false;
+    let mut seen_te = false;
+    let mut seen_expires = false;
     let mut conn_close = false;
     let mut conn_keepalive = false;
     let mut upgrade = None;
@@ -371,15 +376,39 @@ fn parse_upstream_head(buf: &[u8]) -> Option<Head> {
                 }
             }
             "transfer-encoding" => {
-                if value.to_ascii_lowercase().contains("chunked") {
-                    // Re-emit the header: the body is forwarded still chunked,
-                    // so the client needs it to delimit the message.
-                    chunked = true;
-                    raw.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+                // Duplicate, conflicting with Content-Length, or any coding
+                // other than `chunked` invalidates the response.
+                if seen_te || seen_cl || !value.eq_ignore_ascii_case("chunked") {
+                    return None;
                 }
+                seen_te = true;
+                chunked = true;
+                // Re-emit the header: the body is forwarded still chunked,
+                // so the client needs it to delimit the message.
+                raw.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
             }
             "content-length" => {
-                content_length = value.parse::<u64>().ok();
+                if seen_cl || seen_te {
+                    return None;
+                }
+                seen_cl = true;
+                match value.parse::<u64>() {
+                    Ok(n) => content_length = Some(n),
+                    // `Content-Length: foo` is invalid, not "unknown length".
+                    Err(_) => return None,
+                }
+            }
+
+            "expires" => {
+                // A duplicate is logged and ignored: only the first is kept.
+                if seen_expires {
+                    continue;
+                }
+                seen_expires = true;
+                raw.extend_from_slice(name);
+                raw.extend_from_slice(b": ");
+                raw.extend_from_slice(value.as_bytes());
+                raw.extend_from_slice(b"\r\n");
             }
             "server" | "date" | "x-pad" | "keep-alive" => {}
             "upgrade" => {
@@ -525,10 +554,28 @@ pub async fn handle(
     if let (Some(zone), Some(key)) = (zone, cache_key.as_ref()) {
         if !bypass {
             if let Some(entry) = crate::cache::load(zone, key) {
-                if !entry.is_fresh(crate::cache::now()) {
+                let fresh = entry.is_fresh(crate::cache::now());
+                // With `proxy_cache_background_update` nginx serves the stale
+                // copy and refreshes it behind the client's back.
+                // nginx serves a stale copy only when a background update is
+                // allowed *and* `stale-while-revalidate` still covers now.
+                let serve_stale = !fresh
+                    && loc.proxy_cache_background_update
+                    && entry.may_serve_stale(crate::cache::now());
+                if !fresh && !serve_stale {
                     stale_hit = true;
                 }
-                if entry.is_fresh(crate::cache::now()) {
+                if fresh || serve_stale {
+                    let hit_status = if fresh { "HIT" } else { "STALE" };
+                    if serve_stale {
+                        spawn_background_update(
+                            loc,
+                            http,
+                            req,
+                            key.clone(),
+                            &conn.peer.ip().to_string(),
+                        );
+                    }
                     let mut raw = Vec::with_capacity(entry.body.len() + 256);
                     for (k, v) in &entry.headers {
                         raw.extend_from_slice(k.as_bytes());
@@ -540,7 +587,7 @@ pub async fn handle(
                         &mut raw,
                         &loc.headers,
                         entry.status,
-                        "HIT",
+                        hit_status,
                         "",
                     );
                     raw.extend_from_slice(b"Content-Length: ");
@@ -1705,5 +1752,199 @@ fn dechunk(input: &[u8]) -> Option<Vec<u8>> {
         }
         out.extend_from_slice(&input[i..i + size]);
         i += size + 2; // skip trailing CRLF
+    }
+}
+
+/// Recompute the cache key exactly as the request path does.
+///
+/// Used by the background refresh, which has no connection context.
+pub fn cache_key_for(
+    loc: &LocCfg,
+    req: &Request,
+    peer_ip: &str,
+) -> Option<String> {
+    let pp = loc.proxy_pass.as_ref()?;
+    let scheme = "http";
+    let proxy_host = &pp.host_header;
+    let (uri_only, args_only) = match req.raw_target.split_once('?') {
+        Some((u, a)) => (u.to_string(), a.to_string()),
+        None => (req.raw_target.clone(), String::new()),
+    };
+    let host = req.host.as_ref().map(|h| h.as_str()).unwrap_or("");
+    Some(match &loc.proxy_cache_key {
+        Some(spec) => crate::cache::expand_key(
+            spec, scheme, proxy_host, host, &req.raw_target, &uri_only, &args_only, peer_ip,
+            req.method.as_str(),
+        ),
+        None => crate::cache::default_key(scheme, proxy_host, &req.raw_target),
+    })
+}
+
+
+/// Refresh a stale cache entry behind the client's back.
+///
+/// Everything the task needs is materialised before spawning: neither `Request`
+/// nor `Http` is `Clone`, and both are borrowed from the live request.
+pub fn spawn_background_update(
+    loc: &LocCfg,
+    http: &Http,
+    req: &Request,
+    key: String,
+    peer_ip: &str,
+) {
+    let Some(zone) = loc
+        .proxy_cache
+        .as_ref()
+        .and_then(|name| http.cache_zones.iter().find(|z| &z.name == name))
+        .cloned()
+    else {
+        return;
+    };
+    let Some(pp) = loc.proxy_pass.clone() else {
+        return;
+    };
+    let Some(candidates) = choose(http, loc, &match peer_ip.parse() {
+        Ok(ip) => ip,
+        Err(_) => return,
+    }) else {
+        return;
+    };
+    let addrs: Vec<SocketAddr> = candidates
+        .into_iter()
+        .map(|c| match c {
+            Chosen::Direct(_, a) => a,
+            Chosen::Upstream { addr, .. } => addr,
+        })
+        .collect();
+
+    // The refresh always asks for the whole body, even for a HEAD request.
+    let target_uri = upstream_target(req_uri(req), req_query(req), loc, &pp);
+    let head = build_upstream_head(req, &target_uri, &[], loc, &pp, peer_ip, false, true);
+
+    let connect_timeout = loc.proxy_connect_timeout;
+    let read_timeout = loc.proxy_read_timeout;
+    let loc_owned = loc.clone();
+
+    tokio::spawn(async move {
+        let Some((status, headers, body)) =
+            refetch(&head, &addrs, connect_timeout, read_timeout).await
+        else {
+            return;
+        };
+        if let Some(valid) = crate::cache::ttl(
+            &loc_owned,
+            status,
+            &headers,
+            loc_owned.proxy_cache_ignore,
+        ) {
+            let entry = crate::cache::Cached {
+                status,
+                headers,
+                body,
+                stored_at: crate::cache::now(),
+                valid_for: valid.as_secs(),
+            };
+            let _ = crate::cache::store(&zone, &key, &entry);
+        }
+    });
+}
+
+fn req_uri(req: &Request) -> &str {
+    match req.raw_target.split_once('?') {
+        Some((u, _)) => u,
+        None => &req.raw_target,
+    }
+}
+
+fn req_query(req: &Request) -> &str {
+    match req.raw_target.split_once('?') {
+        Some((_, q)) => q,
+        None => "",
+    }
+}
+
+/// Read one upstream response, decoding its body.
+async fn refetch(
+    head: &[u8],
+    addrs: &[SocketAddr],
+    connect_timeout: std::time::Duration,
+    read_timeout: std::time::Duration,
+) -> Option<(u16, Vec<(String, String)>, Vec<u8>)> {
+    let mut up = None;
+    for addr in addrs {
+        if let Ok(Ok(s)) = tokio::time::timeout(connect_timeout, tokio::net::TcpStream::connect(addr)).await {
+            up = Some(s);
+            break;
+        }
+    }
+    let mut up = up?;
+    up.write_all(head).await.ok()?;
+
+    let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+    loop {
+        if let Some(pos) = find_head_end(&buf) {
+            let h = parse_upstream_head(&buf[..pos])?;
+            let mut body = buf.split_off(pos);
+            if h.chunked {
+                loop {
+                    if dechunk(&body).is_some() {
+                        break;
+                    }
+                    let mut chunk = vec![0u8; 16 * 1024];
+                    let n = tokio::time::timeout(read_timeout, up.read(&mut chunk))
+                        .await
+                        .ok()?
+                        .ok()?;
+                    if n == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&chunk[..n]);
+                }
+                body = dechunk(&body).unwrap_or_default();
+            } else if let Some(len) = h.content_length {
+                while (body.len() as u64) < len {
+                    let mut chunk = vec![0u8; 16 * 1024];
+                    let n = tokio::time::timeout(read_timeout, up.read(&mut chunk))
+                        .await
+                        .ok()?
+                        .ok()?;
+                    if n == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&chunk[..n]);
+                }
+                body.truncate(len as usize);
+            } else {
+                loop {
+                    let mut chunk = vec![0u8; 16 * 1024];
+                    let n = tokio::time::timeout(read_timeout, up.read(&mut chunk))
+                        .await
+                        .ok()?
+                        .ok()?;
+                    if n == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&chunk[..n]);
+                }
+            }
+            let headers: Vec<(String, String)> = crate::http::split_head(&h.raw)
+                .into_iter()
+                .filter(|(k, _)| {
+                    !k.eq_ignore_ascii_case("connection")
+                        && !k.eq_ignore_ascii_case("keep-alive")
+                        && !k.eq_ignore_ascii_case("transfer-encoding")
+                })
+                .collect();
+            return Some((h.status, headers, body));
+        }
+        let mut chunk = vec![0u8; 16 * 1024];
+        let n = tokio::time::timeout(read_timeout, up.read(&mut chunk))
+            .await
+            .ok()?
+            .ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
     }
 }

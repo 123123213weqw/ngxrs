@@ -79,13 +79,32 @@ pub fn http_date(ts: i64) -> String {
     )
 }
 
+/// Append a `Date:` value, reusing a per-thread cache for the current second
+/// (nginx keeps a single cached time string as well).
+pub fn write_date_header(out: &mut Vec<u8>, now: i64) {
+    use std::cell::RefCell;
+    thread_local! {
+        static CACHE: RefCell<(i64, String)> = const { RefCell::new((0, String::new())) };
+    }
+    CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.0 != now {
+            c.1 = http_date(now);
+            c.0 = now;
+        }
+        out.extend_from_slice(b"Date: ");
+        out.extend_from_slice(c.1.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    });
+}
+
 pub fn log_time(ts: i64) -> String {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let t = ts as libc::time_t;
     unsafe {
         libc::localtime_r(&t, &mut tm);
     }
-    let off = unsafe { tm.tm_gmtoff };
+    let off = tm.tm_gmtoff;
     let sign = if off < 0 { '-' } else { '+' };
     let off = off.abs();
     format!(

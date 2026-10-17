@@ -145,7 +145,14 @@ impl Request {
         let version_minor = match v {
             b"HTTP/1.1" => 1,
             b"HTTP/1.0" => 0,
-            b"HTTP/1.2" | b"HTTP/2.0" => return Err(HttpError::new(505, true)),
+            v if v.starts_with(b"HTTP/")
+                && v.len() == 8
+                && v[5].is_ascii_digit()
+                && v[6] == b'.'
+                && v[7].is_ascii_digit() =>
+            {
+                return Err(HttpError::new(505, true))
+            }
             _ => return Err(HttpError::new(400, true)),
         };
 

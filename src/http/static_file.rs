@@ -209,8 +209,10 @@ fn serve_entry(
         ("Content-Length".to_string(), len.to_string()),
         ("Last-Modified".to_string(), last_modified),
         ("ETag".to_string(), etag),
-        ("Accept-Ranges".to_string(), "bytes".to_string()),
     ];
+    if status == 200 {
+        headers.push(("Accept-Ranges".to_string(), "bytes".to_string()));
+    }
     if let Some(cr) = content_range {
         headers.push(("Content-Range".to_string(), cr));
     }

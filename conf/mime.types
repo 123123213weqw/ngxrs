@@ -14,11 +14,9 @@ types {
     image/webp                            webp;
     image/avif                            avif;
     image/x-icon                          ico;
-    image/vnd.microsoft.icon              ico;
     application/pdf                       pdf;
     application/zip                       zip;
     application/gzip                      gz;
-    application/x-gzip                    gz;
     application/wasm                      wasm;
     font/woff                             woff;
     font/woff2                            woff2;

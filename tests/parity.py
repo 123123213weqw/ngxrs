@@ -46,15 +46,19 @@ def read_all(port, raw, timeout=5.0):
     return status, headers, body
 
 
-def summarize(res):
+def summarize(res, port):
     status, headers, body = res
     picked = {k: headers.get(k) for k in INTERESTING if k in headers}
+    if "location" in picked and picked["location"]:
+        # the two servers listen on different ports; that is the only
+        # legitimate Location difference
+        picked["location"] = picked["location"].replace(f":{port}", ":PORT")
     return status, picked, len(body), hashlib.sha256(body).hexdigest()[:16]
 
 
-def compare(name, a, b, strict_headers=True):
-    sa, ha, la, da = summarize(a)
-    sb, hb, lb, db = summarize(b)
+def compare(pa, pb, strict_headers=True):
+    sa, ha, la, da = summarize(pa[0], pa[1])
+    sb, hb, lb, db = summarize(pb[0], pb[1])
     problems = []
     if sa.split(" ")[0] != sb.split(" ")[0]:
         problems.append(f"status {sa!r} != {sb!r}")
@@ -92,8 +96,8 @@ CASES = [
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--nginx", type=int, default=18080)
-    ap.add_argument("--ngxrs", type=int, default=18081)
+    ap.add_argument("--nginx", type=int, default=18180)
+    ap.add_argument("--ngxrs", type=int, default=18181)
     ap.add_argument("--www", default=os.path.join(os.path.dirname(__file__), "..", "bench", "www"))
     args = ap.parse_args()
 
@@ -111,7 +115,7 @@ def main():
             continue
         a = read_all(args.nginx, raw)
         b = read_all(args.ngxrs, raw)
-        problems, (sa, sb) = compare(name, a, b)
+        problems, (sa, sb) = compare((a, args.nginx), (b, args.ngxrs))
         rows.append((name, sa.split(" ")[1] if " " in sa else sa,
                      sb.split(" ")[1] if " " in sb else sb, problems))
         if problems:
@@ -125,7 +129,7 @@ def main():
                "Connection: close\r\n\r\n").encode()
         a = read_all(args.nginx, raw)
         b = read_all(args.ngxrs, raw)
-        problems, (sa, sb) = compare("if-none-match", a, b)
+        problems, (sa, sb) = compare((a, args.nginx), (b, args.ngxrs))
         rows.append(("if-none-match", sa.split(" ")[1], sb.split(" ")[1], problems))
         if problems:
             failures += 1

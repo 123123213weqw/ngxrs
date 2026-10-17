@@ -63,6 +63,8 @@ impl Response {
     }
 }
 
+const SMALL_FILE_WRITE: u64 = 16 * 1024;
+
 pub struct Outcome {
     pub status: u16,
     pub bytes: u64,
@@ -143,10 +145,10 @@ pub async fn handle_conn(mut conn: Conn, group: &ListenGroup, ctx: &Ctx) {
         }
 
         let started = SystemTime::now();
-        let outcome = dispatch(&mut conn, &req, &path, &query, server, loc, http).await;
+        let outcome = dispatch(&mut conn, &req, &path, &query, server, loc, http, group.addr.port()).await;
         let elapsed = started.elapsed().unwrap_or_default();
 
-        let (status, bytes, mut close) = match outcome {
+        let (status, bytes, close) = match outcome {
             Ok(o) => (o.status, o.bytes, o.close),
             Err(_e) => (499, 0, true),
         };
@@ -169,21 +171,34 @@ async fn dispatch(
     server: &Server,
     loc: &LocCfg,
     http: &Http,
+    listen_port: u16,
 ) -> io::Result<Outcome> {
+    let head_only = req.method == Method::Head;
+
     if !req.method.is_read() {
-        let mut resp = Response::empty(405).header("Allow", "GET, HEAD");
-        resp = resp.header("Content-Type", "text/html");
-        let bytes = write_response(conn, resp, false, server.server_tokens, req.method == Method::Head).await?;
-        return Ok(Outcome { status: 405, bytes, close: false });
+        let body = error_body(405, server.server_tokens);
+        let resp = Response {
+            status: 405,
+            headers: vec![
+                ("Content-Type".to_string(), "text/html".to_string()),
+                ("Content-Length".to_string(), body.len().to_string()),
+            ],
+            body: Body::Bytes(body),
+        };
+        let bytes = write_response(conn, resp, req.keepalive, server.server_tokens, head_only).await?;
+        return Ok(Outcome {
+            status: 405,
+            bytes,
+            close: false,
+        });
     }
 
     if loc.internal {
-        return send_error_into(conn, 404, server.server_tokens, false, req.method == Method::Head).await;
+        return send_error_into(conn, 404, server.server_tokens, req.keepalive, head_only).await;
     }
 
     if let Some((code, body)) = &loc.ret {
         let status = *code;
-        let head_only = req.method == Method::Head;
         let mut resp;
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
             resp = Response::empty(status).header("Location", body.clone());
@@ -195,8 +210,12 @@ async fn dispatch(
             r.headers.push(("Content-Length".into(), body.len().to_string()));
             resp = r;
         }
-        let bytes = write_response(conn, resp, head_only, server.server_tokens, head_only).await?;
-        return Ok(Outcome { status, bytes, close: false });
+        let bytes = write_response(conn, resp, req.keepalive, server.server_tokens, head_only).await?;
+        return Ok(Outcome {
+            status,
+            bytes,
+            close: false,
+        });
     }
 
     if !loc.try_files.is_empty() {
@@ -211,13 +230,80 @@ async fn dispatch(
     };
 
     let status = resp.status;
-    let head_only = req.method == Method::Head;
     let _ = query;
-    if status >= 400 && resp.body.is_empty() {
-        return send_error_into(conn, status, server.server_tokens, false, head_only).await;
+
+    if matches!(status, 301 | 302 | 303 | 307 | 308) {
+        return write_redirect(conn, req, resp, listen_port, server.server_tokens).await;
     }
-    let bytes = write_response(conn, resp, head_only, server.server_tokens, head_only).await?;
-    Ok(Outcome { status, bytes, close: false })
+
+    if status >= 400 && resp.body.is_empty() {
+        return send_error_into(conn, status, server.server_tokens, req.keepalive, head_only).await;
+    }
+    let bytes = write_response(conn, resp, req.keepalive, server.server_tokens, head_only).await?;
+    Ok(Outcome {
+        status,
+        bytes,
+        close: false,
+    })
+}
+
+/// nginx answers directory redirects with an absolute Location and a small
+/// HTML body; mirror that (absolute_redirect / port_in_redirect defaults).
+async fn write_redirect(
+    conn: &mut Conn,
+    req: &Request,
+    resp: Response,
+    listen_port: u16,
+    tokens: bool,
+) -> io::Result<Outcome> {
+    let status = resp.status;
+    let mut headers = resp.headers;
+    let location = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+
+    let absolute = if location.starts_with('/') {
+        let host = req.host.clone().unwrap_or_default();
+        let host_has_port = host.rsplit_once(':').map(|(_, p)| p.parse::<u16>().is_ok()).unwrap_or(false);
+        let host = if host_has_port || listen_port == 80 {
+            host
+        } else {
+            format!("{host}:{listen_port}")
+        };
+        format!("http://{host}{location}")
+    } else {
+        location
+    };
+
+    headers.retain(|(k, _)| {
+        !k.eq_ignore_ascii_case("location")
+            && !k.eq_ignore_ascii_case("content-length")
+            && !k.eq_ignore_ascii_case("content-type")
+    });
+    headers.push(("Location".to_string(), absolute));
+    let body = error_body(status, tokens);
+    headers.push(("Content-Type".to_string(), "text/html".to_string()));
+    headers.push(("Content-Length".to_string(), body.len().to_string()));
+
+    let bytes = write_response(
+        conn,
+        Response {
+            status,
+            headers,
+            body: Body::Bytes(body),
+        },
+        req.keepalive,
+        tokens,
+        req.method == Method::Head,
+    )
+    .await?;
+    Ok(Outcome {
+        status,
+        bytes,
+        close: false,
+    })
 }
 
 async fn try_files(
@@ -233,7 +319,7 @@ async fn try_files(
         let last = i + 1 == n;
         if let Some(code) = cand.strip_prefix('=') {
             if let Ok(status) = code.parse::<u16>() {
-                let o = send_error_into(conn, status, server.server_tokens, false, req.method == Method::Head).await?;
+                let o = send_error_into(conn, status, server.server_tokens, req.keepalive, req.method == Method::Head).await?;
                 return Ok(Some(o));
             }
             continue;
@@ -246,11 +332,11 @@ async fn try_files(
             let resp = static_file::respond_fs(req, &fs_path, path, loc, http)?;
             let status = resp.status;
             let head_only = req.method == Method::Head;
-            let bytes = write_response(conn, resp, head_only, server.server_tokens, head_only).await?;
+            let bytes = write_response(conn, resp, req.keepalive, server.server_tokens, head_only).await?;
             return Ok(Some(Outcome { status, bytes, close: false }));
         }
         if last {
-            let o = send_error_into(conn, 404, server.server_tokens, false, req.method == Method::Head).await?;
+            let o = send_error_into(conn, 404, server.server_tokens, req.keepalive, req.method == Method::Head).await?;
             return Ok(Some(o));
         }
     }
@@ -261,10 +347,10 @@ async fn send_error_into(
     conn: &mut Conn,
     status: u16,
     tokens: bool,
-    _keepalive: bool,
+    keepalive: bool,
     head_only: bool,
 ) -> io::Result<Outcome> {
-    let bytes = send_error(conn, status, tokens, true, head_only).await?;
+    let bytes = send_error(conn, status, tokens, keepalive, head_only).await?;
     Ok(Outcome {
         status,
         bytes,
@@ -322,53 +408,88 @@ pub async fn write_response(
         Body::File { len, .. } => *len,
     };
 
-    let mut out = String::with_capacity(256);
-    out.push_str("HTTP/1.1 ");
-    out.push_str(&resp.status.to_string());
-    out.push(' ');
-    out.push_str(reason(resp.status));
-    out.push_str("\r\n");
-    out.push_str(if tokens {
-        "Server: nginx/1.28.0\r\n"
+    let mut out = Vec::with_capacity(512);
+    out.extend_from_slice(b"HTTP/1.1 ");
+    out.extend_from_slice(resp.status.to_string().as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(reason(resp.status).as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(if tokens {
+        b"Server: nginx/1.28.0\r\n"
     } else {
-        "Server: nginx\r\n"
+        b"Server: nginx\r\n"
     });
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    out.push_str("Date: ");
-    out.push_str(&util::http_date(now));
-    out.push_str("\r\n");
+    util::write_date_header(&mut out, now);
 
     if !known("Content-Length", &headers) && !matches!(resp.status, 204 | 304) {
         headers.push(("Content-Length".to_string(), body_len.to_string()));
     }
 
     for (k, v) in &headers {
-        out.push_str(k);
-        out.push_str(": ");
-        out.push_str(v);
-        out.push_str("\r\n");
+        out.extend_from_slice(k.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(v.as_bytes());
+        out.extend_from_slice(b"\r\n");
     }
-    out.push_str("Connection: ");
-    out.push_str(if keepalive { "keep-alive" } else { "close" });
-    out.push_str("\r\n\r\n");
-
-    conn.write_all(out.as_bytes()).await?;
+    out.extend_from_slice(b"Connection: ");
+    out.extend_from_slice(if keepalive { b"keep-alive" } else { b"close" });
+    out.extend_from_slice(b"\r\n\r\n");
 
     if head_only {
+        conn.write_all(&out).await?;
         return Ok(0);
     }
 
     match resp.body {
-        Body::Empty => Ok(0),
+        Body::Empty => {
+            conn.write_all(&out).await?;
+            Ok(0)
+        }
         Body::Bytes(b) => {
-            conn.write_all(&b).await?;
+            out.extend_from_slice(&b);
+            conn.write_all(&out).await?;
             Ok(b.len() as u64)
         }
-        Body::File { file, offset, len } => conn.send_file(&file, offset, len).await,
+        // Small files: one write beats header+sendfile (two segments on the
+        // wire, two syscalls). Large files stay zero-copy.
+        Body::File { file, offset, len } if len <= SMALL_FILE_WRITE => {
+            use std::os::unix::fs::FileExt;
+            let start = out.len();
+            out.resize(start + len as usize, 0);
+            let mut read_total = 0usize;
+            while read_total < len as usize {
+                match file.read_at(&mut out[start + read_total..], offset + read_total as u64) {
+                    Ok(0) => break,
+                    Ok(n) => read_total += n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            out.truncate(start + read_total);
+            conn.write_all(&out).await?;
+            Ok(read_total as u64)
+        }
+        Body::File { file, offset, len } => {
+            if conn.tcp_nopush {
+                conn.set_cork(true);
+                let w = conn.write_all(&out).await;
+                if w.is_err() {
+                    conn.set_cork(false);
+                    return w.map(|_| 0);
+                }
+                let sent = conn.send_file(&file, offset, len).await;
+                conn.set_cork(false);
+                sent
+            } else {
+                conn.write_all(&out).await?;
+                conn.send_file(&file, offset, len).await
+            }
+        }
     }
 }
 

@@ -27,19 +27,44 @@ impl From<io::Error> for RecvError {
 pub struct Conn {
     stream: TcpStream,
     pub peer: SocketAddr,
+    pub tcp_nopush: bool,
     buf: Vec<u8>,
     start: usize,
     end: usize,
 }
 
 impl Conn {
-    pub fn new(stream: TcpStream, peer: SocketAddr) -> Self {
+    pub fn new(stream: TcpStream, peer: SocketAddr, tcp_nopush: bool) -> Self {
         Conn {
             stream,
             peer,
+            tcp_nopush,
             buf: Vec::with_capacity(16 * 1024),
             start: 0,
             end: 0,
+        }
+    }
+
+    /// nginx's tcp_nopush: hold the header until the file payload is queued so
+    /// both leave in one segment (TCP_CORK on Linux, TCP_NOPUSH on BSD/macOS).
+    pub fn set_cork(&self, on: bool) {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let v: libc::c_int = i32::from(on);
+            unsafe {
+                libc::setsockopt(
+                    self.stream.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    libc::TCP_CORK,
+                    &v as *const libc::c_int as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = on;
         }
     }
 
@@ -227,8 +252,8 @@ async fn send_file_impl(stream: &mut TcpStream, file: &File, offset: u64, len: u
         match err.kind() {
             io::ErrorKind::Interrupted => continue,
             io::ErrorKind::WouldBlock => {
-                let ready = stream.writable().await?;
-                match ready.try_io(|| {
+                stream.writable().await?;
+                match stream.try_io(tokio::io::Interest::WRITABLE, || {
                     let n = unsafe { libc::sendfile(sock, fd, &mut off, chunk) };
                     if n < 0 {
                         Err(io::Error::last_os_error())
@@ -236,13 +261,13 @@ async fn send_file_impl(stream: &mut TcpStream, file: &File, offset: u64, len: u
                         Ok(n as usize)
                     }
                 }) {
-                    Ok(Ok(0)) => break,
-                    Ok(Ok(n)) => {
+                    Ok(0) => break,
+                    Ok(n) => {
                         remaining -= n as u64;
                         sent_total += n as u64;
                     }
-                    Ok(Err(e)) => return Err(e),
-                    Err(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => return Err(e),
                 }
             }
             _ => return Err(err),

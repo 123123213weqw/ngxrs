@@ -28,10 +28,10 @@ pub fn load_full(conf: &Path, prefix: Option<&Path>) -> Result<Config, ConfigErr
                     .join(p)
             }
         }
-        None => conf_path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from(".")),
+        // nginx resolves relative paths against its prefix, not the config
+        // file's directory; for the dev binary the working directory is the
+        // natural analogue.
+        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     };
 
     let src = std::fs::read_to_string(&conf_path).map_err(|e| ConfigError::Io {

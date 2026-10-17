@@ -290,6 +290,8 @@ pub fn serve(cfg: Config) -> io::Result<()> {
     eprintln!("ngxrs: shutting down");
     // Stop accepting first, then let in-flight requests finish (nginx's
     // graceful shutdown). Bounded so a stuck client cannot block exit.
+    // Flipping this makes already-running responses advertise `Connection: close`.
+    crate::http::SHUTTING_DOWN.store(true, Ordering::SeqCst);
     stopping.store(true, Ordering::SeqCst);
     let _ = shutdown_tx.send(true);
     for t in threads {

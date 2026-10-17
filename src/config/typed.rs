@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::parser::{ConfigError, Directive};
@@ -63,6 +64,13 @@ pub struct LocCfg {
     pub access: Vec<AccessRule>,
     /// `limit_except METHOD... { allow/deny ... }` blocks.
     pub limit_except: Vec<LimitExcept>,
+    /// `proxy_bind ADDR[:PORT]` / `off`; empty means "not configured".
+    pub proxy_bind: Option<String>,
+    pub limit_reqs: Vec<LimitReq>,
+    pub limit_conns: Vec<LimitConn>,
+    /// Status returned when a limit is exceeded (`limit_req_status`).
+    pub limit_req_status: u16,
+    pub limit_conn_status: u16,
     /// Length of the location prefix, used to strip it for `alias`.
     pub prefix_len: usize,
     // ---- gzip ----
@@ -134,6 +142,11 @@ impl LocCfg {
             server_name: String::new(),
             access: Vec::new(),
             limit_except: Vec::new(),
+            proxy_bind: None,
+            limit_reqs: Vec::new(),
+            limit_conns: Vec::new(),
+            limit_req_status: 503,
+            limit_conn_status: 503,
             prefix_len: 0,
             gzip_min_length: 20,
             gzip_comp_level: 1,
@@ -249,6 +262,14 @@ pub fn parse_cidr(s: &str) -> Option<Option<Cidr>> {
         _ => bits,
     };
     Some(Some(Cidr { addr: ip, bits }))
+}
+
+/// `rate=2r/s`, `rate=1r/m`, `rate=10r/s`.
+fn parse_rate_spec(spec: &str) -> Option<f64> {
+    let rest = spec.strip_suffix("r/s").or_else(|| spec.strip_suffix("r/m"))?;
+    let per_minute = spec.ends_with("r/m");
+    let n: f64 = rest.parse().ok()?;
+    Some(if per_minute { n / 60.0 } else { n })
 }
 
 /// `ngx_http_access_module`: first matching rule wins, default is allow.
@@ -526,7 +547,56 @@ pub struct Http {
     pub default_access_logs: Vec<AccessLog>,
     pub upstreams: Vec<Upstream>,
     pub cache_zones: Vec<CacheZone>,
+    pub limit_req_zones: Vec<LimitReqZone>,
+    pub limit_conn_zones: Vec<LimitConnZone>,
     pub log_formats: HashMap<String, String>,
+}
+
+/// A declared `limit_req_zone`.
+pub struct LimitReqZone {
+    pub name: String,
+    pub key: String,
+    pub rate: f64,
+    /// Shared state, created at config time so a reload keeps the same table.
+    pub state: Arc<crate::limit::ReqZone>,
+}
+
+impl std::fmt::Debug for LimitReqZone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LimitReqZone")
+            .field("name", &self.name)
+            .field("rate", &self.rate)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for LimitConnZone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LimitConnZone").field("name", &self.name).finish()
+    }
+}
+
+/// A declared `limit_conn_zone`.
+pub struct LimitConnZone {
+    pub name: String,
+    pub key: String,
+    pub state: Arc<crate::limit::ConnZone>,
+}
+
+/// One `limit_req` directive inside a location.
+#[derive(Debug, Clone)]
+pub struct LimitReq {
+    pub zone: String,
+    pub burst: u32,
+    pub nodelay: bool,
+    pub delay: Option<u32>,
+}
+
+/// One `limit_conn` directive inside a location.
+#[derive(Debug, Clone)]
+pub struct LimitConn {
+    pub zone: String,
+    pub limit: u32,
 }
 
 #[derive(Debug)]
@@ -1079,6 +1149,59 @@ impl Builder {
             "internal" => cfg.internal = true,
             "expires" => {
                 cfg.expires = Some(d.args.first().cloned().unwrap_or_else(|| "off".into()));
+            }
+            "limit_req" => {
+                // limit_req zone=NAME [burst=N] [nodelay | delay=N]
+                let mut lr = LimitReq {
+                    zone: String::new(),
+                    burst: 0,
+                    nodelay: false,
+                    delay: None,
+                };
+                for a in &d.args {
+                    if let Some(v) = a.strip_prefix("zone=") {
+                        lr.zone = v.to_string();
+                    } else if let Some(v) = a.strip_prefix("burst=") {
+                        lr.burst = v.parse().unwrap_or(0);
+                    } else if let Some(v) = a.strip_prefix("delay=") {
+                        lr.delay = v.parse().ok();
+                    } else if a == "nodelay" {
+                        lr.nodelay = true;
+                    }
+                }
+                if lr.zone.is_empty() {
+                    return Err(sem(&d.file, d.line, "limit_req zone=NAME required"));
+                }
+                cfg.limit_reqs.push(lr);
+            }
+            "limit_conn" => {
+                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "limit_conn needs zone and limit"))?;
+                let n = d.args.get(1).ok_or_else(|| sem(&d.file, d.line, "limit_conn needs a limit"))?;
+                cfg.limit_conns.push(LimitConn {
+                    zone: v.clone(),
+                    limit: n.parse().unwrap_or(0),
+                });
+            }
+            "limit_req_status" | "limit_conn_status" => {
+                if let Some(v) = d.args.first() {
+                    if let Ok(code) = v.parse::<u16>() {
+                        if d.name == "limit_req_status" {
+                            cfg.limit_req_status = code;
+                        } else {
+                            cfg.limit_conn_status = code;
+                        }
+                    }
+                }
+            }
+            "limit_req_log_level" | "limit_conn_log_level" | "limit_req_dry_run"
+            | "limit_conn_dry_run" => {
+                // Accepted; dry-run bookkeeping is not implemented.
+            }
+            "proxy_bind" => {
+                let v = d.args.first().ok_or_else(|| {
+                    sem(&d.file, d.line, "proxy_bind requires an address")
+                })?;
+                cfg.proxy_bind = Some(v.clone());
             }
             "allow" | "deny" => {
                 let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "allow/deny requires an address"))?;
@@ -1851,6 +1974,8 @@ pub fn build(
         default_loc: LocCfg::new(prefix.to_path_buf()),
         upstreams: Vec::new(),
         cache_zones: Vec::new(),
+        limit_req_zones: Vec::new(),
+        limit_conn_zones: Vec::new(),
         default_access_logs: vec![AccessLog {
             path: prefix.join("logs/access.log"),
             format: "combined".to_string(),
@@ -1866,6 +1991,50 @@ pub fn build(
     for d in &http_roots {
         match d.name.as_str() {
             "server" => server_dirs.push(d.clone()),
+            "limit_req_zone" | "limit_conn_zone" => {
+                // limit_req_zone KEY zone=NAME:SIZE rate=Nr/s
+                let key = d
+                    .args
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| sem(&d.file, d.line, "zone requires a key"))?;
+                let mut name = String::new();
+                let mut rate = 0.0f64;
+                for a in &d.args[1..] {
+                    if let Some(v) = a.strip_prefix("zone=") {
+                        name = v.split(':').next().unwrap_or("").to_string();
+                    } else if let Some(v) = a.strip_prefix("rate=") {
+                        rate = parse_rate_spec(v)
+                            .ok_or_else(|| sem(&d.file, d.line, "invalid rate"))?;
+                    }
+                }
+                if name.is_empty() {
+                    return Err(sem(&d.file, d.line, "zone=NAME:SIZE required"));
+                }
+                if d.name == "limit_req_zone" {
+                    http.limit_req_zones.push(LimitReqZone {
+                        name,
+                        key,
+                        rate,
+                        state: Arc::new(crate::limit::ReqZone::new(rate)),
+                    });
+                } else {
+                    http.limit_conn_zones.push(LimitConnZone {
+                        name,
+                        key,
+                        state: Arc::new(crate::limit::ConnZone::new()),
+                    });
+                }
+            }
+            "limit_req_status" | "limit_conn_status" => {
+                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "status required"))?;
+                let code: u16 = v.parse().map_err(|_| sem(&d.file, d.line, "invalid status"))?;
+                if d.name == "limit_req_status" {
+                    http.default_loc.limit_req_status = code;
+                } else {
+                    http.default_loc.limit_conn_status = code;
+                }
+            }
             "types" => {
                 if let Some(block) = &d.block {
                     for t in block {

@@ -420,6 +420,14 @@ impl Request {
             ));
         }
 
+        // nginx rejects a repeated header for anything it treats as unique
+        // (`ngx_http_process_unique_header_line` in the header table).
+        for name in UNIQUE_HEADERS {
+            if headers.get_all(name).count() > 1 {
+                return Err(HttpError::new(400, true));
+            }
+        }
+
         // ---- framing -----------------------------------------------------
         let mut chunked = false;
         if let Some(te) = headers.get("transfer-encoding") {
@@ -445,14 +453,6 @@ impl Request {
         }
         if saw_len && chunked {
             return Err(HttpError::new(400, true));
-        }
-
-        // nginx rejects a repeated header for anything it treats as unique
-        // (`ngx_http_process_unique_header_line` in the header table).
-        for name in UNIQUE_HEADERS {
-            if headers.get_all(name).count() > 1 {
-                return Err(HttpError::new(400, true));
-            }
         }
 
         // nginx validates the Host header strictly, even for HTTP/1.0:

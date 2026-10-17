@@ -2,6 +2,7 @@ mod cache;
 mod config;
 mod conn;
 mod http;
+mod limit;
 mod log;
 mod fastcgi;
 mod gzip;

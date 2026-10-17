@@ -1315,6 +1315,29 @@ pub async fn resolve_response_local(
     for (k, v) in captures {
         custom.insert(k.clone(), v.clone());
     }
+    // Reverse proxying needs a socket for streaming in HTTP/1; when this
+    // resolver is used without one (HTTP/2), buffer the upstream reply instead.
+    if loc.proxy_pass.is_some() {
+        if let Some(resp) = crate::proxy::fetch(req, path, query, loc, http, peer_ip).await {
+            let mut resp = resp;
+            return finalize_response(
+                req,
+                &mut resp,
+                path,
+                query,
+                server,
+                http,
+                peer_ip,
+                server_port,
+                captures,
+                &custom,
+                state,
+                local_addr,
+            )
+            .await;
+        }
+    }
+
     let mut resp = match resolve_target(req, path, query, server, loc, http) {
         Target::Done(r) => r,
         Target::Loc(p, q, l, skip) => {
@@ -1355,6 +1378,29 @@ pub async fn resolve_response_state(
     let mut custom: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for (k, v) in captures {
         custom.insert(k.clone(), v.clone());
+    }
+
+    // Reverse proxying needs a socket for streaming in HTTP/1; when this
+    // resolver is used without one (HTTP/2), buffer the upstream reply instead.
+    if loc.proxy_pass.is_some() {
+        if let Some(resp) = crate::proxy::fetch(req, path, query, loc, http, peer_ip).await {
+            let mut resp = resp;
+            return finalize_response(
+                req,
+                &mut resp,
+                path,
+                query,
+                server,
+                http,
+                peer_ip,
+                server_port,
+                captures,
+                &custom,
+                state,
+                local_addr,
+            )
+            .await;
+        }
     }
 
     let mut resp = match resolve_target(req, path, query, server, loc, http) {

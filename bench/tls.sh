@@ -15,12 +15,14 @@ import tls_parity
 tls_parity.ensure_certs()
 PY
 
-render() { # $1=port $2=out
+render() { # $1=port $2=out $3=backend port
   sed -e "s|__ROOT__|$ROOT|g" -e "s|__WORKERS__|${WORKER_PROCESSES:-auto}|" \
-      -e "s/listen 19443/listen $1/" "$ROOT/bench/tls.conf" > "$2"
+      -e "s/listen 19443/listen $1/" \
+      -e "s/listen 19450/listen $3/" \
+      -e "s|127.0.0.1:19450|127.0.0.1:$3|" "$ROOT/bench/tls.conf" > "$2"
 }
-render "$PORT_NGINX_TLS" "$RUN/tls-nginx.conf"
-render "$PORT_NGXRS_TLS" "$RUN/tls-ngxrs.conf"
+render "$PORT_NGINX_TLS" "$RUN/tls-nginx.conf" 19450
+render "$PORT_NGXRS_TLS" "$RUN/tls-ngxrs.conf" 19451
 
 cleanup() {
   set +e

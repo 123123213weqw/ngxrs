@@ -410,6 +410,12 @@ pub async fn handle(
         return Ok(Some(respond_error(conn, 502, tokens, req.keepalive).await?));
     };
 
+    // nginx answers `Expect: 100-continue` before reading the body.
+    // RFC 7231: never send 100 Continue to an HTTP/1.0 client.
+    if req.expect_continue && req.version_minor == 1 {
+        conn.send_100_continue().await?;
+    }
+
     // Request body (buffered; the static path never needs it).
     let body = if req.chunked {
         conn.take_chunked_body(MAX_PROXY_BODY).await?
@@ -651,23 +657,17 @@ struct CacheCtx<'a> {
     status: &'a str,
 }
 
+/// Serialize the upstream request head exactly as nginx does.
 #[allow(clippy::too_many_arguments)]
-async fn exchange(
-    conn: &mut crate::conn::Conn,
+fn build_upstream_head(
     req: &Request,
     target_uri: &str,
-    body: &[u8],
+    body_of_request: &[u8],
     loc: &LocCfg,
     pp: &crate::config::ProxyPass,
-    mut up: TcpStream,
-    from_pool: bool,
-    tokens: bool,
-    is_upgrade: bool,
     peer_ip: &str,
-    pool_key: (usize, u32),
-    cache: CacheCtx<'_>,
-    upstream_addr: &str,
-) -> io::Result<Outcome> {
+    is_upgrade: bool,
+) -> Vec<u8> {
     // ---- request head ----
     let mut out = Vec::with_capacity(512);
     out.extend_from_slice(req.method.as_str().as_bytes());
@@ -769,12 +769,34 @@ async fn exchange(
         out.extend_from_slice(b"Connection: close\r\n");
     }
 
-    if !body.is_empty() || req.body_len > 0 || req.chunked {
+    if !body_of_request.is_empty() || req.body_len > 0 || req.chunked {
         out.extend_from_slice(b"Content-Length: ");
-        out.extend_from_slice(body.len().to_string().as_bytes());
+        out.extend_from_slice(body_of_request.len().to_string().as_bytes());
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b"\r\n");
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn exchange(
+    conn: &mut crate::conn::Conn,
+    req: &Request,
+    target_uri: &str,
+    body: &[u8],
+    loc: &LocCfg,
+    pp: &crate::config::ProxyPass,
+    mut up: TcpStream,
+    from_pool: bool,
+    tokens: bool,
+    is_upgrade: bool,
+    peer_ip: &str,
+    pool_key: (usize, u32),
+    cache: CacheCtx<'_>,
+    upstream_addr: &str,
+) -> io::Result<Outcome> {
+    // ---- request head ----
+    let out = build_upstream_head(req, target_uri, body, loc, pp, peer_ip, is_upgrade);
 
     if std::env::var_os("NGXRS_DEBUG_PROXY").is_some() {
         eprintln!("ngxrs: [debug] upstream request:\n{}", String::from_utf8_lossy(&out));
@@ -1102,6 +1124,11 @@ async fn stream_chunked(
 
 impl crate::conn::Conn {
     /// Take a Content-Length body into memory (bounded).
+    /// Send the interim `100 Continue` nginx emits for `Expect: 100-continue`.
+    pub async fn send_100_continue(&mut self) -> io::Result<()> {
+        self.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await
+    }
+
     pub async fn take_body(&mut self, len: usize) -> io::Result<Vec<u8>> {
         if len > MAX_PROXY_BODY {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "body too large"));
@@ -1140,5 +1167,153 @@ impl crate::conn::Conn {
             let _crlf = self.read_line_pub().await?;
         }
         Ok(out)
+    }
+}
+
+
+/// Buffered variant used by HTTP/2, where there is no socket to stream to.
+///
+/// Returns `None` when the location does not proxy. The whole upstream reply is
+/// read into memory, which is what nginx does for proxy_buffering on.
+pub async fn fetch(
+    req: &Request,
+    path: &str,
+    query: &str,
+    loc: &LocCfg,
+    http: &Http,
+    peer_ip: &str,
+) -> Option<Response> {
+    let pp = loc.proxy_pass.clone()?;
+    let candidates = choose(http, loc, &peer_ip.parse().ok()?)?;
+    let target_uri = upstream_target(path, query, loc, &pp);
+
+    let mut last_err: Option<io::Error> = None;
+    for cand in candidates {
+        let addr = match &cand {
+            Chosen::Direct(_, a) => *a,
+            Chosen::Upstream { addr, .. } => *addr,
+        };
+        let mut up = match connect_timeout(addr, loc.proxy_connect_timeout).await {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+
+        let out = build_upstream_head(req, &target_uri, &[], loc, &pp, peer_ip, false);
+        if up.write_all(&out).await.is_err() {
+            continue;
+        }
+
+        // Read until the head is complete, then to Content-Length or EOF.
+        let mut buf: Vec<u8> = Vec::with_capacity(8192);
+        let mut chunk = vec![0u8; 16 * 1024];
+        let mut head_end: Option<usize> = None;
+        loop {
+            let n = match tokio::time::timeout(loc.proxy_read_timeout, up.read(&mut chunk)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => {
+                    last_err = Some(e);
+                    break;
+                }
+                Err(_) => {
+                    last_err = Some(io::Error::new(io::ErrorKind::TimedOut, "read timeout"));
+                    break;
+                }
+            };
+            buf.extend_from_slice(&chunk[..n]);
+            if head_end.is_none() {
+                head_end = memchr::memmem::find(&buf, b"\r\n\r\n").map(|i| i + 4);
+            }
+            if let Some(h) = head_end {
+                if let Some(head) = parse_upstream_head(&buf[..h]) {
+                    let have = buf.len() - h;
+                    if let Some(len) = head.content_length {
+                        if have as u64 >= len {
+                            break;
+                        }
+                    } else if !head.chunked {
+                        // No framing information: the upstream closes to signal
+                        // the end, so keep reading until EOF.
+                    }
+                }
+            }
+        }
+
+        let Some(h) = head_end else {
+            last_err = Some(io::Error::new(io::ErrorKind::InvalidData, "no response head"));
+            continue;
+        };
+        let head = match parse_upstream_head(&buf[..h]) {
+            Some(x) => x,
+            None => continue,
+        };
+        let payload = buf[h..].to_vec();
+        let body = if head.chunked {
+            match dechunk(&payload) {
+                Some(b) => b,
+                None => payload,
+            }
+        } else {
+            match head.content_length {
+                Some(len) if payload.len() as u64 > len => payload[..len as usize].to_vec(),
+                _ => payload,
+            }
+        };
+
+        let mut raw = head.raw.clone();
+        if !crate::http::split_head(&raw)
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        {
+            raw.extend_from_slice(b"Content-Length: ");
+            raw.extend_from_slice(body.len().to_string().as_bytes());
+            raw.extend_from_slice(b"\r\n");
+        }
+        let upstream_headers = crate::http::split_head(&head.raw);
+        crate::http::apply_add_headers_full(
+            &mut raw,
+            &loc.headers,
+            head.status,
+            "BYPASS",
+            &addr.to_string(),
+            &upstream_headers,
+        );
+
+        return Some(Response {
+            status: head.status,
+            headers: Vec::new(),
+            raw,
+            explicit_len: true,
+            no_error_page: false,
+            body: Body::Bytes(body),
+        });
+    }
+
+    if let Some(e) = &last_err {
+        eprintln!("ngxrs: [error] h2 upstream failure for {}: {e}", req.raw_target);
+    }
+    Some(Response::bytes(502, "text/html", crate::http::error_body(502, true)))
+}
+
+/// Strip chunked framing.
+fn dechunk(input: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0usize;
+    loop {
+        let line_end = memchr::memmem::find(&input[i..], b"\r\n")? + i;
+        let size_str = std::str::from_utf8(&input[i..line_end]).ok()?;
+        let size = usize::from_str_radix(size_str.split(';').next()?.trim(), 16).ok()?;
+        i = line_end + 2;
+        if size == 0 {
+            return Some(out);
+        }
+        if i + size > input.len() {
+            return None;
+        }
+        out.extend_from_slice(&input[i..i + size]);
+        i += size + 2; // skip trailing CRLF
     }
 }

@@ -11,11 +11,12 @@ OUT="$ROOT/bench/run/ntscan"
 mkdir -p "$OUT"
 
 LIMIT="${LIMIT:-40}"
-PATTERN="${PATTERN:-http_*.t}"
+# Categories ngxrs actually implements.
+PATTERN="${PATTERN:-http_*.t proxy_*.t upstream_*.t range_*.t fastcgi_*.t scgi_*.t uwsgi_*.t stream*.t}"
 
 # shellcheck disable=SC2086
 files=$(cd "$TESTS_DIR" && ls $PATTERN 2>/dev/null \
-  | grep -vE '^(addition|sub|slice|auth_|dav|mirror|xslt|perl|lua|js|njs|image_filter|mp4|flv|geoip|random_index|limit_|secure_link|realip|rewrite_log|debug|h2|h3|quic|ssl|grpc|uwsgi|memcached|mail|proxy_protocol|resolver|stream)' \
+  | grep -vE '^(addition|sub|slice|auth_|dav|mirror|xslt|perl|lua|js|njs|image_filter|mp4|flv|geoip|random_index|limit_|secure_link|realip|rewrite_log|debug|h2|h3|quic|ssl|grpc|memcached|mail|proxy_protocol|resolver)' \
   | head -n "$LIMIT")
 
 outcomes() {

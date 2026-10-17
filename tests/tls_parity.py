@@ -188,6 +188,24 @@ def main():
         if problems:
             failures += 1
 
+    # reverse proxy over HTTP/2 (used to answer 502)
+    a = h2_request(args.nginx, "default.example", "/proxied/who")
+    b = h2_request(args.ngxrs, "default.example", "/proxied/who")
+    if a is not None and b is not None and a[0] != "no-h2":
+        if b"backend" not in (a[1] or b""):
+            rows.append(("h2:proxy-setup", a[0], b[0], "h2",
+                         ["reference nginx did not reach the backend either"]))
+            failures += 1
+    if a is not None and b is not None and a[0] != "no-h2" and b[0] != "no-h2":
+        problems = []
+        if a[0] != b[0]:
+            problems.append(f"status {a[0]} != {b[0]}")
+        if a[1] != b[1]:
+            problems.append(f"body {a[1][:40]!r} != {b[1][:40]!r}")
+        rows.append(("h2:proxy", a[0], b[0], "h2", problems))
+        if problems:
+            failures += 1
+
     # static file over TLS
     a = tls_request(args.nginx, "default.example", path="/1k.txt")
     b = tls_request(args.ngxrs, "default.example", path="/1k.txt")

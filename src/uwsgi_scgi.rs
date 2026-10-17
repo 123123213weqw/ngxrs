@@ -209,6 +209,11 @@ async fn run(
     read_timeout: Duration,
     tokens: bool,
 ) -> io::Result<Option<Outcome>> {
+    // RFC 7231: never send 100 Continue to an HTTP/1.0 client.
+    if req.expect_continue && req.version_minor == 1 {
+        conn.send_100_continue().await?;
+    }
+
     let body = if req.chunked {
         conn.take_chunked_body(32 * 1024 * 1024).await?
     } else if req.body_len > 0 {

@@ -189,36 +189,35 @@ HTTP/1.1 keepalive 响应会一直阻塞到 8s 超时并返回 `undef`。**真 n
 
 ### 当前 A/B 结果
 
-`bench/nginxtests.sh TEST_LIST="..."` 是逐文件对比；`bench/ntscan.sh` 自动扫一批
-`http_*.t` 并只报告「nginx 过而 ngxrs 不过」的真缺陷。
+`bench/nginx_tests.sh` 是逐文件对比；`bench/ntscan.sh` 自动扫 http/proxy/upstream/
+range/fastcgi/scgi/uwsgi/stream 各类用例，只报告「nginx 过而 ngxrs 不过」的真缺陷。
 
-最近一次全扫（23 个可运行文件）：
+最近一次全扫（27 个可运行文件）：**20 个与 nginx 断言数完全一致**，1 个更好，
+6 个更差；剩余差距 **19 条断言**（上一轮 25 条）。
 
-| 结果 | 数量 | 说明 |
-|---|---|---|
-| 与 nginx 完全一致 | **16** | 含 location / uri / server_name / method / try_files / error_page / include / absolute_redirect / host 等 |
-| ngxrs 更好 | 1 | `http_host.t` 58/62 vs nginx 54/62 |
-| ngxrs 更差 | 6 | 剩余 20 条断言 |
-| 无法运行（双方都缺模块） | 6 | resolver 等 |
-
-逐文件一致的用例（断言数与 nginx 相同）：`http_location` 16/16、`http_uri` 21/21、
+完全一致的用例（断言数与 nginx 相同）：`http_location` 16/16、`http_uri` 21/21、
 `http_server_name` 22/22、`http_method` 4/6、`http_try_files` 12/12、
-`http_error_page` 11/11、`http_include` 7/7、`http_absolute_redirect` 25/25。
+`http_error_page` 11/11、`http_include` 7/7、`http_absolute_redirect` 25/25、
+`http_header_buffers` 10/12、`http_expect_100_continue` 5/7、`fastcgi_body` 7/7。
 
-### 剩余差距（20 条断言）
+### 剩余差距（19 条断言）
 
 | 用例 | 差 | 缺什么 |
 |---|---|---|
-| http_headers_multi.t | 4 | `$sent_trailer_*`、非法 `Content-Type` 的 `$content_type`、无 Host 时 `$host` 取 server_name、重复 `Transfer-Encoding` |
-| http_variables.t | 6 | `$limit_rate` 的特殊 set/get handler、`expires`、含 `$upstream_http_*` 的日志格式 |
+| http_variables.t | 6 | `$limit_rate` 的特殊 set/get handler、`expires`、含 `$upstream_http_*` 的日志 |
+| proxy_bind.t | 3 | `proxy_bind` 源地址绑定 |
 | http_keepalive.t | 3 | `keepalive_time` 依赖 nginx `ngx_current_msec` 的缓存计时 |
-| http_header_buffers.t | 4 | keepalive 之后超长请求头/请求行的缓冲行为 |
+| proxy_available.t | 2 | 需要配置 reload（SIGHUP 重读） |
+| http_headers_multi.t | 4 | `$sent_trailer_*`、非法 `Content-Type` 的 `$content_type`、无 Host 时 `$host` 取 server_name |
 | http_keepalive_shutdown.t | 1 | 关闭时的连接处理 |
 
 ### 本轮由官方用例发现并修复的缺陷
 
 | 缺陷 | 影响 |
 |---|---|
+| **keepalive 连接缓冲未清空** | `consume` 只把 start/end 归零，`buf` 仍留着上一个请求的字节；下一个请求会重新解析到旧数据（`http_header_buffers.t` 6/12 → 10/12） |
+| HTTP/2 上的反向代理返回 502 | 新增 socket-free 的 `proxy::fetch`，h2 请求现在能代理 |
+| `Expect: 100-continue` 从未响应 | 客户端等 100 才发 body，直接挂住；现按 RFC 只对 HTTP/1.1 发送 |
 | `$http_*` 未合并重复请求头 | 多值头只取第一个 |
 | 缺 `$cookie_*` / `$sent_http_*` / `$upstream_http_*` / `$upstream_cookie_*` / `$remote_user` | 大量变量为空 |
 | `add_header` 只取 args[1] | `always` 被丢弃，值里的空格被截断 |

@@ -192,8 +192,12 @@ impl Conn {
     fn consume(&mut self, n: usize) {
         self.start += n;
         if self.start >= self.end {
+            // The buffer must be *emptied*, not merely marked empty: `fill`
+            // appends at buf.len(), so a stale tail would be re-parsed as the
+            // next request on a keepalive connection.
             self.start = 0;
             self.end = 0;
+            self.buf.clear();
         }
     }
 

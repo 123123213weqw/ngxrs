@@ -610,13 +610,30 @@ async fn access_phase(
         if let Some(status) = status {
             let mut resp = error_response(status, server.server_tokens);
             if status == 401 {
-                let realm = loc
-                    .auth_basic
-                    .realm
-                    .clone()
-                    .unwrap_or_else(|| "restricted".to_string());
+                // nginx forwards every `WWW-Authenticate` the auth subrequest
+                // produced (a proxy-based check can return several, and they
+                // must all reach the client). Only when the subrequest supplied
+                // none do we fall back to the realm of a local `auth_basic`.
+                let from_subrequest: Vec<&str> = auth_headers
+                    .iter()
+                    .filter(|(k, _)| k == "upstream_http_www_authenticate")
+                    .map(|(_, v)| v.as_str())
+                    .collect();
                 let mut extra = Vec::new();
-                crate::auth::www_authenticate(&realm, &mut extra);
+                if from_subrequest.is_empty() {
+                    let realm = loc
+                        .auth_basic
+                        .realm
+                        .clone()
+                        .unwrap_or_else(|| "restricted".to_string());
+                    crate::auth::www_authenticate(&realm, &mut extra);
+                } else {
+                    for v in from_subrequest {
+                        extra.extend_from_slice(b"WWW-Authenticate: ");
+                        extra.extend_from_slice(v.as_bytes());
+                        extra.extend_from_slice(b"\r\n");
+                    }
+                }
                 resp.raw.splice(0..0, extra);
             }
             return Some(resp);
@@ -939,6 +956,19 @@ async fn route(
         };
         resp.no_error_page = true;
         return resp;
+    }
+
+    // A `proxy_pass` location reached through `route` -- an `error_page`
+    // target, or a named location -- must actually reach the upstream. `route`
+    // is the socket-free resolver used by those paths, and without this branch
+    // the request fell through to the static handler and answered 404, so
+    // `error_page 404 = /fallback` (bare `=`, adopt the target's status)
+    // reported the original 404 instead of the proxied status.
+    if loc.proxy_pass.is_some() {
+        return match crate::proxy::fetch(req, path, query, loc, http, vars.peer_ip).await {
+            Some(resp) => resp,
+            None => error_response(502, server.server_tokens),
+        };
     }
 
     match static_file::respond(req, path, query, loc, http) {

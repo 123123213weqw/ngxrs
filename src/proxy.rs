@@ -2337,6 +2337,28 @@ pub async fn fetch(
     let candidates = choose(http, loc, &peer_ip.parse().ok()?)?;
     let target_uri = upstream_target(path, query, loc, &pp);
 
+    // The socket-free path serves HTTP/2, HTTP/3, SSI includes and auth
+    // subrequests, and it must honour `proxy_cache` exactly like the streaming
+    // path: nginx's `auth_request` combined with `proxy_cache` is a documented
+    // way to cache an authentication decision, and a hit is what makes the
+    // second client request skip the upstream.
+    let zone = loc
+        .proxy_cache
+        .as_deref()
+        .and_then(|name| http.cache_zones.iter().find(|z| z.name == name));
+    let cache_key = if zone.is_some() {
+        cache_key_for(loc, req, peer_ip)
+    } else {
+        None
+    };
+    if let (Some(z), Some(key)) = (zone, cache_key.as_deref()) {
+        if let Some(entry) = crate::cache::load(z, key) {
+            if entry.is_fresh(crate::cache::now()) {
+                return Some(cached_response(entry, loc, "HIT"));
+            }
+        }
+    }
+
     let mut last_err: Option<io::Error> = None;
     for cand in candidates {
         // The socket-free path buffers the whole reply, so `proxy_bind` (which
@@ -2481,6 +2503,26 @@ pub async fn fetch(
             &upstream_headers,
         );
 
+        // Store for the next request, following the same rules as the
+        // streaming path (status validity, Cache-Control, Vary).
+        if let (Some(z), Some(key)) = (zone, cache_key.as_deref()) {
+            if let Some(ttl) =
+                crate::cache::ttl(loc, head.status, &upstream_headers, loc.proxy_cache_ignore)
+            {
+                if !ttl.is_zero() {
+                    let entry = crate::cache::Cached {
+                        status: head.status,
+                        error: None,
+                        headers: upstream_headers.clone(),
+                        body: body.clone(),
+                        stored_at: crate::cache::now(),
+                        valid_for: ttl.as_secs(),
+                    };
+                    let _ = crate::cache::store(z, key, &entry);
+                }
+            }
+        }
+
         return Some(Response {
             status: head.status,
             headers: Vec::new(),
@@ -2529,6 +2571,31 @@ fn dechunk(input: &[u8]) -> Option<Vec<u8>> {
 /// Recompute the cache key exactly as the request path does.
 ///
 /// Used by the background refresh, which has no connection context.
+/// Turn a stored entry into a response, for the socket-free path.
+fn cached_response(entry: crate::cache::Cached, loc: &LocCfg, status: &str) -> Response {
+    let mut raw = Vec::with_capacity(entry.body.len() + 256);
+    for (k, v) in &entry.headers {
+        raw.extend_from_slice(k.as_bytes());
+        raw.extend_from_slice(b": ");
+        raw.extend_from_slice(v.as_bytes());
+        raw.extend_from_slice(b"\r\n");
+    }
+    crate::http::apply_add_headers_upstream(&mut raw, &loc.headers, entry.status, status, "");
+    raw.extend_from_slice(b"Content-Length: ");
+    raw.extend_from_slice(entry.body.len().to_string().as_bytes());
+    raw.extend_from_slice(b"\r\n");
+    Response {
+        status: entry.status,
+        headers: Vec::new(),
+        raw,
+        explicit_len: true,
+        no_error_page: false,
+        trailers: Vec::new(),
+        expect_trailers: false,
+        body: Body::Bytes(entry.body),
+    }
+}
+
 pub fn cache_key_for(loc: &LocCfg, req: &Request, peer_ip: &str) -> Option<String> {
     let pp = loc.proxy_pass.as_ref()?;
     let scheme = "http";

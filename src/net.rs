@@ -259,6 +259,7 @@ pub fn serve(cfg: Config) -> io::Result<()> {
             backends,
             proxy_timeout: sc.proxy_timeout,
             proxy_connect_timeout: sc.proxy_connect_timeout,
+            sinks: crate::config::typed::open_sinks(&sc.error_logs),
         });
     }
     let stream_cfg = Arc::new(stream_cfg);

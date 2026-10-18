@@ -68,6 +68,10 @@ pub struct LocCfg {
     pub proxy_bind: Option<String>,
     pub limit_reqs: Vec<LimitReq>,
     pub limit_conns: Vec<LimitConn>,
+    /// `error_log` directives that apply to this location, in order.
+    pub error_logs: Vec<LogSpec>,
+    /// `limit_req_log_level`: severity of the "limiting requests" message.
+    pub limit_req_log_level: crate::log::Level,
     /// Status returned when a limit is exceeded (`limit_req_status`).
     pub limit_req_status: u16,
     pub limit_conn_status: u16,
@@ -168,6 +172,8 @@ pub struct LocCfg {
 impl LocCfg {
     fn new(root: PathBuf) -> Self {
         LocCfg {
+            error_logs: Vec::new(),
+            limit_req_log_level: crate::log::Level::Error,
             root,
             steps: Vec::new(),
             alias: None,
@@ -573,6 +579,10 @@ pub fn open_sinks(specs: &[LogSpec]) -> Vec<std::sync::Arc<crate::log::Sink>> {
 }
 
 /// `server=host:port[,facility=local7][,tag=nginx]`
+pub fn open_syslog_pub(rest: &str, level: crate::log::Level) -> Option<std::sync::Arc<crate::log::Sink>> {
+    open_syslog(rest, level)
+}
+
 fn open_syslog(rest: &str, level: crate::log::Level) -> Option<std::sync::Arc<crate::log::Sink>> {
     let mut server = None;
     let mut facility = 23u8; // local7, nginx's default
@@ -964,6 +974,8 @@ pub struct StreamServerCfg {
     pub proxy_pass: Option<String>,
     pub proxy_timeout: Duration,
     pub proxy_connect_timeout: Duration,
+    /// `error_log` directives of this stream server.
+    pub error_logs: Vec<LogSpec>,
 }
 
 impl Http {
@@ -1776,6 +1788,16 @@ impl Builder {
             "internal" => cfg.internal = true,
             "expires" => {
                 cfg.expires = Some(d.args.first().cloned().unwrap_or_else(|| "off".into()));
+            }
+            "error_log" => {
+                if let Some(spec) = parse_log_spec(&self.prefix, &d.args) {
+                    cfg.error_logs.push(spec);
+                }
+            }
+            "limit_req_log_level" => {
+                if let Some(l) = d.args.first().and_then(|v| crate::log::Level::parse(v)) {
+                    cfg.limit_req_log_level = l;
+                }
             }
             "limit_req" => {
                 // limit_req zone=NAME [burst=N] [nodelay | delay=N]
@@ -2689,6 +2711,7 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             | "preread_timeout" | "ssl_certificate" | "ssl_certificate_key" | "ssl_protocols"
             | "ssl_ciphers" | "ssl_session_cache" | "ssl_session_timeout" | "ssl_dhparam"
             | "ssl_prefer_server_ciphers" | "ssl_handshake_timeout" | "ssl_ecdh_curve" => {}
+            "error_log" => {}
             other => b.warn(d, format!("unknown directive \"{other}\" in stream context; ignored")),
         }
     }
@@ -2698,6 +2721,7 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             listen: SocketAddr::from(([0, 0, 0, 0], 0)),
             udp: false,
             proxy_pass: None,
+            error_logs: Vec::new(),
             proxy_timeout: Duration::from_secs(600),
             proxy_connect_timeout: Duration::from_secs(60),
         };
@@ -2735,6 +2759,11 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                 }
                 "return" => {
                     // Parsed but not executed yet (see COMPAT.md).
+                }
+                "error_log" => {
+                    if let Some(spec) = parse_log_spec(&b.prefix.clone(), &child.args) {
+                        cfg.error_logs.push(spec);
+                    }
                 }
                 "proxy_protocol" | "proxy_buffer_size" | "proxy_responses" | "preread_buffer_size"
                 | "preread_timeout" | "ssl_certificate" | "ssl_certificate_key" | "set"

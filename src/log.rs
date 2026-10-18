@@ -244,6 +244,37 @@ pub fn log_to(sinks: &[Arc<Sink>], level: Level, msg: &str) {
     }
 }
 
+static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Arc<Sink>>>> =
+    std::sync::OnceLock::new();
+
+/// Open (once) the sink described by an `error_log` directive.
+///
+/// Location-level directives are only known after routing, and opening the file
+/// on every request would be wasteful, so sinks are cached by destination and
+/// level. A destination appearing twice in the config still produces the same
+/// shared sink — the *caller* writes once per configured directive, which is
+/// what makes a duplicate `error_log` emit two lines.
+pub fn sink_cached(dest: &str, level: Level) -> Option<Arc<Sink>> {
+    let key = format!("{dest}\x00{}", level.name());
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Ok(c) = cache.lock() {
+        if let Some(s) = c.get(&key) {
+            return Some(s.clone());
+        }
+    }
+    let sink = if dest == "stderr" {
+        Sink::stderr(level)
+    } else if let Some(rest) = dest.strip_prefix("syslog:") {
+        crate::config::typed::open_syslog_pub(rest, level)?
+    } else {
+        Sink::file(Path::new(dest), level).ok()?
+    };
+    if let Ok(mut c) = cache.lock() {
+        c.insert(key, sink.clone());
+    }
+    Some(sink)
+}
+
 /// Compatibility wrapper for the call sites that only know a level name.
 pub fn error_log(level: &str, msg: &str) {
     let lv = Level::parse(level).unwrap_or(Level::Error);

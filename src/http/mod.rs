@@ -2242,13 +2242,23 @@ fn check_limits(
         let key = limit_key(&zone.key, vars);
         match zone.state.account(&key, lr.burst, lr.nodelay) {
             None => {
-                crate::log::error_log(
-                    "error",
-                    &format!(
-                        "limiting requests, excess: zone=\"{}\" key=\"{key}\"",
-                        lr.zone
-                    ),
+                // nginx writes this once per configured `error_log` of the
+                // location, at `limit_req_log_level`. Two `error_log`
+                // directives pointing at the same file therefore produce two
+                // identical lines (error_log.t checks exactly that).
+                let msg = format!(
+                    "limiting requests, excess: zone=\"{}\" key=\"{key}\"",
+                    lr.zone
                 );
+                for spec in &loc.error_logs {
+                    if let Some(sink) = crate::log::sink_cached(&spec.dest, spec.level) {
+                        crate::log::log_to(
+                            &[sink],
+                            loc.limit_req_log_level,
+                            &msg,
+                        );
+                    }
+                }
                 return Some(error_response(loc.limit_req_status, true));
             }
             Some(delay) if !delay.is_zero() => {

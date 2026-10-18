@@ -168,6 +168,11 @@ struct Conn {
 /// nginx numbers mail connections per worker (`*1`, `*2`, ...).
 static CONN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Next connection id for the error log's `*N` prefix.
+pub fn next_conn_id() -> u64 {
+    CONN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
 async fn handle(client: TcpStream, peer: SocketAddr, server: Arc<MailServer>) -> io::Result<()> {
     let mut conn = Conn::default();
     // nginx logs the peer and the local address at `info` on every connection.

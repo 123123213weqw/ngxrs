@@ -24,6 +24,8 @@ pub struct StreamServer {
     pub backends: Vec<SocketAddr>,
     pub proxy_timeout: Duration,
     pub proxy_connect_timeout: Duration,
+    /// `error_log` destinations of this stream server.
+    pub sinks: Vec<std::sync::Arc<crate::log::Sink>>,
 }
 
 pub struct StreamConfig {
@@ -108,6 +110,22 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                     Err(_) => continue,
                 };
                 let _ = client.set_nodelay(true);
+                // nginx logs stream connections at `info`: the peer, the local
+                // address and the chosen upstream.
+                let local = client.local_addr().ok();
+                let n = crate::mail::next_conn_id();
+                if let Some(local) = local {
+                    let backends_now = server.backends.clone();
+                    let up = pick_backend(&backends_now, &counter)
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    let up = if up == "-" { "127.0.0.1:0".to_string() } else { up };
+                    crate::log::log_to(
+                        &server.sinks,
+                        crate::log::Level::Info,
+                        &format!("*{n} client {peer} connected to {local}, proxy to \"{up}\"", ),
+                    );
+                }
                 let backends = server.backends.clone();
                 let timeout = server.proxy_timeout;
                 let connect_timeout = server.proxy_connect_timeout;

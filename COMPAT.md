@@ -252,8 +252,8 @@ nginx 逐字节一致；`STLS` / `STARTTLS` 执行**真实的 TLS 升级**（rus
 
 - `max_errors` 的完整语义
 - `ssl_password_file`（加密私钥）
-- **http 侧**的 `error_log`：`location` 级 `error_log`、`limit_req_log_level`
-  尚未接入（`error_log.t` 仍 5/27）
+- `error_log` 的 `alert` / `crit` 之外的细粒度事件（各模块自己产生的
+  debug 级消息）尚未补全
 
 ### 本轮修掉的真缺陷
 

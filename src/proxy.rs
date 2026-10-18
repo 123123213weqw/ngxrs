@@ -201,6 +201,37 @@ enum Chosen {
     },
 }
 
+/// Resolve a `proxy_pass` authority that only exists at request time.
+///
+/// An `upstream {}` name wins; otherwise the value is `host[:port][/uri]` and
+/// needs `resolver` (nginx refuses to start without one in that case).
+async fn dynamic_addr(
+    http: &Http,
+    authority: &str,
+    https: bool,
+    vars: &crate::http::ServerVars<'_>,
+    _h: &Http,
+) -> Option<std::net::SocketAddr> {
+    let authority = authority.split('/').next().unwrap_or(authority);
+    if let Some(up) = http.upstreams.iter().find(|u| u.name == authority) {
+        return up.servers.first().map(|s| s.addr);
+    }
+    let default_port = if https { 443 } else { 80 };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => {
+            (h, p.parse::<u16>().ok()?)
+        }
+        _ => (authority, default_port),
+    };
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Some(std::net::SocketAddr::new(ip, port));
+    }
+    let resolver = http.resolver.as_ref()?;
+    let _ = vars;
+    let ip = crate::resolver::resolve(resolver, host).await?;
+    Some(std::net::SocketAddr::new(ip, port))
+}
+
 fn choose(http: &Http, loc: &LocCfg, client_ip: &std::net::IpAddr) -> Option<Vec<Chosen>> {
     let pp = loc.proxy_pass.as_ref()?;
     match &pp.target {
@@ -342,11 +373,38 @@ fn expand(spec: &str, v: &Vars<'_>) -> String {
                 if let Some(h) = name.strip_prefix("http_") {
                     let key = h.replace('_', "-");
                     Some(v.req.headers.get(&key).unwrap_or("").to_string())
+                } else if let Some(want) = name.strip_prefix("arg_") {
+                    // Query arguments were missing here, which silently broke
+                    // `proxy_pass http://$arg_b`: the name stayed literal and
+                    // the target failed to parse (502). nginx does not
+                    // percent-decode `$arg_*`, and the key match ignores case.
+                    Some(
+                        v.args
+                            .split('&')
+                            .filter_map(|p| p.split_once('='))
+                            .find(|(k, _)| k.eq_ignore_ascii_case(want))
+                            .map(|(_, val)| val.to_string())
+                            .unwrap_or_default(),
+                    )
+                } else if let Some(want) = name.strip_prefix("cookie_") {
+                    Some(crate::http::cookie_value(v.req, want))
                 } else {
                     None
                 }
             }
         };
+        let value = value.or_else(|| {
+            crate::http::resolve_var_for_proxy(
+                name,
+                v.req,
+                v.peer_ip,
+                v.scheme,
+                v.host,
+                v.uri,
+                v.args,
+                v.server_port,
+            )
+        });
         match value {
             Some(val) => {
                 out.push_str(&val);
@@ -557,7 +615,47 @@ pub async fn handle(
     let peer_ip = conn.peer.ip();
     let peer_ip_owned = peer_ip.to_string();
     let peer_port = conn.peer.port();
-    let Some(candidates) = choose(http, loc, &peer_ip) else {
+    // A `proxy_pass` whose authority contains variables is resolved per
+    // request (`proxy_pass http://$arg_b`). nginx looks the expanded value up
+    // as an `upstream` name first and otherwise needs `resolver`.
+    let dynamic = if pp.host_header.contains('$') {
+        Some(vars.expand(&pp.host_header))
+    } else {
+        None
+    };
+    // A variable target may carry its own URI (`proxy_pass http://$b` with
+    // `$b = host/`): that part replaces the request URI, as nginx does.
+    let dyn_uri: Option<String> = dynamic.as_deref().and_then(|e| {
+        // The expanded value carries its own URI; the request's arguments are
+        // not re-attached (nginx parses the value as a full URL).
+        e.find('/').map(|i| e[i..].to_string())
+    });
+    let dyn_target = match dynamic.as_deref() {
+        Some(expanded) if !expanded.is_empty() => {
+            match dynamic_addr(http, expanded, pp.https, vars, http).await {
+                Some(a) => Some(a),
+                None => {
+                    crate::log::error_log(
+                        "error",
+                        &format!("no resolver defined to resolve {expanded}"),
+                    );
+                    return Ok(Some(written(
+                        respond_error(conn, 502, tokens, req.keepalive).await?,
+                    )));
+                }
+            }
+        }
+        Some(_) => {
+            return Ok(Some(written(
+                respond_error(conn, 502, tokens, req.keepalive).await?,
+            )));
+        }
+        None => None,
+    };
+    let Some(candidates) = dyn_target
+        .map(|a| vec![Chosen::Direct(0, a)])
+        .or_else(|| choose(http, loc, &peer_ip))
+    else {
         return Ok(Some(written(
             respond_error(conn, 502, tokens, req.keepalive).await?,
         )));
@@ -596,7 +694,7 @@ pub async fn handle(
         Vec::new()
     };
 
-    let target_uri = upstream_target(path, query, loc, &pp);
+    let target_uri = dyn_uri.unwrap_or_else(|| upstream_target(path, query, loc, &pp));
     let is_upgrade = req
         .headers
         .get("upgrade")
@@ -1600,7 +1698,20 @@ async fn exchange(
             return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout"));
         }
         let mut chunk = [0u8; 8192];
-        let n = match tokio::time::timeout(remaining, up.read(&mut chunk)).await {
+        // Race the upstream against a client disconnect. nginx finalizes the
+        // request as soon as the client goes away, which is what frees a
+        // `limit_conn` slot while the upstream is still thinking.
+        // Only watch the client where it changes an observable outcome: while
+        // a `limit_conn` slot is held, nginx drops it the moment the client
+        // goes away (`ngx_http_limit_conn_cleanup`).
+        let watch_client = !loc.limit_conns.is_empty();
+        let read = tokio::select! {
+            r = tokio::time::timeout(remaining, up.read(&mut chunk)) => r,
+            _ = conn.peer_closed(), if watch_client => {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "client closed"));
+            }
+        };
+        let n = match read {
             Ok(Ok(n)) => n,
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout")),
@@ -2041,6 +2152,7 @@ async fn exchange(
         upstream_addr,
         &upstream_headers,
         Some(vars),
+        &pp.host_header,
     );
     apply_cookie_rules(&mut raw, loc, vars);
     // `add_trailer` forces chunked framing even when the upstream sent a

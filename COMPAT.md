@@ -589,3 +589,53 @@ CONTENT，所以 ACCESS 必须先求值。
 已知未完成：`proxy_cache_use_stale.t` 27/36（缺 `updating`/`revalidated` 事件），
 `limit_req_delay.t` 4/6（`delay=N` 的排队语义），`limit_conn.t` 9/10（客户端一断开
 就要立刻释放名额）。
+
+## 本轮（limit_req 漏桶按 nginx 单位重写 + limit_conn 名额回收 + proxy_pass 变量目标）
+
+### limit_req：`delay=N` 之前完全没生效
+
+用真 nginx 探到的三点（`rate=30r/m`，即每 2s 一个请求）：
+
+| 配置 | 行为 |
+|---|---|
+| `burst=2 nodelay` | 前 3 个立刻 200，第 4 个 503 |
+| `burst=2`（无 delay/nodelay） | 第 1 个立刻，之后每个延迟 2s 后 200（**不拒绝**） |
+| `delay=1 burst=2` | 前 2 个立刻，之后每个延迟 2s 后 200 |
+
+原来的实现用 `interval * excess` 估延迟，且把 `nodelay` 和 `excess==1` 混在一起，
+`delay=N` 只解析不使用。现改为 nginx 的**毫请求单位**（1000 = 一个请求，
+`rate` 为毫请求/秒，新节点从 -1000 起）：
+
+```
+excess = excess - rate*ms/1000 + 1000
+if excess > burst*1000      -> 503（且不记账）
+if excess > delay*1000      -> 延迟 (excess - delay*1000)/rate 秒
+```
+
+`limit_req_delay.t` 4/6 → **6/6**，`limit_req.t` 保持 8/8。
+
+### limit_conn：客户端断开的瞬间释放名额
+
+nginx 在连接可读事件里立刻回收（`ngx_http_limit_conn_cleanup`）。我们没有共享内存，
+只能在"下一个请求做判定时"补一次检查：`ConnZone` 现在保存每个名额的客户端 fd，
+达到上限时先 `recv(MSG_PEEK)` 探活，已关闭的名额直接回收。另外代理等待上游时
+也 `select!` 一个客户端断开探测（仅在该 location 有 `limit_conn` 时启用）。
+`limit_conn.t` 9/10 → **10/10**（连跑三次稳定）。
+
+### proxy_pass 的变量目标
+
+`proxy_pass http://$arg_b` 之前直接 502：变量展开用的是 `src/proxy.rs` 里另写的
+第二个展开器，它不认 `$arg_*`（和之前 `RwVars` 那个坑同一类）。现在：
+
+- 未知名字回落到 `ServerVars::get`，两套实现不会再漂移；
+- 变量目标的 authority 在请求时展开，先按 `upstream {}` 名字匹配，否则 IP 直连或
+  用 `resolver`；
+- 展开值里的 URI 部分（`host/`）替换请求 URI，且**不**追加原查询串（实测 nginx 行为）。
+- 补上 `$proxy_host` / `$proxy_port` / `$proxy_add_x_forwarded_for`（`add_header` 用）。
+
+`proxy.t` 12/30 → **17/30**（4 条剩余都是 `$upstream_header_time` / 重试尝试列表）。
+
+### 允许清单（诚实）
+`proxy.t` 剩余 4 条：慢响应头下的 `$upstream_header_time`，以及 next_upstream 后
+`$upstream_response_time` / `$upstream_header_time` 的逗号列表（我们只存单次值）。
+`proxy_cache_use_stale.t` 27/36（缺 `updating`/`revalidated` 事件）。

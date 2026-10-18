@@ -125,6 +125,18 @@ pub struct TlsInfo {
 }
 
 impl Conn {
+    /// Raw descriptor of the underlying socket, for `limit_conn` slot
+    /// reclaim: nginx notices a client close through epoll, and this is how we
+    /// ask the same question from another request's thread.
+    pub fn raw_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        use std::os::unix::io::AsRawFd;
+        match &self.stream {
+            Stream::Plain(s) => Some(s.as_raw_fd()),
+            Stream::Unix(s) => Some(s.as_raw_fd()),
+            Stream::Tls(s) => Some(s.get_ref().0.as_raw_fd()),
+        }
+    }
+
     /// The client certificate chain as presented in the handshake, if any.
     pub fn peer_chain(&self) -> Option<Vec<rustls::pki_types::CertificateDer<'static>>> {
         let Stream::Tls(tls) = &self.stream else {
@@ -264,6 +276,60 @@ impl Conn {
             self.end -= self.start;
             self.start = 0;
             self.buf.truncate(self.end);
+        }
+    }
+
+    /// Resolves when the peer has closed its side, without consuming data.
+    ///
+    /// nginx watches the client for a readable event while it waits on an
+    /// upstream, so a request whose client has gone away is finalized at once
+    /// (this is what releases a `limit_conn` slot). Only plain sockets are
+    /// watched: a TLS stream cannot be probed without consuming records, and
+    /// "not closed" is the safe answer there.
+    ///
+    /// Callers only await this where the answer changes behaviour (a
+    /// `limit_conn` slot is held), because probing costs a 2 ms timer per
+    /// iteration for as long as the upstream takes.
+    pub async fn peer_closed(&self) {
+        // `recv(MSG_PEEK)` reports end-of-stream without consuming anything and
+        // behaves the same on Linux and macOS (POLLRDHUP is Linux-only).
+        let probe = |fd: std::os::unix::io::RawFd| -> bool {
+            let mut b = [0u8; 1];
+            let n = unsafe {
+                libc::recv(
+                    fd,
+                    b.as_mut_ptr() as *mut libc::c_void,
+                    1,
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            n == 0
+                || (n < 0
+                    && std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock)
+        };
+        use std::os::unix::io::AsRawFd;
+        let fd = match &self.stream {
+            Stream::Plain(s) => s.as_raw_fd(),
+            Stream::Unix(s) => s.as_raw_fd(),
+            Stream::Tls(_) => {
+                std::future::pending::<()>().await;
+                return;
+            }
+        };
+        // 1 ms for the first 200 ms (the window a following request can
+        // observe), then back off so a very slow upstream does not spin.
+        let started = std::time::Instant::now();
+        loop {
+            if probe(fd) {
+                return;
+            }
+            let waited = started.elapsed();
+            let step = if waited < Duration::from_millis(200) {
+                Duration::from_millis(1)
+            } else {
+                Duration::from_millis(10)
+            };
+            tokio::time::sleep(step).await;
         }
     }
 

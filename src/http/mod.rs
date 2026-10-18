@@ -1571,8 +1571,44 @@ fn base64_decode_user(b64: &str) -> Option<String> {
     text.split_once(':').map(|(u, _)| u.to_string())
 }
 
-/// `$cookie_name`: the value of a request cookie, `, `-joined across repeats.
-fn cookie_value(req: &Request, want: &str) -> String {
+/// Resolve `$name` exactly as `ServerVars::get` would. Used by `proxy_pass`
+/// target expansion so the two never drift.
+pub(crate) fn resolve_var_for_proxy(
+    name: &str,
+    req: &Request,
+    peer_ip: &str,
+    scheme: &str,
+    host: &str,
+    uri: &str,
+    args: &str,
+    server_port: u16,
+) -> Option<String> {
+    thread_local! {
+        static EMPTY_CUSTOM: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+    }
+    EMPTY_CUSTOM.with(|c| {
+        let v = ServerVars {
+            req,
+            path: uri,
+            query: args,
+            server_name: host,
+            server_port,
+            peer_ip,
+            peer_port: 0,
+            scheme,
+            document_root: "",
+            upstream_cache_status: "",
+            custom: c,
+            connection_requests: 0,
+            connection_time: 0,
+            sent: &[],
+        };
+        Some(v.get(name))
+    })
+}
+
+pub(crate) fn cookie_value(req: &Request, want: &str) -> String {
     let Some(cookie) = req.headers.get_joined("cookie") else {
         return String::new();
     };
@@ -1716,6 +1752,31 @@ pub fn apply_add_headers_upstream(
     )
 }
 
+/// Same, but with the configured `proxy_pass` authority for `$proxy_host` /
+/// `$proxy_port` (the backend address is not the same thing).
+#[allow(clippy::too_many_arguments)]
+pub fn apply_add_headers_proxy(
+    raw: &mut Vec<u8>,
+    headers: &[(String, String)],
+    status: u16,
+    upstream_cache_status: &str,
+    upstream_addr: &str,
+    upstream_headers: &[(String, String)],
+    proxy_host: &str,
+    ctx_vars: Option<&ServerVars<'_>>,
+) {
+    apply_add_headers_ctx(
+        raw,
+        headers,
+        status,
+        upstream_cache_status,
+        upstream_addr,
+        upstream_headers,
+        ctx_vars,
+        proxy_host,
+    )
+}
+
 /// Full variant, with the upstream response headers for `$upstream_http_*`.
 pub fn apply_add_headers_full(
     raw: &mut Vec<u8>,
@@ -1733,6 +1794,7 @@ pub fn apply_add_headers_full(
         upstream_addr,
         upstream_headers,
         None,
+        "",
     )
 }
 
@@ -1746,6 +1808,7 @@ pub fn apply_add_headers_ctx(
     upstream_addr: &str,
     upstream_headers: &[(String, String)],
     ctx_vars: Option<&ServerVars<'_>>,
+    proxy_host: &str,
 ) {
     let mut sent: Vec<(String, String)> = split_head(raw);
     for (name, value) in headers {
@@ -1758,10 +1821,32 @@ pub fn apply_add_headers_ctx(
         }
         // Upstream variables first: the generic resolver would drop them as
         // unknown.
+        let proxy_port = match proxy_host.rsplit_once(':') {
+            Some((_, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => p.to_string(),
+            _ => "80".to_string(),
+        };
         let mut expanded = expand_upstream_vars(value, upstream_headers)
             .replace("$upstream_cache_status", upstream_cache_status)
             .replace("$upstream_addr", upstream_addr)
+            .replace("$proxy_host", proxy_host)
+            .replace("$proxy_port", &proxy_port)
             .replace("$status", &status.to_string());
+        if expanded.contains("$proxy_add_x_forwarded_for") {
+            if let Some(v) = ctx_vars {
+                let prior = v
+                    .req
+                    .headers
+                    .get("x-forwarded-for")
+                    .unwrap_or("")
+                    .to_string();
+                let xff = if prior.is_empty() {
+                    v.peer_ip.to_string()
+                } else {
+                    format!("{prior}, {}", v.peer_ip)
+                };
+                expanded = expanded.replace("$proxy_add_x_forwarded_for", &xff);
+            }
+        }
         if let Some(v) = ctx_vars {
             let local = ServerVars {
                 req: v.req,
@@ -2865,13 +2950,14 @@ async fn check_limits(
     http: &Http,
     vars: &ServerVars<'_>,
     guards: &mut Vec<crate::limit::ConnGuard>,
+    client_fd: Option<std::os::unix::io::RawFd>,
 ) -> Option<Response> {
     for lr in &loc.limit_reqs {
         let Some(zone) = http.limit_req_zones.iter().find(|z| z.name == lr.zone) else {
             continue;
         };
         let key = limit_key(&zone.key, vars);
-        match zone.state.account(&key, lr.burst, lr.nodelay) {
+        match zone.state.account(&key, lr.burst, lr.nodelay, lr.delay) {
             None => {
                 // nginx writes this once per configured `error_log` of the
                 // location, at `limit_req_log_level`. Two `error_log`
@@ -2907,7 +2993,7 @@ async fn check_limits(
             continue;
         };
         let key = limit_key(&zone.key, vars);
-        match zone.state.acquire(&key, lc.limit) {
+        match zone.state.acquire(&key, lc.limit, client_fd) {
             Some(guard) => guards.push(guard),
             None => {
                 let msg = format!("limiting connections by zone \"{}\"", lc.zone);
@@ -3546,7 +3632,7 @@ async fn dispatch(
             connection_time: state.elapsed_secs(),
             sent: &[],
         };
-        if let Some(reject) = check_limits(loc, http, &limit_vars, guards).await {
+        if let Some(reject) = check_limits(loc, http, &limit_vars, guards, conn.raw_fd()).await {
             let status = reject.status;
             let sent = split_head(&reject.raw);
             let bytes = write_response(

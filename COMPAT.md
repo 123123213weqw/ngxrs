@@ -252,8 +252,14 @@ nginx 逐字节一致；`STLS` / `STARTTLS` 执行**真实的 TLS 升级**（rus
 
 - `max_errors` 的完整语义
 - `ssl_password_file`（加密私钥）
-- `error_log` 的 `alert` / `crit` 之外的细粒度事件（各模块自己产生的
-  debug 级消息）尚未补全
+- `error_log` 的细粒度事件（各模块自己产生的 debug 级消息）尚未补全
+- **`limit_conn.t` 9/10**：剩下 1 条是「客户端关闭后立刻释放名额」。nginx 在
+  连接关闭的瞬间归还 slot；我们是在那次在途上游请求结束（含 `limit_req`
+  延迟）之后才归还，所以紧跟其后的请求仍看到计数未清零
+- **`stream` 的 TLS 未实现**（`listen ... ssl` / `proxy_ssl`），因此
+  `stream_ssl.t` 在本机是 **UNRUN**（nginx 7/7，我们 0 条断言）。
+  这类「因未声明模块而被静默跳过」的用例现在会被 harness 显式标成 UNRUN，
+  不再混进 SAME
 
 ### 本轮修掉的真缺陷
 

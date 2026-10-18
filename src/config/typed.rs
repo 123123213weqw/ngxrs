@@ -72,6 +72,8 @@ pub struct LocCfg {
     pub error_logs: Vec<LogSpec>,
     /// `limit_req_log_level`: severity of the "limiting requests" message.
     pub limit_req_log_level: crate::log::Level,
+    /// `limit_conn_log_level`: severity of "limiting connections".
+    pub limit_conn_log_level: crate::log::Level,
     /// Status returned when a limit is exceeded (`limit_req_status`).
     pub limit_req_status: u16,
     pub limit_conn_status: u16,
@@ -174,6 +176,7 @@ impl LocCfg {
         LocCfg {
             error_logs: Vec::new(),
             limit_req_log_level: crate::log::Level::Error,
+            limit_conn_log_level: crate::log::Level::Error,
             root,
             steps: Vec::new(),
             alias: None,
@@ -1799,6 +1802,11 @@ impl Builder {
                     cfg.limit_req_log_level = l;
                 }
             }
+            "limit_conn_log_level" => {
+                if let Some(l) = d.args.first().and_then(|v| crate::log::Level::parse(v)) {
+                    cfg.limit_conn_log_level = l;
+                }
+            }
             "limit_req" => {
                 // limit_req zone=NAME [burst=N] [nodelay | delay=N]
                 let mut lr = LimitReq {
@@ -1842,7 +1850,7 @@ impl Builder {
                     }
                 }
             }
-            "limit_req_log_level" | "limit_conn_log_level" | "limit_req_dry_run"
+            "limit_req_dry_run"
             | "limit_conn_dry_run" => {
                 // Accepted; dry-run bookkeeping is not implemented.
             }

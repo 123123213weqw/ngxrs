@@ -59,7 +59,7 @@ outcomes() { # $1=log -> sorted "id ok" / "id notok" lines
 }
 
 idx=0
-declare -a NAMES=() SAME=() WORSE=() BETTER=() REF_OK=() OUR_OK=()
+declare -a NAMES=() SAME=() WORSE=() BETTER=() UNRUN=() REF_OK=() OUR_OK=()
 
 for t in $TESTS; do
   f="$TESTS_DIR/$t"
@@ -92,7 +92,15 @@ for t in $TESTS; do
              "$OUT_DIR/${t%.t}.ref.out" "$OUT_DIR/${t%.t}.out")
 
   NAMES+=("$t"); REF_OK+=("$r_ok"); OUR_OK+=("$o_ok")
-  if [ "$worse" -gt 0 ]; then
+  # A suite that never ran on our side has no `not ok` lines at all, so the
+  # worse/better counts are both zero and it used to be reported as SAME even
+  # though the numbers disagreed (stream_ssl showed "SAME 7/7 vs 0/7"). Suite
+  # runs are only comparable when both sides produced assertions.
+  if [ "$o_ok" -eq 0 ] && [ "$r_ok" -gt 0 ]; then
+    UNRUN+=("$t")
+    printf 'UNRUN  %-26s nginx %2s/%-3s   ngxrs %2s/%-3s   (we produced no assertions)\n' \
+      "$t" "$r_ok" "$total" "$o_ok" "$total"
+  elif [ "$worse" -gt 0 ]; then
     WORSE+=("$t")
     printf 'WORSE  %-26s nginx %2s/%-3s   ngxrs %2s/%-3s   (%s assertions we fail)\n' \
       "$t" "$r_ok" "$total" "$o_ok" "$total" "$worse"
@@ -118,5 +126,6 @@ printf 'files compared : %d\n' "${#NAMES[@]}"
 printf 'assertions      : nginx %d / ngxrs %d\n' "$total_ref" "$total_our"
 printf 'identical       : %d\n' "${#SAME[@]}"
 printf 'ngxrs worse     : %d  %s\n' "${#WORSE[@]}" "${WORSE[*]:-}"
+printf 'not comparable  : %d  %s\n' "${#UNRUN[@]}" "${UNRUN[*]:-}"
 printf 'ngxrs better    : %d  %s\n' "${#BETTER[@]}" "${BETTER[*]:-}"
 [ "${#WORSE[@]}" -eq 0 ]

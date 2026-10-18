@@ -2259,6 +2259,9 @@ fn check_limits(
                         );
                     }
                 }
+                if loc.error_logs.is_empty() {
+                    crate::log::error_log(loc.limit_req_log_level.name(), &msg);
+                }
                 return Some(error_response(loc.limit_req_status, true));
             }
             Some(delay) if !delay.is_zero() => {
@@ -2278,10 +2281,16 @@ fn check_limits(
         match zone.state.acquire(&key, lc.limit) {
             Some(guard) => guards.push(guard),
             None => {
-                crate::log::error_log(
-                    "error",
-                    &format!("limiting connections by zone \"{}\"", lc.zone),
-                );
+                let msg = format!("limiting connections by zone \"{}\"", lc.zone);
+                for spec in &loc.error_logs {
+                    if let Some(sink) = crate::log::sink_cached(&spec.dest, spec.level) {
+                        crate::log::log_to(&[sink], loc.limit_conn_log_level, &msg);
+                    }
+                }
+                // The main-context log still sees it, as in nginx.
+                if loc.error_logs.is_empty() {
+                    crate::log::error_log(loc.limit_conn_log_level.name(), &msg);
+                }
                 return Some(error_response(loc.limit_conn_status, true));
             }
         }

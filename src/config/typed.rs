@@ -2612,6 +2612,16 @@ impl Server {
             None => &self.default_loc,
         }
     }
+
+    /// Resolve a named location (`location @fallback { ... }`), which nginx uses
+    /// as an `error_page` target. Named locations never take part in prefix or
+    /// regex matching.
+    pub fn locate_named(&self, name: &str) -> Option<&LocCfg> {
+        self.locations.iter().find_map(|l| match &l.matcher {
+            Match::Named(n) if n == name => Some(&l.cfg),
+            _ => None,
+        })
+    }
 }
 
 fn match_list<'a>(list: &'a [Location], path: &str) -> Option<&'a LocCfg> {

@@ -2096,14 +2096,27 @@ async fn finalize_response(
         let Some(target) = cur_loc.error_pages.get(&resp.status).cloned() else {
             break;
         };
-        let (new_status, uri) = match target.strip_prefix('=') {
-            Some(rest) => match rest.split_once(char::is_whitespace) {
-                Some((code, uri)) => (code.parse::<u16>().ok(), uri.trim().to_string()),
-                None => (None, rest.trim().to_string()),
-            },
-            None => (None, target.clone()),
+        // `error_page 404 /a.html` keeps the original status;
+        // `error_page 404 =200 /a.html` forces 200; a bare `=`
+        // (`error_page 404 = /a.html`, `... = @named`) adopts whatever status
+        // the target produced.
+        let (new_status, use_target_status, uri) = match target.strip_prefix('=') {
+            Some(rest) => {
+                let rest = rest.trim_start();
+                match rest.split_once(char::is_whitespace) {
+                    Some((first, tail)) => match first.parse::<u16>() {
+                        Ok(code) => (Some(code), false, tail.trim().to_string()),
+                        Err(_) => (None, true, rest.to_string()),
+                    },
+                    None => (None, true, rest.to_string()),
+                }
+            }
+            None => (None, false, target.clone()),
         };
         let original_status = resp.status;
+        // nginx keeps `r->uri` untouched when the error page target is a named
+        // location, so remember the URI that failed.
+        let uri_before = cur_path.clone();
         let (p, q) = match uri.split_once('?') {
             Some((p, q)) => (p.to_string(), q.to_string()),
             None => (uri.clone(), String::new()),
@@ -2163,6 +2176,42 @@ async fn finalize_response(
         };
             cur_query = vars.expand(&cur_query);
         }
+        // `error_page 404 = @fallback` jumps to a named location. Named
+        // locations take no part in prefix/regex matching: nginx just swaps the
+        // location config and runs its content phase, leaving `r->uri` alone.
+        if let Some(named) = server.locate_named(&cur_path) {
+            cur_loc = named;
+            cur_path = uri_before;
+            let vars = ServerVars {
+                req,
+                path: &cur_path,
+                query: &cur_query,
+                server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
+                server_port,
+                peer_ip,
+                peer_port,
+                scheme: "http",
+                document_root: &root_str,
+                upstream_cache_status: "",
+                custom,
+                connection_requests: state.requests,
+                connection_time: state.elapsed_secs(),
+                sent: &[],
+            };
+            let redirected = route(req, &cur_path, &cur_query, named, server, http, true, &vars).await;
+            let redirected_status = redirected.status;
+            *resp = redirected;
+            resp.status = if use_target_status {
+                redirected_status
+            } else {
+                match new_status {
+                    Some(code) => code,
+                    None if (300..400).contains(&redirected_status) => redirected_status,
+                    None => original_status,
+                }
+            };
+            continue;
+        }
         cur_loc = server.locate(&cur_path);
 
         // The error page target runs the full rewrite phase too, so a
@@ -2191,19 +2240,21 @@ async fn finalize_response(
                 route(req, &cur_path, &cur_query, l, server, http, true, &vars).await
             }
         };
-        if redirected.status >= 400 && redirected.body.is_empty() {
-            *resp = error_response(original_status, server.server_tokens);
-            break;
-        }
         // A redirect generated while serving the error page (directory
         // auto-redirect, `rewrite ... permanent`, ...) keeps its own status;
-        // otherwise the original error status is preserved.
+        // otherwise the original error status is preserved. A bare `=` adopts
+        // the target's status outright. An empty body here is normal — `return
+        // 403;` has none and gets the error page generated after the loop.
         let redirected_status = redirected.status;
         *resp = redirected;
-        resp.status = match new_status {
-            Some(code) => code,
-            None if (300..400).contains(&redirected_status) => redirected_status,
-            None => original_status,
+        resp.status = if use_target_status {
+            redirected_status
+        } else {
+            match new_status {
+                Some(code) => code,
+                None if (300..400).contains(&redirected_status) => redirected_status,
+                None => original_status,
+            }
         };
     }
 
@@ -2425,20 +2476,74 @@ async fn dispatch(
             connection_time: state.elapsed_secs(),
             sent: &[],
         };
-        if let Some(o) =
-            crate::proxy::handle(
-                conn,
-                req,
-                path,
-                query,
-                loc,
-                http,
-                server.server_tokens,
-                &proxy_vars,
-            )
-            .await?
+        match crate::proxy::handle(
+            conn,
+            req,
+            path,
+            query,
+            loc,
+            http,
+            server.server_tokens,
+            &proxy_vars,
+        )
+        .await?
         {
-            return Ok(o);
+            Some(crate::proxy::Proxied::Written(o)) => return Ok(o),
+            Some(crate::proxy::Proxied::Intercept { status, headers }) => {
+                // `proxy_intercept_errors`: nothing has been written, so run the
+                // normal error_page/headers pipeline for this status. The final
+                // status stays the upstream one (nginx keeps `err_status`).
+                let mut resp = error_response(status, false);
+                let preserved = headers;
+                let peer_ip = conn.peer.ip().to_string();
+                resp = finalize_response(
+                    req,
+                    &mut resp,
+                    path,
+                    query,
+                    server,
+                    http,
+                    &peer_ip,
+                    peer_port,
+                    listen_port,
+                    captures,
+                    &set_vars,
+                    state,
+                    local_addr,
+                )
+                .await;
+                // `WWW-Authenticate` from upstream goes in front of the headers
+                // the error page produced, matching the order nginx emits.
+                if !preserved.is_empty() {
+                    let mut raw = Vec::with_capacity(resp.raw.len() + 64);
+                    for (k, v) in &preserved {
+                        raw.extend_from_slice(k.as_bytes());
+                        raw.extend_from_slice(b": ");
+                        raw.extend_from_slice(v.as_bytes());
+                        raw.extend_from_slice(b"\r\n");
+                    }
+                    raw.extend_from_slice(&resp.raw);
+                    resp.raw = raw;
+                }
+                let status = resp.status;
+                let sent = split_head(&resp.raw);
+                let bytes = write_response_ka(
+                    conn,
+                    resp,
+                    keepalive_allowed,
+                    server.server_tokens,
+                    head_only,
+                    ka_header,
+                )
+                .await?;
+                return Ok(Outcome {
+                    status,
+                    bytes,
+                    close: !keepalive_allowed,
+                    sent,
+                });
+            }
+            None => {}
         }
     }
 

@@ -481,7 +481,7 @@ pub async fn handle(
     http: &Http,
     tokens: bool,
     vars: &crate::http::ServerVars<'_>,
-) -> io::Result<Option<Outcome>> {
+) -> io::Result<Option<Proxied>> {
     let pp = match &loc.proxy_pass {
         Some(p) => p.clone(),
         None => return Ok(None),
@@ -492,7 +492,7 @@ pub async fn handle(
     let peer_ip_owned = peer_ip.to_string();
     let peer_port = conn.peer.port();
     let Some(candidates) = choose(http, loc, &peer_ip) else {
-        return Ok(Some(respond_error(conn, 502, tokens, req.keepalive).await?));
+        return Ok(Some(written(respond_error(conn, 502, tokens, req.keepalive).await?)));
     };
 
     // `proxy_bind` applies to every candidate connection below.
@@ -507,7 +507,7 @@ pub async fn handle(
         Ok(b) => b,
         Err(()) => {
             crate::log::error_log("error", "invalid proxy_bind value");
-            return Ok(Some(respond_error(conn, 500, tokens, req.keepalive).await?));
+            return Ok(Some(written(respond_error(conn, 500, tokens, req.keepalive).await?)));
         }
     };
 
@@ -553,12 +553,12 @@ pub async fn handle(
                 req.method == Method::Head,
             )
             .await?;
-            return Ok(Some(Outcome {
+            return Ok(Some(written(Outcome {
                 status: 500,
                 bytes,
                 close: false,
                 sent: Vec::new(),
-            }));
+            })));
         }
     }
     let zone = zone_name
@@ -727,12 +727,12 @@ pub async fn handle(
                     // cost more assertions than it won (24 vs 26). The refresh
                     // still lands a few milliseconds later.
                     drop(pending_update);
-                    return Ok(Some(Outcome {
+                    return Ok(Some(written(Outcome {
                         status,
                         bytes,
                         close: false,
                         sent: Vec::new(),
-                    }));
+                    })));
                 }
             }
         }
@@ -790,12 +790,12 @@ pub async fn handle(
                         req.method == Method::Head,
                     )
                     .await?;
-                    return Ok(Some(Outcome {
+                    return Ok(Some(written(Outcome {
                         status: entry.status,
                         bytes,
                         close: false,
                         sent: Vec::new(),
-                    }));
+                    })));
                 }
             }
 
@@ -938,7 +938,7 @@ pub async fn handle(
     if let Some(e) = &last_err {
         eprintln!("ngxrs: [error] upstream failure for {}: {e}", req.raw_target);
     }
-    Ok(Some(respond_error(conn, 502, tokens, req.keepalive).await?))
+    Ok(Some(written(respond_error(conn, 502, tokens, req.keepalive).await?)))
 }
 
 async fn connect_timeout(addr: SocketAddr, dur: Duration) -> io::Result<TcpStream> {
@@ -1110,6 +1110,27 @@ struct CacheCtx<'a> {
     status: &'a str,
     /// Expired entry that may be revalidated with `If-None-Match` / `If-Modified-Since`.
     reval: Option<&'a crate::cache::Cached>,
+}
+
+/// Result of one proxy attempt.
+///
+/// The proxy normally writes the response itself (it streams to the socket), but
+/// `proxy_intercept_errors` needs the error_page machinery in `http`, which runs
+/// after the content phase — so that case hands the status back instead.
+pub enum Proxied {
+    /// The response is already on the wire.
+    Written(Outcome),
+    /// Nothing was written; the caller must run `error_page` for this status.
+    Intercept {
+        status: u16,
+        /// `WWW-Authenticate` survives the interception (nginx copies it into
+        /// `r->headers_out` in `ngx_http_upstream_intercept_errors`).
+        headers: Vec<(String, String)>,
+    },
+}
+
+fn written(o: Outcome) -> Proxied {
+    Proxied::Written(o)
 }
 
 /// Serialize the upstream request head exactly as nginx does.
@@ -1297,7 +1318,7 @@ async fn exchange(
     upstream_addr: &str,
     vars: &crate::http::ServerVars<'_>,
     convert_head: bool,
-) -> io::Result<Outcome> {
+) -> io::Result<Proxied> {
     // ---- request head ----
     let out = build_upstream_head(
         req, target_uri, body, loc, pp, peer_ip, is_upgrade, convert_head, cache.reval,
@@ -1454,14 +1475,38 @@ async fn exchange(
                     };
                     checkin(pool_key, up, cap);
                 }
-                return Ok(Outcome {
+                return Ok(written(Outcome {
                     status,
                     bytes,
                     close: false,
                     sent: Vec::new(),
-                });
+                }));
             }
         }
+    }
+
+    // ---- `proxy_intercept_errors`: let `error_page` handle this status ----
+    //
+    // nginx decides this in `ngx_http_upstream_intercept_errors`, called from
+    // `ngx_http_upstream_process_headers` — i.e. right after the head is parsed
+    // and before the body is relayed or cached. `WWW-Authenticate` is copied
+    // into `r->headers_out` first so it survives the internal redirect.
+    if loc.proxy_intercept_errors
+        && crate::util::is_special_status(head.status)
+        && loc.error_pages.contains_key(&head.status)
+    {
+        let preserved = if head.status == 401 {
+            crate::http::split_head(&head.raw)
+                .into_iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case("www-authenticate"))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        return Ok(Proxied::Intercept {
+            status: head.status,
+            headers: preserved,
+        });
     }
 
     // ---- 101 Switching Protocols: hand the sockets to a bidirectional pipe ----
@@ -1475,12 +1520,12 @@ async fn exchange(
             conn.write_all(&buf).await?;
         }
         conn.pipe_with(up).await?;
-        return Ok(Outcome {
+        return Ok(written(Outcome {
             status: 101,
             bytes: 0,
             close: true,
             sent: Vec::new(),
-        });
+        }));
     }
 
     // ---- body ----
@@ -1683,12 +1728,12 @@ async fn exchange(
                     req.method == Method::Head,
                 )
                 .await?;
-                return Ok(Outcome {
+                return Ok(written(Outcome {
                     status,
                     bytes,
                     close: false,
                     sent: Vec::new(),
-                });
+                }));
             }
         }
         write_head(conn, status, &out_raw, req.keepalive, tokens).await?;
@@ -1696,12 +1741,12 @@ async fn exchange(
         if req.method != Method::Head {
             conn.write_all(&payload).await?;
         }
-        return Ok(Outcome {
+        return Ok(written(Outcome {
             status,
             bytes: payload.len() as u64,
             close: false,
             sent: Vec::new(),
-        });
+        }));
     }
 
     let mut raw = raw;
@@ -1723,12 +1768,12 @@ async fn exchange(
     let mut sent = 0u64;
     if req.method == Method::Head {
         // Converted HEAD: drain (and discard) the body we asked for.
-        return Ok(Outcome {
+        return Ok(written(Outcome {
             status: head.status,
             bytes: 0,
             close: false,
             sent: sent_headers,
-        });
+        }));
     }
     if head.chunked {
         sent = stream_chunked(conn, &mut up, buf, loc.proxy_read_timeout).await?;
@@ -1811,12 +1856,12 @@ async fn exchange(
         checkin(pool_key, up, cap);
     }
 
-    Ok(Outcome {
+    Ok(written(Outcome {
         status: head.status,
         bytes: sent,
         close: false,
         sent: sent_headers,
-    })
+    }))
 }
 
 fn loc_upstream_cap(idx: usize, _pp: &crate::config::ProxyPass) -> Option<usize> {

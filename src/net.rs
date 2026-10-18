@@ -116,7 +116,30 @@ pub fn serve(cfg: Config) -> io::Result<()> {
     }
     .max(1);
 
-    crate::log::init_error_log(cfg.error_log.as_deref());
+    // Install the main-context `error_log` sinks. Without explicit directives
+    // nginx logs to `<prefix>/logs/error.log` at `error` level; we keep `info`
+    // so nothing previously written is lost.
+    {
+        let mut sinks = crate::config::typed::open_sinks(&cfg.error_logs);
+        if sinks.is_empty() {
+            if let Some(path) = cfg.error_log.as_deref() {
+                if let Ok(s) = crate::log::Sink::file(path, crate::log::Level::Info) {
+                    sinks.push(s);
+                }
+            }
+        }
+        crate::log::set_global(sinks);
+    }
+    // nginx announces its build in the error log at `notice`.
+    crate::log::log_global(crate::log::Level::Notice, "using the \"epoll\" event method");
+    crate::log::log_global(
+        crate::log::Level::Notice,
+        &format!(
+            "{ngxrs} (nginx/{ver} compatible)",
+            ngxrs = crate::VERSION,
+            ver = crate::COMPAT_VERSION
+        ),
+    );
     let logger = Arc::new(Logger::new()?);
     let cfg = Arc::new(cfg);
 
@@ -239,7 +262,12 @@ pub fn serve(cfg: Config) -> io::Result<()> {
         });
     }
     let stream_cfg = Arc::new(stream_cfg);
-    let mail_servers = cfg.mail_servers.clone();
+    let mut mail_servers = cfg.mail_servers.clone();
+    // A mail `server {}` with its own `error_log` adds destinations; the file is
+    // opened here, not during `-t`, so a config test creates nothing.
+    for srv in &mut mail_servers {
+        srv.sinks = crate::config::typed::open_sinks(&srv.error_logs);
+    }
     crate::proxy::init(&cfg.http);
     crate::proxy::init_keepalive(&cfg.http);
 

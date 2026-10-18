@@ -165,8 +165,20 @@ struct Conn {
     upgrade: bool,
 }
 
+/// nginx numbers mail connections per worker (`*1`, `*2`, ...).
+static CONN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 async fn handle(client: TcpStream, peer: SocketAddr, server: Arc<MailServer>) -> io::Result<()> {
     let mut conn = Conn::default();
+    // nginx logs the peer and the local address at `info` on every connection.
+    if let Ok(local) = client.local_addr() {
+        let n = CONN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        crate::log::log_to(
+            &server.sinks,
+            crate::log::Level::Info,
+            &format!("*{n} client {peer} connected to {local}"),
+        );
+    }
 
     // `listen ... ssl`: TLS starts before the greeting. The greeting is only
     // suppressed for a `STARTTLS` upgrade, so `resumed` stays false here.
@@ -1220,6 +1232,24 @@ where
     W: AsyncWriteExt + Unpin,
 {
     // nginx puts its own `server_name` in the banner.
+    if !conn.resumed && server.greeting_delay > std::time::Duration::ZERO {
+        // Hold the banner back. A client that talks over the delay is probing
+        // (real MTAs wait for `220`), so it gets RFC 5321's 503 for improper
+        // pipelining and the session ends. Measured against nginx: the reply
+        // arrives after the full delay, not immediately.
+        let mut probe = [0u8; 1];
+        let spoke_first = tokio::select! {
+            _ = tokio::time::sleep(server.greeting_delay) => false,
+            r = reader.read(&mut probe) => !matches!(r, Ok(0) | Err(_)),
+        };
+        if spoke_first {
+            writer
+                .write_all(b"503 5.5.0 Improper use of SMTP command pipelining\r\n")
+                .await?;
+            writer.flush().await?;
+            return Ok(());
+        }
+    }
     if !conn.resumed {
         writer
             .write_all(format!("220 {} ESMTP ready\r\n", server.name).as_bytes())

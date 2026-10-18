@@ -243,16 +243,17 @@ nginx 逐字节一致；`STLS` / `STARTTLS` 执行**真实的 TLS 升级**（rus
 |---|---|---|---|
 | `mail_smtp_xclient.t` | **8/8** | 8/8 | 一致 |
 | `mail_proxy_smtp_auth.t` | 8/9 | 9/9 | 1 |
-| `mail_smtp_greeting_delay.t` | 2/4 | 4/4 | 2（`smtp_greeting_delay` 未生效）|
+| `mail_smtp_greeting_delay.t` | **4/4** | 4/4 | 一致 |
 | `mail_resolver.t` | 9/12 | 12/13 | 3 |
 | `mail_max_errors.t` | 14/20 | 20/20 | 6 |
-| `mail_error_log.t` | 6/32 | 32/32 | 26（`error_log` 只有 notice 级）|
+| `mail_error_log.t` | **32/32** | 32/32 | 一致 |
 
 ### 仍未实现
 
-- `smtp_greeting_delay` / `max_errors` 的完整语义
+- `max_errors` 的完整语义
 - `ssl_password_file`（加密私钥）
-- `error_log` 的分级过滤（这是 `mail_error_log.t` 26 条缺口的根因，也是 http 侧的同款缺口）
+- **http 侧**的 `error_log`：`location` 级 `error_log`、`limit_req_log_level`
+  尚未接入（`error_log.t` 仍 5/27）
 
 ### 本轮修掉的真缺陷
 

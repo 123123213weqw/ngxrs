@@ -525,6 +525,90 @@ impl AuthSet {
     }
 }
 
+/// One `error_log <dest> [level]` directive, kept unresolved so that the file
+/// is only opened when the server actually starts (`-t` must not create logs).
+#[derive(Clone, Debug)]
+pub struct LogSpec {
+    pub dest: String,
+    pub level: crate::log::Level,
+}
+
+/// Split `error_log <dest> [level]` into its parts. Unknown levels are ignored
+/// by nginx with a warning, and the default level is `error`.
+pub fn parse_log_spec(prefix: &Path, args: &[String]) -> Option<LogSpec> {
+    let dest = args.first()?;
+    let level = args
+        .get(1)
+        .and_then(|l| crate::log::Level::parse(l))
+        .unwrap_or(crate::log::Level::Error);
+    let dest = if dest == "stderr" || dest.starts_with("syslog:") {
+        dest.clone()
+    } else {
+        let p = Path::new(dest);
+        let full = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            prefix.join(p)
+        };
+        full.to_string_lossy().to_string()
+    };
+    Some(LogSpec { dest, level })
+}
+
+/// Turn specs into live sinks.
+pub fn open_sinks(specs: &[LogSpec]) -> Vec<std::sync::Arc<crate::log::Sink>> {
+    let mut out = Vec::new();
+    for spec in specs {
+        if spec.dest == "stderr" {
+            out.push(crate::log::Sink::stderr(spec.level));
+        } else if let Some(rest) = spec.dest.strip_prefix("syslog:") {
+            if let Some(sink) = open_syslog(rest, spec.level) {
+                out.push(sink);
+            }
+        } else if let Ok(s) = crate::log::Sink::file(Path::new(&spec.dest), spec.level) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// `server=host:port[,facility=local7][,tag=nginx]`
+fn open_syslog(rest: &str, level: crate::log::Level) -> Option<std::sync::Arc<crate::log::Sink>> {
+    let mut server = None;
+    let mut facility = 23u8; // local7, nginx's default
+    let mut tag = "nginx".to_string();
+    for part in rest.split(',') {
+        let (k, v) = part.split_once('=')?;
+        match k {
+            "server" => server = Some(v.to_string()),
+            "facility" => {
+                facility = match v {
+                    "kern" => 0, "user" => 1, "mail" => 2, "daemon" => 3, "auth" => 4,
+                    "syslog" => 5, "lpr" => 6, "news" => 7, "uucp" => 8, "cron" => 9,
+                    "authpriv" => 10, "ftp" => 11,
+                    "local0" => 16, "local1" => 17, "local2" => 18, "local3" => 19,
+                    "local4" => 20, "local5" => 21, "local6" => 22, "local7" => 23,
+                    _ => 23,
+                }
+            }
+            "tag" => tag = v.to_string(),
+            _ => {}
+        }
+    }
+    let addr = server.and_then(|s| {
+        s.parse::<std::net::SocketAddr>().ok().or_else(|| {
+            s.rsplit_once(':').and_then(|(h, p)| {
+                p.parse::<u16>().ok().and_then(|port| {
+                    h.parse::<std::net::IpAddr>()
+                        .ok()
+                        .map(|ip| std::net::SocketAddr::new(ip, port))
+                })
+            })
+        })
+    })?;
+    crate::log::Sink::syslog(addr, facility, tag, level).ok()
+}
+
 /// One `mail { server { ... } }` listener.
 #[derive(Debug, Clone)]
 pub struct MailServer {
@@ -547,6 +631,9 @@ pub struct MailServer {
     pub auth_login: bool,
     pub auth_cram_md5: bool,
     pub auth_external: bool,
+    /// `smtp_greeting_delay`: hold the `220` back so a client that speaks
+    /// first can be rejected (anti-probe measure).
+    pub greeting_delay: std::time::Duration,
     /// `starttls off|on|only`.
     pub starttls: StarttlsCfg,
     /// `{imap,pop3,smtp}_capabilities`: replaces the protocol's default list.
@@ -556,6 +643,11 @@ pub struct MailServer {
     pub tls: Option<std::sync::Arc<rustls::ServerConfig>>,
     /// `listen ... ssl`: the connection is TLS from the first byte.
     pub ssl: bool,
+    /// `error_log` directives of this mail server. nginx *adds* these to the
+    /// main-context ones rather than replacing them.
+    pub error_logs: Vec<LogSpec>,
+    /// Live sinks built from `error_logs` at startup.
+    pub sinks: Vec<std::sync::Arc<crate::log::Sink>>,
 }
 
 /// `starttls` in a mail server.
@@ -596,10 +688,13 @@ impl Default for MailServer {
             auth_login: true,
             auth_cram_md5: false,
             auth_external: false,
+            greeting_delay: std::time::Duration::ZERO,
             starttls: StarttlsCfg::Off,
             capabilities: None,
             tls: None,
             ssl: false,
+            error_logs: Vec::new(),
+            sinks: Vec::new(),
         }
     }
 }
@@ -841,6 +936,8 @@ pub struct Config {
     pub daemon: bool,
     pub pid: Option<PathBuf>,
     pub error_log: Option<PathBuf>,
+    /// `error_log` directives of the main context, in order.
+    pub error_logs: Vec<LogSpec>,
     pub http: Http,
     pub stream: StreamSection,
     /// `mail {}` listeners (a top-level section, like stream, not part of http).
@@ -1291,15 +1388,25 @@ impl Builder {
                 "smtp_auth" => dflt_smtp = AuthSet::from_args(&d.args),
                 // Accepted, not yet plumbed.
                 "proxy_buffer" | "auth_http_header" | "resolver" | "resolver_timeout"
-                | "error_log" | "log_format" | "timeout" | "proxy_protocol"
+                | "log_format" | "timeout" | "proxy_protocol"
                 | "max_errors" | "protocol"
                 | "ssl_protocols" | "ssl_ciphers" | "ssl_prefer_server_ciphers"
                 | "ssl_session_cache" | "ssl_session_timeout" | "ssl_conf_command"
-                | "xclient" | "smtp_greeting_delay"
+                | "xclient"
                 | "smtp_auth_methods" | "smtp_client_buffer" | "worker_aio_requests" => {}
                 "starttls" => {
                     if let Some(v) = d.args.first().and_then(|v| StarttlsCfg::parse(v)) {
                         defaults.starttls = v;
+                    }
+                }
+                "smtp_greeting_delay" => {
+                    if let Some(t) = d.args.first().and_then(|v| parse_time(v)) {
+                        defaults.greeting_delay = t;
+                    }
+                }
+                "error_log" => {
+                    if let Some(spec) = parse_log_spec(&self.prefix, &d.args) {
+                        defaults.error_logs.push(spec);
                     }
                 }
                 "pop3_capabilities" | "imap_capabilities" | "smtp_capabilities" => {
@@ -1413,6 +1520,16 @@ impl Builder {
                             srv.starttls = v;
                         }
                     }
+                    "smtp_greeting_delay" => {
+                        if let Some(t) = child.args.first().and_then(|v| parse_time(v)) {
+                            srv.greeting_delay = t;
+                        }
+                    }
+                    "error_log" => {
+                        if let Some(spec) = parse_log_spec(&self.prefix, &child.args) {
+                            srv.error_logs.push(spec);
+                        }
+                    }
                     "pop3_capabilities" | "imap_capabilities" | "smtp_capabilities" => {
                         srv.capabilities = Some(child.args.clone());
                     }
@@ -1427,7 +1544,7 @@ impl Builder {
                         }
                     }
                     // Accepted, not yet plumbed.
-                    "proxy_buffer" | "xclient" | "smtp_greeting_delay"
+                    "proxy_buffer" | "xclient"
                     | "ssl_protocols"
                     | "ssl_ciphers" | "ssl_prefer_server_ciphers" | "ssl_session_cache"
                     | "ssl_session_timeout" | "auth_http_header" | "proxy_protocol"
@@ -2653,6 +2770,7 @@ pub fn build(
     let mut daemon = true;
     let mut pid: Option<PathBuf> = None;
     let mut error_log: Option<PathBuf> = None;
+    let mut error_logs: Vec<LogSpec> = Vec::new();
     let mut http_roots: Vec<Directive> = Vec::new();
     let mut stream_dirs: Vec<Directive> = Vec::new();
     let mut mail_dirs: Vec<Directive> = Vec::new();
@@ -2683,6 +2801,9 @@ pub fn build(
                     if p != "stderr" {
                         error_log = Some(resolve_path(prefix, p));
                     }
+                }
+                if let Some(spec) = parse_log_spec(&prefix, &d.args) {
+                    error_logs.push(spec);
                 }
             }
             "events" | "worker_rlimit_nofile" | "worker_connections" | "use" | "accept_mutex"
@@ -3145,6 +3266,7 @@ pub fn build(
         daemon,
         pid,
         error_log,
+        error_logs,
         http,
         stream,
         mail_servers: mail_servers_probe,

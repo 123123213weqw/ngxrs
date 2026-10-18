@@ -237,6 +237,23 @@ nginx 逐字节一致；`STLS` / `STARTTLS` 执行**真实的 TLS 升级**（rus
 `mail_ssl.t` / `mail_imap_ssl.t` 在 **nginx 自己**上也只跑到 2 条断言就中止
 （依赖 `ssl_password_file` 等），因此**不作为兼容性证据**。
 
+### 其余 mail 用例（A/B 实测，nginx 1.28 为基准）
+
+| 用例 | ngxrs | nginx | 缺口 |
+|---|---|---|---|
+| `mail_smtp_xclient.t` | **8/8** | 8/8 | 一致 |
+| `mail_proxy_smtp_auth.t` | 8/9 | 9/9 | 1 |
+| `mail_smtp_greeting_delay.t` | 2/4 | 4/4 | 2（`smtp_greeting_delay` 未生效）|
+| `mail_resolver.t` | 9/12 | 12/13 | 3 |
+| `mail_max_errors.t` | 14/20 | 20/20 | 6 |
+| `mail_error_log.t` | 6/32 | 32/32 | 26（`error_log` 只有 notice 级）|
+
+### 仍未实现
+
+- `smtp_greeting_delay` / `max_errors` 的完整语义
+- `ssl_password_file`（加密私钥）
+- `error_log` 的分级过滤（这是 `mail_error_log.t` 26 条缺口的根因，也是 http 侧的同款缺口）
+
 ### 本轮修掉的真缺陷
 
 1. **`pop3_auth` / `imap_auth` / `smtp_auth` 必须按协议分开存**。nginx 把它们

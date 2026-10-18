@@ -682,3 +682,80 @@ pub fn hex_u64_into(buf: &mut [u8; 16], v: u64) -> &str {
     buf[..n].copy_from_slice(&tmp[..n]);
     std::str::from_utf8(&buf[..n]).unwrap_or("0")
 }
+
+/// Render `ts` (seconds since the epoch, UTC) using a `strftime`-style format.
+///
+/// Implements the subset of `strftime` that the SSI `config timefmt` directive
+/// uses in practice: %A %a %B %b %d %e %H %I %j %M %m %p %S %U %w %Y %y %Z %%
+/// Unknown specifiers are copied through verbatim, as glibc does not, but nginx
+/// renders them literally rather than dropping them.
+pub fn strftime_gmt(ts: i64, fmt: &str) -> String {
+    const DAYS: [&str; 7] = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
+    const MONTHS: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    let days = ts.div_euclid(86_400);
+    let secs = ts.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    let (hh, mm, ss) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    // 1970-01-01 was a Thursday (4), with Sunday as 0.
+    let wday = (days + 4).rem_euclid(7) as usize;
+    let yday = days - days_from_civil(y, 1, 1) + 1;
+
+    let mut out = String::with_capacity(fmt.len() + 16);
+    let mut it = fmt.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('A') => out.push_str(DAYS[wday]),
+            Some('a') => out.push_str(&DAYS[wday][..3]),
+            Some('B') => out.push_str(MONTHS[(m - 1) as usize]),
+            Some('b') => out.push_str(&MONTHS[(m - 1) as usize][..3]),
+            Some('d') => out.push_str(&format!("{d:02}")),
+            Some('e') => out.push_str(&format!("{d:2}")),
+            Some('H') => out.push_str(&format!("{hh:02}")),
+            Some('I') => {
+                let h12 = if hh % 12 == 0 { 12 } else { hh % 12 };
+                out.push_str(&format!("{h12:02}"));
+            }
+            Some('j') => out.push_str(&format!("{yday:03}")),
+            Some('M') => out.push_str(&format!("{mm:02}")),
+            Some('m') => out.push_str(&format!("{m:02}")),
+            Some('p') => out.push_str(if hh < 12 { "AM" } else { "PM" }),
+            Some('S') => out.push_str(&format!("{ss:02}")),
+            Some('Y') => out.push_str(&format!("{y}")),
+            Some('y') => out.push_str(&format!("{:02}", y % 100)),
+            Some('Z') => out.push_str("GMT"),
+            Some('%') => out.push('%'),
+            // Unsupported specifiers keep their literal form.
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
+}

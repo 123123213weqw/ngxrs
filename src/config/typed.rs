@@ -40,6 +40,8 @@ pub struct LocCfg {
     pub alias_prefix_len: usize,
     pub index: Vec<String>,
     pub autoindex: bool,
+    /// `ssi on`: process Server Side Include directives in the response body.
+    pub ssi: bool,
     pub gzip: bool,
     pub client_max_body_size: u64,
     pub headers: Vec<(String, String)>,
@@ -187,6 +189,7 @@ impl LocCfg {
             alias_prefix_len: 0,
             index: vec!["index.html".to_string()],
             autoindex: false,
+            ssi: false,
             gzip: false,
             client_max_body_size: DEFAULT_CLIENT_MAX_BODY,
             headers: Vec::new(),
@@ -1738,6 +1741,14 @@ impl Builder {
                 cfg.autoindex = parse_on_off(v).ok_or_else(|| {
                     sem(&d.file, d.line, format!("invalid autoindex value \"{v}\""))
                 })?;
+            }
+            "ssi" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "ssi requires on|off"))?;
+                cfg.ssi = parse_on_off(v)
+                    .ok_or_else(|| sem(&d.file, d.line, format!("invalid ssi value \"{v}\"")))?;
             }
             "gzip" => {
                 let v = d
@@ -3623,8 +3634,8 @@ pub fn build(
                     });
                 }
             }
-            "root" | "index" | "autoindex" | "add_header" | "add_trailer" | "error_page"
-            | "expires" => {
+            "root" | "index" | "autoindex" | "ssi" | "add_header" | "add_trailer"
+            | "error_page" | "expires" => {
                 b.apply_loc(d, &mut http.default_loc)?;
             }
             "upstream" => {

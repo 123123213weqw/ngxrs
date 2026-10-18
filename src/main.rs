@@ -24,6 +24,7 @@ mod mapping;
 mod net;
 mod proxy;
 mod resolver;
+mod ssi;
 mod stream;
 mod tls;
 mod util;
@@ -103,7 +104,7 @@ fn real_main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                         "configure arguments: --with-http_ssl_module \
                          --with-http_v2_module --with-stream --with-stream_ssl_module \
             --with-http_v3_module \
-                         --with-http_grpc_module --without-http_ssi_module \
+                         --with-http_grpc_module --with-http_ssi_module \
                          --without-http_auth_request_module --without-http_sub_module \
                          --without-http_dav_module --without-http_slice_module \
                          --with-mail --with-mail_ssl_module --without-http_memcached_module \

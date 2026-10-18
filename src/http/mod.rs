@@ -1660,6 +1660,16 @@ impl<'a> ServerVars<'a> {
             "ssl_client_v_start" => tls.map(|t| t.client_v_start.clone()).unwrap_or_default(),
             "ssl_client_v_end" => tls.map(|t| t.client_v_end.clone()).unwrap_or_default(),
             "ssl_client_v_remain" => "0".to_string(),
+            // nginx's default format for these two is
+            // "Mon, 02 Jan 2006 15:04:05 GMT" (ngx_http_ssi_timefmt), and they
+            // are available to every variable consumer, not just SSI.
+            "date_gmt" | "date_local" => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                crate::util::strftime_gmt(now, "%A, %d-%b-%Y %H:%M:%S %Z")
+            }
             "server_name" => self.server_name.trim_start_matches('.').to_string(),
             "server_port" => self.server_port.to_string(),
             "server_protocol" => {
@@ -1718,7 +1728,10 @@ impl<'a> ServerVars<'a> {
                         .collect();
                     joined.join(", ")
                 } else if let Some(want) = name.strip_prefix("arg_") {
-                    // $arg_name looks the key up in the query string.
+                    // $arg_name looks the key up in the query string. An empty
+                    // value (`?a=`) is present-but-empty, which SSI's `#echo`
+                    // must render as "" rather than "(none)", so it is carried
+                    // through as a sentinel that the SSI host understands.
                     self.query
                         .split('&')
                         .filter_map(|pair| pair.split_once('='))
@@ -3077,6 +3090,30 @@ async fn dispatch(
         &set_vars,
     )
     .await;
+    // `ssi on` rewrites the body before it is written. HEAD has no body to
+    // process, and nginx skips the filter for non-200 replies.
+    let resp = if loc.ssi && resp.status == 200 && req.method != Method::Head {
+        let root = loc.root.to_string_lossy().to_string();
+        let vars = ServerVars {
+            req,
+            path,
+            query,
+            server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
+            server_port: listen_port,
+            peer_ip: &peer_ip,
+            peer_port,
+            scheme: if req.tls.is_some() { "https" } else { "http" },
+            document_root: &root,
+            upstream_cache_status: "",
+            custom: &set_vars,
+            connection_requests: state.requests,
+            connection_time: state.elapsed_secs(),
+            sent: &[],
+        };
+        apply_ssi(req, resp, server, http, &vars).await
+    } else {
+        resp
+    };
     let status = resp.status;
     if matches!(status, 301 | 302 | 303 | 307 | 308) {
         return write_redirect(
@@ -3604,6 +3641,247 @@ pub async fn write_response_ka(
     out.clear();
     conn.out = out;
     result
+}
+
+/// Bridge between the SSI renderer and the request pipeline.
+///
+/// `#include virtual` needs a subrequest, which is async, but the renderer is
+/// synchronous. So rendering runs repeatedly: any include that is not cached
+/// yet is recorded and returns `None`, the driver fetches it, and the body is
+/// re-rendered. Each pass adds at least one URI, so it converges, and the loop
+/// is bounded in case of a self-including file.
+struct SsiHost<'a> {
+    vars: &'a ServerVars<'a>,
+    include_cache: std::collections::HashMap<String, Option<Vec<u8>>>,
+    wanted: Vec<String>,
+    /// Seconds since the epoch, for `$date_gmt` / `$date_local`.
+    now: i64,
+}
+
+impl crate::ssi::Host for SsiHost<'_> {
+    fn var(&self, name: &str, ctx: &crate::ssi::Ctx) -> Option<String> {
+        // `#set` variables shadow everything else.
+        if let Some(v) = ctx.vars.get(name) {
+            return Some(v.clone());
+        }
+        match name {
+            "date_gmt" => Some(crate::util::strftime_gmt(self.now, &ctx.timefmt)),
+            "date_local" => Some(crate::util::strftime_gmt(self.now, &ctx.timefmt)),
+            _ => {
+                // `$arg_x` is present-but-empty for `?x=`, which renders as ""
+                // rather than "(none)". Presence has to be tested against the
+                // query itself because the rendered value cannot tell them apart.
+                if let Some(want) = name.strip_prefix("arg_") {
+                    let present = self
+                        .vars
+                        .query
+                        .split('&')
+                        .filter_map(|pair| pair.split_once('='))
+                        .any(|(k, _)| k.eq_ignore_ascii_case(want));
+                    if present {
+                        return Some(self.vars.get(name));
+                    }
+                }
+                let v = self.vars.get(name);
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v)
+                }
+            }
+        }
+    }
+
+    fn include(&mut self, uri: &str) -> Option<Vec<u8>> {
+        match self.include_cache.get(uri) {
+            Some(v) => v.clone(),
+            None => {
+                if !self.wanted.iter().any(|w| w == uri) {
+                    self.wanted.push(uri.to_string());
+                }
+                None
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// Nesting depth of SSI subrequests, so `#include` cycles terminate.
+    static SSI_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Run the SSI filter over a response body, resolving includes through the
+/// normal location pipeline.
+/// Boxed so SSI subrequests can recurse (an `#include` may target a document
+/// that is itself filtered).
+fn apply_ssi<'a>(
+    req: &'a Request,
+    resp: Response,
+    server: &'a Server,
+    http: &'a Http,
+    vars: &'a ServerVars<'a>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + 'a>> {
+    Box::pin(apply_ssi_inner(req, resp, server, http, vars))
+}
+
+async fn apply_ssi_inner(
+    req: &Request,
+    mut resp: Response,
+    server: &Server,
+    http: &Http,
+    vars: &ServerVars<'_>,
+) -> Response {
+    let body = match std::mem::replace(&mut resp.body, Body::Empty) {
+        Body::Empty => return resp,
+        Body::Bytes(b) => b,
+        Body::File { file, offset, len } => {
+            use std::os::unix::fs::FileExt;
+            let mut buf = vec![0u8; len as usize];
+            let mut read = 0usize;
+            while read < buf.len() {
+                match file.read_at(&mut buf[read..], offset + read as u64) {
+                    Ok(0) => break,
+                    Ok(n) => read += n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            buf.truncate(read);
+            buf
+        }
+    };
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let mut host = SsiHost {
+        vars,
+        include_cache: std::collections::HashMap::new(),
+        wanted: Vec::new(),
+        now,
+    };
+
+    let mut rendered = crate::ssi::render(&body, &mut host);
+
+    // Resolve includes pass by pass. Bounded so a self-including document
+    // cannot spin forever (nginx errors out instead; the bound keeps the
+    // output deterministic).
+    for _ in 0..8 {
+        if host.wanted.is_empty() {
+            break;
+        }
+        let batch = std::mem::take(&mut host.wanted);
+        for uri in batch {
+            if host.include_cache.contains_key(&uri) {
+                continue;
+            }
+            let (ipath, iquery) = crate::ssi::split_include_uri(&uri);
+            let iloc = server.locate(&ipath);
+            let sub = resolve_response(
+                req,
+                &ipath,
+                &iquery,
+                server,
+                iloc,
+                http,
+                &vars.peer_ip.to_string(),
+                vars.server_port,
+            )
+            .await;
+            let mut sub = sub;
+            // The included document is itself filtered: nginx runs the same
+            // SSI filter for the subrequest, so a nested `#include` or `#echo`
+            // inside it is expanded too. Depth is bounded to stop a document
+            // from including itself forever.
+            if iloc.ssi && sub.status == 200 && SSI_DEPTH.with(|d| d.get()) < 8 {
+                let iroot = iloc.root.to_string_lossy().to_string();
+                let ivars = ServerVars {
+                    req,
+                    path: &ipath,
+                    query: &iquery,
+                    server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
+                    server_port: vars.server_port,
+                    peer_ip: vars.peer_ip,
+                    peer_port: vars.peer_port,
+                    scheme: vars.scheme,
+                    document_root: &iroot,
+                    upstream_cache_status: "",
+                    custom: vars.custom,
+                    connection_requests: vars.connection_requests,
+                    connection_time: vars.connection_time,
+                    sent: &[],
+                };
+                SSI_DEPTH.with(|d| d.set(d.get() + 1));
+                sub = apply_ssi(req, sub, server, http, &ivars).await;
+                SSI_DEPTH.with(|d| d.set(d.get() - 1));
+            }
+            let value = if sub.status >= 400 {
+                None
+            } else {
+                Some(body_bytes(sub.body).await.unwrap_or_default())
+            };
+            host.include_cache.insert(uri, value);
+        }
+        rendered = crate::ssi::render(&body, &mut host);
+    }
+
+    resp.body = Body::Bytes(rendered);
+    // The length changed, so any pre-rendered Content-Length is now wrong.
+    strip_content_length(&mut resp);
+    // nginx's SSI filter clears these two: the body is no longer the file it
+    // came from, so a validator would be a lie.
+    strip_header(&mut resp, "Last-Modified");
+    strip_header(&mut resp, "Accept-Ranges");
+    resp
+}
+
+/// Remove a pre-rendered header line (case-insensitive) from the raw block.
+fn strip_header(resp: &mut Response, name: &str) {
+    let raw = std::mem::take(&mut resp.raw);
+    let mut out = Vec::with_capacity(raw.len());
+    let mut start = 0usize;
+    while start < raw.len() {
+        let end = match memchr::memchr(b'\n', &raw[start..]) {
+            Some(p) => start + p + 1,
+            None => raw.len(),
+        };
+        let line = &raw[start..end];
+        let hit = line.len() > name.len()
+            && line[..name.len()].eq_ignore_ascii_case(name.as_bytes())
+            && line[name.len()] == b':';
+        if !hit {
+            out.extend_from_slice(line);
+        }
+        start = end;
+    }
+    resp.raw = out;
+    resp.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+}
+
+/// Remove a pre-rendered `Content-Length:` line from a raw header block.
+fn strip_content_length(resp: &mut Response) {
+    if !resp.explicit_len {
+        return;
+    }
+    let raw = std::mem::take(&mut resp.raw);
+    let mut out = Vec::with_capacity(raw.len());
+    let mut start = 0usize;
+    while start < raw.len() {
+        let end = match memchr::memchr(b'\n', &raw[start..]) {
+            Some(p) => start + p + 1,
+            None => raw.len(),
+        };
+        let line = &raw[start..end];
+        let is_cl = line.len() > 15 && line[..15].eq_ignore_ascii_case(b"Content-Length:");
+        if !is_cl {
+            out.extend_from_slice(line);
+        }
+        start = end;
+    }
+    resp.raw = out;
+    resp.explicit_len = false;
 }
 
 /// Append trailer lines plus the terminating chunk.

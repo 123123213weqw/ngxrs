@@ -18,6 +18,7 @@ use crate::config::{CacheZone, LocCfg};
 pub const CACHE_STATUS_KEY: &str = "X-Cache-Status";
 
 /// A stored response.
+#[derive(Clone)]
 pub struct Cached {
     pub status: u16,
     /// Header lines as `Name: value`.

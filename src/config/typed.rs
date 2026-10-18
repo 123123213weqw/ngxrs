@@ -125,6 +125,12 @@ pub struct LocCfg {
     pub proxy_cache_ignore: crate::cache::Ignore,
     /// `proxy_cache_convert_head`, on by default like nginx.
     pub proxy_cache_convert_head: bool,
+    /// `proxy_cache_use_stale` events. Only `updating` changes what a client
+    /// sees today (it turns a concurrent background refresh into `UPDATING`).
+    pub proxy_cache_use_stale_updating: bool,
+    /// `proxy_cache_revalidate`: send conditional headers upstream for an
+    /// expired entry and reuse the cached body on `304`.
+    pub proxy_cache_revalidate: bool,
     /// `proxy_cache_background_update`: serve a stale entry while refreshing.
     pub proxy_cache_background_update: bool,
     /// `proxy_intercept_errors`: let `error_page` handle proxy error statuses.
@@ -213,6 +219,8 @@ impl LocCfg {
             cookie_flags_set: false,
             proxy_cache_ignore: crate::cache::Ignore::default(),
             proxy_cache_convert_head: true,
+            proxy_cache_use_stale_updating: false,
+            proxy_cache_revalidate: false,
             proxy_cache_background_update: false,
             trailers: Vec::new(),
             max_ranges: None,
@@ -1639,8 +1647,20 @@ impl Builder {
                 cfg.proxy_cache_background_update =
                     d.args.first().map(|v| v != "off").unwrap_or(true);
             }
-            "proxy_cache_revalidate" | "proxy_cache_use_stale"
-            | "proxy_cache_methods" | "proxy_cache_min_uses" => {
+            "proxy_cache_revalidate" => {
+                cfg.proxy_cache_revalidate =
+                    d.args.first().map(|v| v != "off").unwrap_or(true);
+            }
+            "proxy_cache_use_stale" => {
+                cfg.proxy_cache_use_stale_updating = d
+                    .args
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case("updating") || a == "off");
+                if d.args.iter().any(|a| a == "off") {
+                    cfg.proxy_cache_use_stale_updating = false;
+                }
+            }
+            "proxy_cache_methods" | "proxy_cache_min_uses" => {
                 // Accepted; behavioural parity for these is not implemented.
             }
             "proxy_cache_valid" => {

@@ -498,13 +498,49 @@ http/proxy/upstream/range/fastcgi/scgi/uwsgi/stream/limit 各类用例，
 | `$server_name` 未去掉前导点、空值 `add_header` 未省略 | |
 | dispatch 二次解析目标导致 rewrite 后 location 错配 | `rewrite … break` 语义回退 |
 
-### 当前 A/B 结果（4 个用例文件）
+### 访问控制在内容处理器之前执行（安全相关）
+
+nginx 的相位顺序是 `POST_READ → SERVER_REWRITE → FIND_CONFIG → REWRITE →
+POST_REWRITE → PREACCESS → ACCESS → POST_ACCESS → PRECONTENT → CONTENT`。
+`proxy_pass` / `fastcgi_pass` / `scgi_pass` / `uwsgi_pass` / `grpc_pass` 走的是
+CONTENT，所以 ACCESS 必须先求值。
+
+在修复前，这些上游处理器在 `route` 之前就被分派，导致：
+
+| 配置 | 修复前 | 修复后 | nginx |
+|---|---|---|---|
+| `location / { auth_basic …; proxy_pass …; }` | **200**（未认证放行） | 401 | 401 |
+| 同上 + 正确凭据 | 200 | 200 | 200 |
+| `location / { deny all; proxy_pass …; }` | **200** | 403 | 403 |
+
+同时修正 `auth_request_set $args …`：它写回 `r->args`，改写后的查询串必须传给上游。
+
+### 当前 A/B 结果（本机 nginx 1.28.0 对照，逐条断言）
 
 | 用例 | nginx | ngxrs | 备注 |
 |---|---|---|---|
-| http_server_name.t | 22/22 | **21/22** | 仅剩 `server_name ""` 空名匹配 |
-| http_method.t | 4/6 | **4/6** | 完全一致 |
-| http_uri.t | 21/21 | 17/21 | 待查 |
-| http_host.t | 54/62 | 42/62 | 待查 |
+| http_location.t | 16/16 | 16/16 | 一致 |
+| http_server_name.t | 22/22 | 22/22 | 一致 |
+| http_uri.t | 21/21 | 21/21 | 一致 |
+| http_method.t | 4/6 | 4/6 | 一致（双方共享的失败） |
+| http_variables.t | 9/9 | 9/9 | 一致 |
+| auth_request_satisfy.t | 20/20 | 20/20 | 一致 |
+| auth_request_set.t | 8/8 | 8/8 | 一致 |
+| auth_request.t | 22/22 | **19/22** | 缺：auth 子请求缓存、请求体回放、多个 `WWW-Authenticate` |
+| proxy_cache_lock.t | 19/19 | 19/19 | 一致 |
+| proxy_intercept_errors.t | 6/6 | 6/6 | 一致 |
+| proxy_cache.t | 17/17 | **14/17** | 差 3 条 |
+| ssi.t | 32/32 | **30/32** | 差：代理响应上的 SSI |
+| access.t | 14/14 | **无法运行** | 配置需要 `listen unix:` 与 `allow unix:` |
+| h2.t | 144/145 | **115/145** | HPACK 编码与连接级帧形状由 `h2` crate 决定 |
+| h2_host.t | 48/62 | **52/62** | 我们多过 4 条 |
+| h3_headers.t | 无基线 | 28/77 | 本机 nginx 无 `--with-http_v3_module` |
 
-合计断言：nginx 101 / ngxrs 84。
+自建差分套件 `bench/all.sh`：**70/70**（静态 19 + 功能 28 + TLS/H2 9 + fastcgi/ugcgi/grpc/stream 14）。
+
+### 尚未实现
+
+- `listen unix:` / `proxy_pass http://unix:…:/`（HTTP 与 stream）、`allow unix:`
+- HTTP/3 与 nginx 的逐帧一致（本机无法建立基线）
+- `auth_request` 子请求缓存、`max_errors`、`stream`/`mail` 客户端证书校验
+- 高并发（c≥1024）吞吐约为 nginx 的 0.94–0.95×；64KB 尾延迟优于 nginx 一个数量级

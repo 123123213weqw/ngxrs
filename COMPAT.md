@@ -531,7 +531,7 @@ CONTENT，所以 ACCESS 必须先求值。
 | proxy_intercept_errors.t | 6/6 | 6/6 | 一致 |
 | proxy_cache.t | 17/17 | **14/17** | 差 3 条 |
 | ssi.t | 32/32 | **30/32** | 差：代理响应上的 SSI |
-| access.t | 14/14 | **无法运行** | 配置需要 `listen unix:` 与 `allow unix:` |
+| access.t | 14/14 | 14/14 | 一致（`listen unix:` / `allow unix:` / `proxy_pass http://unix:`）|
 | h2.t | 144/145 | **115/145** | HPACK 编码与连接级帧形状由 `h2` crate 决定 |
 | h2_host.t | 48/62 | **52/62** | 我们多过 4 条 |
 | h3_headers.t | 无基线 | 28/77 | 本机 nginx 无 `--with-http_v3_module` |
@@ -540,7 +540,7 @@ CONTENT，所以 ACCESS 必须先求值。
 
 ### 尚未实现
 
-- `listen unix:` / `proxy_pass http://unix:…:/`（HTTP 与 stream）、`allow unix:`
+- `stream` 上的 `listen unix:`（HTTP 已支持）
 - HTTP/3 与 nginx 的逐帧一致（本机无法建立基线）
 - `auth_request` 子请求缓存、`max_errors`、`stream`/`mail` 客户端证书校验
 - 高并发（c≥1024）吞吐约为 nginx 的 0.94–0.95×；64KB 尾延迟优于 nginx 一个数量级

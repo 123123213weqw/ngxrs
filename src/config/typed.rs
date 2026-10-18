@@ -86,6 +86,9 @@ pub struct LocCfg {
     /// `set $var value;`
     pub sets: Vec<(String, String)>,
     pub proxy_pass: Option<ProxyPass>,
+    /// `grpc_pass <target>`: kept raw; nginx strips the scheme and looks the
+    /// remainder up in the upstream table, then resolves at request time.
+    pub grpc_pass: Option<String>,
     /// Set while parsing `proxy_pass http://<name>` so the http level can
     /// resolve the name to an `upstream` index after all blocks are read.
     pub proxy_upstream_name: Option<String>,
@@ -200,6 +203,7 @@ impl LocCfg {
             ifs: Vec::new(),
             sets: Vec::new(),
             proxy_pass: None,
+            grpc_pass: None,
             proxy_upstream_name: None,
             proxy_set_headers: Vec::new(),
             proxy_http_version: 1,
@@ -629,6 +633,8 @@ pub struct Http {
     /// `http2 on|off` at http level: the inherited default for every server
     /// (nginx 1.25.1+; `listen ... http2` is the older spelling).
     pub http2: bool,
+    /// `resolver <addr>`: consulted for hosts that only appear at request time.
+    pub resolver: Option<crate::resolver::Resolver>,
     /// `large_client_header_buffers <num> <size>` as (num, size).
     /// nginx defaults to `4 8k`.
     pub large_client_header_buffers: (usize, usize),
@@ -1432,6 +1438,15 @@ impl Builder {
                 cfg.gzip_vary = parse_on_off(v)
                     .ok_or_else(|| sem(&d.file, d.line, format!("invalid gzip_vary value \"{v}\"")))?;
             }
+            "grpc_pass" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "grpc_pass requires a target"))?;
+                // Keep the raw value: nginx resolves it per request so that
+                // variables are allowed.
+                cfg.grpc_pass = Some(v.clone());
+            }
             "proxy_pass" => {
                 let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "proxy_pass requires a URL"))?;
                 cfg.proxy_pass = Some(parse_proxy_pass(v).ok_or_else(|| {
@@ -1874,7 +1889,7 @@ impl Builder {
         http_http2: bool,
         http_header_field_limit: usize,
         http_header_bufs: usize,
-    ) -> Result<(Server, Vec<(SocketAddr, bool)>), ConfigError> {
+    ) -> Result<(Server, Vec<(SocketAddr, bool, bool)>), ConfigError> {
         let block = d
             .block
             .as_ref()
@@ -1884,7 +1899,10 @@ impl Builder {
         let mut names: Vec<String> = Vec::new();
         let mut locations: Vec<Location> = Vec::new();
         let mut access_logs: Vec<AccessLog> = Vec::new();
-        let mut listens: Vec<(SocketAddr, bool)> = Vec::new();
+        // (addr, is_default, ssl): TLS is decided per listen socket, not per
+        // server — nginx lets one server block serve `listen 8081;` alongside
+        // `listen 8082 ssl;`.
+        let mut listens: Vec<(SocketAddr, bool, bool)> = Vec::new();
         let mut keepalive = http_keepalive;
         let mut tokens = http_tokens;
         let mut access_log_off = false;
@@ -1919,13 +1937,14 @@ impl Builder {
                     let is_default = child.args[1..]
                         .iter()
                         .any(|p| p == "default_server" || p == "default");
-                    if child.args[1..].iter().any(|p| p == "ssl") {
+                    let listen_ssl = child.args[1..].iter().any(|p| p == "ssl");
+                    if listen_ssl {
                         ssl = true;
                     }
                     if child.args[1..].iter().any(|p| p == "http2" || p == "quic") {
                         http2 = true;
                     }
-                    listens.push((addr, is_default));
+                    listens.push((addr, is_default, listen_ssl));
                 }
                 "server_name" => {
                     names.extend(child.args.iter().cloned());
@@ -2085,7 +2104,7 @@ impl Builder {
         }
 
         if listens.is_empty() {
-            listens.push((SocketAddr::from((Ipv4Addr::UNSPECIFIED, 80)), false));
+            listens.push((SocketAddr::from((Ipv4Addr::UNSPECIFIED, 80)), false, ssl));
         }
 
         Ok((
@@ -2305,6 +2324,7 @@ pub fn build(
         sendfile: false,
         tcp_nopush: false,
         http2: false,
+        resolver: None,
         large_client_header_buffers: (4, 8192),
         tcp_nodelay: true,
         gzip: false,
@@ -2486,6 +2506,12 @@ pub fn build(
                 http.http2 = parse_on_off(&v)
                     .ok_or_else(|| sem(&d.file, d.line, "invalid http2 value"))?;
             }
+            "resolver" => {
+                http.resolver = crate::resolver::Resolver::parse(&d.args, prefix);
+                if http.resolver.is_none() {
+                    return Err(sem(&d.file, d.line, "invalid resolver"));
+                }
+            }
             "large_client_header_buffers" => {
                 let num = d
                     .args
@@ -2639,7 +2665,7 @@ pub fn build(
     }
 
     let mut groups: BTreeMap<u16, ListenGroup> = BTreeMap::new();
-    let mut listens_by_server: Vec<(usize, Vec<(SocketAddr, bool)>)> = Vec::new();
+    let mut listens_by_server: Vec<(usize, Vec<(SocketAddr, bool, bool)>)> = Vec::new();
 
     for (i, sd) in server_dirs.iter().enumerate() {
         let (server, listens) = b.parse_server(
@@ -2672,7 +2698,7 @@ pub fn build(
     resolve_proxy_upstreams(&mut http)?;
 
     for (idx, listens) in listens_by_server {
-        for (addr, is_default) in listens {
+        for (addr, is_default, listen_ssl) in listens {
             let group = groups.entry(addr.port()).or_insert_with(|| ListenGroup {
                 addr,
                 servers: Vec::new(),
@@ -2688,7 +2714,7 @@ pub fn build(
             if is_default {
                 group.default_server = idx;
             }
-            if http.servers[idx].ssl {
+            if listen_ssl {
                 group.ssl = true;
             }
         }

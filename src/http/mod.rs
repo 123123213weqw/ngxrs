@@ -1828,6 +1828,60 @@ pub async fn resolve_response_local(
     }
     // Reverse proxying needs a socket for streaming in HTTP/1; when this
     // resolver is used without one (HTTP/2), buffer the upstream reply instead.
+    if loc.grpc_pass.is_some() {
+        // `grpc_pass` accepts variables, so build the same variable view the
+        // rest of the request uses rather than only handling literal targets.
+        let grpc_vars = ServerVars {
+            req,
+            path,
+            query,
+            server_name: server
+                .names
+                .first()
+                .map(|s| s.as_str())
+                .unwrap_or(""),
+            server_port,
+            peer_ip,
+            peer_port,
+            scheme: "http",
+            document_root: loc.root.to_str().unwrap_or(""),
+            upstream_cache_status: "",
+            custom: &custom,
+            connection_requests: state.requests,
+            connection_time: 0,
+            sent: &[],
+        };
+        if let Some(resp) = crate::grpc::fetch(
+            http,
+            loc,
+            req,
+            path,
+            query,
+            peer_ip,
+            Some(&grpc_vars),
+        )
+        .await
+        {
+            let mut resp = resp;
+            return finalize_response(
+                req,
+                &mut resp,
+                path,
+                query,
+                server,
+                http,
+                peer_ip,
+                peer_port,
+                server_port,
+                captures,
+                &custom,
+                state,
+                local_addr,
+            )
+            .await;
+        }
+    }
+
     if loc.proxy_pass.is_some() {
         if let Some(resp) = crate::proxy::fetch(req, path, query, loc, http, peer_ip).await {
             let mut resp = resp;
@@ -2506,6 +2560,64 @@ async fn dispatch(
             close: !keepalive_allowed,
             sent,
         });
+    }
+
+    // ---- gRPC ----
+    if loc.grpc_pass.is_some() {
+        let grpc_vars = ServerVars {
+            req,
+            path,
+            query,
+            server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
+            server_port: listen_port,
+            peer_ip: client_ip,
+            peer_port,
+            scheme: "http",
+            document_root: loc.root.to_str().unwrap_or(""),
+            upstream_cache_status: "",
+            custom: &set_vars,
+            connection_requests: state.requests,
+            connection_time: 0,
+            sent: &[],
+        };
+        if let Some(resp) =
+            crate::grpc::fetch(http, loc, req, path, query, client_ip, Some(&grpc_vars)).await
+        {
+            let mut resp = resp;
+            let resp = finalize_response(
+                req,
+                &mut resp,
+                path,
+                query,
+                server,
+                http,
+                client_ip,
+                peer_port,
+                listen_port,
+                captures,
+                &set_vars,
+                state,
+                local_addr,
+            )
+            .await;
+            let status = resp.status;
+            let sent = split_head(&resp.raw);
+            let bytes = write_response_ka(
+                conn,
+                resp,
+                keepalive_allowed,
+                server.server_tokens,
+                req.method == Method::Head,
+                None,
+            )
+            .await?;
+            return Ok(Outcome {
+                status,
+                bytes,
+                close: !keepalive_allowed,
+                sent,
+            });
+        }
     }
 
     // ---- FastCGI ----

@@ -124,6 +124,7 @@
 | h2c prior-knowledge（明文 HTTP/2） | ✅ | 探测连接前言，仅在该组配置了 `http2 on` 时启用 |
 | `$scheme` | ✅ | 此前恒为 `http`，TLS 连接上也报 `http`；现按连接推导 |
 | `ssl_verify_client` / `ssl_client_certificate` | 🟡 | 12/16，见下节 |
+| `grpc_pass` / `resolver` | ✅ | `grpc_pass.t` 7/7；`grpc_ssl.t` 17/40 |
 | `large_client_header_buffers` | ✅ | http/server 级；h1 用 `size`，h2 用 `size` 做单字段上限、`size*num` 做整块上限（与 `ngx_http_v2_state_header_complete` 一致，按 `name.len+value.len` 计，含伪头） |
 | HTTP/2 SETTINGS / WINDOW_UPDATE 帧 | ✅ | 与 nginx 逐字节一致：`MAX_CONCURRENT_STREAMS=128`、`INITIAL_WINDOW_SIZE=65536`、`MAX_FRAME_SIZE=16777215`，外加连接级 `WINDOW_UPDATE 0x7fff0000` |
 | HTTP/2 上的反向代理 | ⬜ | 目前 proxy 需要 socket 写入；h2 请求走 proxy 会返回 502 |
@@ -178,6 +179,26 @@
 | `h2_proxy_cache.t` | 10/11 | 11/11 |
 | `ssl_sni.t` | 4/10 | 10/10 |
 | `ssl_verify_client.t` | **12/16** | 16/16 |
+
+## gRPC
+
+`grpc_pass` 已实现：`grpc://`（h2c）、`grpcs://`（TLS + ALPN h2）、直接写
+`upstream {}` 的名字（nginx 先剥掉 scheme 再查 upstream 表，所以 `grpc://u`
+命中的是 `upstream u` 而不是一次 DNS 查询）、以及含变量的目标。
+
+变量目标需要 `resolver`，因此新增了 **`resolver` 指令 + 最小 DNS 客户端**
+（`src/resolver.rs`，A 记录，带 TTL 缓存）。这同时也让 `proxy_pass` 用变量
+时有了回退解析能力。
+
+`grpc_pass.t` **7/7 与 nginx 断言数完全一致**。
+
+顺带修掉两个真实缺陷：
+
+1. **TLS 判定粒度错了**：`ssl` 之前记在 server 上，于是
+   `server { listen 8081; listen 8082 ssl; }` 会把 8081 也变成 TLS。
+   nginx 是按 **listen socket** 决定的，现改为每个 listen 各自带 `ssl` 标记。
+   这个 bug 让整个 grpc_pass.t 从 404 变成可测。
+2. `grpcs://` 的 SNI 直接用了 `host:port`，`ServerName` 解析失败。
 
 ## TLS 客户端证书
 

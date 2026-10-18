@@ -33,6 +33,9 @@ WRK="env LD_LIBRARY_PATH=/lib/x86_64-linux-gnu wrk"
 
 make_fixtures() {
   mkdir -p "$RUN" "$WWW" "$OUT"
+  # `auth_basic` regression fixture: the guarded-proxy locations in
+  # feature.conf authenticate against this file.
+  printf 'user:{PLAIN}secret\n' > "$ROOT/htpasswd"
   python3 - "$WWW" <<'PY'
 import os, sys
 www = sys.argv[1]

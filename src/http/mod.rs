@@ -745,6 +745,69 @@ async fn auth_request_status_inner(
     (code, headers)
 }
 
+/// Evaluate the ACCESS phase for a location whose content handler is an upstream
+/// protocol.
+///
+/// `auth_basic`, `auth_request` and `allow`/`deny` are ACCESS-phase handlers, so
+/// nginx runs them *before* the content phase. The upstream protocols here are
+/// dispatched ahead of the generic route, which means without this a
+/// `location / { auth_basic ...; proxy_pass ...; }` would proxy the request
+/// without ever asking for credentials.
+///
+/// Returns the response to send when the request is denied, plus the query the
+/// content handler must use: `auth_request_set $args ...` rewrites the request
+/// arguments, and nginx passes the rewritten value on to the upstream.
+#[allow(clippy::too_many_arguments)]
+async fn access_guard(
+    req: &Request,
+    path: &str,
+    query: &str,
+    loc: &LocCfg,
+    server: &Server,
+    http: &Http,
+    peer_ip: &str,
+    peer_port: u16,
+    server_port: u16,
+    state: ConnState,
+    custom: &mut std::collections::HashMap<String, String>,
+) -> (Option<Response>, Option<String>) {
+    if !loc.auth_basic.enabled()
+        && loc.auth_request.is_none()
+        && loc.access.is_empty()
+        && loc.limit_except.is_empty()
+    {
+        return (None, None);
+    }
+    let root = loc.root.to_string_lossy().to_string();
+    let mut sets: Vec<(String, String)> = Vec::new();
+    let denied = {
+        let vars = ServerVars {
+            req,
+            path,
+            query,
+            server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
+            server_port,
+            peer_ip,
+            peer_port,
+            scheme: if req.tls.is_some() { "https" } else { "http" },
+            document_root: &root,
+            upstream_cache_status: "",
+            custom,
+            connection_requests: state.requests,
+            connection_time: state.elapsed_secs(),
+            sent: &[],
+        };
+        access_phase(req, loc, server, http, &vars, &mut sets).await
+    };
+    if denied.is_some() {
+        return (denied, None);
+    }
+    for (name, value) in sets {
+        custom.insert(name, value);
+    }
+    (None, custom.get("args").cloned())
+}
+
 /// ACCESS phase followed by the content phase, so every entry point (initial
 /// dispatch, `error_page` file target, `error_page` named location) runs the
 /// same checks in nginx's order.
@@ -2263,6 +2326,53 @@ pub async fn resolve_response_local(
     }
     // Reverse proxying needs a socket for streaming in HTTP/1; when this
     // resolver is used without one (HTTP/2), buffer the upstream reply instead.
+    //
+    // The ACCESS phase has to run first for the same reason as in `dispatch`:
+    // these handlers are ahead of the generic route, so `auth_basic` /
+    // `auth_request` / `allow`+`deny` would otherwise be skipped over HTTP/2.
+    let (path_owned, query_owned);
+    let (path, query) = {
+        let (denied, args) = access_guard(
+            req,
+            path,
+            query,
+            loc,
+            server,
+            http,
+            peer_ip,
+            peer_port,
+            server_port,
+            state,
+            &mut custom,
+        )
+        .await;
+        if let Some(mut d) = denied {
+            return finalize_response(
+                req,
+                &mut d,
+                path,
+                query,
+                server,
+                http,
+                peer_ip,
+                peer_port,
+                server_port,
+                captures,
+                &mut custom,
+                state,
+                local_addr,
+            )
+            .await;
+        }
+        match args {
+            Some(a) => {
+                path_owned = path.to_string();
+                query_owned = a;
+                (path_owned.as_str(), query_owned.as_str())
+            }
+            None => (path, query),
+        }
+    };
     if loc.grpc_pass.is_some() {
         // `grpc_pass` accepts variables, so build the same variable view the
         // rest of the request uses rather than only handling literal targets.
@@ -3169,6 +3279,90 @@ async fn dispatch(
             sent,
         });
     }
+
+    // ---- ACCESS phase, ahead of any upstream content handler -------------
+    //
+    // These protocols are dispatched before the generic route, so the ACCESS
+    // phase has to be evaluated here for them; otherwise credentials and
+    // `allow`/`deny` would only be enforced for static content.
+    let mut set_vars = set_vars;
+    let upstream_content = loc.grpc_pass.is_some()
+        || loc.fastcgi_pass.is_some()
+        || loc.uwsgi_pass.is_some()
+        || loc.scgi_pass.is_some()
+        || loc.proxy_pass.is_some();
+    let args_override;
+    let query = if upstream_content {
+        let mut access_custom = set_vars.clone();
+        for (k, v) in captures {
+            access_custom.insert(k.clone(), v.clone());
+        }
+        let (denied, args) = access_guard(
+            req,
+            path,
+            query,
+            loc,
+            server,
+            http,
+            &conn.peer.ip().to_string(),
+            peer_port,
+            listen_port,
+            state,
+            &mut access_custom,
+        )
+        .await;
+        if let Some(mut d) = denied {
+            let peer = conn.peer.ip().to_string();
+            let resp = finalize_response(
+                req,
+                &mut d,
+                path,
+                query,
+                server,
+                http,
+                &peer,
+                peer_port,
+                listen_port,
+                captures,
+                &mut access_custom,
+                state,
+                local_addr,
+            )
+            .await;
+            let status = resp.status;
+            let sent = if sent_headers_needed(server) {
+                split_head(&resp.raw)
+            } else {
+                Vec::new()
+            };
+            let bytes = write_response_ka(
+                conn,
+                resp,
+                keepalive_allowed,
+                server.server_tokens,
+                req.method == Method::Head,
+                None,
+            )
+            .await?;
+            return Ok(Outcome {
+                status,
+                bytes,
+                close: !keepalive_allowed,
+                sent,
+            });
+        }
+        // The auth subrequest's `auth_request_set` values are ordinary
+        // variables from here on, visible to `add_header` and to the upstream
+        // request line.
+        set_vars = access_custom;
+        args_override = args;
+        match &args_override {
+            Some(a) => a.as_str(),
+            None => query,
+        }
+    } else {
+        query
+    };
 
     // ---- gRPC ----
     if loc.grpc_pass.is_some() {

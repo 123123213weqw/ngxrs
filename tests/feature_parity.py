@@ -8,6 +8,7 @@ only the listening port differs.
 
 import argparse
 import gzip
+import re
 import http.client
 import os
 import socket
@@ -144,6 +145,10 @@ def summarize(status, headers, body, port=None):
             body = gzip.decompress(body)
         except OSError:
             pass
+    # The echo backend reports which instance answered, and round-robin state
+    # differs between the two servers by the time later cases run, so the port is
+    # not a semantic difference.
+    body = re.sub(rb'"backend":\s*\d+', b'"backend":*', body)
     keep = {}
     for k in ("content-type", "content-encoding", "content-length", "transfer-encoding",
               "vary", "etag", "last-modified", "connection", "location"):
@@ -209,6 +214,12 @@ def main():
         ("if-else-branch", "/if/x", {"X-Tier": "basic"}),
         ("if-regex", "/if-re/x", {"User-Agent": "curl/8.0"}),
         ("if-regex-miss", "/if-re/x", {"User-Agent": "Mozilla/5.0"}),
+        # ACCESS phase runs before an upstream content handler. Without that,
+        # `auth_basic` + `proxy_pass` would proxy without asking for
+        # credentials, so these two cases are a security regression guard.
+        ("auth-proxy-401", "/p-guarded/echo", {}),
+        ("auth-proxy-ok", "/p-guarded/echo", {"Authorization": "Basic dXNlcjpzZWNyZXQ="}),
+        ("deny-proxy-403", "/p-denied/echo", {}),
     ]
 
     rows = []

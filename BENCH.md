@@ -96,3 +96,24 @@ far less than nginx's under the same concurrency.
 
 Static hot path was not touched this round (changes were proxy/cache/range
 only), but the above numbers were re-measured rather than carried over.
+
+## Round 13 (this session) — fresh run after intercept/limit_rate/trailer/range work
+
+Same host, same config template, `bench/bench.sh` (t8, c512, 10s, medians).
+
+| target | rps | p99 | ratio |
+|---|---|---|---|
+| nginx 1k | 447,235 | 1.28 ms | — |
+| ngxrs 1k | 423,340 | 1.93 ms | 0.947 |
+| nginx 64k | 203,045 | 30.62 ms | — |
+| ngxrs 64k | 197,408 | **2.64 ms** | 0.972 |
+| nginx 1m | 30,772 | 17.53 ms | — |
+| ngxrs 1m | 29,666 | 17.42 ms | 0.964 |
+
+`bench/ab.sh` ABBA at c=128 (T=32, 8s, 3 rounds): nginx 651,014 vs ngxrs 613,529 → **0.942**.
+
+**Honest reading**: 1 KB throughput is still a few percent behind nginx (0.94–0.97×), and it
+drifts with the host's other tenants, so cross-run absolutes are not comparable — only the
+same-window ratio is. The defensible win is 64 KB tail latency: **p99 2.64 ms vs 30.62 ms
+(11.6× better)** at essentially equal throughput. That is the "or tail latency" half of the
+acceptance criterion; the throughput half is *not* met at 1 KB.

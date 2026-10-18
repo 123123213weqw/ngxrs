@@ -52,7 +52,8 @@
 | `index` | ✅ | 多候选 |
 | `autoindex` | 🟡 | 有列表页，样式/字段未逐字对齐 |
 | ETag / Last-Modified / 304 | ✅ | ETag 格式与 nginx 一致（mtime-size 十六进制） |
-| Range（单区间/后缀） | ✅ | 206 + Content-Range；多区间未做 |
+| Range（单区间/后缀） | ✅ | 206 + Content-Range |
+| 多区间 Range（`multipart/byteranges`） | ✅ | 按 nginx 的 boundary 与分段布局；此前被静默降级成 200 全量 |
 | 416 | ✅ | `Content-Range: bytes */size` |
 | 条件请求 If-Match / If-Unmodified-Since | ✅ | |
 | `sendfile` | ✅ | Linux 走 `sendfile(2)`，非 Linux 回退 read+write |
@@ -87,6 +88,8 @@
 | `proxy_cache_valid` / `proxy_cache_key` / `proxy_cache_bypass` | ✅ | 只缓存 `proxy_cache_valid` 列出的状态码 |
 | 缓存淘汰（max_size / inactive） | 🟡 | max_size 按 mtime 淘汰；`inactive` 只解析未执行定时清理 |
 | `proxy_no_cache` | 🟡 | 已解析，未按变量求值 |
+| `proxy_cache_max_range_offset` | ✅ | 起始偏移 ≥ 值（或值为 0）时绕过缓存，让上游看到 `Range` |
+| 缓存场景下的 `Range` 处理 | ✅ | 缓存生效时**不把 `Range` 转发上游**（取整实体再切片），绕过时原样转发——ngx_http_upstream_cache_check_range 的语义 |
 | 缓存错误状态（nginx `c->error`，ticket #827） | ✅ | 被拦截的上游错误以「无 body 的错误条目」入缓存，后续请求重放该错误；`bypass` 不写 |
 | `fastcgi_pass` / `fastcgi_param` / `fastcgi_index` / `fastcgi_split_path_info` | ✅ | FastCGI 1.0 记录协议；`$fastcgi_script_name`、`$fastcgi_path_info` 等变量 |
 | FastCGI 无 Content-Length 时用 chunked | ✅ | 与 nginx 帧格式逐字节一致 |
@@ -158,10 +161,10 @@
 ## 已知差异（必须修）
 
 1. `add_header` 继承语义与 nginx 不同（nginx：子上下文定义即替换）。
-2. 多区间 Range 返回 200 全量，nginx 返回 multipart/byteranges。
-3. `server_tokens` 默认值在 http/server 合并时的边界情况。
-4. 访问日志不做 `\x` 转义，UA 含引号会破坏行格式。
-5. 无 `open_file_cache`，高并发小文件下 stat 次数多于 nginx。
+2. `server_tokens` 默认值在 http/server 合并时的边界情况。
+3. 访问日志不做 `\x` 转义，UA 含引号会破坏行格式。
+4. 无 `open_file_cache`，高并发小文件下 stat 次数多于 nginx。
+5. `proxy_cache_min_uses` 只解析未生效。
 
 
 ## nginx-tests 状态（官方 Perl 测试集）

@@ -639,3 +639,38 @@ nginx 在连接可读事件里立刻回收（`ngx_http_limit_conn_cleanup`）。
 `proxy.t` 剩余 4 条：慢响应头下的 `$upstream_header_time`，以及 next_upstream 后
 `$upstream_response_time` / `$upstream_header_time` 的逗号列表（我们只存单次值）。
 `proxy_cache_use_stale.t` 27/36（缺 `updating`/`revalidated` 事件）。
+
+## 本轮（$upstream_*_time、location access_log、log_format 拼接）
+
+### proxy.t 12/30 → 30/30，与 nginx 完全一致
+
+三处缺口，都是先看测试怎么断言、再对 nginx 探测确认的：
+
+1. **`$upstream_connect_time` / `$upstream_header_time` / `$upstream_response_time`
+   根本不存在**。新增 `src/timing.rs`：按 nginx 的语义为**每次尝试**记录一个条目，
+   用 `, ` 连接，未取到的值打印 `-`。值在**发送响应头时**求值，所以正在应答的那次
+   尝试还没有 response time——这正是 `proxy.t` 的 `rt2 == '-'` 断言。
+   放在 task-local 里：同一个连接任务内既能在代理深处写、又能在访问日志处读。
+
+2. **location 级 `access_log` 未实现**，所以 `access_log %%TESTDIR%%/time.log time;`
+   一个字节都没写；`$t->read_file('time.log')` 直接 die，测试在第 21 条断言后中止。
+   现在 `LocCfg.access_logs: Option<Vec<AccessLog>>`，`None` 表示继承 server。
+
+3. **`log_format` 的相邻字符串被我用空格拼接**。nginx 是**直接相连**（这正是
+   `'...connect:header:' 'response...'` 拆行写法的用途）。结果日志里多出空格，
+   正则匹配不上。
+
+4. 客户端提前断开时，nginx 会立刻终结上游请求（header time 保持 `-`）。我们原来只在
+   有 `limit_conn` 的 location 上探测客户端断开；现在对所有代理请求探测，步长 1ms
+   起、200ms 后放宽到 10ms。
+
+### 测试框架的又一个盲点（已修）
+
+`proxy.t` 曾显示 `SAME nginx 30/30 ngxrs 21/30`——因为我们的运行**中途 die**，
+没产生任何 `not ok` 行，逐条 id 对比自然找不到「更差」。这与之前 `h2.t` 的
+UNRUN 是同一类问题。现在断言行数少于参考运行的一律进 `TRUNC` 桶并让脚本失败。
+
+### 回归
+31 个用例文件：29 个完全一致，2 个更好（`http_host` 58 vs 54、`http_headers_multi`
+49 vs 48），0 个更差，0 个截断；断言总数 ngxrs 606 / nginx 601。
+自建差分套件 70/70；单测 101。

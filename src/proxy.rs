@@ -992,6 +992,9 @@ pub async fn handle(
     let mut last_err = None;
 
     'candidates: for cand in candidates {
+        // One entry in `$upstream_*_time` per backend tried.
+        let tidx = crate::timing::begin();
+        let t_up = std::time::Instant::now();
         let key = pool_key_of(&cand);
         let upstream_addr = match &cand {
             Chosen::Direct(_, a) => a.to_string(),
@@ -1044,6 +1047,15 @@ pub async fn handle(
             if up_idx != usize::MAX {
                 active_add(up_idx, sidx, 1);
             }
+            // nginx records 0 for a connection taken from the keepalive pool.
+            crate::timing::set_connect(
+                tidx,
+                if from_pool {
+                    std::time::Duration::ZERO
+                } else {
+                    t_up.elapsed()
+                },
+            );
 
             let result = exchange(
                 conn,
@@ -1072,12 +1084,14 @@ pub async fn handle(
                 vars,
                 convert_head,
                 http,
+                tidx,
             )
             .await;
 
             if up_idx != usize::MAX {
                 active_add(up_idx, sidx, -1);
             }
+            crate::timing::set_response(tidx, t_up.elapsed());
 
             match result {
                 Ok(o) => return Ok(Some(o)),
@@ -1633,7 +1647,9 @@ async fn exchange(
     vars: &crate::http::ServerVars<'_>,
     convert_head: bool,
     http: &crate::config::Http,
+    tidx: usize,
 ) -> io::Result<Proxied> {
+    let t_up = Instant::now();
     // ---- request head ----
     // The cache only helps a ranged request if it can hold the whole entity, so
     // the Range header is withheld from the upstream while the cache is in play
@@ -1685,6 +1701,7 @@ async fn exchange(
                 io::Error::new(io::ErrorKind::InvalidData, "bad upstream response")
             })?;
             buf = buf.split_off(pos);
+            crate::timing::set_header(tidx, t_up.elapsed());
             break h;
         }
         if buf.len() > 64 * 1024 {
@@ -1701,10 +1718,11 @@ async fn exchange(
         // Race the upstream against a client disconnect. nginx finalizes the
         // request as soon as the client goes away, which is what frees a
         // `limit_conn` slot while the upstream is still thinking.
-        // Only watch the client where it changes an observable outcome: while
-        // a `limit_conn` slot is held, nginx drops it the moment the client
-        // goes away (`ngx_http_limit_conn_cleanup`).
-        let watch_client = !loc.limit_conns.is_empty();
+        // nginx finalizes the upstream request as soon as the client goes
+        // away: `$upstream_header_time` stays unset and the `limit_conn` slot
+        // is released (`ngx_http_upstream_finalize_request`). Watching costs a
+        // timer per poll step, so the step starts at 1 ms and backs off.
+        let watch_client = true;
         let read = tokio::select! {
             r = tokio::time::timeout(remaining, up.read(&mut chunk)) => r,
             _ = conn.peer_closed(), if watch_client => {

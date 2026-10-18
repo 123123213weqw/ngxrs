@@ -184,7 +184,18 @@ impl Ctx {
     }
 }
 
-pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx: &Ctx) {
+pub async fn handle_conn(conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx: &Ctx) {
+    // Upstream attempt timings are collected per request inside this task; the
+    // value is needed by `add_header` deep in the proxy code and by the access
+    // logger afterwards, which have no plumbing between them.
+    crate::timing::scope(
+        crate::timing::new_state(),
+        handle_conn_inner(conn, cfg, group_idx, ctx),
+    )
+    .await
+}
+
+async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx: &Ctx) {
     let _active = ActiveGuard::enter();
     let http = &cfg.http;
     let group = &http.groups[group_idx];
@@ -395,6 +406,8 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
             }
         }
 
+        // A keepalive connection serves many requests from the same task.
+        crate::timing::reset();
         let (path, query) = match util::parse_target(&req.raw_target) {
             Ok(v) => v,
             Err(_) => {
@@ -414,6 +427,7 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
                     std::time::Duration::ZERO,
                     conn.peer,
                     &[],
+                    None,
                 );
                 break;
             }
@@ -512,7 +526,18 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
         #[cfg(feature = "alloc-count")]
         crate::alloccnt::set_phase(2);
         log_access(
-            ctx, group, server, &req, &path, &query, status, bytes, elapsed, conn.peer, &sent,
+            ctx,
+            group,
+            server,
+            &req,
+            &path,
+            &query,
+            status,
+            bytes,
+            elapsed,
+            conn.peer,
+            &sent,
+            loc.access_logs.as_deref(),
         );
         #[cfg(feature = "alloc-count")]
         let _ = {
@@ -1831,6 +1856,7 @@ pub fn apply_add_headers_ctx(
             .replace("$proxy_host", proxy_host)
             .replace("$proxy_port", &proxy_port)
             .replace("$status", &status.to_string());
+        expanded = crate::timing::expand(&expanded);
         if expanded.contains("$proxy_add_x_forwarded_for") {
             if let Some(v) = ctx_vars {
                 let prior = v
@@ -4831,8 +4857,14 @@ fn log_access(
     _elapsed: Duration,
     peer: std::net::SocketAddr,
     sent: &[(String, String)],
+    loc_logs: Option<&[crate::config::AccessLog]>,
 ) {
-    if server.access_logs.is_empty() {
+    // nginx: a location `access_log` replaces the server's, and `off` clears it.
+    let logs: &[crate::config::AccessLog] = match loc_logs {
+        Some(l) => l,
+        None => &server.access_logs,
+    };
+    if logs.is_empty() {
         return;
     }
     let now = SystemTime::now()
@@ -4877,6 +4909,13 @@ fn log_access(
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
 
+    // Upstream attempt timings; nginx prints a comma-separated list, `-` for a
+    // value an attempt never reached.
+    let t_connect = crate::timing::variable("upstream_connect_time").unwrap_or_default();
+    let t_header = crate::timing::variable("upstream_header_time").unwrap_or_default();
+    let t_response = crate::timing::variable("upstream_response_time").unwrap_or_default();
+    let scheme = if req.tls.is_some() { "https" } else { "http" };
+
     let mut vars: Vec<(&str, &str)> = vec![
         ("remote_addr", &peer),
         ("remote_port", "0"),
@@ -4895,13 +4934,16 @@ fn log_access(
         ("host", host),
         ("server_name", server_name),
         ("server_port", &port_s),
-        ("scheme", "http"),
+        ("scheme", scheme),
+        ("upstream_connect_time", &t_connect),
+        ("upstream_header_time", &t_header),
+        ("upstream_response_time", &t_response),
     ];
     vars.extend(sent_refs);
 
     let vars = &vars[..];
 
-    for log in &server.access_logs {
+    for log in logs {
         let line = expand_log(&log.format, vars, now);
         ctx.logger.access(&log.path, line);
     }

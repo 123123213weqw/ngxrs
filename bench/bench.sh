@@ -14,7 +14,14 @@ start_pair
 
 RESULT_FILE="$OUT/bench-$(date +%Y%m%d-%H%M%S).tsv"
 printf 'target\trequests_per_sec\tavg_latency\tp99\tratio\n' >"$RESULT_FILE"
-echo "commit: $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)" >>"$RESULT_FILE"
+# The benchmark host is a mirror of this repository and usually has no `.git`,
+# so the commit is taken from the environment when it is not available locally.
+if [ -n "${NGXRS_COMMIT:-}" ]; then
+  commit="$NGXRS_COMMIT"
+else
+  commit="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+fi
+echo "commit: $commit" >>"$RESULT_FILE"
 
 echo "benchmark: t=$THREADS c=$CONNS d=${DUR}s repeat=$REPEAT  (nginx :$PORT_NGINX, ngxrs :$PORT_NGXRS)"
 

@@ -27,6 +27,7 @@ mod proxy;
 mod resolver;
 mod ssi;
 mod stream;
+mod timing;
 mod tls;
 mod util;
 mod uwsgi_scgi;

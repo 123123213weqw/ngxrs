@@ -33,6 +33,8 @@ pub struct Location {
 
 #[derive(Debug, Clone)]
 pub struct LocCfg {
+    /// `access_log` inside this location; `None` inherits the server's.
+    pub access_logs: Option<Vec<AccessLog>>,
     pub root: PathBuf,
     pub alias: Option<PathBuf>,
     /// Prefix length that belongs to the alias itself (a nested location
@@ -192,6 +194,7 @@ pub struct LocCfg {
 impl LocCfg {
     fn new(root: PathBuf) -> Self {
         LocCfg {
+            access_logs: None,
             error_logs: Vec::new(),
             limit_req_log_level: crate::log::Level::Error,
             limit_conn_log_level: crate::log::Level::Error,
@@ -1518,6 +1521,10 @@ mod regex_tests {
 struct Builder {
     prefix: PathBuf,
     warnings: Vec<String>,
+    /// `log_format name 'fmt'` seen at http scope. Location-level `access_log`
+    /// needs it too, and nginx allows the format to be defined before any
+    /// server that uses it.
+    log_formats: HashMap<String, String>,
 }
 
 impl Builder {
@@ -1847,6 +1854,25 @@ impl Builder {
                 cfg.autoindex = parse_on_off(v).ok_or_else(|| {
                     sem(&d.file, d.line, format!("invalid autoindex value \"{v}\""))
                 })?;
+            }
+            "access_log" => {
+                let logs = cfg.access_logs.get_or_insert_with(Vec::new);
+                if d.args.first().map(|s| s.as_str()) == Some("off") {
+                    logs.clear();
+                } else if let Some(path) = d.args.first() {
+                    let fmt = match d.args.get(1).map(|s| s.as_str()).unwrap_or("combined") {
+                        "combined" => "combined".to_string(),
+                        name => self
+                            .log_formats
+                            .get(name)
+                            .cloned()
+                            .unwrap_or_else(|| "combined".to_string()),
+                    };
+                    logs.push(AccessLog {
+                        path: resolve_path(&self.prefix, path),
+                        format: fmt,
+                    });
+                }
             }
             "auth_basic" => {
                 // The realm may contain spaces, so join every argument.
@@ -3448,6 +3474,7 @@ pub fn build(
     let mut b = Builder {
         prefix: prefix.to_path_buf(),
         warnings: Vec::new(),
+        log_formats: HashMap::new(),
     };
 
     // nginx defaults to a single worker; `auto` expands to the CPU count.
@@ -3795,8 +3822,17 @@ pub fn build(
             }
             "log_format" => {
                 if d.args.len() >= 2 {
-                    http.log_formats
-                        .insert(d.args[0].clone(), d.args[1..].join(" "));
+                    let name = d.args[0].clone();
+                    // `log_format name escape=json '...'`: the escape parameter
+                    // is not a format string.
+                    let start = if d.args.get(1).is_some_and(|a| a.starts_with("escape=")) {
+                        2
+                    } else {
+                        1
+                    };
+                    let fmt = d.args[start..].concat();
+                    http.log_formats.insert(name.clone(), fmt.clone());
+                    b.log_formats.insert(name, fmt);
                 }
             }
             "access_log" => {

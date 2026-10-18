@@ -59,7 +59,7 @@ outcomes() { # $1=log -> sorted "id ok" / "id notok" lines
 }
 
 idx=0
-declare -a NAMES=() SAME=() WORSE=() BETTER=() UNRUN=() REF_OK=() OUR_OK=()
+declare -a NAMES=() SAME=() WORSE=() BETTER=() UNRUN=() TRUNC=() REF_OK=() OUR_OK=()
 
 for t in $TESTS; do
   f="$TESTS_DIR/$t"
@@ -80,6 +80,7 @@ for t in $TESTS; do
   r_ok=$(grep -c ' ok$' "$OUT_DIR/${t%.t}.ref.out" || true)
   o_ok=$(grep -c ' ok$' "$OUT_DIR/${t%.t}.out" || true)
   total=$(wc -l < "$OUT_DIR/${t%.t}.ref.out" | tr -d ' ')
+  o_total=$(wc -l < "$OUT_DIR/${t%.t}.out" | tr -d ' ')
 
   # Assertions nginx passes but we do not (and vice versa).
   worse=$(awk 'NR==FNR && $2=="ok" {ref[$1]=1; next}
@@ -96,7 +97,15 @@ for t in $TESTS; do
   # worse/better counts are both zero and it used to be reported as SAME even
   # though the numbers disagreed (stream_ssl showed "SAME 7/7 vs 0/7"). Suite
   # runs are only comparable when both sides produced assertions.
-  if [ "$o_ok" -eq 0 ] && [ "$r_ok" -gt 0 ]; then
+  # A run that stopped early (a `die` in the harness, a missing log file) emits
+  # fewer lines than the reference, so the per-id diff finds nothing "worse"
+  # and the suite used to be reported as SAME. proxy.t showed `SAME 30/30 vs
+  # 21/30` that way: the plan mismatch aborted the last nine assertions.
+  if [ "$o_total" -lt "$total" ]; then
+    TRUNC+=("$t")
+    printf 'TRUNC  %-26s nginx %2s/%-3s   ngxrs %2s/%-3s   (%s assertions never ran)\n' \
+      "$t" "$r_ok" "$total" "$o_ok" "$total" "$((total - o_total))"
+  elif [ "$o_ok" -eq 0 ] && [ "$r_ok" -gt 0 ]; then
     UNRUN+=("$t")
     printf 'UNRUN  %-26s nginx %2s/%-3s   ngxrs %2s/%-3s   (we produced no assertions)\n' \
       "$t" "$r_ok" "$total" "$o_ok" "$total"
@@ -127,5 +136,6 @@ printf 'assertions      : nginx %d / ngxrs %d\n' "$total_ref" "$total_our"
 printf 'identical       : %d\n' "${#SAME[@]}"
 printf 'ngxrs worse     : %d  %s\n' "${#WORSE[@]}" "${WORSE[*]:-}"
 printf 'not comparable  : %d  %s\n' "${#UNRUN[@]}" "${UNRUN[*]:-}"
+printf 'truncated runs  : %d  %s\n' "${#TRUNC[@]}" "${TRUNC[*]:-}"
 printf 'ngxrs better    : %d  %s\n' "${#BETTER[@]}" "${BETTER[*]:-}"
-[ "${#WORSE[@]}" -eq 0 ]
+[ "${#WORSE[@]}" -eq 0 ] && [ "${#TRUNC[@]}" -eq 0 ]

@@ -18,7 +18,10 @@ mkdir -p "$OUT"
 
 LIMIT="${LIMIT:-40}"
 # Categories ngxrs actually implements.
-PATTERN="${PATTERN:-http_*.t proxy_*.t upstream_*.t range_*.t fastcgi_*.t scgi_*.t uwsgi_*.t stream*.t}"
+# Keep this list honest and broad: a narrower pattern silently omits whole
+# protocol families (h2_*, ssl_*, grpc_*) and makes the headline look better
+# than it is. Suites for unimplemented modules are expected to show as losses.
+PATTERN="${PATTERN:-http_*.t proxy_*.t upstream_*.t range_*.t fastcgi_*.t scgi_*.t uwsgi_*.t stream*.t h2_*.t ssl_*.t grpc_*.t}"
 
 # shellcheck disable=SC2086
 files=$(cd "$TESTS_DIR" && ls $PATTERN 2>/dev/null \

@@ -190,6 +190,27 @@ pub fn build_config(http: &Http, server_idxs: &[usize]) -> io::Result<Arc<Server
     Ok(Arc::new(cfg))
 }
 
+/// Build a TLS configuration from a single certificate/key pair, for `mail`.
+///
+/// No SNI: a mail `server {}` has no `server_name`, so nginx presents the one
+/// certificate from its `mail` block for every connection.
+pub fn build_mail_config(
+    cert: &Path,
+    key: &Path,
+) -> io::Result<Arc<ServerConfig>> {
+    let key_id = load_cert(key, cert)?;
+    let resolver = Arc::new(SniResolver {
+        exact: HashMap::new(),
+        wildcard: HashMap::new(),
+        default: Some(key_id),
+    });
+    let mut cfg = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    cfg.alpn_protocols = Vec::new();
+    Ok(Arc::new(cfg))
+}
+
 /// A client-cert verifier that *requests* a certificate but accepts any chain.
 ///
 /// nginx completes the handshake even when `ssl_verify_client` rejects the peer

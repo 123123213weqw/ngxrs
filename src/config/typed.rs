@@ -488,6 +488,43 @@ pub struct CacheZone {
     pub uses: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
 }
 
+/// One protocol's authentication bitmask. nginx keeps `pop3_auth`,
+/// `imap_auth` and `smtp_auth` in *separate* server configs, so setting one
+/// must not affect the others.
+#[derive(Clone, Copy)]
+pub struct AuthSet {
+    pub plain: bool,
+    pub apop: bool,
+    pub none: bool,
+    pub login: bool,
+    pub cram_md5: bool,
+    pub external: bool,
+}
+
+impl Default for AuthSet {
+    fn default() -> Self {
+        // nginx's default is `*_auth plain`; LOGIN is unconditional on top.
+        AuthSet { plain: true, apop: false, none: false, login: true, cram_md5: false, external: false }
+    }
+}
+
+impl AuthSet {
+    fn from_args(args: &[String]) -> Self {
+        let mut set = AuthSet { plain: false, apop: false, none: false, login: true, cram_md5: false, external: false };
+        for a in args {
+            match a.as_str() {
+                "plain" => set.plain = true,
+                "apop" => set.apop = true,
+                "none" => set.none = true,
+                "cram-md5" => set.cram_md5 = true,
+                "external" => set.external = true,
+                _ => {}
+            }
+        }
+        set
+    }
+}
+
 /// One `mail { server { ... } }` listener.
 #[derive(Debug, Clone)]
 pub struct MailServer {
@@ -510,6 +547,33 @@ pub struct MailServer {
     pub auth_login: bool,
     pub auth_cram_md5: bool,
     pub auth_external: bool,
+    /// `starttls off|on|only`.
+    pub starttls: StarttlsCfg,
+    /// `{imap,pop3,smtp}_capabilities`: replaces the protocol's default list.
+    pub capabilities: Option<Vec<String>>,
+    /// Certificates from the mail block, used by `STLS` / `STARTTLS`.
+    pub tls: Option<std::sync::Arc<rustls::ServerConfig>>,
+}
+
+/// `starttls` in a mail server.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StarttlsCfg {
+    Off,
+    /// Advertise TLS but still allow plaintext authentication.
+    On,
+    /// Advertise TLS and refuse every authentication command until it is used.
+    Only,
+}
+
+impl StarttlsCfg {
+    fn parse(v: &str) -> Option<Self> {
+        match v {
+            "off" => Some(StarttlsCfg::Off),
+            "on" => Some(StarttlsCfg::On),
+            "only" => Some(StarttlsCfg::Only),
+            _ => None,
+        }
+    }
 }
 
 impl Default for MailServer {
@@ -522,13 +586,16 @@ impl Default for MailServer {
             auth_http_timeout: std::time::Duration::from_secs(60),
             pass_error_message: false,
             proxy_timeout: std::time::Duration::from_secs(24 * 3600),
-            // nginx enables every mechanism by default.
+            // nginx's default is `*_auth plain`; LOGIN is unconditional on top.
             auth_plain: true,
-            auth_apop: true,
+            auth_apop: false,
             auth_none: false,
             auth_login: true,
-            auth_cram_md5: true,
+            auth_cram_md5: false,
             auth_external: false,
+            starttls: StarttlsCfg::Off,
+            capabilities: None,
+            tls: None,
         }
     }
 }
@@ -1179,6 +1246,13 @@ impl Builder {
         let mut defaults = MailServer::default();
         let mut servers: Vec<MailServer> = Vec::new();
         let mut servers_dirs: Vec<&Directive> = Vec::new();
+        // `ssl_certificate` and `ssl_certificate_key` may come in either order.
+        let mut mail_cert: Option<PathBuf> = None;
+        let mut mail_key: Option<PathBuf> = None;
+        // Per-protocol authentication defaults; see `AuthSet`.
+        let mut dflt_pop3 = AuthSet::default();
+        let mut dflt_imap = AuthSet::default();
+        let mut dflt_smtp = AuthSet::default();
 
         for d in dirs {
             match d.name.as_str() {
@@ -1208,38 +1282,54 @@ impl Builder {
                 "server" => servers_dirs.push(d),
                 // `pop3_auth` / `imap_auth` / `smtp_auth` are valid in the mail
                 // main context as well; there they set the server defaults.
-                "pop3_auth" | "imap_auth" | "smtp_auth" => {
-                    defaults.auth_plain = false;
-                    defaults.auth_apop = false;
-                    defaults.auth_none = false;
-                    defaults.auth_cram_md5 = false;
-                    defaults.auth_external = false;
-                    for a in &d.args {
-                        match a.as_str() {
-                            "plain" => defaults.auth_plain = true,
-                            "apop" => defaults.auth_apop = true,
-                            "none" => defaults.auth_none = true,
-                            "cram-md5" => defaults.auth_cram_md5 = true,
-                            "external" => defaults.auth_external = true,
-                            _ => {}
-                        }
-                    }
-                }
-                // Accepted, not yet plumbed (starttls is unimplemented).
+                "pop3_auth" => dflt_pop3 = AuthSet::from_args(&d.args),
+                "imap_auth" => dflt_imap = AuthSet::from_args(&d.args),
+                "smtp_auth" => dflt_smtp = AuthSet::from_args(&d.args),
+                // Accepted, not yet plumbed.
                 "proxy_buffer" | "auth_http_header" | "resolver" | "resolver_timeout"
                 | "error_log" | "log_format" | "timeout" | "proxy_protocol"
-                | "max_errors" | "protocol" | "ssl_certificate" | "ssl_certificate_key"
+                | "max_errors" | "protocol"
                 | "ssl_protocols" | "ssl_ciphers" | "ssl_prefer_server_ciphers"
                 | "ssl_session_cache" | "ssl_session_timeout" | "ssl_conf_command"
-                | "starttls" | "xclient" | "smtp_greeting_delay"
-                | "pop3_capabilities" | "imap_capabilities" | "smtp_capabilities"
+                | "xclient" | "smtp_greeting_delay"
                 | "smtp_auth_methods" | "smtp_client_buffer" | "worker_aio_requests" => {}
+                "starttls" => {
+                    if let Some(v) = d.args.first().and_then(|v| StarttlsCfg::parse(v)) {
+                        defaults.starttls = v;
+                    }
+                }
+                "pop3_capabilities" | "imap_capabilities" | "smtp_capabilities" => {
+                    defaults.capabilities = Some(d.args.clone());
+                }
+                "ssl_certificate" => {
+                    if let Some(v) = d.args.first() {
+                        mail_cert = Some(self.prefix.join(v));
+                    }
+                }
+                "ssl_certificate_key" => {
+                    if let Some(v) = d.args.first() {
+                        mail_key = Some(self.prefix.join(v));
+                    }
+                }
                 other => {
                     self.warnings.push(format!(
                         "{}:{}: unknown directive \"{other}\" in mail; ignored",
-                        d.file.display(), d.line
+                        d.file.display(),
+                        d.line
                     ));
                 }
+            }
+        }
+
+        // nginx accepts the certificate and key in either order, so the context
+        // is built only once both paths are known.
+        if let (Some(c), Some(k)) = (mail_cert.as_ref(), mail_key.as_ref()) {
+            match crate::tls::build_mail_config(c, k) {
+                Ok(cfg) => defaults.tls = Some(cfg),
+                Err(e) => self.warnings.push(format!(
+                    "cannot load mail certificate {}: {e}",
+                    c.display()
+                )),
             }
         }
 
@@ -1248,6 +1338,9 @@ impl Builder {
                 sem(&sd.file, sd.line, "mail server requires a block")
             })?;
             let mut srv = defaults.clone();
+            let mut srv_pop3: Option<AuthSet> = None;
+            let mut srv_imap: Option<AuthSet> = None;
+            let mut srv_smtp: Option<AuthSet> = None;
             // `listen <addr> [pop3|imap|smtp]`
             srv.listen = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 110));
             for child in block {
@@ -1278,27 +1371,11 @@ impl Builder {
                             sem(&child.file, child.line, format!("invalid protocol \"{v}\""))
                         })?;
                     }
-                    "pop3_auth" | "imap_auth" | "smtp_auth" => {
-                        // nginx's bitmask only covers plain/apop/cram-md5/
-                        // external; LOGIN is unconditional and always
-                        // advertised (`NGX_MAIL_POP3_AUTH_LOGIN` has no flag).
-                        srv.auth_plain = false;
-                        srv.auth_apop = false;
-                        srv.auth_none = false;
-                        srv.auth_cram_md5 = false;
-                        srv.auth_external = false;
-                        for a in &child.args {
-                            match a.as_str() {
-                                "plain" => srv.auth_plain = true,
-                                "apop" => srv.auth_apop = true,
-                                "none" => srv.auth_none = true,
-                                "login" => srv.auth_login = true,
-                                "cram-md5" => srv.auth_cram_md5 = true,
-                                "external" => srv.auth_external = true,
-                                _ => {}
-                            }
-                        }
-                    }
+                    // Kept per protocol and resolved after the block, because
+                    // `listen ... imap` may come after the auth directive.
+                    "pop3_auth" => srv_pop3 = Some(AuthSet::from_args(&child.args)),
+                    "imap_auth" => srv_imap = Some(AuthSet::from_args(&child.args)),
+                    "smtp_auth" => srv_smtp = Some(AuthSet::from_args(&child.args)),
                     "auth_http" => {
                         let v = child.args.first().ok_or_else(|| {
                             sem(&child.file, child.line, "auth_http requires a URL")
@@ -1322,12 +1399,19 @@ impl Builder {
                             srv.pass_error_message = parse_on_off(v).unwrap_or(false);
                         }
                     }
+                    "starttls" => {
+                        if let Some(v) = child.args.first().and_then(|v| StarttlsCfg::parse(v)) {
+                            srv.starttls = v;
+                        }
+                    }
+                    "pop3_capabilities" | "imap_capabilities" | "smtp_capabilities" => {
+                        srv.capabilities = Some(child.args.clone());
+                    }
                     // Accepted, not yet plumbed.
-                    "proxy_buffer" | "xclient" | "smtp_greeting_delay" | "starttls"
+                    "proxy_buffer" | "xclient" | "smtp_greeting_delay"
                     | "ssl_certificate" | "ssl_certificate_key" | "ssl_protocols"
                     | "ssl_ciphers" | "ssl_prefer_server_ciphers" | "ssl_session_cache"
-                    | "ssl_session_timeout" | "pop3_capabilities" | "imap_capabilities"
-                    | "smtp_capabilities" | "auth_http_header" | "proxy_protocol"
+                    | "ssl_session_timeout" | "auth_http_header" | "proxy_protocol"
                     | "max_errors" | "smtp_client_buffer" | "smtp_auth_methods"
                     | "smtp_xclient" | "timeout" => {}
                     other => {
@@ -1338,6 +1422,18 @@ impl Builder {
                     }
                 }
             }
+            // Apply the set belonging to this server's protocol.
+            let set = match srv.protocol {
+                crate::mail::Protocol::Pop3 => srv_pop3.unwrap_or(dflt_pop3),
+                crate::mail::Protocol::Imap => srv_imap.unwrap_or(dflt_imap),
+                crate::mail::Protocol::Smtp => srv_smtp.unwrap_or(dflt_smtp),
+            };
+            srv.auth_plain = set.plain;
+            srv.auth_apop = set.apop;
+            srv.auth_none = set.none;
+            srv.auth_login = set.login;
+            srv.auth_cram_md5 = set.cram_md5;
+            srv.auth_external = set.external;
             servers.push(srv);
         }
         Ok(servers)

@@ -161,7 +161,15 @@ pub fn serve(cfg: Config) -> io::Result<()> {
     let mut threads = Vec::with_capacity(workers + 1);
     let shared = accept_mode() == "shared";
 
-    if shared {
+    // A `mail {}`-only (or `stream {}`-only) config has no HTTP listeners at
+    // all. Spawning HTTP workers for it makes worker 0 find zero sockets and
+    // abort the process, so the HTTP side is skipped and the readiness
+    // handshake completes immediately.
+    let has_http = !cfg.http.groups.is_empty();
+
+    if !has_http {
+        let _ = ready_tx.send(());
+    } else if shared {
         let mut senders = Vec::with_capacity(workers);
         let mut receivers = Vec::with_capacity(workers);
         for _ in 0..workers {

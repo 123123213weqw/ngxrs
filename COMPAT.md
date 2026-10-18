@@ -215,9 +215,31 @@
 7. **IMAP `AUTHENTICATE` 只把机制名大写**，且支持 inline initial response。
 8. **IMAP 字面量** `{N}` / `{N+}`，引号串的 `\"` 与 `\\` 反转义。
 
-### 仍未实现
+### 能力协商与 STARTTLS
 
-- `starttls`（`mail_capability.t` 因此无法运行）
+`starttls off|on|only`、`{imap,pop3,smtp}_capabilities` 已实现，能力串与
+nginx 逐字节一致；`STLS` / `STARTTLS` 执行**真实的 TLS 升级**（rustls），
+已用 `openssl s_client -starttls imap|pop3|smtp` 三种协议验证握手成功。
+
+**实测（nginx 1.28 对照）：**
+
+| 用例 | ngxrs | nginx |
+|---|---|---|
+| `mail_capability.t` | **19/19** | 19/19 |
+
+### 本轮修掉的真缺陷
+
+1. **`pop3_auth` / `imap_auth` / `smtp_auth` 必须按协议分开存**。nginx 把它们
+   放在各自的 server 配置里；我之前共用一个集合，导致 mail 主上下文的
+   `pop3_auth plain apop cram-md5` 泄漏到 imap 和 smtp，能力串多出
+   `AUTH=CRAM-MD5` / `CRAM-MD5`。
+2. **`*_auth` 的默认值是 `plain`**（LOGIN 无条件叠加），不是「全开」。
+3. **只有 mail（或只有 stream）的配置无法启动**：HTTP worker 0 发现没有
+   listen socket 就 `exit(1)`。现在没有 http 监听时跳过 HTTP 侧并立即完成就绪握手。
+4. 能力串拼装顺序与 nginx 一致：IMAP 为
+   `<caps> AUTH=... STARTTLS [LOGINDISABLED]`（**AUTH= 不含 LOGIN**）；
+   POP3 为 `TOP USER UIDL SASL ... STLS`，`only` 时去掉 USER 与 SASL；
+   SMTP 为 `250-<name>` 后逐个能力行，最后一行用 `250 `，且**没有 8BITMIME**。
 
 ## gRPC
 

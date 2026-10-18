@@ -153,15 +153,66 @@ async fn serve_one(server: MailServer, shutdown: &mut watch::Receiver<bool>) {
     }
 }
 
+/// Per-connection state that survives a `STLS` / `STARTTLS` upgrade.
+#[derive(Default)]
+struct Conn {
+    /// The greeting has already been sent; do not send it again after the
+    /// handshake.
+    resumed: bool,
+    /// The session is running inside TLS.
+    tls: bool,
+    /// Set when the client asked for the upgrade; the caller performs it.
+    upgrade: bool,
+}
+
 async fn handle(client: TcpStream, peer: SocketAddr, server: Arc<MailServer>) -> io::Result<()> {
+    let mut conn = Conn::default();
     let (rd, wr) = client.into_split();
     let mut reader = BufReader::new(rd);
     let mut writer = BufWriter::new(wr);
 
+    run(&mut reader, &mut writer, &peer, &server, &mut conn).await?;
+    if !conn.upgrade {
+        return Ok(());
+    }
+    writer.flush().await?;
+
+    let cfg = match server.tls.as_ref() {
+        Some(c) => c.clone(),
+        // Advertising STARTTLS without a certificate would be a lie, so the
+        // directive is only honoured when the mail block loaded one.
+        None => return Ok(()),
+    };
+    let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+    // Rejoin the halves: the handshake needs one duplex stream. Any bytes the
+    // client pipelined past `STLS` would be lost here, which is why nginx (and
+    // this code) only answer the upgrade after a complete command line.
+    let stream = tokio::io::join(reader.into_inner(), writer.into_inner());
+    let tls = acceptor.accept(stream).await?;
+    let (rd, wr) = tokio::io::split(tls);
+    let mut reader = BufReader::new(rd);
+    let mut writer = BufWriter::new(wr);
+    conn.resumed = true;
+    conn.tls = true;
+    conn.upgrade = false;
+    run(&mut reader, &mut writer, &peer, &server, &mut conn).await
+}
+
+async fn run<R, W>(
+    reader: &mut BufReader<R>,
+    writer: &mut BufWriter<W>,
+    peer: &SocketAddr,
+    server: &MailServer,
+    conn: &mut Conn,
+) -> io::Result<()>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
     match server.protocol {
-        Protocol::Pop3 => pop3(&mut reader, &mut writer, &peer, &server).await,
-        Protocol::Imap => imap(&mut reader, &mut writer, &peer, &server).await,
-        Protocol::Smtp => smtp(&mut reader, &mut writer, &peer, &server).await,
+        Protocol::Pop3 => pop3(reader, writer, peer, server, conn).await,
+        Protocol::Imap => imap(reader, writer, peer, server, conn).await,
+        Protocol::Smtp => smtp(reader, writer, peer, server, conn).await,
     }
 }
 
@@ -405,6 +456,7 @@ async fn pop3<R, W>(
     writer: &mut BufWriter<W>,
     peer: &SocketAddr,
     server: &MailServer,
+    conn: &mut Conn,
 ) -> io::Result<()>
 where
     R: AsyncReadExt + Unpin,
@@ -413,14 +465,16 @@ where
     // With APOP enabled nginx appends `<pid.seq@host>` to the greeting so the
     // client can digest it; the authenticator then sees it as `Auth-Salt`.
     let apop_salt = if server.auth_apop { make_salt() } else { String::new() };
-    if apop_salt.is_empty() {
-        writer.write_all(POP3_GREETING).await?;
-    } else {
-        writer
-            .write_all(format!("+OK POP3 ready {apop_salt}\r\n").as_bytes())
-            .await?;
+    if !conn.resumed {
+        if apop_salt.is_empty() {
+            writer.write_all(POP3_GREETING).await?;
+        } else {
+            writer
+                .write_all(format!("+OK POP3 ready {apop_salt}\r\n").as_bytes())
+                .await?;
+        }
+        writer.flush().await?;
     }
-    writer.flush().await?;
 
     let mut s = Session::new();
     // Set once `USER` has been accepted, so `PASS` knows a login is pending.
@@ -444,10 +498,23 @@ where
                 return Ok(());
             }
             "CAPA" => {
-                writer
-                    .write_all(b"+OK\r\nUSER\r\nSASL\r\n.\r\n")
-                    .await?;
+                let body = pop3_capa(server, conn);
+                writer.write_all(body.as_bytes()).await?;
+                writer.write_all(b"\r\n").await?;
                 writer.flush().await?;
+            }
+            "STLS" if server.starttls != crate::config::typed::StarttlsCfg::Off => {
+                if server.tls.is_none() {
+                    writer.write_all(b"-ERR TLS not configured\r\n").await?;
+                    writer.flush().await?;
+                } else {
+                    writer
+                        .write_all(b"+OK Begin TLS negotiation now\r\n")
+                        .await?;
+                    writer.flush().await?;
+                    conn.upgrade = true;
+                    return Ok(());
+                }
             }
             "NOOP" => {
                 writer.write_all(b"+OK\r\n").await?;
@@ -726,13 +793,16 @@ async fn imap<R, W>(
     writer: &mut BufWriter<W>,
     peer: &SocketAddr,
     server: &MailServer,
+    conn: &mut Conn,
 ) -> io::Result<()>
 where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    writer.write_all(IMAP_GREETING).await?;
-    writer.flush().await?;
+    if !conn.resumed {
+        writer.write_all(IMAP_GREETING).await?;
+        writer.flush().await?;
+    }
 
     let mut s = Session::new();
     loop {
@@ -771,16 +841,27 @@ where
                 writer.flush().await?;
             }
             "CAPABILITY" => {
+                let caps = imap_capability_line(server, conn);
+                writer.write_all(caps.as_bytes()).await?;
                 writer
-                    .write_all(
-                        format!(
-                            "* CAPABILITY IMAP4 AUTH={}\r\n{tag} OK\r\n",
-                            imap_mechanisms(server).join(" ")
-                        )
-                        .as_bytes(),
-                    )
+                    .write_all(format!("{tag} OK completed\r\n").as_bytes())
                     .await?;
                 writer.flush().await?;
+            }
+            "STARTTLS" if server.starttls != crate::config::typed::StarttlsCfg::Off => {
+                if server.tls.is_none() {
+                    writer
+                        .write_all(format!("{tag} NO TLS not configured\r\n").as_bytes())
+                        .await?;
+                    writer.flush().await?;
+                } else {
+                    writer
+                        .write_all(format!("{tag} OK Begin TLS negotiation now\r\n").as_bytes())
+                        .await?;
+                    writer.flush().await?;
+                    conn.upgrade = true;
+                    return Ok(());
+                }
             }
             "LOGOUT" => {
                 writer
@@ -958,6 +1039,115 @@ where
     }
 }
 
+/// SASL mechanism list in nginx's fixed order. `LOGIN` has no configuration
+/// flag in nginx and is therefore always present.
+fn sasl_methods(server: &MailServer) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if server.auth_plain {
+        out.push("PLAIN");
+    }
+    out.push("LOGIN");
+    if server.auth_cram_md5 {
+        out.push("CRAM-MD5");
+    }
+    if server.auth_external {
+        out.push("EXTERNAL");
+    }
+    out
+}
+
+/// `AUTH=` entries for IMAP. Unlike SASL, nginx does *not* list LOGIN here.
+fn imap_auth_entries(server: &MailServer) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if server.auth_plain {
+        out.push("AUTH=PLAIN");
+    }
+    if server.auth_cram_md5 {
+        out.push("AUTH=CRAM-MD5");
+    }
+    if server.auth_external {
+        out.push("AUTH=EXTERNAL");
+    }
+    out
+}
+
+/// Authentication is refused until TLS when `starttls only` is used.
+fn auth_blocked(server: &MailServer, conn: &Conn) -> bool {
+    server.starttls == crate::config::typed::StarttlsCfg::Only && !conn.tls
+}
+
+const IMAP_DEFAULT_CAPS: &str = "IMAP4 IMAP4rev1 UIDPLUS";
+const POP3_DEFAULT_CAPS: [&str; 3] = ["TOP", "USER", "UIDL"];
+
+/// One IMAP `CAPABILITY` reply, exactly as nginx composes it.
+fn imap_capability_line(server: &MailServer, conn: &Conn) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    match server.capabilities.as_ref() {
+        Some(c) => parts.extend(c.iter().cloned()),
+        None => parts.extend(IMAP_DEFAULT_CAPS.split(' ').map(|s| s.to_string())),
+    }
+    if !auth_blocked(server, conn) && !server.auth_none {
+        parts.extend(imap_auth_entries(server).into_iter().map(String::from));
+    }
+    if server.starttls != crate::config::typed::StarttlsCfg::Off {
+        parts.push("STARTTLS".to_string());
+    }
+    if server.starttls == crate::config::typed::StarttlsCfg::Only {
+        parts.push("LOGINDISABLED".to_string());
+    }
+    format!("* CAPABILITY {}\r\n", parts.join(" "))
+}
+
+/// The POP3 `CAPA` body.
+fn pop3_capa(server: &MailServer, conn: &Conn) -> String {
+    let mut lines = vec!["+OK Capability list follows".to_string()];
+    let blocked = auth_blocked(server, conn);
+    match server.capabilities.as_ref() {
+        Some(c) => lines.extend(c.iter().cloned()),
+        None => {
+            lines.extend(POP3_DEFAULT_CAPS.iter().map(|s| s.to_string()));
+        }
+    }
+    if blocked {
+        // `starttls only`: no USER, no SASL until the tunnel exists.
+        lines.retain(|l| l != "USER");
+    } else if !server.auth_none {
+        lines.push(format!("SASL {}", sasl_methods(server).join(" ")));
+    }
+    if server.starttls != crate::config::typed::StarttlsCfg::Off {
+        lines.push("STLS".to_string());
+    }
+    lines.push(".".to_string());
+    lines.join("\r\n")
+}
+
+/// The SMTP `EHLO` reply: one `250-` line per capability, the last one `250 `.
+fn smtp_ehlo(server: &MailServer, conn: &Conn) -> String {
+    let mut caps: Vec<String> = Vec::new();
+    if let Some(c) = server.capabilities.as_ref() {
+        caps.extend(c.iter().cloned());
+    }
+    if !auth_blocked(server, conn) && !server.auth_none {
+        caps.push(format!("AUTH {}", sasl_methods(server).join(" ")));
+    }
+    if server.starttls != crate::config::typed::StarttlsCfg::Off {
+        caps.push("STARTTLS".to_string());
+    }
+    let mut out = String::new();
+    if caps.is_empty() {
+        return format!("250 {}\r\n", server.name);
+    }
+    out.push_str(&format!("250-{}\r\n", server.name));
+    for (i, c) in caps.iter().enumerate() {
+        if i + 1 == caps.len() {
+            out.push_str(&format!("250 {c}\r\n"));
+        } else {
+            out.push_str(&format!("250-{c}\r\n"));
+        }
+    }
+    out
+}
+
 fn imap_mechanisms(server: &MailServer) -> Vec<&'static str> {
     let mut out = Vec::new();
     if server.auth_plain {
@@ -1000,16 +1190,19 @@ async fn smtp<R, W>(
     writer: &mut BufWriter<W>,
     peer: &SocketAddr,
     server: &MailServer,
+    conn: &mut Conn,
 ) -> io::Result<()>
 where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
     // nginx puts its own `server_name` in the banner.
-    writer
-        .write_all(format!("220 {} ESMTP ready\r\n", server.name).as_bytes())
-        .await?;
-    writer.flush().await?;
+    if !conn.resumed {
+        writer
+            .write_all(format!("220 {} ESMTP ready\r\n", server.name).as_bytes())
+            .await?;
+        writer.flush().await?;
+    }
 
     let mut s = Session::new();
     loop {
@@ -1028,13 +1221,21 @@ where
                 writer.flush().await?;
                 return Ok(());
             }
-            "EHLO" | "HELO" => {
-                let mechs = smtp_mechanisms(server);
-                let mut out = format!("250-{}\r\n", server.name);
-                if !mechs.is_empty() {
-                    out.push_str(&format!("250-AUTH {}\r\n", mechs.join(" ")));
+            "STARTTLS" if server.starttls != crate::config::typed::StarttlsCfg::Off => {
+                if server.tls.is_none() {
+                    writer.write_all(b"454 4.7.0 TLS not available\r\n").await?;
+                    writer.flush().await?;
+                } else {
+                    writer
+                        .write_all(b"220 2.0.0 Ready to start TLS\r\n")
+                        .await?;
+                    writer.flush().await?;
+                    conn.upgrade = true;
+                    return Ok(());
                 }
-                out.push_str("250 8BITMIME\r\n");
+            }
+            "EHLO" | "HELO" => {
+                let out = smtp_ehlo(server, conn);
                 writer.write_all(out.as_bytes()).await?;
                 writer.flush().await?;
             }

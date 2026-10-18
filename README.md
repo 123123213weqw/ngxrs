@@ -27,33 +27,48 @@ python3 tests/parity.py         # 差分测试：同一请求分别打 nginx / n
 
 ## 当前状态
 
-第一阶段：配置解析 + HTTP/1.1 keepalive + 静态文件（sendfile、ETag、Last-Modified、Range、条件请求、index、autoindex、301、try_files、return、add_header、access_log、Host 虚拟主机）。
+已实现（每一项都有同机 A/B 对照用例，不是"看起来能跑"）：
 
-当前实测（V100，wrk -t8 -c512 -d10s，详见 [BENCH.md](BENCH.md)）：
+- **配置**：自研 nginx 语法解析（引号/转义/`${var}`/`include` 通配）、`-t` 自检、`-T` dump、`-e`/`-g`、`-s reload|stop|quit|reopen`、SIGHUP 热重载、优雅停机
+- **HTTP/1.1**：keepalive、pipelining、Host 虚拟主机（精确/最长通配/尾缀/正则，完整 `server_name` 优先级）、`Expect: 100-continue`、定长与 chunked 请求体
+- **静态文件**：`sendfile(2)`、ETag/Last-Modified、条件请求、Range（单段 + 多段 `multipart/byteranges`）、index、autoindex、301、`try_files`
+- **路由**：location 全优先级、`rewrite`（last/break/redirect/permanent）、`if`/`set`、`return`、`error_page`（`=code`、外部 URL、内部 location、重跑 rewrite）
+- **反向代理**：`proxy_pass`（URI 前缀/变量）、`upstream`（rr/`least_conn`/`ip_hash`、weight/backup/down）、连接池 `keepalive`、WebSocket 101 双向管道、`proxy_bind`（源地址绑定）、`proxy_force_ranges`
+- **缓存**：`proxy_cache`（`levels`/`keys_zone`/`max_size`/`inactive`）、`proxy_cache_valid`、Vary 变体、cache lock、`proxy_cache_revalidate`（304 → `REVALIDATED`）、`STALE`/`UPDATING`、`proxy_cookie_domain|path|flags`
+- **上游协议**：FastCGI、uwsgi、SCGI
+- **其它**：`gzip`、`add_header`/`add_trailer`（含 `$sent_http_*`、`$sent_trailer_*`）、`expires`、`access_log`、`allow`/`deny`/`limit_except`、`limit_req`/`limit_conn`、`map`、`geo`
+- **TLS / HTTP2 / stream**：TLS 1.2–1.3 + SNI（精确/通配/默认回落选证）、ALPN `h2`（复用同一套路由表）、`stream {}` TCP/UDP 转发
 
-| 场景 | nginx 1.28 | ngxrs | 相对 |
-|---|---|---|---|
-| 1 KB | 464,628 rps | 438,367 rps | 94.3% |
-| 64 KB | 208,074 rps | 201,040 rps | 96.6%（p99 2.60 ms vs 32.74 ms） |
-| 1 MB | 30,802 rps | 29,849 rps | 96.9% |
+**未实现**：HTTP/3 (QUIC)、`grpc_pass`、`mail` 模块、SSI；`proxy_intercept_errors`、`error_log` 只有 notice 级。
+逐项兼容矩阵与已知语义差异见 [COMPAT.md](COMPAT.md)。
 
 ## 验证套件
 
 ```bash
-bash bench/all.sh     # 一键跑全部差分套件（当前 61 项全过）
+bash bench/all.sh     # 一键跑全部自有差分套件（当前 67 项全过）
 bash bench/pair.sh    # 静态/协议 19 项
 bash bench/feature.sh # gzip / error_page / 代理 / 负载均衡 / WebSocket / rewrite / cache / if 25 项
-bash bench/tls.sh     # SNI / TLS1.2-1.3 / HTTP2 8 项
-bash bench/fcgi.sh    # FastCGI + stream TCP/UDP 9 项
+bash bench/tls.sh     # SNI / TLS1.2-1.3 / HTTP2 9 项
+bash bench/fcgi.sh    # FastCGI / uwsgi / SCGI / stream TCP-UDP 14 项
 ```
 
-已实现模块：配置解析、HTTP/1.1、静态文件、rewrite/if/set、反向代理与负载均衡、
-`proxy_cache`、gzip、error_page、FastCGI、`stream {}` TCP/UDP、TLS+SNI、HTTP/2。
+每个套件都是"同一份配置起 nginx 与 ngxrs，发同一批请求，逐字节比对状态行/关键头/body"。
 
-完整的功能对等矩阵与差距见 [COMPAT.md](COMPAT.md)。尚未实现的部分（反向代理、TLS、HTTP/2、HTTP/3、gzip、fastcgi、stream、mail、cache 等）按矩阵逐项推进。
+另外接了 nginx 官方 Perl 测试集做 A/B（`bench/nginxtests.sh`、`bench/ntscan.sh`）：
+**绝对通过率没有意义**——nginx-tests master 依赖比 CPAN 更新的 `Test::Nginx`，很多用例对真 nginx 也是失败/阻塞。
+这两个脚本只报"nginx 过而 ngxrs 不过"的断言，那才是真缺陷。
 
-## 设计取舍
+最近一次全量扫描：63 个可运行文件中 **47 个断言数与 nginx 完全一致**，2 个优于 nginx
+（`http_headers_multi.t` 49 vs 48、`http_host.t` 58 vs 54）。
 
-- 线程模型：每核一个 worker 线程 + 独立 `SO_REUSEPORT` 监听 + current_thread runtime（连接不跨核迁移）；静态文件走 `sendfile(2)`，≤16 KB 的响应合并成一次 write。
-- 配置：自研 nginx 语法解析器（引号、转义、`${var}`、include 通配），不依赖第三方解析库；未知指令记录 warning 而不是直接失败（便于渐进兼容真实配置）。
-- 语义差异会显式记在 COMPAT.md，不做"看起来兼容"的静默降级。
+## 性能
+
+同机、同配置、同一时间窗 ABBA 交错，`wrk -t8 -c128 -d10s`，3 轮取中位数（详见 [BENCH.md](BENCH.md)）：
+
+| 场景 | nginx 1.28 | ngxrs | 相对 | 平均延迟 |
+|---|---|---|---|---|
+| 1 KB | 439,286 rps | 440,923 rps | **1.004×** | 540 µs → 380 µs |
+| 64 KB | 206,988 rps | 203,886 rps | 0.985× | 39.35 ms → **703 µs** |
+
+小文件基本持平；大文件的**平均延迟**因为我们的大文件路径没有 nginx 那样的多次拷贝而显著更低。
+高并发（c≥1024）时吞吐仍略低于 nginx，差距记在 COMPAT.md 里。

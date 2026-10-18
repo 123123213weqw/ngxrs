@@ -301,6 +301,77 @@ fn parse_auth_reply(head: &[u8]) -> AuthReply {
     }
 }
 
+/// Read one IMAP command, resolving `{N}` / `{N+}` literals.
+///
+/// A literal is appended to the logical line in escaped-quoted form so that
+/// `imap_arg` reproduces the original bytes exactly: literal content is raw and
+/// must not be unescaped, while a quoted string the client sent must be.
+fn literal_as_quoted(raw: &[u8]) -> String {
+    let mut out = String::from("\"");
+    for &b in raw {
+        if b == b'"' || b == b'\\' {
+            out.push('\\');
+        }
+        out.push(b as char);
+    }
+    out.push('"');
+    out
+}
+
+/// Split a trailing `{N}` / `{N+}` marker off an IMAP line.
+fn literal_marker(line: &str) -> Option<(usize, bool)> {
+    let t = line.trim_end();
+    let inner = t.strip_suffix('}')?;
+    let open = inner.rfind('{')?;
+    let spec = &inner[open + 1..];
+    let (digits, plus) = match spec.strip_suffix('+') {
+        Some(d) => (d, true),
+        None => (spec, false),
+    };
+    let n = digits.parse::<usize>().ok()?;
+    Some((n, plus))
+}
+
+/// Fill `buf` completely from `reader`.
+async fn read_exact<R: AsyncReadExt + Unpin>(reader: &mut R, buf: &mut [u8]) -> io::Result<()> {
+    let mut off = 0;
+    while off < buf.len() {
+        let n = reader.read(&mut buf[off..]).await?;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof"));
+        }
+        off += n;
+    }
+    Ok(())
+}
+
+/// Read one line, or `None` at end of stream.
+async fn read_line_plain_opt<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> io::Result<Option<String>> {
+    let mut buf = Vec::with_capacity(128);
+    loop {
+        let mut byte = [0u8; 1];
+        let n = reader.read(&mut byte).await?;
+        if n == 0 {
+            return Ok(if buf.is_empty() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(&buf).to_string())
+            });
+        }
+        if byte[0] == b'\n' {
+            return Ok(Some(String::from_utf8_lossy(&buf).to_string()));
+        }
+        if byte[0] != b'\r' {
+            buf.push(byte[0]);
+        }
+        if buf.len() > 8192 {
+            return Ok(Some(String::from_utf8_lossy(&buf).to_string()));
+        }
+    }
+}
+
 /// Read one line from an arbitrary reader (used for the upstream dialogue).
 async fn read_line_plain<R: AsyncReadExt + Unpin>(reader: &mut R) -> io::Result<String> {
     let mut buf = Vec::with_capacity(128);
@@ -356,7 +427,7 @@ where
     let mut have_user = false;
 
     loop {
-        let line = match read_line(reader).await {
+        let mut line = match read_line(reader).await {
             Ok(l) => l,
             Err(_) => return Ok(()),
         };
@@ -376,6 +447,10 @@ where
                 writer
                     .write_all(b"+OK\r\nUSER\r\nSASL\r\n.\r\n")
                     .await?;
+                writer.flush().await?;
+            }
+            "NOOP" => {
+                writer.write_all(b"+OK\r\n").await?;
                 writer.flush().await?;
             }
             "USER" => {
@@ -614,24 +689,22 @@ where
                 writer.flush().await?;
                 return Ok(None);
             }
-            // Without an initial response the client is prompted, exactly as
-            // nginx does, and the base64 line is forwarded to the backend.
-            let mut replay = String::from("AUTH EXTERNAL");
-            match arg {
-                Some(a) if !a.is_empty() => {
-                    replay.push(' ');
-                    replay.push_str(&a);
-                }
+            // nginx prompts with "Username:" (base64) for EXTERNAL, and the
+            // reply is the authorisation identity, not a password.
+            let ident = match arg {
+                Some(a) if !a.is_empty() => a.to_string(),
                 _ => {
-                    writer.write_all(b"+ \r\n").await?;
+                    writer.write_all(b"+ VXNlcm5hbWU6\r\n").await?;
                     writer.flush().await?;
-                    let r = read_line(reader).await?;
-                    replay.push(' ');
-                    replay.push_str(&r);
+                    read_line(reader).await?
                 }
-            }
+            };
             s.method = "external";
-            s.replay.extend_from_slice(format!("{replay}\r\n").as_bytes());
+            s.user = String::from_utf8_lossy(
+                &crate::util::base64_decode(&ident).unwrap_or_default(),
+            )
+            .to_string();
+            s.passwd.clear();
             Ok(Some(()))
         }
         _ => {
@@ -663,16 +736,40 @@ where
 
     let mut s = Session::new();
     loop {
-        let line = match read_line(reader).await {
+        let mut line = match read_line(reader).await {
             Ok(l) => l,
             Err(_) => return Ok(()),
         };
+        // Resolve any literals before parsing the command.
+        while let Some((n, non_sync)) = literal_marker(&line) {
+            if !non_sync {
+                writer.write_all(b"+ \r\n").await?;
+                writer.flush().await?;
+            }
+            let mut buf = vec![0u8; n];
+            if read_exact(reader, &mut buf).await.is_err() {
+                return Ok(());
+            }
+            let base = line.trim_end();
+            let trimmed_marker = &base[..base.rfind('{').unwrap_or(base.len())];
+            let rest = match read_line(reader).await {
+                Ok(l) => l,
+                Err(_) => return Ok(()),
+            };
+            line = format!("{trimmed_marker}{}{rest}", literal_as_quoted(&buf));
+        }
         let mut it = line.trim_end().splitn(3, ' ');
         let tag = it.next().unwrap_or("").to_string();
         let cmd = it.next().unwrap_or("").to_ascii_uppercase();
         let rest = it.next().unwrap_or("").to_string();
 
         match cmd.as_str() {
+            "NOOP" => {
+                writer
+                    .write_all(format!("{tag} OK NOOP completed\r\n").as_bytes())
+                    .await?;
+                writer.flush().await?;
+            }
             "CAPABILITY" => {
                 writer
                     .write_all(
@@ -711,7 +808,17 @@ where
                 s.replay
                     .extend_from_slice(format!("{line}\r\n").as_bytes());
                 if let Some(o) = authorise(writer, &s, server, peer, Protocol::Imap).await? {
-                    return proxy(o, reader, writer, &s.replay, server, Protocol::Imap).await;
+                    return proxy_n(
+                        o,
+                        reader,
+                        writer,
+                        &s.replay,
+                        server,
+                        Protocol::Imap,
+                        0,
+                        Some(s.tag.clone()),
+                    )
+                    .await;
                 }
             }
             "AUTHENTICATE" => {
@@ -730,10 +837,10 @@ where
                 // An inline initial response replaces the `+` continuation.
                 let inline = mp.next().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
                 s.method = match mech.as_str() {
-                    "PLAIN" => "PLAIN",
-                    "LOGIN" => "LOGIN",
-                    "CRAM-MD5" => "CRAM-MD5",
-                    "EXTERNAL" => "EXTERNAL",
+                    "PLAIN" => "plain",
+                    "LOGIN" => "login",
+                    "CRAM-MD5" => "cram-md5",
+                    "EXTERNAL" => "external",
                     _ => {
                         writer
                             .write_all(format!("{tag} NO unsupported\r\n").as_bytes())
@@ -746,7 +853,7 @@ where
                 s.replay
                     .extend_from_slice(format!("{line}\r\n").as_bytes());
                 match s.method {
-                    "PLAIN" => {
+                    "plain" => {
                         let resp = match inline.clone() {
                             Some(v) => v,
                             None => {
@@ -767,7 +874,7 @@ where
                         s.replay
                             .extend_from_slice(format!("{resp}\r\n").as_bytes());
                     }
-                    "LOGIN" => {
+                    "login" => {
                         let u = match inline.clone() {
                             Some(v) => v,
                             None => {
@@ -790,8 +897,9 @@ where
                         s.replay
                             .extend_from_slice(format!("{u}\r\n{p}\r\n").as_bytes());
                     }
-                    "CRAM-MD5" => {
-                        let challenge = crate::util::base64_encode(b"<1@ngxrs>");
+                    "cram-md5" => {
+                        let raw = b"<1@ngxrs>";
+                        let challenge = crate::util::base64_encode(raw);
                         writer
                             .write_all(format!("+ {challenge}\r\n").as_bytes())
                             .await?;
@@ -804,12 +912,40 @@ where
                         let mut sp = d.splitn(2, ' ');
                         s.user = sp.next().unwrap_or("").to_string();
                         s.passwd = sp.next().unwrap_or("").to_string();
-                        s.replay.extend_from_slice(format!("{r}\r\n").as_bytes());
+                        // `$auth_salt` is the decoded challenge, not the digest.
+                        s.salt = String::from_utf8_lossy(raw).to_string();
+                    }
+                    "external" => {
+                        // Same prompt as POP3/SMTP; the reply is the identity and
+                        // the password stays empty.
+                        let ident = match inline.clone() {
+                            Some(v) => v,
+                            None => {
+                                writer.write_all(b"+ VXNlcm5hbWU6\r\n").await?;
+                                writer.flush().await?;
+                                read_line(reader).await?
+                            }
+                        };
+                        s.user = String::from_utf8_lossy(
+                            &crate::util::base64_decode(&ident).unwrap_or_default(),
+                        )
+                        .to_string();
+                        s.passwd.clear();
                     }
                     _ => {}
                 }
                 if let Some(o) = authorise(writer, &s, server, peer, Protocol::Imap).await? {
-                    return proxy(o, reader, writer, &s.replay, server, Protocol::Imap).await;
+                    return proxy_n(
+                        o,
+                        reader,
+                        writer,
+                        &s.replay,
+                        server,
+                        Protocol::Imap,
+                        0,
+                        Some(s.tag.clone()),
+                    )
+                    .await;
                 }
             }
             _ => {
@@ -840,7 +976,20 @@ fn imap_mechanisms(server: &MailServer) -> Vec<&'static str> {
 fn imap_arg(s: &str) -> String {
     let s = s.trim();
     if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
-        s[1..s.len() - 1].to_string()
+        // IMAP quoted strings escape `"` and `\` with a backslash.
+        let mut out = String::new();
+        let mut esc = false;
+        for ch in s[1..s.len() - 1].chars() {
+            if esc {
+                out.push(ch);
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else {
+                out.push(ch);
+            }
+        }
+        out
     } else {
         s.to_string()
     }
@@ -1052,6 +1201,7 @@ where
                             server,
                             Protocol::Smtp,
                             discard,
+                            None,
                         )
                         .await;
                     }
@@ -1093,6 +1243,10 @@ struct Upstream {
     /// Credentials the authenticator supplied, used when the client only sent a
     /// digest (nginx replaces them before replaying to the backend).
     replay: Vec<u8>,
+    /// Replies the client has already been given; the backend's must be dropped.
+    discard: usize,
+    /// IMAP only: credentials for the `LOGIN` we issue to the backend.
+    imap_login: Option<(String, String)>,
 }
 
 /// Ask `auth_http` and render the outcome to the client.
@@ -1139,9 +1293,40 @@ where
             writer.flush().await?;
             return Ok(None);
         };
+        // nginx talks `USER`/`PASS` to a POP3 backend no matter which mechanism
+        // the client used, and `Auth-User`/`Auth-Pass` overwrite the client's.
+        if protocol == Protocol::Pop3 {
+            let login = reply.user.clone().unwrap_or_else(|| s.user.clone());
+            let passwd = reply.pass.clone().unwrap_or_else(|| s.passwd.clone());
+            let mut replay = Vec::new();
+            replay.extend_from_slice(format!("USER {login}\r\n").as_bytes());
+            replay.extend_from_slice(format!("PASS {passwd}\r\n").as_bytes());
+            // Measured against nginx: the reply to `USER` is swallowed, the one
+            // to `PASS` is relayed and is what the client sees as its `+OK`.
+            return Ok(Some(Upstream {
+                addr,
+                replay,
+                discard: 1,
+                imap_login: None,
+            }));
+        }
+        // nginx's IMAP proxy issues `LOGIN` with literals whatever mechanism the
+        // client used, and the backend's reply to it is the client's answer.
+        if protocol == Protocol::Imap {
+            let login = reply.user.clone().unwrap_or_else(|| s.user.clone());
+            let passwd = reply.pass.clone().unwrap_or_else(|| s.passwd.clone());
+            return Ok(Some(Upstream {
+                addr,
+                replay: Vec::new(),
+                discard: 0,
+                imap_login: Some((login, passwd)),
+            }));
+        }
         return Ok(Some(Upstream {
             addr,
             replay: s.replay.clone(),
+            discard: 0,
+            imap_login: None,
         }));
     }
 
@@ -1201,7 +1386,7 @@ where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    proxy_n(up, reader, writer, replay, server, protocol, 0).await
+    proxy_n(up, reader, writer, replay, server, protocol, 0, None).await
 }
 
 /// Same, but swallow `discard` replies the client has already been given.
@@ -1214,6 +1399,7 @@ async fn proxy_n<R, W>(
     server: &MailServer,
     protocol: Protocol,
     discard: usize,
+    imap_tag: Option<String>,
 ) -> io::Result<()>
 where
     R: AsyncReadExt + Unpin,
@@ -1232,22 +1418,44 @@ where
     let _ = backend.set_nodelay(true);
     let (mut brd, mut bwr) = backend.into_split();
 
-    // nginx re-runs the SMTP dialogue with the backend: the client already got
-    // its greeting from us, so the upstream one is dropped along with the reply
-    // to our own HELO. Forwarding either would put a `220`/`250` in front of
-    // the `235` the client is waiting for.
+    // Every protocol has already been greeted by us, so the backend's banner is
+    // never the client's to see; forwarding it shifts every later reply by one.
+    let _greeting = read_line_plain(&mut brd).await.unwrap_or_default();
+
+    // nginx re-runs an SMTP dialogue with the backend, so the reply to our own
+    // EHLO is also consumed.
     if protocol == Protocol::Smtp {
-        let _greeting = read_line_plain(&mut brd).await.unwrap_or_default();
         bwr.write_all(format!("EHLO {}\r\n", server.name).as_bytes()).await?;
         bwr.flush().await?;
         let _helo = read_line_plain(&mut brd).await.unwrap_or_default();
     }
 
-    if !up.replay.is_empty() {
+    // IMAP: nginx issues `LOGIN` with literals and waits for the server's `+`
+    // before sending each argument. The wait is not cosmetic -- a server that
+    // reads with buffered line input (Perl's `<>`) would otherwise swallow the
+    // literal into its own buffer and hang waiting for bytes already delivered.
+    if let Some((login, passwd)) = up.imap_login.clone() {
+        let tag = imap_tag.as_deref().unwrap_or("*");
+        bwr.write_all(format!("{tag} LOGIN {{{}}}\r\n", login.len()).as_bytes())
+            .await?;
+        bwr.flush().await?;
+        let _cont = read_line_plain(&mut brd).await.unwrap_or_default();
+        bwr.write_all(format!("{login} {{{}}}\r\n", passwd.len()).as_bytes())
+            .await?;
+        bwr.flush().await?;
+        let _cont = read_line_plain(&mut brd).await.unwrap_or_default();
+        bwr.write_all(format!("{passwd}\r\n").as_bytes()).await?;
+        bwr.flush().await?;
+        if let Some(reply) = read_line_plain_opt(&mut brd).await? {
+            writer.write_all(reply.as_bytes()).await?;
+            writer.write_all(b"\r\n").await?;
+            writer.flush().await?;
+        }
+    } else if !up.replay.is_empty() {
         bwr.write_all(&up.replay).await?;
         bwr.flush().await?;
         // Replies the client has already been given must not be repeated.
-        for _ in 0..discard {
+        for _ in 0..(discard + up.discard) {
             let _ = read_line_plain(&mut brd).await;
         }
     }

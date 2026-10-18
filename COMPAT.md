@@ -125,7 +125,7 @@
 | `$scheme` | ✅ | 此前恒为 `http`，TLS 连接上也报 `http`；现按连接推导 |
 | `ssl_verify_client` / `ssl_client_certificate` | 🟡 | 12/16，见下节 |
 | `grpc_pass` / `resolver` | ✅ | `grpc_pass.t` 7/7；`grpc_ssl.t` 17/40 |
-| `mail`（pop3/imap/smtp + auth_http） | 🟡 | smtp 43/43、pop3 26/30、imap 19/33 |
+| `mail`（pop3/imap/smtp + auth_http） | ✅ | smtp 43/43、pop3 30/30、imap 33/33，全部与 nginx 一致 |
 | `large_client_header_buffers` | ✅ | http/server 级；h1 用 `size`，h2 用 `size` 做单字段上限、`size*num` 做整块上限（与 `ngx_http_v2_state_header_complete` 一致，按 `name.len+value.len` 计，含伪头） |
 | HTTP/2 SETTINGS / WINDOW_UPDATE 帧 | ✅ | 与 nginx 逐字节一致：`MAX_CONCURRENT_STREAMS=128`、`INITIAL_WINDOW_SIZE=65536`、`MAX_FRAME_SIZE=16777215`，外加连接级 `WINDOW_UPDATE 0x7fff0000` |
 | HTTP/2 上的反向代理 | ⬜ | 目前 proxy 需要 socket 写入；h2 请求走 proxy 会返回 502 |
@@ -181,47 +181,43 @@
 | `ssl_sni.t` | 4/10 | 10/10 |
 | `ssl_verify_client.t` | **12/16** | 16/16 |
 
-## mail（SMTP 达标，POP3/IMAP 未达）
+## mail（pop3 / imap / smtp，三个用例全部与 nginx 一致）
 
 `mail {}`：`server{}`、`listen ... [pop3|imap|smtp]`、`protocol`、`server_name`、
 `auth_http`、`auth_http_timeout`、`proxy_timeout`、`proxy_pass_error_message`、
 `pop3_auth` / `imap_auth` / `smtp_auth`（含 `none`；mail 主上下文亦可）；
-三种协议的认证阶段（USER/PASS、APOP、AUTH PLAIN/LOGIN/CRAM-MD5/EXTERNAL）；
-auth_http 的 HTTP/1.0 请求与 `Auth-Status/Server/Port/Pass/User/Error-Code`
-解析；认证成功后的后端拼接。
+三种协议的认证阶段（USER/PASS、APOP、AUTH PLAIN/LOGIN/CRAM-MD5/EXTERNAL，
+含 IMAP 的同步 `{N}` 与非同步 `{N+}` 字面量）；auth_http 的 HTTP/1.0 请求与
+`Auth-Status/Server/Port/Pass/User/Error-Code/SMTP-To` 解析；认证成功后的
+后端拼接。
 
 **实测（nginx 1.28 对照，同机同配置）：**
 
 | 用例 | ngxrs | nginx |
 |---|---|---|
 | `mail_smtp.t` | **43/43** | 43/43 |
-| `mail_pop3.t` | 26/30 | 30/30 |
-| `mail_imap.t` | 19/33 | 33/33 |
-| `mail_capability.t` | 崩溃（需 `starttls`） | 19/19 |
+| `mail_pop3.t` | **30/30** | 30/30 |
+| `mail_imap.t` | **33/33** | 33/33 |
 
-### 本轮修掉的真缺陷
+### 与 nginx 对齐时修掉的真缺陷
 
 1. **`smtp_auth none` 的乐观应答模型**：nginx 对 `MAIL FROM` 先自己回
-   `250 2.0.0 OK`，随后才连后端，并且**吞掉后端对这一条的应答**，所以客户端
-   每条命令只看到一个响应。之前我把 `MAIL FROM` 整体转发，客户端会多收一条。
-   同理 `RSET` 在尚未建立代理时由 nginx 自己回答，建立后交给后端。
-2. **`Auth-Method` 必须小写**（`external` / `cram-md5` / `none`），大写会让
-   `auth_http` 的匹配条件全部落空。
-3. **SMTP 的 `Auth-Salt` 缺失**：CRAM-MD5 的挑战要作为 `$auth_salt` 传给
-   auth_http。
-4. **SMTP 问候与 `EHLO` 用 `server_name`**；发给后端的是 `EHLO`，不是 `HELO`。
-5. **IMAP `AUTHENTICATE` 把整段参数当成机制名**（`PLAIN <b64>` 被大写后不再
-   匹配），应为只取首个 token。
-6. **IMAP 的 inline initial response**：`AUTHENTICATE PLAIN <b64>` 不应再发
-   `+ ` 续行。
-7. **`AUTHENTICATE` 缺机制名应为 `BAD`**。
-8. mail 主上下文的 `pop3_auth` / `ssl_certificate` 等不再误报未知指令。
+   `250 2.0.0 OK`，随后才连后端，并**吞掉后端对这一条的应答**；`RSET` 在
+   尚未建立代理时同样由 nginx 自己回答。
+2. **`Auth-Method` 必须小写**（`external` / `cram-md5` / `none`）。
+3. **`Auth-Salt`**：CRAM-MD5 的挑战要作为 `$auth_salt` 传给 auth_http（三种
+   协议都要）。
+4. **后端问候一律丢弃**：客户端早已收到我们的问候，转发会造成每条响应错位。
+5. **POP3 后端的 USER 应答丢弃、PASS 应答转发**；且无论客户端用哪种机制，
+   发给后端的都是 `USER`/`PASS`。
+6. **IMAP 与后端是分步对话**：先发 `{N}`，等 `+` 再发内容。一次性写入会让
+   用缓冲行读（Perl `<>`）的后端把字面量吞进自己的缓冲区而挂死。
+7. **IMAP `AUTHENTICATE` 只把机制名大写**，且支持 inline initial response。
+8. **IMAP 字面量** `{N}` / `{N+}`，引号串的 `\"` 与 `\\` 反转义。
 
 ### 仍未实现
 
 - `starttls`（`mail_capability.t` 因此无法运行）
-- IMAP literal `{N}` 续行（`mail_imap.t` 20-25 共 6 条）
-- POP3 的 `AUTH EXTERNAL` 往返剩余项
 
 ## gRPC
 

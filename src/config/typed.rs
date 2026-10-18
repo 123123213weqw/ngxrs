@@ -328,6 +328,8 @@ pub struct AccessRule {
     pub deny: bool,
     /// `None` means `all`.
     pub net: Option<Cidr>,
+    /// `allow unix:` / `deny unix:` matches only clients on a unix socket.
+    pub unix: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -389,10 +391,20 @@ fn parse_rate_spec(spec: &str) -> Option<f64> {
 
 /// `ngx_http_access_module`: first matching rule wins, default is allow.
 pub fn access_denied(rules: &[AccessRule], ip: std::net::IpAddr) -> bool {
+    access_denied_for(rules, ip, false)
+}
+
+/// `is_unix` is true for a connection accepted on `listen unix:`; nginx allows
+/// `allow unix:` / `deny unix:` to target exactly those.
+pub fn access_denied_for(rules: &[AccessRule], ip: std::net::IpAddr, is_unix: bool) -> bool {
     for r in rules {
-        let matches = match &r.net {
-            None => true,
-            Some(c) => c.contains(ip),
+        let matches = if r.unix {
+            is_unix
+        } else {
+            match &r.net {
+                None => true,
+                Some(c) => c.contains(ip),
+            }
         };
         if matches {
             return r.deny;
@@ -774,6 +786,8 @@ pub enum ProxyTarget {
     Addr(SocketAddr),
     /// Reference to an `upstream {}` block.
     Upstream(usize),
+    /// `proxy_pass http://unix:/path:...`: a unix-domain socket.
+    Unix(std::sync::Arc<std::path::PathBuf>),
 }
 
 #[derive(Debug, Clone)]
@@ -855,9 +869,44 @@ pub struct Server {
     pub http2: bool,
 }
 
-#[derive(Debug, Clone)]
+/// Stand-in `SocketAddr` for a unix listener, which has no address or port.
+/// `ListenGroup::unix` is what callers must consult.
+pub const UNIX_PLACEHOLDER: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
+
+/// A `listen` target: a TCP/UDP socket or a unix-domain path.
+///
+/// nginx treats them as separate namespaces; a unix listener has no address or
+/// port, which is why `ListenGroup` keeps the path alongside a synthetic
+/// `SocketAddr`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ListenAddr {
+    Tcp(SocketAddr),
+    Unix(std::sync::Arc<std::path::PathBuf>),
+}
+
+impl ListenAddr {
+    /// `None` for a unix socket: nginx has no port to report.
+    pub fn port(&self) -> Option<u16> {
+        match self {
+            ListenAddr::Tcp(a) => Some(a.port()),
+            ListenAddr::Unix(_) => None,
+        }
+    }
+
+    pub fn syslog_form(&self) -> String {
+        match self {
+            ListenAddr::Tcp(a) => a.to_string(),
+            ListenAddr::Unix(p) => format!("unix:{}", p.display()),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct ListenGroup {
     pub addr: SocketAddr,
+    /// Set for `listen unix:`. `addr` is then a placeholder.
+    pub unix: Option<std::sync::Arc<std::path::PathBuf>>,
     pub servers: Vec<usize>,
     pub default_server: usize,
     /// True when any server on this socket enabled TLS.
@@ -1171,6 +1220,23 @@ pub fn parse_proxy_pass(url: &str) -> Option<ProxyPass> {
     } else {
         return None;
     };
+    // `unix:/path/to.sock[:uri]`. nginx takes the first `:` after the path
+    // prefix as the URI separator, so `unix:/tmp/a.sock:/x` -> path + `/x`.
+    if let Some(rest_unix) = rest.strip_prefix("unix:") {
+        let (path, uri) = match rest_unix.find(':') {
+            Some(i) => (&rest_unix[..i], Some(rest_unix[i + 1..].to_string())),
+            None => (rest_unix, None),
+        };
+        if path.is_empty() {
+            return None;
+        }
+        return Some(ProxyPass {
+            target: ProxyTarget::Unix(std::sync::Arc::new(std::path::PathBuf::from(path))),
+            uri,
+            host_header: "localhost".to_string(),
+            https: false,
+        });
+    }
     let (authority, uri) = match rest.find('/') {
         Some(i) => (&rest[..i], Some(rest[i..].to_string())),
         None => (rest, None),
@@ -1205,6 +1271,10 @@ pub fn proxy_upstream_name(url: &str) -> Option<String> {
     let rest = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))?;
+    // `unix:/path` is a socket path, never an `upstream {}` name.
+    if rest.starts_with("unix:") {
+        return None;
+    }
     let authority = match rest.find('/') {
         Some(i) => &rest[..i],
         None => rest,
@@ -1338,6 +1408,19 @@ fn resolve_proxy_upstreams(http: &mut Http) -> Result<(), ConfigError> {
     }
     let _ = http;
     Ok(())
+}
+
+/// `listen unix:/path` in addition to the TCP forms.
+pub fn parse_listen_any(s: &str) -> Option<ListenAddr> {
+    if let Some(path) = s.strip_prefix("unix:") {
+        if path.is_empty() {
+            return None;
+        }
+        return Some(ListenAddr::Unix(std::sync::Arc::new(
+            std::path::PathBuf::from(path),
+        )));
+    }
+    parse_listen(s).map(ListenAddr::Tcp)
 }
 
 fn parse_listen(s: &str) -> Option<SocketAddr> {
@@ -2082,12 +2165,21 @@ impl Builder {
                     .args
                     .first()
                     .ok_or_else(|| sem(&d.file, d.line, "allow/deny requires an address"))?;
-                let net = parse_cidr(v)
-                    .ok_or_else(|| sem(&d.file, d.line, format!("invalid address \"{v}\"")))?;
-                cfg.access.push(AccessRule {
-                    deny: d.name == "deny",
-                    net,
-                });
+                if v == "unix:" {
+                    cfg.access.push(AccessRule {
+                        deny: d.name == "deny",
+                        net: None,
+                        unix: true,
+                    });
+                } else {
+                    let net = parse_cidr(v)
+                        .ok_or_else(|| sem(&d.file, d.line, format!("invalid address \"{v}\"")))?;
+                    cfg.access.push(AccessRule {
+                        deny: d.name == "deny",
+                        net,
+                        unix: false,
+                    });
+                }
             }
             "limit_except" => {
                 let block = d
@@ -2103,12 +2195,21 @@ impl Builder {
                         let v = child.args.first().ok_or_else(|| {
                             sem(&child.file, child.line, "allow/deny requires an address")
                         })?;
+                        if v == "unix:" {
+                            le.rules.push(AccessRule {
+                                deny: child.name == "deny",
+                                net: None,
+                                unix: true,
+                            });
+                            continue;
+                        }
                         let net = parse_cidr(v).ok_or_else(|| {
                             sem(&child.file, child.line, format!("invalid address \"{v}\""))
                         })?;
                         le.rules.push(AccessRule {
                             deny: child.name == "deny",
                             net,
+                            unix: false,
                         });
                     }
                 }
@@ -2742,7 +2843,7 @@ impl Builder {
         http_http2: bool,
         http_header_field_limit: usize,
         http_header_bufs: usize,
-    ) -> Result<(Server, Vec<(SocketAddr, bool, bool, bool)>), ConfigError> {
+    ) -> Result<(Server, Vec<(ListenAddr, bool, bool, bool)>), ConfigError> {
         let block = d
             .block
             .as_ref()
@@ -2755,7 +2856,7 @@ impl Builder {
         // (addr, is_default, ssl): TLS is decided per listen socket, not per
         // server — nginx lets one server block serve `listen 8081;` alongside
         // `listen 8082 ssl;`.
-        let mut listens: Vec<(SocketAddr, bool, bool, bool)> = Vec::new();
+        let mut listens: Vec<(ListenAddr, bool, bool, bool)> = Vec::new();
         let mut keepalive = http_keepalive;
         let mut tokens = http_tokens;
         let mut access_log_off = false;
@@ -2779,7 +2880,7 @@ impl Builder {
                     let addr = child
                         .args
                         .first()
-                        .and_then(|a| parse_listen(a))
+                        .and_then(|a| parse_listen_any(a))
                         .ok_or_else(|| {
                             sem(
                                 &child.file,
@@ -2998,7 +3099,7 @@ impl Builder {
 
         if listens.is_empty() {
             listens.push((
-                SocketAddr::from((Ipv4Addr::UNSPECIFIED, 80)),
+                ListenAddr::Tcp(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 80))),
                 false,
                 ssl,
                 false,
@@ -3803,8 +3904,8 @@ pub fn build(
         }
     }
 
-    let mut groups: BTreeMap<u16, ListenGroup> = BTreeMap::new();
-    let mut listens_by_server: Vec<(usize, Vec<(SocketAddr, bool, bool, bool)>)> = Vec::new();
+    let mut groups: BTreeMap<String, ListenGroup> = BTreeMap::new();
+    let mut listens_by_server: Vec<(usize, Vec<(ListenAddr, bool, bool, bool)>)> = Vec::new();
 
     for (i, sd) in server_dirs.iter().enumerate() {
         let (server, listens) = b.parse_server(
@@ -3850,24 +3951,39 @@ pub fn build(
 
     // QUIC lives on UDP, so `<port>/tcp` and `<port>/udp` are distinct
     // sockets; keying both by port would merge them.
-    let mut quic_groups: BTreeMap<u16, ListenGroup> = BTreeMap::new();
+    let mut quic_groups: BTreeMap<String, ListenGroup> = BTreeMap::new();
 
     for (idx, listens) in listens_by_server {
         for (addr, is_default, listen_ssl, listen_quic) in listens {
-            let table = if listen_quic {
+            let table: &mut BTreeMap<String, ListenGroup> = if listen_quic {
                 &mut quic_groups
             } else {
                 &mut groups
             };
-            let group = table.entry(addr.port()).or_insert_with(|| ListenGroup {
-                addr,
+            // nginx groups servers by *listening socket*, i.e. by address and
+            // port together: `listen 127.0.0.1:8081` and `listen [::1]:8081`
+            // are two sockets even though they share a port. Keying by port
+            // alone silently dropped one of them.
+            let (key, tcp_addr, unix) = match &addr {
+                ListenAddr::Tcp(a) => (format!("tcp:{a}"), *a, None),
+                ListenAddr::Unix(p) => (
+                    format!("unix:{}", p.display()),
+                    UNIX_PLACEHOLDER,
+                    Some(p.clone()),
+                ),
+            };
+            let group = table.entry(key).or_insert_with(|| ListenGroup {
+                addr: tcp_addr,
+                unix,
                 servers: Vec::new(),
                 default_server: 0,
                 ssl: listen_ssl,
                 quic: listen_quic,
             });
-            if addr.ip().is_unspecified() {
-                group.addr = addr;
+            if let ListenAddr::Tcp(a) = &addr {
+                if a.ip().is_unspecified() {
+                    group.addr = *a;
+                }
             }
             if !group.servers.contains(&idx) {
                 group.servers.push(idx);

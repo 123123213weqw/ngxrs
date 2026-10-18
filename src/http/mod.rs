@@ -189,7 +189,7 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
     let mut idle = Box::pin(tokio::time::sleep(keepalive_timeout));
     // Peer and local addresses never change over a connection; rendering them
     // per request cost two allocations each time.
-    let client_ip_owned = conn.peer.ip().to_string();
+    let client_ip_owned = conn.peer_ip_str();
     let local_ip_owned = conn
         .local_addr()
         .map(|a| a.ip().to_string())
@@ -228,7 +228,7 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
                 // nginx runs error_page even for requests its parser rejects
                 // (e.g. `Host: .`), using the default server of this socket.
                 let default_server = http.server(group.default_server);
-                let peer = conn.peer.ip().to_string();
+                let peer = conn.peer_ip_str();
                 let synthetic = Request {
                     method: Method::Get,
                     raw_target: "/".to_string(),
@@ -544,21 +544,25 @@ async fn access_phase(
     vars: &ServerVars<'_>,
     sets: &mut Vec<(String, String)>,
 ) -> Option<Response> {
+    // nginx reports `unix:` as the peer address for a unix socket, which does
+    // not parse as an IP; `peer_unix` is what `allow unix:` keys off.
     let peer_addr: std::net::IpAddr = vars
         .peer_ip
         .parse()
         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let peer_unix = vars.peer_ip == "unix:";
 
     for le in &loc.limit_except {
         // `limit_except` applies to every method *except* the listed ones.
         let m = req.method.as_str();
-        if !le.methods.iter().any(|x| x == m) && crate::config::access_denied(&le.rules, peer_addr)
+        if !le.methods.iter().any(|x| x == m)
+            && crate::config::access_denied_for(&le.rules, peer_addr, peer_unix)
         {
             return Some(error_response(403, server.server_tokens));
         }
     }
 
-    let access_code: u16 = if crate::config::access_denied(&loc.access, peer_addr) {
+    let access_code: u16 = if crate::config::access_denied_for(&loc.access, peer_addr, peer_unix) {
         403
     } else {
         0
@@ -3228,7 +3232,7 @@ async fn dispatch(
         }
         let root = loc.root.to_string_lossy().to_string();
         let _ = root;
-        let peer = conn.peer.ip().to_string();
+        let peer = conn.peer_ip_str();
         let resp = finalize_response(
             req,
             &mut r,
@@ -3304,7 +3308,7 @@ async fn dispatch(
             loc,
             server,
             http,
-            &conn.peer.ip().to_string(),
+            &conn.peer_ip_str(),
             peer_port,
             listen_port,
             state,
@@ -3312,7 +3316,7 @@ async fn dispatch(
         )
         .await;
         if let Some(mut d) = denied {
-            let peer = conn.peer.ip().to_string();
+            let peer = conn.peer_ip_str();
             let resp = finalize_response(
                 req,
                 &mut d,
@@ -3538,7 +3542,7 @@ async fn dispatch(
                 // status stays the upstream one (nginx keeps `err_status`).
                 let mut resp = error_response(status, false);
                 let preserved = headers;
-                let peer_ip = conn.peer.ip().to_string();
+                let peer_ip = conn.peer_ip_str();
                 let mut set_vars_owned = set_vars.clone();
                 resp = finalize_response(
                     req,
@@ -3595,7 +3599,7 @@ async fn dispatch(
         }
     }
 
-    let peer_ip = conn.peer.ip().to_string();
+    let peer_ip = conn.peer_ip_str();
     let resp = render_resolved_vars(
         req,
         path,

@@ -468,7 +468,29 @@ fn worker_main(
     rt.block_on(async move {
         let cfg = ctx.cfg();
         let mut listeners: Vec<(Arc<TcpListener>, usize)> = Vec::new();
+        let mut unix_listeners: Vec<(Arc<tokio::net::UnixListener>, usize)> = Vec::new();
         for (gi, group) in cfg.http.groups.iter().enumerate() {
+            if let Some(path) = &group.unix {
+                match unix_bind(path) {
+                    Ok(l) => {
+                        if wid == 0 {
+                            eprintln!(
+                                "ngxrs: listening on unix:{} ({} server{})",
+                                path.display(),
+                                group.servers.len(),
+                                if group.servers.len() == 1 { "" } else { "s" }
+                            );
+                        }
+                        unix_listeners.push((Arc::new(l), gi));
+                    }
+                    Err(e) => {
+                        if wid == 0 {
+                            eprintln!("ngxrs: cannot bind unix:{}: {e}", path.display());
+                        }
+                    }
+                }
+                continue;
+            }
             match bind(group.addr, true) {
                 Ok(l) => {
                     if wid == 0 {
@@ -489,7 +511,14 @@ fn worker_main(
             }
         }
 
-        if wid == 0 && listeners.is_empty() {
+        // Nothing bound at all means the configuration has no usable listener;
+        // fail so the parent reports the error instead of hanging. Unix sockets
+        // and QUIC endpoints count: a `listen unix:`-only server is valid.
+        if wid == 0
+            && listeners.is_empty()
+            && unix_listeners.is_empty()
+            && cfg.http.quic_groups.is_empty()
+        {
             std::process::exit(1);
         }
         if let Some(tx) = ready {
@@ -532,6 +561,14 @@ fn worker_main(
             let shutdown = shutdown.clone();
             tasks.push(tokio::spawn(async move {
                 accept_loop(listener, gi, ctx, shutdown, stopping).await;
+            }));
+        }
+        for (listener, gi) in unix_listeners {
+            let ctx = ctx.clone();
+            let stopping = stopping.clone();
+            let shutdown = shutdown.clone();
+            tasks.push(tokio::spawn(async move {
+                unix_accept_loop(listener, gi, ctx, shutdown, stopping).await;
             }));
         }
         for t in tasks {
@@ -588,6 +625,52 @@ fn bind(addr: SocketAddr, reuse_port: bool) -> io::Result<TcpListener> {
     sock.bind(&addr.into())?;
     sock.listen(65535)?;
     TcpListener::from_std(sock.into())
+}
+
+/// `listen unix:/path`. nginx unlinks a stale socket file before binding.
+fn unix_bind(path: &std::path::Path) -> io::Result<tokio::net::UnixListener> {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::remove_file(path);
+    let listener = std::os::unix::net::UnixListener::bind(path)?;
+    listener.set_nonblocking(true)?;
+    tokio::net::UnixListener::from_std(listener)
+}
+
+async fn unix_accept_loop(
+    listener: Arc<tokio::net::UnixListener>,
+    group_idx: usize,
+    ctx: Arc<Ctx>,
+    mut shutdown: watch::Receiver<bool>,
+    stopping: Arc<AtomicBool>,
+) {
+    loop {
+        if stopping.load(Ordering::Relaxed) {
+            return;
+        }
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            res = listener.accept() => {
+                match res {
+                    Ok((stream, _)) => {
+                        let ctx = ctx.clone();
+                        tokio::spawn(async move {
+                            let cfg = ctx.cfg();
+                            let mut conn = Conn::new(
+                                Stream::Unix(stream),
+                                crate::config::typed::UNIX_PLACEHOLDER,
+                                cfg.http.tcp_nopush,
+                            );
+                            conn.peer_unix = true;
+                            http::handle_conn(conn, cfg, group_idx, &ctx).await;
+                        });
+                    }
+                    Err(_) => return,
+                }
+            }
+        }
+    }
 }
 
 async fn accept_loop(

@@ -29,6 +29,9 @@ impl From<io::Error> for RecvError {
 pub enum Stream {
     Plain(TcpStream),
     Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
+    /// `listen unix:/path`. nginx forbids `ssl` on a unix socket, so there is
+    /// no TLS variant of this.
+    Unix(tokio::net::UnixStream),
 }
 
 impl Stream {
@@ -36,11 +39,16 @@ impl Stream {
         match self {
             Stream::Plain(s) => Some(s),
             Stream::Tls(s) => Some(s.get_ref().0),
+            Stream::Unix(_) => None,
         }
     }
 
     pub fn is_tls(&self) -> bool {
         matches!(self, Stream::Tls(_))
+    }
+
+    pub fn is_unix(&self) -> bool {
+        matches!(self, Stream::Unix(_))
     }
 }
 
@@ -53,6 +61,7 @@ impl AsyncRead for Stream {
         match self.get_mut() {
             Stream::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
             Stream::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            Stream::Unix(s) => std::pin::Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -66,6 +75,7 @@ impl AsyncWrite for Stream {
         match self.get_mut() {
             Stream::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
             Stream::Tls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            Stream::Unix(s) => std::pin::Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -76,6 +86,7 @@ impl AsyncWrite for Stream {
         match self.get_mut() {
             Stream::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
             Stream::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
+            Stream::Unix(s) => std::pin::Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -86,6 +97,7 @@ impl AsyncWrite for Stream {
         match self.get_mut() {
             Stream::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
             Stream::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            Stream::Unix(s) => std::pin::Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -128,7 +140,12 @@ impl Conn {
 
 pub struct Conn {
     stream: Stream,
+    /// Synthesisable for a unix socket, where there is no peer address. Check
+    /// `peer_unix` before reporting it: nginx prints `unix:` as `$remote_addr`.
     pub peer: SocketAddr,
+    /// Connected over `listen unix:`. `allow unix:` and `$remote_addr` depend
+    /// on this, not on `peer`.
+    pub peer_unix: bool,
     pub tcp_nopush: bool,
     buf: Vec<u8>,
     start: usize,
@@ -174,10 +191,21 @@ impl Conn {
         Some(info)
     }
 
+    /// `$remote_addr`. nginx reports the literal `unix:` for a unix socket,
+    /// where there is no address at all.
+    pub fn peer_ip_str(&self) -> String {
+        if self.peer_unix {
+            "unix:".to_string()
+        } else {
+            self.peer.ip().to_string()
+        }
+    }
+
     pub fn new(stream: Stream, peer: SocketAddr, tcp_nopush: bool) -> Self {
         Conn {
             stream,
             peer,
+            peer_unix: false,
             tcp_nopush,
             // Grown on demand: a request head is a few hundred bytes, and a
             // 16 KB reservation per connection costs more in cache misses than
@@ -441,7 +469,9 @@ impl Conn {
     pub async fn send_file(&mut self, file: &File, offset: u64, len: u64) -> io::Result<u64> {
         match &mut self.stream {
             Stream::Plain(tcp) => send_file_impl(tcp, file, offset, len).await,
-            // TLS cannot use sendfile: copy through a bounded buffer instead.
+            // TLS cannot use sendfile, and neither can a unix socket (which
+            // nginx also serves through a buffered copy): fall through to the
+            // bounded-buffer path.
             stream => {
                 use std::os::unix::fs::FileExt;
                 let mut remaining = len;

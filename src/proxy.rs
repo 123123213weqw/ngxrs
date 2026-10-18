@@ -23,8 +23,62 @@ static RR_COUNTERS: OnceLock<Vec<AtomicUsize>> = OnceLock::new();
 static ACTIVE: OnceLock<Vec<Vec<AtomicUsize>>> = OnceLock::new();
 static POOL: OnceLock<Mutex<HashMap<(usize, u32), Vec<PooledConn>>>> = OnceLock::new();
 
+/// An established upstream connection. `proxy_pass http://unix:...` reaches a
+/// unix socket, everything else a TCP socket; the rest of the proxy code only
+/// needs the byte stream, so the two share one type.
+pub enum UpStream {
+    Tcp(TcpStream),
+    Unix(tokio::net::UnixStream),
+}
+
+impl tokio::io::AsyncRead for UpStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            UpStream::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            UpStream::Unix(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for UpStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        match self.get_mut() {
+            UpStream::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            UpStream::Unix(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            UpStream::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
+            UpStream::Unix(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            UpStream::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            UpStream::Unix(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
 pub struct PooledConn {
-    stream: TcpStream,
+    stream: UpStream,
     last_used: Instant,
 }
 
@@ -98,11 +152,12 @@ fn updating_test(key: &str) -> bool {
 fn pool_key_of(c: &Chosen) -> (usize, u32) {
     match c {
         Chosen::Direct(_, a) => (usize::MAX, a.port() as u32),
+        Chosen::Unix(_) => (usize::MAX, 0),
         Chosen::Upstream { up, sidx, .. } => (*up, *sidx as u32),
     }
 }
 
-fn checkout(key: (usize, u32)) -> Option<TcpStream> {
+fn checkout(key: (usize, u32)) -> Option<UpStream> {
     let pool = POOL.get()?;
     let mut guard = pool.lock().ok()?;
     let list = guard.get_mut(&key)?;
@@ -114,7 +169,7 @@ fn checkout(key: (usize, u32)) -> Option<TcpStream> {
     None
 }
 
-fn checkin(key: (usize, u32), stream: TcpStream, cap: usize) {
+fn checkin(key: (usize, u32), stream: UpStream, cap: usize) {
     if cap == 0 {
         return;
     }
@@ -135,6 +190,9 @@ fn checkin(key: (usize, u32), stream: TcpStream, cap: usize) {
 
 enum Chosen {
     Direct(usize, SocketAddr),
+    /// `proxy_pass http://unix:/path:`. Never pooled: a unix connect is local
+    /// and cheap, and the pool is keyed by address.
+    Unix(std::sync::Arc<std::path::PathBuf>),
     Upstream {
         up: usize,
         sidx: usize,
@@ -147,6 +205,7 @@ fn choose(http: &Http, loc: &LocCfg, client_ip: &std::net::IpAddr) -> Option<Vec
     let pp = loc.proxy_pass.as_ref()?;
     match &pp.target {
         ProxyTarget::Addr(addr) => Some(vec![Chosen::Direct(0, *addr)]),
+        ProxyTarget::Unix(path) => Some(vec![Chosen::Unix(path.clone())]),
         ProxyTarget::Upstream(idx) => {
             let up = http.upstreams.get(*idx)?;
             let order = select_order(up, *idx, client_ip)?;
@@ -894,6 +953,7 @@ pub async fn handle(
         let key = pool_key_of(&cand);
         let upstream_addr = match &cand {
             Chosen::Direct(_, a) => a.to_string(),
+            Chosen::Unix(p) => format!("unix:{}", p.display()),
             Chosen::Upstream { addr, .. } => addr.to_string(),
         };
         // First attempt may reuse a pooled socket; if that socket turns out to
@@ -906,7 +966,7 @@ pub async fn handle(
                     match pooled {
                         Some(s) => (s, true, usize::MAX, 0),
                         None => match connect_bound(*addr, bind, loc.proxy_connect_timeout).await {
-                            Ok(s) => (s, false, usize::MAX, 0),
+                            Ok(s) => (UpStream::Tcp(s), false, usize::MAX, 0),
                             Err(e) => {
                                 last_err = Some(e);
                                 continue 'candidates;
@@ -914,6 +974,13 @@ pub async fn handle(
                         },
                     }
                 }
+                Chosen::Unix(path) => match connect_unix(path, loc.proxy_connect_timeout).await {
+                    Ok(s) => (s, false, usize::MAX, 0),
+                    Err(e) => {
+                        last_err = Some(e);
+                        continue 'candidates;
+                    }
+                },
                 Chosen::Upstream { up, sidx, addr, .. } => {
                     let pooled = if want_pool && http.upstreams[*up].keepalive > 0 {
                         checkout(key)
@@ -923,7 +990,7 @@ pub async fn handle(
                     match pooled {
                         Some(s) => (s, true, *up, *sidx),
                         None => match connect_bound(*addr, bind, loc.proxy_connect_timeout).await {
-                            Ok(s) => (s, false, *up, *sidx),
+                            Ok(s) => (UpStream::Tcp(s), false, *up, *sidx),
                             Err(e) => {
                                 last_err = Some(e);
                                 continue 'candidates;
@@ -996,8 +1063,18 @@ pub async fn handle(
     )))
 }
 
-async fn connect_timeout(addr: SocketAddr, dur: Duration) -> io::Result<TcpStream> {
-    connect_bound(addr, None, dur).await
+async fn connect_timeout(addr: SocketAddr, dur: Duration) -> io::Result<UpStream> {
+    Ok(UpStream::Tcp(connect_bound(addr, None, dur).await?))
+}
+
+/// `proxy_pass http://unix:/path:`. A missing socket file is reported like any
+/// refused connect, so `proxy_next_upstream` can move on.
+async fn connect_unix(path: &std::path::Path, dur: Duration) -> io::Result<UpStream> {
+    match tokio::time::timeout(dur, tokio::net::UnixStream::connect(path)).await {
+        Ok(Ok(s)) => Ok(UpStream::Unix(s)),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out")),
+    }
 }
 
 /// Connect, optionally binding the local (source) address first — nginx's
@@ -1421,7 +1498,7 @@ async fn exchange(
     body: &[u8],
     loc: &LocCfg,
     pp: &crate::config::ProxyPass,
-    mut up: TcpStream,
+    mut up: UpStream,
     from_pool: bool,
     tokens: bool,
     is_upgrade: bool,
@@ -1674,7 +1751,19 @@ async fn exchange(
         if !buf.is_empty() {
             conn.write_all(&buf).await?;
         }
-        conn.pipe_with(up).await?;
+        match up {
+            UpStream::Tcp(tcp) => conn.pipe_with(tcp).await?,
+            // `proxy_pass http://unix:` cannot be upgraded; answer like an
+            // unusable upstream so the client is not left hanging.
+            UpStream::Unix(_) => {
+                return Ok(written(Outcome {
+                    status: 502,
+                    bytes: 0,
+                    close: true,
+                    sent: Vec::new(),
+                }))
+            }
+        }
         return Ok(written(Outcome {
             status: 101,
             bytes: 0,
@@ -2123,7 +2212,7 @@ impl Pacer {
 
 async fn stream_chunked(
     conn: &mut crate::conn::Conn,
-    up: &mut TcpStream,
+    up: &mut UpStream,
     mut pending: Vec<u8>,
     read_timeout: Duration,
     pacer: &mut Pacer,
@@ -2250,30 +2339,43 @@ pub async fn fetch(
 
     let mut last_err: Option<io::Error> = None;
     for cand in candidates {
-        let addr = match &cand {
-            Chosen::Direct(_, a) => *a,
-            Chosen::Upstream { addr, .. } => *addr,
-        };
-        let mut up = match connect_bound(
-            addr,
-            resolve_bind(
-                loc,
-                &BindVars {
-                    peer_ip,
-                    peer_port: 0,
-                    query,
-                },
+        // The socket-free path buffers the whole reply, so `proxy_bind` (which
+        // needs a TCP socket) only applies to TCP targets.
+        let mut up: UpStream = if let Chosen::Unix(path) = &cand {
+            match connect_unix(path, loc.proxy_connect_timeout).await {
+                Ok(s) => s,
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            }
+        } else {
+            let addr = match &cand {
+                Chosen::Direct(_, a) => *a,
+                Chosen::Upstream { addr, .. } => *addr,
+                Chosen::Unix(_) => unreachable!(),
+            };
+            match connect_bound(
+                addr,
+                resolve_bind(
+                    loc,
+                    &BindVars {
+                        peer_ip,
+                        peer_port: 0,
+                        query,
+                    },
+                )
+                .ok()
+                .flatten(),
+                loc.proxy_connect_timeout,
             )
-            .ok()
-            .flatten(),
-            loc.proxy_connect_timeout,
-        )
-        .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                last_err = Some(e);
-                continue;
+            .await
+            {
+                Ok(s) => UpStream::Tcp(s),
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
             }
         };
 
@@ -2363,13 +2465,19 @@ pub async fn fetch(
             raw.extend_from_slice(b"\r\n");
         }
         let upstream_headers = crate::http::split_head(&head.raw);
+        // `$upstream_addr` for a unix target is `unix:<path>`, as nginx prints it.
+        let upstream_addr_display = match &cand {
+            Chosen::Unix(p) => format!("unix:{}", p.display()),
+            Chosen::Direct(_, a) => a.to_string(),
+            Chosen::Upstream { addr, .. } => addr.to_string(),
+        };
         crate::http::apply_expires(&mut raw, loc);
         crate::http::apply_add_headers_full(
             &mut raw,
             &loc.headers,
             head.status,
             "BYPASS",
-            &addr.to_string(),
+            &upstream_addr_display,
             &upstream_headers,
         );
 
@@ -2487,9 +2595,12 @@ pub fn spawn_background_update(
     };
     let addrs: Vec<SocketAddr> = candidates
         .into_iter()
-        .map(|c| match c {
-            Chosen::Direct(_, a) => a,
-            Chosen::Upstream { addr, .. } => addr,
+        // A unix target cannot be represented as a SocketAddr; a background
+        // cache refresh for one simply does not run.
+        .filter_map(|c| match c {
+            Chosen::Direct(_, a) => Some(a),
+            Chosen::Upstream { addr, .. } => Some(addr),
+            Chosen::Unix(_) => None,
         })
         .collect();
 

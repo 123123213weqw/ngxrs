@@ -433,13 +433,17 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
             }
         };
 
-        let (server, captures) = select_server_ex(
+        let (server, server_caps) = select_server_ex(
             http,
             &group.servers,
             group.default_server,
             req.host.as_deref(),
         );
-        let loc = server.locate(&path);
+        let (loc, loc_caps) = server.locate_with_captures(&path);
+        // Location regex captures are ordinary variables (`$1`, `$name`), and
+        // they take precedence over `server_name` captures when both exist.
+        let mut all_caps: Vec<(String, String)> = loc_caps;
+        all_caps.extend(server_caps.iter().cloned());
         if let Some((t, _)) = loc.keepalive_timeout {
             keepalive_timeout = t;
         }
@@ -501,7 +505,7 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
             loc,
             http,
             group.addr.port(),
-            &captures,
+            &all_caps,
             state,
             &local_ip,
             peer_port,
@@ -1020,7 +1024,9 @@ async fn route(
     // `error_page 404 = /fallback` (bare `=`, adopt the target's status)
     // reported the original 404 instead of the proxied status.
     if loc.proxy_pass.is_some() {
-        return match crate::proxy::fetch(req, path, query, loc, http, vars.peer_ip).await {
+        return match crate::proxy::fetch(req, path, query, loc, http, vars.peer_ip, vars.custom)
+            .await
+        {
             Some(resp) => resp,
             None => error_response(502, server.server_tokens),
         };
@@ -2597,7 +2603,8 @@ pub async fn resolve_response_local(
     }
 
     if loc.proxy_pass.is_some() {
-        if let Some(resp) = crate::proxy::fetch(req, path, query, loc, http, peer_ip).await {
+        if let Some(resp) = crate::proxy::fetch(req, path, query, loc, http, peer_ip, &custom).await
+        {
             let mut resp = resp;
             return finalize_response(
                 req,
@@ -2686,7 +2693,8 @@ pub async fn resolve_response_state(
     // Reverse proxying needs a socket for streaming in HTTP/1; when this
     // resolver is used without one (HTTP/2), buffer the upstream reply instead.
     if loc.proxy_pass.is_some() {
-        if let Some(resp) = crate::proxy::fetch(req, path, query, loc, http, peer_ip).await {
+        if let Some(resp) = crate::proxy::fetch(req, path, query, loc, http, peer_ip, &custom).await
+        {
             let mut resp = resp;
             return finalize_response(
                 req,
@@ -3704,7 +3712,7 @@ async fn dispatch(
         loc.ssi || (loc.gzip && crate::gzip::accepts_gzip(req) && loc.proxy_cache.is_none());
     let mut ssi_proxied: Option<Response> = None;
     if loc.proxy_pass.is_some() && wants_buffered && req.method != Method::Head {
-        ssi_proxied = crate::proxy::fetch(req, path, query, loc, http, client_ip).await;
+        ssi_proxied = crate::proxy::fetch(req, path, query, loc, http, client_ip, &set_vars).await;
     }
 
     // ---- reverse proxy (streams to the socket, cannot be resolved first) ----

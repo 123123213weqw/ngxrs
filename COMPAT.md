@@ -674,3 +674,38 @@ UNRUN 是同一类问题。现在断言行数少于参考运行的一律进 `TRU
 31 个用例文件：29 个完全一致，2 个更好（`http_host` 58 vs 54、`http_headers_multi`
 49 vs 48），0 个更差，0 个截断；断言总数 ngxrs 606 / nginx 601。
 自建差分套件 70/70；单测 101。
+
+## 本轮（location 正则捕获变量、proxy_pass URI 变量、background update 等它完成）
+
+### 新的真缺陷：location 正则的捕获根本不是变量
+
+`location ~ /(reg)(?P<name>exp).html { proxy_pass http://u/$1$name.html; }` 我们
+返回 404。两个缺口叠在一起：
+
+1. **location 正则的 `$1..$9` 与命名组从未被采集**。之前只有 `server_name ~`
+   的捕获会进变量表，location 的捕获根本没有落到 `custom` 里，所以任何
+   `$1`/`$name` 在 `proxy_pass`、`fastcgi_param`、`add_header` 里都是空串。
+   新增 `Server::locate_with_captures`：赢家是正则 location 时把捕获并入变量表。
+2. **`proxy_pass` 的 URI 部分完全不展开变量**，只做前缀替换。现在若 URI 含 `$`
+   就按请求展开（`upstream_target` 收 `ServerVars`）。
+
+顺带：`proxy::fetch`（HTTP/2 / HTTP/3 / SSI / auth 子请求用）现在收 `custom`，
+这几条路径也能看到捕获与 `set` 变量。
+
+### background update 之前是 fire-and-forget
+
+代码注释写着「caller must await the handle」，调用点却是 `drop(pending_update)`。
+于是刷新任务和客户端赛跑，紧随其后的请求仍拿到 STALE。改成写完缓存体后等待句柄
+（nginx 在 finalize 前等子请求），`X-Cache-Status` 的 STALE→HIT 序列才成立。
+
+结果：`proxy_cache_use_stale.t` 27/36 → **29/36**。剩余 7 条都卡在 UPDATING
+语义（另一个刷新在途时的事件位、`use_stale updating` 与 `stale-while-revalidate`
+叠加、子请求里的 background update、`if` 里的更新），不是缓存本体的问题。
+
+### 回归
+35 个用例文件：32 个完全一致，3 个更好（`http_host` 58 vs 54、`ssi_if` 41 vs 32、
+`http_headers_multi` 49 vs 48），0 个更差；断言 683 / 669。
+`proxy_cache_use_stale.t` 单独计 29/36（见上）。自建差分套件 70/70，单测 101。
+
+### 基准（同机 ABBA）
+1k 0.950（447,538 vs 425,180）、64k 0.959、1m 0.959；64KB p99 30.59ms vs **2.65ms**。

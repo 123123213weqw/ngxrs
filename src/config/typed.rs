@@ -4156,6 +4156,34 @@ impl Server {
         }
     }
 
+    /// `locate`, plus the captures of the winning regex location.
+    ///
+    /// nginx stores them in `r->captures`, which makes `$1`..`$9` and any named
+    /// group usable in `proxy_pass`, `fastcgi_param`, `add_header` and so on.
+    /// `match_list` only returns the config, so the winning `Location` is found
+    /// again here.
+    pub fn locate_with_captures(&self, path: &str) -> (&LocCfg, Vec<(String, String)>) {
+        let cfg = self.locate(path);
+        let mut caps = Vec::new();
+        if let Some(l) = find_location(&self.locations, path, cfg) {
+            if let Match::Regex { re, .. } = &l.matcher {
+                if let Some(c) = re.captures(path) {
+                    for i in 1..10 {
+                        if let Some(m) = c.get(i) {
+                            caps.push((i.to_string(), m.as_str().to_string()));
+                        }
+                    }
+                    for name in re.capture_names().flatten() {
+                        if let Some(m) = c.name(name) {
+                            caps.push((name.to_string(), m.as_str().to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        (cfg, caps)
+    }
+
     /// Resolve a named location (`location @fallback { ... }`), which nginx uses
     /// as an `error_page` target. Named locations never take part in prefix or
     /// regex matching.
@@ -4165,6 +4193,57 @@ impl Server {
             _ => None,
         })
     }
+}
+
+/// Find the `Location` whose config `match_list` selected. Mirrors its order so
+/// the two cannot disagree.
+fn find_location<'a>(list: &'a [Location], path: &str, want: &LocCfg) -> Option<&'a Location> {
+    let mut best: Option<&'a Location> = None;
+    for l in list {
+        match &l.matcher {
+            Match::Exact(s) if s == path => return Some(l),
+            Match::Prefix(s) | Match::PrefixNoRegex(s) => {
+                if path.starts_with(s.as_str())
+                    && best.map_or(true, |b| prefix_of(&b.matcher).len() < s.len())
+                {
+                    best = Some(l);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(b) = best {
+        if let Some(child) = find_location(&b.nested, path, want) {
+            return Some(child);
+        }
+        if matches!(b.matcher, Match::PrefixNoRegex(_)) {
+            return Some(b);
+        }
+        if std::ptr::eq(&b.cfg, want) && !has_regex_child(&b.nested, path) {
+            return Some(b);
+        }
+    }
+    for l in list {
+        if let Match::Regex { re, .. } = &l.matcher {
+            if re.is_match(path) {
+                if let Some(child) = find_location(&l.nested, path, want) {
+                    return Some(child);
+                }
+                return Some(l);
+            }
+        }
+    }
+    best
+}
+
+fn has_regex_child(list: &[Location], path: &str) -> bool {
+    list.iter().any(|l| match &l.matcher {
+        Match::Regex { re, .. } => re.is_match(path) || has_regex_child(&l.nested, path),
+        Match::Prefix(s) | Match::PrefixNoRegex(s) => {
+            path.starts_with(s.as_str()) && has_regex_child(&l.nested, path)
+        }
+        _ => false,
+    })
 }
 
 fn match_list<'a>(list: &'a [Location], path: &str) -> Option<&'a LocCfg> {

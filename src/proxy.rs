@@ -420,8 +420,17 @@ fn expand(spec: &str, v: &Vars<'_>) -> String {
     out
 }
 
-fn upstream_target(path: &str, query: &str, loc: &LocCfg, pp: &crate::config::ProxyPass) -> String {
+fn upstream_target(
+    path: &str,
+    query: &str,
+    loc: &LocCfg,
+    pp: &crate::config::ProxyPass,
+    vars: &crate::http::ServerVars<'_>,
+) -> String {
     let mut target = match &pp.uri {
+        // `proxy_pass http://u/$1$name.html`: the URI part is a complex value,
+        // expanded per request with the location's regex captures.
+        Some(prefix) if prefix.contains('$') => vars.expand(prefix),
         Some(prefix) => {
             let cut = loc.prefix_len.min(path.len());
             let rest = &path[cut..];
@@ -694,7 +703,7 @@ pub async fn handle(
         Vec::new()
     };
 
-    let target_uri = dyn_uri.unwrap_or_else(|| upstream_target(path, query, loc, &pp));
+    let target_uri = dyn_uri.unwrap_or_else(|| upstream_target(path, query, loc, &pp, vars));
     let is_upgrade = req
         .headers
         .get("upgrade")
@@ -849,7 +858,16 @@ pub async fn handle(
                     };
                     let written_out =
                         serve_cached(conn, req, loc, http, tokens, &entry, hit_status).await?;
-                    drop(pending_update);
+                    // nginx finalizes the client request only after the
+                    // background subrequest finishes
+                    // (`ngx_http_upstream_finalize_request` waits on
+                    // `u->cache`), so the next request for the same key sees
+                    // the refreshed entry. Dropping the handle instead left the
+                    // refresh racing the client and `$upstream_cache_status`
+                    // answering STALE a second time.
+                    if let Some(h) = pending_update {
+                        let _ = h.await;
+                    }
                     return Ok(Some(written_out));
                 }
             }
@@ -2497,10 +2515,27 @@ pub async fn fetch(
     loc: &LocCfg,
     http: &Http,
     peer_ip: &str,
+    custom: &std::collections::HashMap<String, String>,
 ) -> Option<Response> {
     let pp = loc.proxy_pass.clone()?;
     let candidates = choose(http, loc, &peer_ip.parse().ok()?)?;
-    let target_uri = upstream_target(path, query, loc, &pp);
+    let fetch_vars = crate::http::ServerVars {
+        req,
+        path,
+        query,
+        server_name: "",
+        server_port: 80,
+        peer_ip,
+        peer_port: 0,
+        scheme: "http",
+        document_root: "",
+        upstream_cache_status: "",
+        custom,
+        connection_requests: 0,
+        connection_time: 0,
+        sent: &[],
+    };
+    let target_uri = upstream_target(path, query, loc, &pp, &fetch_vars);
 
     // The socket-free path serves HTTP/2, HTTP/3, SSI includes and auth
     // subrequests, and it must honour `proxy_cache` exactly like the streaming

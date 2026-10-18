@@ -602,7 +602,7 @@ pub async fn handle(
         let e = vars.expand(v);
         let e = e.trim();
         !e.is_empty() && e != "0"
-    });
+    }) || !cache_range_allowed(loc, req);
 
     // A stored-but-stale entry is reported as EXPIRED (nginx does the same)
     // rather than MISS.
@@ -707,7 +707,7 @@ pub async fn handle(
                     let mut body = entry.body.clone();
                     if ranges_from_cache {
                         let (s2, raw2, body2) =
-                            apply_force_ranges(req, loc, status, &mut raw, body);
+                            apply_force_ranges(req, status, &mut raw, body);
                         status = s2;
                         raw = raw2;
                         body = body2;
@@ -1137,6 +1137,37 @@ pub enum Proxied {
     },
 }
 
+/// nginx's `ngx_http_upstream_cache_check_range`: may the cache be used for
+/// this ranged request?
+///
+/// `false` means the request bypasses the cache (and keeps its `Range` header),
+/// which nginx signals with NGX_DECLINED.
+fn cache_range_allowed(loc: &LocCfg, req: &Request) -> bool {
+    let Some(header) = req.headers.get("range") else {
+        return true;
+    };
+    let Some(max) = loc.proxy_cache_max_range_offset else {
+        // Unlimited: never bypass.
+        return true;
+    };
+    if max == 0 {
+        return false;
+    }
+    let Some(spec) = header.trim().strip_prefix("bytes=") else {
+        return true;
+    };
+    let spec = spec.trim_start();
+    if spec.starts_with('-') {
+        // Suffix range: nginx declines.
+        return false;
+    }
+    let digits: String = spec.chars().take_while(|c| c.is_ascii_digit()).collect();
+    match digits.parse::<u64>() {
+        Ok(offset) => offset < max,
+        Err(_) => true,
+    }
+}
+
 fn written(o: Outcome) -> Proxied {
     Proxied::Written(o)
 }
@@ -1165,6 +1196,7 @@ fn build_upstream_head(
     is_upgrade: bool,
     convert_head: bool,
     reval: Option<&crate::cache::Cached>,
+    drop_range: bool,
 ) -> Vec<u8> {
     // ---- request head ----
     let mut out = Vec::with_capacity(512);
@@ -1221,6 +1253,13 @@ fn build_upstream_head(
             "host" | "connection" | "keep-alive" | "transfer-encoding" | "te" | "trailer"
                 | "upgrade" | "proxy-connection" | "content-length" | "expect"
         ) {
+            continue;
+        }
+        // When the cache is going to be used, nginx fetches the *whole* entity
+        // so later range requests can be served from it.
+        if drop_range
+            && (lk == "range" || lk == "if-range")
+        {
             continue;
         }
         if set.contains_key(&lk) {
@@ -1328,8 +1367,15 @@ async fn exchange(
     convert_head: bool,
 ) -> io::Result<Proxied> {
     // ---- request head ----
+    // The cache only helps a ranged request if it can hold the whole entity, so
+    // the Range header is withheld from the upstream while the cache is in play
+    // (`ngx_http_proxy_create_request` + `ngx_http_upstream_cache_check_range`).
+    let drop_range = cache.zone.is_some()
+        && cache.key.is_some()
+        && cache.status != "BYPASS"
+        && !is_upgrade;
     let out = build_upstream_head(
-        req, target_uri, body, loc, pp, peer_ip, is_upgrade, convert_head, cache.reval,
+        req, target_uri, body, loc, pp, peer_ip, is_upgrade, convert_head, cache.reval, drop_range,
     );
 
     if std::env::var_os("NGXRS_DEBUG_PROXY").is_some() {
@@ -1446,7 +1492,7 @@ async fn exchange(
                 let mut body = entry.body.clone();
                 if ranges_from_cache {
                     let (s2, raw2, body2) =
-                        apply_force_ranges(req, loc, status, &mut raw, body);
+                        apply_force_ranges(req, status, &mut raw, body);
                     status = s2;
                     raw = raw2;
                     body = body2;
@@ -1580,7 +1626,10 @@ async fn exchange(
     // the headers decide a validity (verified against nginx 1.28).
     // `proxy_force_ranges` needs the whole body in memory to slice it, so a
     // ranged request is buffered even when the response is not cacheable.
-    let wants_ranges = loc.proxy_force_ranges
+    // Slicing is needed when `proxy_force_ranges` asks for it *or* when the
+    // cache withheld the Range header upstream: then the body in hand is the
+    // whole entity and the client still expects its range.
+    let wants_ranges = (loc.proxy_force_ranges || drop_range)
         && req.headers.get("range").is_some()
         && !is_upgrade;
     let cacheable = cache.zone.is_some() && cache.key.is_some() && !is_upgrade;
@@ -1724,7 +1773,7 @@ async fn exchange(
         }
         let mut status = head.status;
         if wants_ranges {
-            let (s2, raw2, body2) = apply_force_ranges(req, loc, status, &mut out_raw, payload);
+            let (s2, raw2, body2) = apply_force_ranges(req, status, &mut out_raw, payload);
             status = s2;
             out_raw = raw2;
             payload = body2;
@@ -2133,7 +2182,8 @@ pub async fn fetch(
             }
         };
 
-        let out = build_upstream_head(req, &target_uri, &[], loc, &pp, peer_ip, false, false, None);
+        let out =
+            build_upstream_head(req, &target_uri, &[], loc, &pp, peer_ip, false, false, None, false);
         if up.write_all(&out).await.is_err() {
             continue;
         }
@@ -2325,7 +2375,8 @@ pub fn spawn_background_update(
     // The refresh reuses the target the foreground request resolved, so a
     // `location ~ /(reg)(?P<name>exp)` style `proxy_pass .../$1$name` keeps its
     // captures instead of being rebuilt from the raw URI.
-    let head = build_upstream_head(req, target_uri, &[], loc, &pp, peer_ip, false, true, None);
+    // The background refresh re-fetches the whole entity for the cache.
+    let head = build_upstream_head(req, target_uri, &[], loc, &pp, peer_ip, false, true, None, true);
 
     let connect_timeout = loc.proxy_connect_timeout;
     let read_timeout = loc.proxy_read_timeout;
@@ -2475,14 +2526,19 @@ async fn refetch(
 /// nginx serves ranges from a proxied response even when the upstream never
 /// sent `Accept-Ranges` (verified against 1.28 with `max_ranges 0` upstream).
 /// Returns the (possibly rewritten) status, head and body.
+/// Slice a buffered 200 body for a `Range` request.
+///
+/// Callers decide *whether* ranges apply: `proxy_force_ranges`, or a cached
+/// entry whose origin advertised `Accept-Ranges: bytes`. Re-checking the
+/// directive here would silently disable the cache path, which is exactly the
+/// bug `proxy_cache_range.t` caught.
 fn apply_force_ranges(
     req: &Request,
-    loc: &LocCfg,
     status: u16,
     raw: &mut Vec<u8>,
     body: Vec<u8>,
 ) -> (u16, Vec<u8>, Vec<u8>) {
-    if !loc.proxy_force_ranges || status != 200 {
+    if status != 200 {
         return (status, std::mem::take(raw), body);
     }
     let Some(range) = req.headers.get("range") else {

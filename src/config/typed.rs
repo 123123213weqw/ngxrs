@@ -133,6 +133,10 @@ pub struct LocCfg {
     pub proxy_cache_revalidate: bool,
     /// `proxy_cache_background_update`: serve a stale entry while refreshing.
     pub proxy_cache_background_update: bool,
+    /// `proxy_cache_max_range_offset`: a `Range` request whose start offset is
+    /// at or beyond this bypasses the cache. `None` = unlimited (never bypass),
+    /// which is nginx's default.
+    pub proxy_cache_max_range_offset: Option<u64>,
     /// `proxy_limit_rate`: pace the upstream→client transfer, bytes/second
     /// (0 = unlimited). nginx stores this on the upstream conf.
     pub proxy_limit_rate: u64,
@@ -227,6 +231,7 @@ impl LocCfg {
             proxy_cache_background_update: false,
             trailers: Vec::new(),
             max_ranges: None,
+            proxy_cache_max_range_offset: None,
             proxy_limit_rate: 0,
             proxy_intercept_errors: false,
             proxy_force_ranges: false,
@@ -1636,6 +1641,15 @@ impl Builder {
             "proxy_cache_convert_head" => {
                 cfg.proxy_cache_convert_head =
                     d.args.first().map(|v| v != "off").unwrap_or(true);
+            }
+            "proxy_cache_max_range_offset" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "proxy_cache_max_range_offset requires a value"))?;
+                cfg.proxy_cache_max_range_offset = Some(parse_size(v).ok_or_else(|| {
+                    sem(&d.file, d.line, format!("invalid proxy_cache_max_range_offset \"{v}\""))
+                })?);
             }
             "proxy_limit_rate" => {
                 let v = d

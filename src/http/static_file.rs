@@ -173,6 +173,9 @@ fn serve_entry(
     let mut offset = 0u64;
     let mut len = size;
     let mut content_range: Option<(u64, u64)> = None;
+    // Set when the request asked for more than one span: the reply becomes
+    // `multipart/byteranges`, which cannot be expressed as a file slice.
+    let mut multipart: Option<Vec<u8>> = None;
 
     // `max_ranges 0` disables byte ranges entirely; any other value caps how
     // many spans a request may ask for (nginx ignores the header beyond it).
@@ -193,6 +196,23 @@ fn serve_entry(
             }
         };
         if if_range_ok {
+            // `bytes=0-2,4-` produces one part per span (nginx builds a
+            // multipart body); a single span stays a plain 206.
+            if range.contains(',') {
+                match parse_multi_range(range, size) {
+                    MultiRange::Ranges(spans) if spans.len() > 1 => {
+                        let boundary = format!("{:016X}", multipart_seed(req, size));
+                        status = 206;
+                        multipart = Some(read_multipart(&file, &boundary, mime, size, &spans)?);
+                    }
+                    MultiRange::Unsatisfiable => {
+                        status = 416;
+                        len = 0;
+                        content_range = Some((u64::MAX, size));
+                    }
+                    _ => {}
+                }
+            } else {
             match parse_range(range, size) {
                 RangeSpec::Single(start, end) => {
                     status = 206;
@@ -212,13 +232,21 @@ fn serve_entry(
                 }
                 RangeSpec::Ignore => {}
             }
+            }
         }
     }
 
     // Pre-render every header line into one buffer: no per-header Strings.
     let mut raw = Vec::with_capacity(256);
     raw.extend_from_slice(b"Content-Type: ");
-    raw.extend_from_slice(mime.as_bytes());
+    match &multipart {
+        Some(body) => {
+            raw.extend_from_slice(b"multipart/byteranges; boundary=");
+            raw.extend_from_slice(format!("{:016X}", multipart_seed(req, size)).as_bytes());
+            len = body.len() as u64;
+        }
+        None => raw.extend_from_slice(mime.as_bytes()),
+    }
     raw.extend_from_slice(b"\r\nContent-Length: ");
     raw.extend_from_slice(len.to_string().as_bytes());
     raw.extend_from_slice(b"\r\nLast-Modified: ");
@@ -247,7 +275,10 @@ fn serve_entry(
             explicit_len: true,
         trailers: Vec::new(),
         expect_trailers: false,
-        body: Body::File { file, offset, len },
+        body: match multipart {
+            Some(b) => Body::Bytes(b),
+            None => Body::File { file, offset, len },
+        },
     })
 }
 
@@ -340,6 +371,52 @@ pub fn parse_multi_range(header: &str, size: u64) -> MultiRange {
         return MultiRange::Ignore;
     }
     MultiRange::Ranges(spans)
+}
+
+/// Boundary seed: nginx derives it from the request and the entity size.
+fn multipart_seed(req: &Request, size: u64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    req.raw_target.hash(&mut h);
+    size.hash(&mut h);
+    h.finish()
+}
+
+/// Read every span from `file` and lay them out as `multipart/byteranges`.
+///
+/// The parts are framed here rather than through [`multipart_body`]: that
+/// helper slices the *whole* entity by absolute offsets, so handing it a single
+/// span's bytes would index past the end and silently drop the data.
+fn read_multipart(
+    file: &std::fs::File,
+    boundary: &str,
+    content_type: &str,
+    size: u64,
+    spans: &[(u64, u64)],
+) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let total: u64 = spans.iter().map(|(a, b)| b - a + 1).sum();
+    let mut buf = Vec::with_capacity(total as usize + spans.len() * 128);
+    for (start, end) in spans {
+        buf.extend_from_slice(b"\r\n--");
+        buf.extend_from_slice(boundary.as_bytes());
+        buf.extend_from_slice(b"\r\nContent-Type: ");
+        buf.extend_from_slice(content_type.as_bytes());
+        buf.extend_from_slice(b"\r\nContent-Range: bytes ");
+        buf.extend_from_slice(start.to_string().as_bytes());
+        buf.push(b'-');
+        buf.extend_from_slice(end.to_string().as_bytes());
+        buf.push(b'/');
+        buf.extend_from_slice(size.to_string().as_bytes());
+        buf.extend_from_slice(b"\r\n\r\n");
+        let mut part = vec![0u8; (end - start + 1) as usize];
+        file.read_exact_at(&mut part, *start)?;
+        buf.extend_from_slice(&part);
+    }
+    buf.extend_from_slice(b"\r\n--");
+    buf.extend_from_slice(boundary.as_bytes());
+    buf.extend_from_slice(b"--\r\n");
+    Ok(buf)
 }
 
 /// Build a `multipart/byteranges` body exactly as nginx lays it out.

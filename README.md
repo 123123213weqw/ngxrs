@@ -39,9 +39,9 @@ python3 tests/parity.py         # 差分测试：同一请求分别打 nginx / n
 - **mail**：POP3 / IMAP / SMTP 三个协议完整实现（`auth_http`、`Auth-Method`/`Salt`、`*_auth` 按协议独立、`*_capabilities`、`starttls off|on|only` 与 `STLS`/`STARTTLS` 真实 TLS 升级、`listen ... ssl` 隐式 TLS、`smtp_greeting_delay`）
 - **日志**：`error_log` 八个级别（debug…emerg）在 main/http/server/location/stream/mail 各上下文，多目的地、`stderr`、`syslog:` 走 RFC 3164
 - **其它**：`gzip`、`add_header`/`add_trailer`（含 `$sent_http_*`、`$sent_trailer_*`）、`expires`、`access_log`、`allow`/`deny`/`limit_except`、`limit_req`/`limit_conn`、`map`、`geo`
-- **TLS / HTTP2 / stream**：TLS 1.2–1.3 + SNI（精确/通配/默认回落选证）、ALPN `h2`（复用同一套路由表）、`stream {}` TCP/UDP 转发 + `listen ... ssl` TLS 终止
+- **TLS / HTTP2 / stream**：TLS 1.2–1.3 + SNI（精确/通配/默认回落选证）、客户端证书（`ssl_verify_client`）、加密私钥（`ssl_password_file`，PKCS#8 PBES2）、ALPN `h2`（复用同一套路由表）、`stream {}` TCP/UDP 转发 + `listen ... ssl` TLS 终止
 
-**未实现**：HTTP/3 (QUIC)、SSI、`stream` 的上游 TLS (`proxy_ssl`) 与客户端证书校验、`ssl_password_file`（加密私钥）、`auth_request`。
+**未实现**：HTTP/3 (QUIC)、SSI、`stream` 的上游 TLS (`proxy_ssl`) 与客户端证书校验、mail 侧客户端证书校验、`auth_request`。
 
 **已知差距（有实测数字，见 COMPAT.md）**：HTTP/2 帧级细节（HPACK 编码选择、连接级错误帧形状）因底层用 `h2` crate 而无法逐帧对齐，`h2.t` 116/144（nginx 144/144）；1 KB 静态吞吐约 0.94× nginx，64 KB 尾延迟 p99 显著更低。
 逐项兼容矩阵与已知语义差异见 [COMPAT.md](COMPAT.md)。

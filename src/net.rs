@@ -395,7 +395,11 @@ fn stream_tls(sc: &crate::config::typed::StreamServerCfg) -> Option<Arc<rustls::
             return None;
         }
     };
-    match crate::tls::build_mail_config(cert, key) {
+    let pw = match &sc.ssl_password_file {
+        Some(p) => crate::tls::read_passwords(p).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    match crate::tls::build_mail_config_with(cert, key, &pw) {
         Ok(c) => Some(c),
         Err(e) => {
             eprintln!(

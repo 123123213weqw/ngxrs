@@ -251,17 +251,15 @@ nginx 逐字节一致；`STLS` / `STARTTLS` 执行**真实的 TLS 升级**（rus
 ### 仍未实现
 
 - `max_errors` 的完整语义
-- `ssl_password_file`（加密私钥）
+- mail 侧的 `ssl_verify_client`
 - `error_log` 的细粒度事件（各模块自己产生的 debug 级消息）尚未补全
 - **`limit_conn.t` 9/10**：剩下 1 条是「客户端关闭后立刻释放名额」。nginx 在
   连接关闭的瞬间归还 slot；我们是在那次在途上游请求结束（含 `limit_req`
-  延迟）之后才归还，所以紧跟其后的请求仍看到计数未清零
+  延迟）之后才归还，所以紧跟其后的请求仍看到计数未清零。
+  这条**会偶发通过**（曾出现过 10/10），连跑三次稳定为 9/10，因此按 9/10 记录
 - **`stream` 的 TLS 终止已实现**（`listen ... ssl`，证书可从 `stream {}` 继承），
-  已手工验证：TLS 客户端经 stream 代理拿到 `200 OK`，明文连接拿不到任何响应。
-  **但 `stream_ssl.t` 仍是 0/7**：该用例的 `localhost.key` 是
-  `BEGIN ENCRYPTED PRIVATE KEY`（PKCS#8 PBES2），而 `ssl_password_file`
-  的私钥解密还没做，所以握手建立不起来。`stream_proxy_ssl.t`（上游 TLS）、
-  `stream_ssl_verify_client.t` 也未实现，均为 UNRUN
+  `stream_ssl.t` **7/7 与 nginx 完全一致**
+- `stream_proxy_ssl.t`（上游 TLS）、`stream_ssl_verify_client.t` 未实现，仍为 UNRUN
 - 「因未声明模块而被静默跳过」的用例现在会被 harness 显式标成 **UNRUN**，
   不再混进 SAME
 

@@ -654,6 +654,8 @@ pub struct MailServer {
     /// Certificates for this listener, used by `STLS` / `STARTTLS` and by
     /// implicit TLS.
     pub tls: Option<std::sync::Arc<rustls::ServerConfig>>,
+    /// `ssl_password_file` effective for this listener.
+    pub ssl_password_file: Option<PathBuf>,
     /// `listen ... ssl`: the connection is TLS from the first byte.
     pub ssl: bool,
     /// `error_log` directives of this mail server. nginx *adds* these to the
@@ -705,6 +707,7 @@ impl Default for MailServer {
             starttls: StarttlsCfg::Off,
             capabilities: None,
             tls: None,
+            ssl_password_file: None,
             ssl: false,
             error_logs: Vec::new(),
             sinks: Vec::new(),
@@ -789,6 +792,8 @@ pub struct Server {
     pub ssl: bool,
     pub ssl_certificate: Option<PathBuf>,
     pub ssl_certificate_key: Option<PathBuf>,
+    /// `ssl_password_file`: passwords tried in order for an encrypted key.
+    pub ssl_password_file: Option<PathBuf>,
     /// `ssl_verify_client`: 0 = off, 1 = on, 2 = optional, 3 = optional_no_ca.
     /// Same encoding as nginx's `sscf->verify`.
     pub ssl_verify_client: u8,
@@ -884,6 +889,11 @@ pub struct Http {
     pub server_tokens: bool,
     pub client_max_body_size: u64,
     pub default_loc: LocCfg,
+    /// `ssl_certificate` / `ssl_certificate_key` / `ssl_password_file` from the
+    /// `http` block, inherited by any server that does not set its own.
+    pub ssl_certificate: Option<PathBuf>,
+    pub ssl_certificate_key: Option<PathBuf>,
+    pub ssl_password_file: Option<PathBuf>,
     pub default_access_logs: Vec<AccessLog>,
     pub upstreams: Vec<Upstream>,
     pub cache_zones: Vec<CacheZone>,
@@ -983,6 +993,7 @@ pub struct StreamServerCfg {
     pub ssl: bool,
     pub ssl_certificate: Option<PathBuf>,
     pub ssl_certificate_key: Option<PathBuf>,
+    pub ssl_password_file: Option<PathBuf>,
 }
 
 impl Http {
@@ -1428,6 +1439,11 @@ impl Builder {
                         defaults.error_logs.push(spec);
                     }
                 }
+                "ssl_password_file" => {
+                    if let Some(v) = d.args.first() {
+                        defaults.ssl_password_file = Some(self.prefix.join(v));
+                    }
+                }
                 "pop3_capabilities" | "imap_capabilities" | "smtp_capabilities" => {
                     defaults.capabilities = Some(d.args.clone());
                 }
@@ -1454,7 +1470,11 @@ impl Builder {
         // nginx accepts the certificate and key in either order, so the context
         // is built only once both paths are known.
         if let (Some(c), Some(k)) = (mail_cert.as_ref(), mail_key.as_ref()) {
-            match crate::tls::build_mail_config(c, k) {
+            let pw = match &defaults.ssl_password_file {
+                Some(p) => crate::tls::read_passwords(p).unwrap_or_default(),
+                None => Vec::new(),
+            };
+            match crate::tls::build_mail_config_with(c, k, &pw) {
                 Ok(cfg) => defaults.tls = Some(cfg),
                 Err(e) => self.warnings.push(format!(
                     "cannot load mail certificate {}: {e}",
@@ -1549,6 +1569,11 @@ impl Builder {
                             srv.error_logs.push(spec);
                         }
                     }
+                    "ssl_password_file" => {
+                        if let Some(v) = child.args.first() {
+                            srv.ssl_password_file = Some(self.prefix.join(v));
+                        }
+                    }
                     "pop3_capabilities" | "imap_capabilities" | "smtp_capabilities" => {
                         srv.capabilities = Some(child.args.clone());
                     }
@@ -1564,7 +1589,7 @@ impl Builder {
                     }
                     // Accepted, not yet plumbed.
                     "proxy_buffer" | "xclient"
-                    | "ssl_protocols"
+| "ssl_protocols"
                     | "ssl_ciphers" | "ssl_prefer_server_ciphers" | "ssl_session_cache"
                     | "ssl_session_timeout" | "auth_http_header" | "proxy_protocol"
                     | "max_errors" | "smtp_client_buffer" | "smtp_auth_methods"
@@ -1580,7 +1605,11 @@ impl Builder {
             // A `mail server` may carry its own certificate; otherwise the
             // one from the `mail` block is inherited.
             if let (Some(c), Some(k)) = (srv_cert.as_ref(), srv_key.as_ref()) {
-                match crate::tls::build_mail_config(c, k) {
+                let pw = match &srv.ssl_password_file {
+                    Some(p) => crate::tls::read_passwords(p).unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                match crate::tls::build_mail_config_with(c, k, &pw) {
                     Ok(cfg) => srv.tls = Some(cfg),
                     Err(e) => self.warnings.push(format!(
                         "cannot load mail certificate {}: {e}",
@@ -2448,6 +2477,7 @@ impl Builder {
         let mut header_bufs = http_header_bufs;
         let mut ssl_certificate: Option<PathBuf> = None;
         let mut ssl_certificate_key: Option<PathBuf> = None;
+        let mut ssl_password_file: Option<PathBuf> = None;
         let mut ssl_verify_client: u8 = 0;
         let mut ssl_client_certificate: Option<PathBuf> = None;
 
@@ -2531,6 +2561,11 @@ impl Builder {
                         // Certs only populate the store; TLS is enabled by
                         // `listen ... ssl`, exactly as in nginx.
                         ssl_certificate = Some(resolve_path(&self.prefix, v));
+                    }
+                }
+                "ssl_password_file" => {
+                    if let Some(v) = child.args.first() {
+                        ssl_password_file = Some(resolve_path(&self.prefix, v));
                     }
                 }
                 "ssl_certificate_key" => {
@@ -2672,6 +2707,7 @@ impl Builder {
                 ssl,
                 ssl_certificate,
                 ssl_certificate_key,
+                ssl_password_file,
                 ssl_verify_client,
                 ssl_client_certificate,
                 http2,
@@ -2688,6 +2724,7 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
     // Certificates at `stream {}` level are inherited by every server.
     let mut stream_cert: Option<PathBuf> = None;
     let mut stream_key: Option<PathBuf> = None;
+    let mut stream_password: Option<PathBuf> = None;
 
     for d in dirs {
         match d.name.as_str() {
@@ -2723,7 +2760,7 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             "log_format" | "access_log" | "error_log" | "resolver" | "map" | "geo"
             | "split_clients" | "limit_conn_zone" | "limit_req_zone" | "variables_hash_max_size"
             | "variables_hash_bucket_size" | "proxy_protocol" | "preread_buffer_size"
-            | "preread_timeout" | "ssl_password_file" | "ssl_protocols"
+            | "preread_timeout" | "ssl_protocols"
             | "ssl_ciphers" | "ssl_session_cache" | "ssl_session_timeout" | "ssl_dhparam"
             | "ssl_prefer_server_ciphers" | "ssl_handshake_timeout" | "ssl_ecdh_curve" => {}
             "error_log" => {}
@@ -2735,6 +2772,11 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             "ssl_certificate_key" => {
                 if let Some(p) = d.args.first() {
                     stream_key = Some(b.prefix.join(p));
+                }
+            }
+            "ssl_password_file" => {
+                if let Some(p) = d.args.first() {
+                    stream_password = Some(b.prefix.join(p));
                 }
             }
             other => b.warn(d, format!("unknown directive \"{other}\" in stream context; ignored")),
@@ -2750,6 +2792,7 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             ssl: false,
             ssl_certificate: None,
             ssl_certificate_key: None,
+            ssl_password_file: None,
             proxy_timeout: Duration::from_secs(600),
             proxy_connect_timeout: Duration::from_secs(60),
         };
@@ -2806,8 +2849,13 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                         cfg.ssl_certificate_key = Some(b.prefix.join(p));
                     }
                 }
+                "ssl_password_file" => {
+                    if let Some(p) = child.args.first() {
+                        cfg.ssl_password_file = Some(b.prefix.join(p));
+                    }
+                }
                 "proxy_protocol" | "proxy_buffer_size" | "proxy_responses" | "preread_buffer_size"
-                | "preread_timeout" | "ssl_password_file" | "set"
+                | "preread_timeout" | "set"
                 | "if" | "proxy_ssl_server_name" | "proxy_ssl_verify" | "proxy_requests" => {}
                 other => {
                     return Err(sem(
@@ -2826,6 +2874,9 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
         }
         if cfg.ssl_certificate_key.is_none() {
             cfg.ssl_certificate_key = stream_key.clone();
+        }
+        if cfg.ssl_password_file.is_none() {
+            cfg.ssl_password_file = stream_password.clone();
         }
         section.servers.push(cfg);
     }
@@ -2907,6 +2958,9 @@ pub fn build(
     }
 
     let mut http = Http {
+        ssl_certificate: None,
+        ssl_certificate_key: None,
+        ssl_password_file: None,
         servers: Vec::new(),
         groups: Vec::new(),
         mime: MimeMap::new(),
@@ -3104,6 +3158,21 @@ pub fn build(
                     return Err(sem(&d.file, d.line, "invalid resolver"));
                 }
             }
+            "ssl_certificate" => {
+                if let Some(v) = d.args.first() {
+                    http.ssl_certificate = Some(resolve_path(prefix, v));
+                }
+            }
+            "ssl_certificate_key" => {
+                if let Some(v) = d.args.first() {
+                    http.ssl_certificate_key = Some(resolve_path(prefix, v));
+                }
+            }
+            "ssl_password_file" => {
+                if let Some(v) = d.args.first() {
+                    http.ssl_password_file = Some(resolve_path(prefix, v));
+                }
+            }
             "large_client_header_buffers" => {
                 let num = d
                     .args
@@ -3271,6 +3340,18 @@ pub fn build(
             http.large_client_header_buffers.1,
             http.large_client_header_buffers.0,
         )?;
+        // Certificates declared in the `http` block are inherited by servers
+        // that do not override them.
+        let mut server = server;
+        if server.ssl_certificate.is_none() {
+            server.ssl_certificate = http.ssl_certificate.clone();
+        }
+        if server.ssl_certificate_key.is_none() {
+            server.ssl_certificate_key = http.ssl_certificate_key.clone();
+        }
+        if server.ssl_password_file.is_none() {
+            server.ssl_password_file = http.ssl_password_file.clone();
+        }
         if server.names.is_empty() {
             // nginx default server_name is ""
         }

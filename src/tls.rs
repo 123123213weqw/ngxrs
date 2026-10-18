@@ -60,7 +60,73 @@ impl ResolvesServerCert for SniResolver {
     }
 }
 
-fn load_cert(key_path: &Path, cert_path: &Path) -> io::Result<Arc<CertifiedKey>> {
+/// Read an `ssl_password_file`: one password per line, tried in order.
+/// nginx loads the whole file at config time and stops at the first password
+/// that decrypts the key, so a file may legitimately hold several.
+pub fn read_passwords(path: &Path) -> io::Result<Vec<String>> {
+    let text = std::fs::read(path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("cannot read ssl_password_file {}: {e}", path.display()),
+        )
+    })?;
+    Ok(String::from_utf8_lossy(&text)
+        .lines()
+        .map(|l| l.trim_end_matches('\r').to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+/// Decrypt a PKCS#8 `BEGIN ENCRYPTED PRIVATE KEY` block.
+///
+/// Returns `None` when the PEM holds no encrypted block, so the common
+/// unencrypted case keeps using `rustls-pemfile` untouched.
+fn decrypt_pkcs8(pem: &[u8], passwords: &[String]) -> io::Result<Option<Vec<u8>>> {
+    let text = match std::str::from_utf8(pem) {
+        Ok(t) => t,
+        Err(_) => return Ok(None),
+    };
+    if !text.contains("ENCRYPTED PRIVATE KEY") {
+        return Ok(None);
+    }
+    if passwords.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "private key is encrypted but no ssl_password_file is configured",
+        ));
+    }
+    // `EncryptedPrivateKeyInfo` borrows from the DER, so `DecodePem` (which
+    // needs an owned result) is unavailable; extract the block and decode it
+    // in place instead.
+    let body: String = text
+        .split_once("-----BEGIN ENCRYPTED PRIVATE KEY-----")
+        .and_then(|(_, rest)| rest.split_once("-----END ENCRYPTED PRIVATE KEY-----"))
+        .map(|(b, _)| b.split_whitespace().collect())
+        .unwrap_or_default();
+    let der = crate::util::base64_decode(&body)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad base64 in encrypted key"))?;
+    let info = <pkcs8::EncryptedPrivateKeyInfo as pkcs8::der::Decode>::from_der(&der)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad encrypted key: {e}")))?;
+    let mut last = String::from("no password matched");
+    for pw in passwords {
+        // `pkcs8` handles PBES2 (PBKDF2 + AES-CBC or 3DES) and yields plain
+        // PKCS#8 DER, which is exactly what ring expects.
+        match info.decrypt(pw.as_bytes()) {
+            Ok(doc) => return Ok(Some(doc.as_bytes().to_vec())),
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("cannot decrypt private key with any password in ssl_password_file: {last}"),
+    ))
+}
+
+fn load_cert_with(
+    key_path: &Path,
+    cert_path: &Path,
+    passwords: &[String],
+) -> io::Result<Arc<CertifiedKey>> {
     let cert_pem = std::fs::read(cert_path).map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -84,18 +150,29 @@ fn load_cert(key_path: &Path, cert_path: &Path) -> io::Result<Arc<CertifiedKey>>
         ));
     }
 
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_pem.as_slice())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad private key: {e}")))?
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("no private key in {}", key_path.display()),
-            )
-        })?;
+    let key: PrivateKeyDer<'static> = match decrypt_pkcs8(&key_pem, passwords)? {
+        // Decrypted PKCS#8 DER needs an explicit tag: the PEM parser would have
+        // to guess between PKCS#8 and PKCS#1.
+        Some(der) => PrivateKeyDer::Pkcs8(der.into()),
+        None => rustls_pemfile::private_key(&mut key_pem.as_slice())
+            .map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("bad private key: {e}"))
+            })?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("no private key in {}", key_path.display()),
+                )
+            })?,
+    };
 
     let signing = ring::sign::any_supported_type(&key)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("unsupported key: {e}")))?;
     Ok(Arc::new(CertifiedKey::new(certs, signing)))
+}
+
+fn load_cert(key_path: &Path, cert_path: &Path) -> io::Result<Arc<CertifiedKey>> {
+    load_cert_with(key_path, cert_path, &[])
 }
 
 /// Build the TLS configuration for one listen socket.
@@ -110,7 +187,13 @@ pub fn build_config(http: &Http, server_idxs: &[usize]) -> io::Result<Arc<Server
             (Some(c), Some(k)) => (c, k),
             _ => continue,
         };
-        let key_id = load_cert(key, cert)?;
+        // `ssl_password_file` is inherited from the http block, so the server
+        // already carries the effective path.
+        let passwords = match &server.ssl_password_file {
+            Some(p) => read_passwords(p)?,
+            None => Vec::new(),
+        };
+        let key_id = load_cert_with(key, cert, &passwords)?;
         for name in &server.names {
             let lower = name.to_ascii_lowercase();
             if lower.is_empty() || lower == "_" || lower.starts_with('~') {
@@ -198,7 +281,16 @@ pub fn build_mail_config(
     cert: &Path,
     key: &Path,
 ) -> io::Result<Arc<ServerConfig>> {
-    let key_id = load_cert(key, cert)?;
+    build_mail_config_with(cert, key, &[])
+}
+
+/// As `build_mail_config`, but able to unlock an encrypted key.
+pub fn build_mail_config_with(
+    cert: &Path,
+    key: &Path,
+    passwords: &[String],
+) -> io::Result<Arc<ServerConfig>> {
+    let key_id = load_cert_with(key, cert, passwords)?;
     let resolver = Arc::new(SniResolver {
         exact: HashMap::new(),
         wildcard: HashMap::new(),

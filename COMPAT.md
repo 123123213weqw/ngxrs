@@ -200,12 +200,17 @@ HTTP/1.1 keepalive 响应会一直阻塞到 8s 超时并返回 `undef`。**真 n
 http/proxy/upstream/range/fastcgi/scgi/uwsgi/stream/limit 各类用例，
 只报告「nginx 过而 ngxrs 不过」的真缺陷。
 
-最近一次全扫（27 个参评文件 / 18 个双方都跳过）：**24 个与 nginx 断言数完全一致**，
-2 个**优于** nginx（`http_headers_multi` 49 vs 48、`http_host` 58 vs 62），
-1 个更差（`http_keepalive_shutdown`，1 条断言）。
+最近一次全扫（39 个参评文件 / 21 个双方都跳过）：
 
-> 该轮扫描时 `http_keepalive_shutdown` 的修复（`limit_req` 延迟后重新判定 keepalive）
-> 还没部署；单独重跑后它是 3/3 与 nginx 一致，所以最新的落后断言数是 **0**（在这 27 个文件范围内）。
+| | 数量 |
+|---|---|
+| 与 nginx 断言数**完全一致** | **34** |
+| **优于** nginx | **3**（`http_headers_multi` 49 vs 48、`http_host` 58 vs 62、`proxy_cache_range` 9 vs 8） |
+| 更差 | 2（`proxy_cache_lock` -1、`proxy_cache_max_range_offset` -1） |
+| **落后断言合计** | **2** |
+
+两个剩余差距：`proxy_cache_lock` 的 lock timeout 边界；`proxy_cache_max_range_offset`
+的 `proxy_cache_min_uses` 分支（该指令目前只解析未生效）。
 
 完全一致的用例（断言数与 nginx 相同）：`http_location` 16/16、`http_uri` 21/21、
 `http_server_name` 22/22、`http_method` 4/6、`http_try_files` 12/12、

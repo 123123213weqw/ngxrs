@@ -179,6 +179,8 @@ pub fn maybe_compress(req: &Request, resp: Response, loc: &LocCfg, http: &Http) 
             raw,
             explicit_len: resp.explicit_len,
             no_error_page: resp.no_error_page,
+            trailers: resp.trailers,
+            expect_trailers: resp.expect_trailers,
             body,
         };
     };
@@ -199,6 +201,8 @@ pub fn maybe_compress(req: &Request, resp: Response, loc: &LocCfg, http: &Http) 
         raw,
         explicit_len: true,
         no_error_page: resp.no_error_page,
+        trailers: resp.trailers,
+        expect_trailers: resp.expect_trailers,
         body: Body::Bytes(payload),
     }
 }

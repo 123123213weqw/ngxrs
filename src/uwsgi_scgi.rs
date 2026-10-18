@@ -315,6 +315,8 @@ async fn run(
         raw,
         explicit_len: true,
         no_error_page: false,
+        trailers: Vec::new(),
+        expect_trailers: false,
         body: Body::Bytes(framed),
     };
     let bytes = crate::http::write_response(
@@ -356,6 +358,8 @@ async fn error_out(conn: &mut Conn, status: u16, tokens: bool, keepalive: bool) 
         raw,
         explicit_len: true,
         no_error_page: false,
+        trailers: Vec::new(),
+        expect_trailers: false,
         body: Body::Bytes(body),
     };
     let bytes = crate::http::write_response(conn, resp, keepalive, tokens, false).await?;

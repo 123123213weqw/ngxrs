@@ -127,6 +127,16 @@ pub struct LocCfg {
     pub proxy_cache_convert_head: bool,
     /// `proxy_cache_background_update`: serve a stale entry while refreshing.
     pub proxy_cache_background_update: bool,
+    /// `proxy_intercept_errors`: let `error_page` handle proxy error statuses.
+    pub proxy_intercept_errors: bool,
+    /// `add_trailer` entries, same shape as `headers`.
+    pub trailers: Vec<(String, String)>,
+    /// `max_ranges N`: at most N ranges are honoured; `0` disables ranges.
+    /// `None` means the directive was not set (unlimited).
+    pub max_ranges: Option<u32>,
+    /// `proxy_force_ranges`: honour `Range` even if the upstream never
+    /// advertised `Accept-Ranges`.
+    pub proxy_force_ranges: bool,
     pub proxy_cache_lock: bool,
     pub proxy_cache_lock_timeout: Duration,
     pub proxy_cache_lock_age: Duration,
@@ -204,6 +214,10 @@ impl LocCfg {
             proxy_cache_ignore: crate::cache::Ignore::default(),
             proxy_cache_convert_head: true,
             proxy_cache_background_update: false,
+            trailers: Vec::new(),
+            max_ranges: None,
+            proxy_intercept_errors: false,
+            proxy_force_ranges: false,
             proxy_cache_lock: false,
             proxy_cache_lock_timeout: Duration::from_secs(5),
             proxy_cache_lock_age: Duration::from_secs(5),
@@ -1044,6 +1058,13 @@ impl Builder {
                 cfg.headers
                     .push((d.args[0].clone(), d.args[1..].join(" ")));
             }
+            "add_trailer" => {
+                if d.args.len() < 2 {
+                    return Err(sem(&d.file, d.line, "add_trailer requires at least 2 arguments"));
+                }
+                cfg.trailers
+                    .push((d.args[0].clone(), d.args[1..].join(" ")));
+            }
             "error_page" => {
                 let mut codes: Vec<u16> = Vec::new();
                 let mut uri: Option<String> = None;
@@ -1603,6 +1624,16 @@ impl Builder {
                 cfg.proxy_cache_convert_head =
                     d.args.first().map(|v| v != "off").unwrap_or(true);
             }
+            "proxy_intercept_errors" => {
+                cfg.proxy_intercept_errors =
+                    d.args.first().map(|v| v != "off").unwrap_or(true);
+            }
+            "max_ranges" => {
+                cfg.max_ranges = d.args.first().and_then(|v| v.parse().ok());
+            }
+            "proxy_force_ranges" => {
+                cfg.proxy_force_ranges = d.args.first().map(|v| v != "off").unwrap_or(true);
+            }
             "proxy_cache_background_update" => {
                 cfg.proxy_cache_background_update =
                     d.args.first().map(|v| v != "off").unwrap_or(true);
@@ -1645,7 +1676,7 @@ impl Builder {
             | "proxy_buffer_size" | "proxy_busy_buffers_size" | "proxy_max_temp_file_size"
             | "proxy_temp_file_write_size" | "proxy_redirect" | "proxy_cache"
             | "proxy_cache_valid" | "proxy_cache_key" | "proxy_cache_bypass" | "proxy_no_cache"
-            | "proxy_intercept_errors" | "proxy_pass_request_body" | "proxy_pass_request_headers"
+            | "proxy_pass_request_body" | "proxy_pass_request_headers"
             | "proxy_ssl_server_name" | "proxy_ssl_verify" => {
                 // Accepted, not yet honoured.
             }
@@ -2350,7 +2381,8 @@ pub fn build(
                     });
                 }
             }
-            "root" | "index" | "autoindex" | "add_header" | "error_page" | "expires" => {
+            "root" | "index" | "autoindex" | "add_header" | "add_trailer" | "error_page"
+            | "expires" => {
                 b.apply_loc(d, &mut http.default_loc)?;
             }
             "upstream" => {

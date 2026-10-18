@@ -43,6 +43,12 @@ pub struct Response {
     pub explicit_len: bool,
     /// Set for `return` responses: nginx does not run error_page on those.
     pub no_error_page: bool,
+    /// `add_trailer` entries that produced a value; sent after the body.
+    pub trailers: Vec<(String, String)>,
+    /// `add_trailer` matched this status, so nginx switches to chunked even if
+    /// every value expands to empty (`ngx_http_headers_filter` sets
+    /// `r->expect_trailers` before the values are known).
+    pub expect_trailers: bool,
     pub body: Body,
 }
 
@@ -60,6 +66,8 @@ impl Response {
             raw: Vec::new(),
             explicit_len: false,
             no_error_page: false,
+            trailers: Vec::new(),
+            expect_trailers: false,
             body: Body::Empty,
         }
     }
@@ -71,6 +79,8 @@ impl Response {
             raw: Vec::new(),
             explicit_len: false,
             no_error_page: false,
+            trailers: Vec::new(),
+            expect_trailers: false,
             body: Body::Bytes(body),
         }
     }
@@ -83,6 +93,8 @@ impl Response {
             raw,
             explicit_len: true,
             no_error_page: false,
+            trailers: Vec::new(),
+            expect_trailers: false,
             body,
         }
     }
@@ -483,7 +495,7 @@ async fn route(
     }
 }
 
-fn error_response(status: u16, tokens: bool) -> Response {
+pub fn error_response(status: u16, tokens: bool) -> Response {
     let body = error_body(status, tokens);
     Response::raw(
         status,
@@ -999,6 +1011,85 @@ fn add_header_applies(status: u16, always: bool) -> bool {
 
 /// Append `add_header` lines to a rendered header block.
 /// Variant for the proxy paths: knows the cache status and `$upstream_addr`.
+
+
+/// Evaluate `add_trailer` for a response.
+///
+/// Mirrors `ngx_http_headers_filter`: any directive whose status matches sets
+/// `expect_trailers` (which forces chunked encoding) *before* the value is
+/// known, so `add_trailer X ""` still produces a chunked response with no
+/// trailer lines. Only non-empty values become actual trailers, and later
+/// directives can see earlier ones through `$sent_trailer_*`.
+pub fn eval_trailers(
+    trailers: &[(String, String)],
+    status: u16,
+    vars: &ServerVars<'_>,
+) -> (bool, Vec<(String, String)>) {
+    let mut expect = false;
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    for (name, value) in trailers {
+        let (value, always) = match value.rsplit_once(' ') {
+            Some((v, "always")) => (v, true),
+            _ => (value.as_str(), false),
+        };
+        if !add_header_applies(status, always) {
+            continue;
+        }
+        expect = true;
+
+        let mut custom = vars.custom.clone();
+        for (k, v) in &seen {
+            custom.insert(k.clone(), v.clone());
+        }
+        let scoped = ServerVars { custom: &custom, ..*vars };
+        let expanded = scoped.expand(value);
+        if expanded.is_empty() {
+            continue;
+        }
+        let key = name.to_ascii_lowercase().replace('-', "_");
+        seen.entry(format!("sent_trailer_{key}"))
+            .and_modify(|v| {
+                v.push_str(", ");
+                v.push_str(&expanded);
+            })
+            .or_insert_with(|| expanded.clone());
+        out.push((name.clone(), expanded));
+    }
+    (expect, out)
+}
+
+/// `add_header` is *not* always additive: nginx's `ngx_http_set_headers` table
+/// gives `Last-Modified` and `ETag` a setter that replaces the existing value
+/// (`Cache-Control` and `Link` append to a list instead).
+///
+/// `proxy_force_ranges.t` depends on this: an upstream `add_header ETag "..."` is
+/// seen by `If-Range`, which only works because the file's own ETag is gone.
+fn drop_replaced_header(raw: &mut Vec<u8>, name: &str) {
+    if !name.eq_ignore_ascii_case("last-modified") && !name.eq_ignore_ascii_case("etag") {
+        return;
+    }
+    let src = std::mem::take(raw);
+    let mut pos = 0usize;
+    let mut out = Vec::with_capacity(src.len());
+    while pos < src.len() {
+        let end = memchr::memmem::find(&src[pos..], b"\r\n")
+            .map(|i| pos + i)
+            .unwrap_or(src.len());
+        let line = &src[pos..end];
+        let same = line.len() > name.len()
+            && line[..name.len()].eq_ignore_ascii_case(name.as_bytes())
+            && line[name.len()] == b':';
+        if !same {
+            out.extend_from_slice(line);
+            out.extend_from_slice(b"\r\n");
+        }
+        pos = end + 2;
+    }
+    *raw = out;
+}
+
 pub fn apply_add_headers_upstream(
     raw: &mut Vec<u8>,
     headers: &[(String, String)],
@@ -1077,6 +1168,7 @@ pub fn apply_add_headers_ctx(
         if expanded.is_empty() {
             continue;
         }
+        drop_replaced_header(raw, name);
         raw.extend_from_slice(name.as_bytes());
         raw.extend_from_slice(b": ");
         raw.extend_from_slice(expanded.as_bytes());
@@ -1170,6 +1262,7 @@ pub fn apply_add_headers_simple(
         if expanded.is_empty() {
             continue;
         }
+        drop_replaced_header(raw, name);
         raw.extend_from_slice(name.as_bytes());
         raw.extend_from_slice(b": ");
         raw.extend_from_slice(expanded.as_bytes());
@@ -1215,6 +1308,7 @@ pub fn apply_add_headers(
         if expanded.is_empty() {
             continue;
         }
+        drop_replaced_header(raw, name);
         raw.extend_from_slice(name.as_bytes());
         raw.extend_from_slice(b": ");
         raw.extend_from_slice(expanded.as_bytes());
@@ -2113,7 +2207,7 @@ async fn finalize_response(
 
     apply_expires(&mut out.raw, cur_loc);
 
-    if !cur_loc.headers.is_empty() {
+    if !cur_loc.headers.is_empty() || !cur_loc.trailers.is_empty() {
         // `$sent_http_*` sees the headers produced so far (nginx evaluates
         // add_header left to right, so earlier ones are visible).
         let existing = split_head(&out.raw);
@@ -2134,6 +2228,11 @@ async fn finalize_response(
             sent: &existing,
         };
         apply_add_headers(&mut out.raw, &cur_loc.headers, out.status, &vars);
+        if !cur_loc.trailers.is_empty() {
+            let (expect, list) = eval_trailers(&cur_loc.trailers, out.status, &vars);
+            out.expect_trailers = expect;
+            out.trailers = list;
+        }
     }
 
     out
@@ -2522,6 +2621,8 @@ async fn write_redirect(
         raw: out_raw,
         explicit_len: true,
         no_error_page: false,
+        trailers: Vec::new(),
+        expect_trailers: false,
         body: Body::Bytes(body),
     };
     let bytes = write_response(conn, resp, req.keepalive, tokens, req.method == Method::Head).await?;
@@ -2627,6 +2728,8 @@ pub async fn send_error(
         },
         no_error_page: false,
             explicit_len: true,
+        trailers: Vec::new(),
+        expect_trailers: false,
         body: Body::Bytes(body),
     };
     write_response(conn, resp, keepalive, tokens, head_only).await
@@ -2704,6 +2807,8 @@ pub async fn write_response_ka(
         raw,
         explicit_len,
         no_error_page: _,
+        trailers,
+        expect_trailers,
         body,
     } = resp;
 
@@ -2729,11 +2834,18 @@ pub async fn write_response_ka(
         .as_secs() as i64;
     util::write_date_header(&mut out, now);
 
-    let has_cl = explicit_len
-        || headers
-            .iter()
-            .any(|(k, _)| k.eq_ignore_ascii_case("content-length"));
-    if !has_cl && !matches!(status, 204 | 304) {
+    // `add_trailer` forces chunked: the length is no longer the message
+    // delimiter, so a Content-Length must not be emitted.
+    let chunked = expect_trailers && !matches!(status, 204 | 304);
+    let has_cl = !chunked
+        && (explicit_len
+            || headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-length")));
+    if chunked {
+        out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+    }
+    if !has_cl && !chunked && !matches!(status, 204 | 304) {
         out.extend_from_slice(b"Content-Length: ");
         out.extend_from_slice(body_len.to_string().as_bytes());
         out.extend_from_slice(b"\r\n");
@@ -2770,10 +2882,27 @@ pub async fn write_response_ka(
     }
 
     let result = match body {
-        Body::Empty => conn.write_all(&out).await.map(|_| 0),
+        Body::Empty => {
+            if chunked {
+                out.extend_from_slice(b"0\r\n");
+                push_trailers(&mut out, &trailers);
+            }
+            conn.write_all(&out).await.map(|_| 0)
+        }
         Body::Bytes(b) => {
-            out.extend_from_slice(&b);
-            conn.write_all(&out).await.map(|_| b.len() as u64)
+            if chunked {
+                if !b.is_empty() {
+                    out.extend_from_slice(format!("{:x}\r\n", b.len()).as_bytes());
+                    out.extend_from_slice(&b);
+                    out.extend_from_slice(b"\r\n");
+                }
+                out.extend_from_slice(b"0\r\n");
+                push_trailers(&mut out, &trailers);
+                conn.write_all(&out).await.map(|_| b.len() as u64)
+            } else {
+                out.extend_from_slice(&b);
+                conn.write_all(&out).await.map(|_| b.len() as u64)
+            }
         }
         // Small files: one write beats header+sendfile (two syscalls, two
         // segments). Large files stay zero-copy.
@@ -2825,6 +2954,17 @@ pub async fn write_response_ka(
     out.clear();
     conn.out = out;
     result
+}
+
+/// Append trailer lines plus the terminating chunk.
+fn push_trailers(out: &mut Vec<u8>, trailers: &[(String, String)]) {
+    for (k, v) in trailers {
+        out.extend_from_slice(k.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(v.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
 }
 
 /// Write a response head only (used by the proxy, which streams its own body).

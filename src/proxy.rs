@@ -505,10 +505,37 @@ pub async fn handle(
         .unwrap_or(false);
 
     // ---- proxy_cache: serve a fresh hit without touching the upstream ----
-    let zone = loc
-        .proxy_cache
-        .as_ref()
-        .and_then(|name| http.cache_zones.iter().find(|z| &z.name == name));
+    // `proxy_cache` takes a complex value: `proxy_cache $arg_c;` picks the zone
+    // per request. An empty result disables caching, an unknown name is a 500
+    // (nginx logs "cache \"%V\" is not found" and fails the request).
+    let zone_name = loc.proxy_cache.as_ref().map(|spec| vars.expand(spec));
+    if let Some(name) = zone_name.as_deref() {
+        if !name.is_empty() && !http.cache_zones.iter().any(|z| z.name == name) {
+            crate::log::error_log(
+                "error",
+                &format!("cache \"{name}\" is not found"),
+            );
+            let resp = crate::http::error_response(500, http.server_tokens);
+            let bytes = crate::http::write_response(
+                conn,
+                resp,
+                req.keepalive,
+                tokens,
+                req.method == Method::Head,
+            )
+            .await?;
+            return Ok(Some(Outcome {
+                status: 500,
+                bytes,
+                close: false,
+                sent: Vec::new(),
+            }));
+        }
+    }
+    let zone = zone_name
+        .as_deref()
+        .filter(|n| !n.is_empty())
+        .and_then(|name| http.cache_zones.iter().find(|z| z.name == name));
     let cache_key = zone.map(|_| {
         let key_spec = loc.proxy_cache_key.as_deref();
         let scheme = "http";
@@ -593,13 +620,25 @@ pub async fn handle(
                     raw.extend_from_slice(b"Content-Length: ");
                     raw.extend_from_slice(entry.body.len().to_string().as_bytes());
                     raw.extend_from_slice(b"\r\n");
+                    // A range is served out of the cached body.
+                    let mut status = entry.status;
+                    let mut body = entry.body.clone();
+                    if loc.proxy_force_ranges {
+                        let (s2, raw2, body2) =
+                            apply_force_ranges(req, loc, status, &mut raw, body);
+                        status = s2;
+                        raw = raw2;
+                        body = body2;
+                    }
                     let resp = Response {
-                        status: entry.status,
+                        status,
                         headers: Vec::new(),
                         raw,
                         explicit_len: true,
                         no_error_page: false,
-                        body: crate::http::Body::Bytes(entry.body.clone()),
+                        trailers: Vec::new(),
+                        expect_trailers: false,
+                        body: crate::http::Body::Bytes(body),
                     };
                     let bytes = crate::http::write_response(
                         conn,
@@ -610,7 +649,7 @@ pub async fn handle(
                     )
                     .await?;
                     return Ok(Some(Outcome {
-                        status: entry.status,
+                        status,
                         bytes,
                         close: false,
                         sent: Vec::new(),
@@ -660,6 +699,8 @@ pub async fn handle(
                         raw,
                         explicit_len: true,
                         no_error_page: false,
+                        trailers: Vec::new(),
+                        expect_trailers: false,
                         body: Body::Bytes(entry.body),
                     };
                     let bytes = crate::http::write_response(
@@ -1251,8 +1292,13 @@ async fn exchange(
     // nginx buffers close-delimited *and* chunked upstream responses so they can
     // be cached and re-sent with a Content-Length. Any status is cacheable when
     // the headers decide a validity (verified against nginx 1.28).
+    // `proxy_force_ranges` needs the whole body in memory to slice it, so a
+    // ranged request is buffered even when the response is not cacheable.
+    let wants_ranges = loc.proxy_force_ranges
+        && req.headers.get("range").is_some()
+        && !is_upgrade;
     let cacheable = cache.zone.is_some() && cache.key.is_some() && !is_upgrade;
-    if cacheable {
+    if cacheable || wants_ranges {
         let mut payload = buf;
         match (head.chunked, total_len) {
             // Chunked: read to the terminator, then decode.
@@ -1306,7 +1352,8 @@ async fn exchange(
             }
         }
 
-        if let (Some(zone), Some(key)) = (cache.zone, cache.key) {
+        if cacheable {
+            if let (Some(zone), Some(key)) = (cache.zone, cache.key) {
             let stored_headers: Vec<(String, String)> = crate::http::split_head(&raw)
                 .into_iter()
                 .filter(|(k, _)| {
@@ -1327,6 +1374,7 @@ async fn exchange(
                     valid_for: valid.as_secs(),
                 };
                 let _ = crate::cache::store(zone, key, &entry);
+            }
             }
         }
 
@@ -1353,13 +1401,56 @@ async fn exchange(
             out_raw.extend_from_slice(payload.len().to_string().as_bytes());
             out_raw.extend_from_slice(b"\r\n");
         }
-        write_head(conn, head.status, &out_raw, req.keepalive, tokens).await?;
+        let mut status = head.status;
+        if wants_ranges {
+            let (s2, raw2, body2) = apply_force_ranges(req, loc, status, &mut out_raw, payload);
+            status = s2;
+            out_raw = raw2;
+            payload = body2;
+        }
+        // `add_trailer` switches the response to chunked encoding, so the
+        // buffered reply must go through the normal response writer.
+        if !loc.trailers.is_empty() {
+            let (expect, list) = crate::http::eval_trailers(&loc.trailers, status, vars);
+            if expect {
+                out_raw = strip_length_headers(&mut out_raw);
+                let resp = Response {
+                    status,
+                    headers: Vec::new(),
+                    raw: out_raw,
+                    explicit_len: false,
+                    no_error_page: false,
+                    trailers: list,
+                    expect_trailers: true,
+                    body: if req.method == Method::Head {
+                        crate::http::Body::Empty
+                    } else {
+                        crate::http::Body::Bytes(payload)
+                    },
+                };
+                let bytes = crate::http::write_response(
+                    conn,
+                    resp,
+                    req.keepalive,
+                    tokens,
+                    req.method == Method::Head,
+                )
+                .await?;
+                return Ok(Outcome {
+                    status,
+                    bytes,
+                    close: false,
+                    sent: Vec::new(),
+                });
+            }
+        }
+        write_head(conn, status, &out_raw, req.keepalive, tokens).await?;
         // A converted HEAD gets no body even though the upstream sent one.
         if req.method != Method::Head {
             conn.write_all(&payload).await?;
         }
         return Ok(Outcome {
-            status: head.status,
+            status,
             bytes: payload.len() as u64,
             close: false,
             sent: Vec::new(),
@@ -1725,6 +1816,8 @@ pub async fn fetch(
             raw,
             explicit_len: true,
             no_error_page: false,
+            trailers: Vec::new(),
+            expect_trailers: false,
             body: Body::Bytes(body),
         });
     }
@@ -1947,4 +2040,132 @@ async fn refetch(
         }
         buf.extend_from_slice(&chunk[..n]);
     }
+}
+
+/// `proxy_force_ranges`: slice a buffered upstream body for a `Range` request.
+///
+/// nginx serves ranges from a proxied response even when the upstream never
+/// sent `Accept-Ranges` (verified against 1.28 with `max_ranges 0` upstream).
+/// Returns the (possibly rewritten) status, head and body.
+fn apply_force_ranges(
+    req: &Request,
+    loc: &LocCfg,
+    status: u16,
+    raw: &mut Vec<u8>,
+    body: Vec<u8>,
+) -> (u16, Vec<u8>, Vec<u8>) {
+    if !loc.proxy_force_ranges || status != 200 {
+        return (status, std::mem::take(raw), body);
+    }
+    let Some(range) = req.headers.get("range") else {
+        return (status, std::mem::take(raw), body);
+    };
+
+    // `If-Range` must still match, exactly like the static-file path.
+    if let Some(cond) = req.headers.get("if-range") {
+        let headers = crate::http::split_head(raw);
+        let get = |name: &str| {
+            headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
+        };
+        let ok = if cond.trim().starts_with('"') || cond.trim().starts_with("W/") {
+            get("etag").map(|e| e.trim() == cond.trim()).unwrap_or(false)
+        } else {
+            match (
+                crate::util::parse_http_date(cond),
+                get("last-modified").and_then(|v| crate::util::parse_http_date(&v)),
+            ) {
+                (Some(want), Some(have)) => have <= want,
+                _ => false,
+            }
+        };
+        if !ok {
+            return (status, std::mem::take(raw), body);
+        }
+    }
+
+    let size = body.len() as u64;
+    let content_type = crate::http::split_head(raw)
+        .into_iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v)
+        .unwrap_or_else(|| "text/html".to_string());
+
+    match crate::http::static_file::parse_multi_range(range, size) {
+        crate::http::static_file::MultiRange::Ignore => (status, std::mem::take(raw), body),
+        crate::http::static_file::MultiRange::Unsatisfiable => {
+            let mut out = Vec::new();
+            out.extend_from_slice(b"Content-Type: text/html\r\nContent-Range: bytes */");
+            out.extend_from_slice(size.to_string().as_bytes());
+            out.extend_from_slice(b"\r\nContent-Length: 0\r\n");
+            (416, out, Vec::new())
+        }
+        crate::http::static_file::MultiRange::Ranges(spans) => {
+            let mut head = strip_length_headers(raw);
+            if spans.len() == 1 {
+                let (start, end) = spans[0];
+                head.extend_from_slice(b"Content-Range: bytes ");
+                head.extend_from_slice(start.to_string().as_bytes());
+                head.push(b'-');
+                head.extend_from_slice(end.to_string().as_bytes());
+                head.push(b'/');
+                head.extend_from_slice(size.to_string().as_bytes());
+                head.extend_from_slice(b"\r\nContent-Length: ");
+                head.extend_from_slice((end - start + 1).to_string().as_bytes());
+                head.extend_from_slice(b"\r\n");
+                let lo = (start as usize).min(body.len());
+                let hi = (end as usize + 1).min(body.len());
+                (206, head, body[lo..hi].to_vec())
+            } else {
+                // nginx picks the boundary from the request's address/size.
+                let boundary = format!("{:016X}", span_hash(req, size));
+                let mbody =
+                    crate::http::static_file::multipart_body(&boundary, &content_type, size, &spans, &body);
+                head.extend_from_slice(b"Content-Type: multipart/byteranges; boundary=");
+                head.extend_from_slice(boundary.as_bytes());
+                head.extend_from_slice(b"\r\nContent-Length: ");
+                head.extend_from_slice(mbody.len().to_string().as_bytes());
+                head.extend_from_slice(b"\r\n");
+                (206, head, mbody)
+            }
+        }
+    }
+}
+
+/// Drop `Content-Length`, `Content-Range` and `Content-Type` before re-adding.
+fn strip_length_headers(raw: &mut Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut pos = 0usize;
+    while pos < raw.len() {
+        let end = memchr::memmem::find(&raw[pos..], b"\r\n")
+            .map(|i| pos + i)
+            .unwrap_or(raw.len());
+        let line = &raw[pos..end];
+        let keep = ![
+            "content-length",
+            "content-range",
+            "content-type",
+            "accept-ranges",
+        ]
+        .iter()
+        .any(|n| {
+            line.len() > n.len() && line[..n.len()].eq_ignore_ascii_case(n.as_bytes())
+        });
+        if keep {
+            out.extend_from_slice(line);
+            out.extend_from_slice(b"\r\n");
+        }
+        pos = end + 2;
+    }
+    out
+}
+
+fn span_hash(req: &Request, size: u64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    req.raw_target.hash(&mut h);
+    size.hash(&mut h);
+    h.finish()
 }

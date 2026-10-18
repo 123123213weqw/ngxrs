@@ -174,7 +174,14 @@ fn serve_entry(
     let mut len = size;
     let mut content_range: Option<(u64, u64)> = None;
 
-    if let Some(range) = req.headers.get("range") {
+    // `max_ranges 0` disables byte ranges entirely; any other value caps how
+    // many spans a request may ask for (nginx ignores the header beyond it).
+    let range_header = req.headers.get("range").filter(|r| match loc.max_ranges {
+        Some(0) => false,
+        Some(max) => (r.matches(',').count() as u32 + 1) <= max,
+        None => true,
+    });
+    if let Some(range) = range_header {
         let if_range_ok = match req.headers.get("if-range") {
             None => true,
             Some(v) => {
@@ -238,6 +245,8 @@ fn serve_entry(
         raw,
         no_error_page: false,
             explicit_len: true,
+        trailers: Vec::new(),
+        expect_trailers: false,
         body: Body::File { file, offset, len },
     })
 }
@@ -268,6 +277,100 @@ pub enum RangeSpec {
     Single(u64, u64),
     Unsatisfiable,
     Ignore,
+}
+
+/// Result of parsing a `Range` header that may list several spans.
+pub enum MultiRange {
+    /// One or more inclusive `(start, end)` spans, in request order.
+    Ranges(Vec<(u64, u64)>),
+    Unsatisfiable,
+    Ignore,
+}
+
+/// Parse every span of a `Range: bytes=...` header.
+///
+/// Overlapping or out-of-order spans are kept as requested (nginx does not
+/// coalesce them).
+pub fn parse_multi_range(header: &str, size: u64) -> MultiRange {
+    let Some(spec) = header.trim().strip_prefix("bytes=") else {
+        return MultiRange::Ignore;
+    };
+    let mut spans = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Some((a, b)) = part.split_once('-') else {
+            return MultiRange::Ignore;
+        };
+        let (a, b) = (a.trim(), b.trim());
+        if a.is_empty() {
+            // suffix range: bytes=-N
+            let Ok(n) = b.parse::<u64>() else {
+                return MultiRange::Ignore;
+            };
+            if n == 0 || size == 0 {
+                return MultiRange::Unsatisfiable;
+            }
+            let n = n.min(size);
+            spans.push((size - n, size - 1));
+            continue;
+        }
+        let Ok(start) = a.parse::<u64>() else {
+            return MultiRange::Ignore;
+        };
+        if start >= size {
+            return MultiRange::Unsatisfiable;
+        }
+        let end = if b.is_empty() {
+            size - 1
+        } else {
+            let Ok(e) = b.parse::<u64>() else {
+                return MultiRange::Ignore;
+            };
+            if e < start {
+                return MultiRange::Ignore;
+            }
+            e.min(size - 1)
+        };
+        spans.push((start, end));
+    }
+    if spans.is_empty() {
+        return MultiRange::Ignore;
+    }
+    MultiRange::Ranges(spans)
+}
+
+/// Build a `multipart/byteranges` body exactly as nginx lays it out.
+pub fn multipart_body(
+    boundary: &str,
+    content_type: &str,
+    size: u64,
+    spans: &[(u64, u64)],
+    body: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len() + spans.len() * 128);
+    for (start, end) in spans {
+        out.extend_from_slice(b"\r\n--");
+        out.extend_from_slice(boundary.as_bytes());
+        out.extend_from_slice(b"\r\nContent-Type: ");
+        out.extend_from_slice(content_type.as_bytes());
+        out.extend_from_slice(b"\r\nContent-Range: bytes ");
+        out.extend_from_slice(start.to_string().as_bytes());
+        out.push(b'-');
+        out.extend_from_slice(end.to_string().as_bytes());
+        out.push(b'/');
+        out.extend_from_slice(size.to_string().as_bytes());
+        out.extend_from_slice(b"\r\n\r\n");
+        let lo = (*start as usize).min(body.len());
+        let hi = (*end as usize + 1).min(body.len());
+        out.extend_from_slice(&body[lo..hi]);
+    }
+    out.extend_from_slice(b"\r\n--");
+    out.extend_from_slice(boundary.as_bytes());
+    out.extend_from_slice(b"--\r\n");
+    out
 }
 
 pub fn parse_range(header: &str, size: u64) -> RangeSpec {

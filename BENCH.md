@@ -1,10 +1,11 @@
 # 基准测试记录
 
-机器：V100（`ssh WZU_V100`），64 核，251 GB，Ubuntu 22.04，kernel 6.8。
+测试机：64 核 / 251 GB / Ubuntu 22.04 / kernel 6.8（单台物理机，同机对跑）。
 
-基线：**nginx 1.28.0**，从源码编译到 `/home/wzu/nginx-baseline`（
+基线：**nginx 1.28.0**，从源码编译到 `$HOME/nginx-baseline`（
 `--with-http_ssl_module --with-http_v2_module --with-http_realip_module --with-http_stub_status_module --with-http_gzip_static_module --with-threads`）。
-本机 `/usr/bin/nginx` 是宝塔 OpenResty 构建且缺 lualib，不能作为基线。
+若要在你自己的机器上复现，请用源码编译的 nginx 1.28 作为基线——发行版自带的
+nginx 常常是多模块打包版（例如缺少 lualib 的 openresty 构建），可能起不来或行为不同。
 
 ## 方法
 

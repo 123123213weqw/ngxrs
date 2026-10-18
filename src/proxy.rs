@@ -687,10 +687,17 @@ pub async fn handle(
                         raw.extend_from_slice(entry.body.len().to_string().as_bytes());
                         raw.extend_from_slice(b"\r\n");
                     }
-                    // A range is served out of the cached body.
+                    // A range is served out of the cached body when the origin
+                    // advertised `Accept-Ranges: bytes` (nginx keeps that header
+                    // in the cache entry); `proxy_force_ranges` overrides it.
+                    let ranges_from_cache = loc.proxy_force_ranges
+                        || entry.headers.iter().any(|(k, v)| {
+                            k.eq_ignore_ascii_case("accept-ranges")
+                                && v.trim().eq_ignore_ascii_case("bytes")
+                        });
                     let mut status = entry.status;
                     let mut body = entry.body.clone();
-                    if loc.proxy_force_ranges {
+                    if ranges_from_cache {
                         let (s2, raw2, body2) =
                             apply_force_ranges(req, loc, status, &mut raw, body);
                         status = s2;
@@ -1401,9 +1408,14 @@ async fn exchange(
                     raw.extend_from_slice(entry.body.len().to_string().as_bytes());
                     raw.extend_from_slice(b"\r\n");
                 }
+                let ranges_from_cache = loc.proxy_force_ranges
+                    || entry.headers.iter().any(|(k, v)| {
+                        k.eq_ignore_ascii_case("accept-ranges")
+                            && v.trim().eq_ignore_ascii_case("bytes")
+                    });
                 let mut status = entry.status;
                 let mut body = entry.body.clone();
-                if loc.proxy_force_ranges {
+                if ranges_from_cache {
                     let (s2, raw2, body2) =
                         apply_force_ranges(req, loc, status, &mut raw, body);
                     status = s2;

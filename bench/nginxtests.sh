@@ -12,8 +12,14 @@
 set -uo pipefail
 source "$(dirname "$0")/lib.sh"
 
-TESTS_DIR="${TESTS_DIR:-/home/wzu/nginx-tests}"
-REF_BIN="${REF_BIN:-/home/wzu/nginx-baseline/sbin/nginx}"
+# nginx-tests checkout: `git clone https://github.com/nginx/nginx-tests`.
+TESTS_DIR="${TESTS_DIR:-$HOME/nginx-tests}"
+[[ -d "$TESTS_DIR" ]] || TESTS_DIR="$ROOT/../nginx-tests"
+if [[ ! -d "$TESTS_DIR" ]]; then
+  echo "TESTS_DIR not found; set it to your nginx-tests checkout" >&2
+  exit 2
+fi
+REF_BIN="${REF_BIN:-$NGINX_BIN}"
 BIN="$ROOT/target/release/ngxrs"
 OUT_DIR="$ROOT/bench/run/nginxtests"
 mkdir -p "$OUT_DIR"

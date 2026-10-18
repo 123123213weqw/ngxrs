@@ -7,16 +7,24 @@ WWW="$ROOT/bench/www"
 OUT="$ROOT/bench/results"
 PORT_NGINX="${PORT_NGINX:-19180}"
 PORT_NGXRS="${PORT_NGXRS:-19181}"
-# Prefer our own nginx 1.28 build; the distro one on this host is a Baota
-# openresty build whose lualib is missing.
+# Reference nginx for the A/B comparisons. Set NGINX_BIN/NGINX_PREFIX to pin it,
+# otherwise look in the two conventional locations before falling back to PATH.
+# A distro nginx is fine as long as it is built with the modules a test needs;
+# some packaged builds (e.g. openresty without lualib) refuse to start, which is
+# why an explicit path is preferred.
 if [[ -z "${NGINX_BIN:-}" ]]; then
-  if [[ -x /home/wzu/nginx-baseline/sbin/nginx ]]; then
-    NGINX_BIN=/home/wzu/nginx-baseline/sbin/nginx
-    NGINX_PREFIX=/home/wzu/nginx-baseline
-  else
+  for _cand in "$HOME/nginx-baseline/sbin/nginx" /usr/local/nginx/sbin/nginx; do
+    if [[ -x "$_cand" ]]; then
+      NGINX_BIN="$_cand"
+      NGINX_PREFIX="${_cand%/sbin/nginx}"
+      break
+    fi
+  done
+  if [[ -z "${NGINX_BIN:-}" ]]; then
     NGINX_BIN=nginx
-    NGINX_PREFIX=/usr/local/nginx
+    NGINX_PREFIX="${NGINX_PREFIX:-/usr/local/nginx}"
   fi
+  unset _cand
 fi
 NGINX_PREFIX="${NGINX_PREFIX:-/usr/local/nginx}"
 

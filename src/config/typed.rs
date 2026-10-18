@@ -809,6 +809,8 @@ pub struct ListenGroup {
     pub default_server: usize,
     /// True when any server on this socket enabled TLS.
     pub ssl: bool,
+    /// `listen ... quic`: this socket also serves HTTP/3 over UDP.
+    pub quic: bool,
 }
 
 #[derive(Debug)]
@@ -870,6 +872,8 @@ const BUILTIN_TYPES: &[(&str, &str)] = &[
 pub struct Http {
     pub servers: Vec<Server>,
     pub groups: Vec<ListenGroup>,
+    /// `listen ... quic` sockets (UDP), kept apart from the TCP groups.
+    pub quic_groups: Vec<ListenGroup>,
     pub mime: MimeMap,
     pub default_type: String,
     pub keepalive_timeout: Duration,
@@ -2451,7 +2455,7 @@ impl Builder {
         http_http2: bool,
         http_header_field_limit: usize,
         http_header_bufs: usize,
-    ) -> Result<(Server, Vec<(SocketAddr, bool, bool)>), ConfigError> {
+    ) -> Result<(Server, Vec<(SocketAddr, bool, bool, bool)>), ConfigError> {
         let block = d
             .block
             .as_ref()
@@ -2464,7 +2468,7 @@ impl Builder {
         // (addr, is_default, ssl): TLS is decided per listen socket, not per
         // server — nginx lets one server block serve `listen 8081;` alongside
         // `listen 8082 ssl;`.
-        let mut listens: Vec<(SocketAddr, bool, bool)> = Vec::new();
+        let mut listens: Vec<(SocketAddr, bool, bool, bool)> = Vec::new();
         let mut keepalive = http_keepalive;
         let mut tokens = http_tokens;
         let mut access_log_off = false;
@@ -2472,6 +2476,7 @@ impl Builder {
         let mut server_sets: Vec<(String, String)> = Vec::new();
         let mut server_steps: Vec<Step> = Vec::new();
         let mut ssl = false;
+        let mut quic = false;
         let mut http2 = http_http2;
         let mut header_field_limit = http_header_field_limit;
         let mut header_bufs = http_header_bufs;
@@ -2505,10 +2510,15 @@ impl Builder {
                     if listen_ssl {
                         ssl = true;
                     }
-                    if child.args[1..].iter().any(|p| p == "http2" || p == "quic") {
+                    if child.args[1..].iter().any(|p| p == "http2") {
                         http2 = true;
                     }
-                    listens.push((addr, is_default, listen_ssl));
+                    // `quic` is a separate transport, not an HTTP/2 switch.
+                    let quic_now = child.args[1..].iter().any(|p| p == "quic");
+                    if quic_now {
+                        quic = true;
+                    }
+                    listens.push((addr, is_default, listen_ssl, quic_now));
                 }
                 "server_name" => {
                     names.extend(child.args.iter().cloned());
@@ -2683,7 +2693,7 @@ impl Builder {
         }
 
         if listens.is_empty() {
-            listens.push((SocketAddr::from((Ipv4Addr::UNSPECIFIED, 80)), false, ssl));
+            listens.push((SocketAddr::from((Ipv4Addr::UNSPECIFIED, 80)), false, ssl, false));
         }
 
         Ok((
@@ -2961,6 +2971,7 @@ pub fn build(
         ssl_certificate: None,
         ssl_certificate_key: None,
         ssl_password_file: None,
+        quic_groups: Vec::new(),
         servers: Vec::new(),
         groups: Vec::new(),
         mime: MimeMap::new(),
@@ -3326,7 +3337,7 @@ pub fn build(
     }
 
     let mut groups: BTreeMap<u16, ListenGroup> = BTreeMap::new();
-    let mut listens_by_server: Vec<(usize, Vec<(SocketAddr, bool, bool)>)> = Vec::new();
+    let mut listens_by_server: Vec<(usize, Vec<(SocketAddr, bool, bool, bool)>)> = Vec::new();
 
     for (i, sd) in server_dirs.iter().enumerate() {
         let (server, listens) = b.parse_server(
@@ -3370,13 +3381,19 @@ pub fn build(
 
     resolve_proxy_upstreams(&mut http)?;
 
+    // QUIC lives on UDP, so `<port>/tcp` and `<port>/udp` are distinct
+    // sockets; keying both by port would merge them.
+    let mut quic_groups: BTreeMap<u16, ListenGroup> = BTreeMap::new();
+
     for (idx, listens) in listens_by_server {
-        for (addr, is_default, listen_ssl) in listens {
-            let group = groups.entry(addr.port()).or_insert_with(|| ListenGroup {
+        for (addr, is_default, listen_ssl, listen_quic) in listens {
+            let table = if listen_quic { &mut quic_groups } else { &mut groups };
+            let group = table.entry(addr.port()).or_insert_with(|| ListenGroup {
                 addr,
                 servers: Vec::new(),
                 default_server: 0,
-                ssl: false,
+                ssl: listen_ssl,
+                quic: listen_quic,
             });
             if addr.ip().is_unspecified() {
                 group.addr = addr;
@@ -3399,6 +3416,12 @@ pub fn build(
             g.default_server = g.servers[0];
         }
         http.groups.push(g);
+    }
+    for (_port, mut g) in quic_groups {
+        if !g.servers.contains(&g.default_server) {
+            g.default_server = g.servers[0];
+        }
+        http.quic_groups.push(g);
     }
 
     // A config may legitimately have no `http {}` at all (mail-only or

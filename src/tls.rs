@@ -122,11 +122,15 @@ fn decrypt_pkcs8(pem: &[u8], passwords: &[String]) -> io::Result<Option<Vec<u8>>
     ))
 }
 
-fn load_cert_with(
+/// Read a certificate chain and its (possibly encrypted) private key.
+fn load_raw_identity(
     key_path: &Path,
     cert_path: &Path,
     passwords: &[String],
-) -> io::Result<Arc<CertifiedKey>> {
+) -> io::Result<(
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    PrivateKeyDer<'static>,
+)> {
     let cert_pem = std::fs::read(cert_path).map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -166,6 +170,15 @@ fn load_cert_with(
             })?,
     };
 
+    Ok((certs, key))
+}
+
+fn load_cert_with(
+    key_path: &Path,
+    cert_path: &Path,
+    passwords: &[String],
+) -> io::Result<Arc<CertifiedKey>> {
+    let (certs, key) = load_raw_identity(key_path, cert_path, passwords)?;
     let signing = ring::sign::any_supported_type(&key)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("unsupported key: {e}")))?;
     Ok(Arc::new(CertifiedKey::new(certs, signing)))
@@ -173,6 +186,31 @@ fn load_cert_with(
 
 fn load_cert(key_path: &Path, cert_path: &Path) -> io::Result<Arc<CertifiedKey>> {
     load_cert_with(key_path, cert_path, &[])
+}
+
+/// Certificate + key for a QUIC listener: the same files HTTP uses, but
+/// returned raw because `quinn` builds its own (TLS 1.3 only) configuration.
+pub fn quic_identity(
+    http: &Http,
+    server_idxs: &[usize],
+) -> io::Result<(
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+)> {
+    for &idx in server_idxs {
+        let server: &Server = http.server(idx);
+        if let (Some(cert), Some(key)) = (&server.ssl_certificate, &server.ssl_certificate_key) {
+            let passwords = match &server.ssl_password_file {
+                Some(p) => read_passwords(p)?,
+                None => Vec::new(),
+            };
+            return load_raw_identity(key, cert, &passwords);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "no ssl_certificate configured for the quic listen socket",
+    ))
 }
 
 /// Build the TLS configuration for one listen socket.

@@ -478,7 +478,36 @@ fn worker_main(
             let _ = tx.send(());
         }
 
+        // HTTP/3: one QUIC endpoint per `listen ... quic` socket. Only worker 0
+        // binds it (QUIC has no SO_REUSEPORT accept distribution here), which
+        // keeps the tests deterministic.
         let mut tasks = Vec::new();
+        if wid == 0 {
+            for (gi, group) in cfg.http.quic_groups.iter().enumerate() {
+                match quic_bind(group.addr, &cfg.http, &group.servers) {
+                    Ok(ep) => {
+                        eprintln!(
+                            "ngxrs: listening on {} (quic, {} server{})",
+                            group.addr,
+                            group.servers.len(),
+                            if group.servers.len() == 1 { "" } else { "s" }
+                        );
+                        let ctx2 = ctx.clone();
+                        let idxs = group.servers.clone();
+                        let def = group.default_server;
+                        let port = group.addr.port();
+                        let shutdown = shutdown.clone();
+                        tasks.push(tokio::spawn(async move {
+                            crate::h3server::serve(ep, ctx2, idxs, def, port, shutdown).await;
+                        }));
+                    }
+                    Err(e) => {
+                        eprintln!("ngxrs: cannot bind {} (quic): {e}", group.addr);
+                    }
+                }
+            }
+        }
+
         for (listener, gi) in listeners {
             let ctx = ctx.clone();
             let stopping = stopping.clone();
@@ -501,6 +530,24 @@ fn worker_main(
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     });
+}
+
+/// Build the QUIC endpoint for a `listen ... quic` socket.
+fn quic_bind(
+    addr: SocketAddr,
+    http: &crate::config::typed::Http,
+    server_idxs: &[usize],
+) -> io::Result<quinn::Endpoint> {
+    let (certs, key) = crate::tls::quic_identity(http, server_idxs)?;
+    let mut server = crate::h3server::quic_server_config(certs, key)?;
+    server.transport = Arc::new(quic_transport());
+    quinn::Endpoint::server(server, addr)
+}
+
+fn quic_transport() -> quinn::TransportConfig {
+    let mut t = quinn::TransportConfig::default();
+    t.max_idle_timeout(Some(Duration::from_secs(30).try_into().expect("30s")));
+    t
 }
 
 fn bind(addr: SocketAddr, reuse_port: bool) -> io::Result<TcpListener> {

@@ -267,7 +267,7 @@ impl Conn {
         }
     }
 
-    fn buffered(&self) -> &[u8] {
+    pub fn buffered(&self) -> &[u8] {
         &self.buf[self.start..self.end]
     }
 

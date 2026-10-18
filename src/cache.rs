@@ -436,13 +436,34 @@ pub fn now() -> i64 {
 // `header=value|header=value` using the Vary names of the stored response.
 // ---------------------------------------------------------------------------
 
+/// RFC 7234 section 4.1 whitespace normalization, which is the only transform
+/// nginx implements: split on commas, trim, drop empty elements, join with a
+/// single comma. `foo, bar` and `foo,bar` and `foo,,  ,bar , ` all collapse to
+/// `foo,bar`.
+pub fn normalize_value(v: &str) -> String {
+    v.split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Build the variant signature for a request given the response's `Vary` names.
 pub fn vary_signature(var_names: &[String], get: impl Fn(&str) -> String) -> String {
     var_names
         .iter()
-        .map(|n| format!("{}={}", n.to_ascii_lowercase(), get(n)))
+        .map(|n| format!("{}={}", n.to_ascii_lowercase(), normalize_value(&get(n))))
         .collect::<Vec<_>>()
         .join("|")
+}
+
+/// A `Vary: *` response is never cacheable (RFC 7231 section 7.1.4: the cache
+/// cannot know whether the representation applies to a later request, so nginx
+/// does not store it at all).
+pub fn vary_star(headers: &[(String, String)]) -> bool {
+    headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("vary") && v.split(',').any(|t| t.trim() == "*"))
 }
 
 /// `Vary` header names of a response, lower-cased, `*` excluded.
@@ -476,47 +497,143 @@ fn variant_key(base: &str, sig: &str) -> String {
 
 /// Store a variant plus its index line. Any previous entry for the same
 /// signature is replaced (nginx keeps at most one entry per variant).
+/// Serialize the index read-modify-write across processes.
+///
+/// nginx keeps the variant list in the cache header of a single file and
+/// coordinates through shared memory. We keep it in a small sidecar file, and
+/// worker processes update it independently: without a lock two workers that
+/// read the same three lines and append their own each write back three lines,
+/// losing one variant (`proxy_cache_vary.t` "cold first" failed exactly this
+/// way under 64 workers).
+fn with_index_lock<T>(path: &Path, f: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    use std::os::unix::io::AsRawFd;
+    let lock_path = path.with_file_name(format!(
+        "{}.lock",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    let handle = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)?;
+    unsafe { libc::flock(handle.as_raw_fd(), libc::LOCK_EX) };
+    let out = f();
+    unsafe { libc::flock(handle.as_raw_fd(), libc::LOCK_UN) };
+    out
+}
+
 pub fn store_variant(zone: &CacheZone, base: &str, sig: &str, entry: &Cached) -> io::Result<()> {
     store(zone, &variant_key(base, sig), entry)?;
     let path = vary_index_path(zone, base);
     if let Some(dir) = path.parent() {
         let _ = fs::create_dir_all(dir);
     }
-    let mut lines: Vec<String> = fs::read_to_string(&path)
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| !l.is_empty() && !l.ends_with(&format!("\t{sig}")))
-        .map(|l| l.to_string())
-        .collect();
-    lines.push(sig.to_string());
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, lines.join("\n"))?;
-    fs::rename(&tmp, &path)
+    with_index_lock(&path, || {
+        let mut lines: Vec<String> = fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.is_empty() && *l != sig)
+            .map(|l| l.to_string())
+            .collect();
+        lines.push(sig.to_string());
+        // A unique temporary name: two processes sharing one name can write
+        // into the same file and publish a torn index.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = path.with_file_name(format!(
+            "{}.{}.{}.tmp",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::write(&tmp, lines.join("\n"))?;
+        fs::rename(&tmp, &path)
+    })
 }
 
 /// Drop every stored variant for `base` (a response without `Vary` replaces
 /// all previously cached representations, as in `proxy_cache_vary.t`).
 pub fn clear_variants(zone: &CacheZone, base: &str) {
     let path = vary_index_path(zone, base);
-    if let Ok(text) = fs::read_to_string(&path) {
-        for sig in text.lines().filter(|l| !l.is_empty()) {
-            let _ = fs::remove_file(entry_path(zone, &variant_key(base, sig)));
+    let _ = with_index_lock(&path, || {
+        if let Ok(text) = fs::read_to_string(&path) {
+            for sig in text.lines().filter(|l| !l.is_empty()) {
+                let _ = fs::remove_file(entry_path(zone, &variant_key(base, sig)));
+            }
         }
+        let _ = fs::remove_file(&path);
+        Ok(())
+    });
+}
+
+/// The representation to serve for this request.
+///
+/// nginx loads the entry stored under the base key and reads its `Vary` name
+/// list from the cache header: with no names the file *is* the response,
+/// otherwise the names are used to compute a secondary key and a second lookup
+/// is done. Trying the base key first, unconditionally, would let a
+/// representation cached before any `Vary` was seen answer every later request
+/// regardless of its headers (`proxy_cache_vary.t` "vary mismatch 2").
+pub fn lookup(
+    zone: &CacheZone,
+    base: &str,
+    get: impl Fn(&str) -> String + Copy,
+) -> Option<(Cached, Option<String>)> {
+    if vary_index_path(zone, base).exists() {
+        let sig = load_variant(zone, base, get)?;
+        return Some((sig.0, Some(sig.1)));
     }
-    let _ = fs::remove_file(&path);
+    load(zone, base).map(|e| (e, None))
+}
+
+/// Store `entry` as the representation for this request: a variant when the
+/// response carries `Vary` (and `proxy_ignore_headers Vary` is off), the base
+/// entry otherwise — in which case every previously stored variant goes away.
+pub fn store_repr(
+    zone: &CacheZone,
+    base: &str,
+    headers: &[(String, String)],
+    get: impl Fn(&str) -> String,
+    entry: &Cached,
+    ignore_vary: bool,
+) -> io::Result<()> {
+    let names = if ignore_vary {
+        Vec::new()
+    } else {
+        vary_names(headers)
+    };
+    if names.is_empty() {
+        clear_variants(zone, base);
+        store(zone, base, entry)
+    } else {
+        let sig = vary_signature(&names, get);
+        store_variant(zone, base, &sig, entry)
+    }
+}
+
+/// Re-store an entry that came back from `lookup`, on the key it was found
+/// under: a revalidated variant must not be written over the base entry.
+pub fn restore(zone: &CacheZone, base: &str, sig: Option<&str>, entry: &Cached) -> io::Result<()> {
+    match sig {
+        Some(sig) => store_variant(zone, base, sig, entry),
+        None => store(zone, base, entry),
+    }
 }
 
 /// Find the stored variant matching the current request.
-pub fn load_variant(zone: &CacheZone, base: &str, get: impl Fn(&str) -> String) -> Option<Cached> {
+pub fn load_variant(
+    zone: &CacheZone,
+    base: &str,
+    get: impl Fn(&str) -> String,
+) -> Option<(Cached, String)> {
     let text = fs::read_to_string(vary_index_path(zone, base)).ok()?;
     for sig in text.lines().filter(|l| !l.is_empty()) {
         let matches = sig.split('|').all(|pair| match pair.split_once('=') {
-            Some((name, want)) => get(name) == want,
+            Some((name, want)) => normalize_value(&get(name)) == want,
             None => false,
         });
         if matches {
             if let Some(e) = load(zone, &variant_key(base, sig)) {
-                return Some(e);
+                return Some((e, sig.to_string()));
             }
         }
     }

@@ -149,6 +149,8 @@ pub struct Request {
     /// request (rather than threaded through every render helper) so `$scheme`
     /// and the `$ssl_*` family can be answered anywhere a `Request` is in scope.
     pub tls: Option<std::sync::Arc<crate::conn::TlsInfo>>,
+    /// When the request head finished parsing. Backs `$request_time`.
+    pub started: std::time::Instant,
 }
 
 impl Drop for Request {
@@ -515,6 +517,7 @@ impl Request {
             host,
             expect_continue,
             tls: None,
+            started: std::time::Instant::now(),
         })
     }
 }

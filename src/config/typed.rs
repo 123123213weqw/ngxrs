@@ -3450,7 +3450,9 @@ pub fn build(
         warnings: Vec::new(),
     };
 
-    let mut worker_processes = 0usize; // 0 = auto
+    // nginx defaults to a single worker; `auto` expands to the CPU count.
+    // nginx defaults to a single worker; `auto` expands to the CPU count.
+    let mut worker_processes = 1usize; // 0 = auto
     let mut daemon = true;
     let mut pid: Option<PathBuf> = None;
     let mut error_log: Option<PathBuf> = None;

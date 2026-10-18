@@ -8,6 +8,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 
 use crate::config::{Http, LocCfg};
+use crate::http::request::Method;
 use crate::http::request::Request;
 use crate::http::{Body, Response};
 
@@ -108,23 +109,60 @@ fn drop_header(raw: &mut Vec<u8>, name: &[u8]) {
     }
 }
 
+/// Append `Vary: Accept-Encoding` unless the response already carries it.
+fn add_vary(mut resp: Response) -> Response {
+    let already = resp.raw.split(|&b| b == b'\n').any(|line| {
+        line.len() > 5
+            && line[..5].eq_ignore_ascii_case(b"vary:")
+            && String::from_utf8_lossy(&line[5..])
+                .split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("accept-encoding"))
+    });
+    if !already {
+        resp.raw.extend_from_slice(b"Vary: Accept-Encoding\r\n");
+    }
+    resp
+}
+
+/// Body length when it is known up front, as `r->headers_out.content_length_n`
+/// is for nginx. `None` stands for "unknown", which the eligibility test treats
+/// as long enough.
+fn known_len(resp: &Response) -> Option<u64> {
+    match &resp.body {
+        Body::Empty => Some(0),
+        Body::Bytes(b) => Some(b.len() as u64),
+        Body::File { len, .. } => Some(*len),
+    }
+}
+
 pub fn maybe_compress(req: &Request, resp: Response, loc: &LocCfg, http: &Http) -> Response {
-    if !loc.gzip || resp.status != 200 {
+    // `ngx_http_gzip_header_filter` decides eligibility *before* it looks at
+    // Accept-Encoding, and sets `r->gzip_vary` at that point. The distinction
+    // matters: a response that is merely gzip-eligible still carries
+    // `Vary: Accept-Encoding` when the client does not accept gzip, which is
+    // what makes the cache key on the request header. Verified against nginx
+    // 1.28: `Accept-Encoding: deflate` on a text/html file answers 200 with
+    // `Vary: Accept-Encoding` and no Content-Encoding.
+    let eligible = loc.gzip
+        && matches!(resp.status, 200 | 403 | 404)
+        && find_header(&resp.raw, b"Content-Encoding:").is_none()
+        && known_len(&resp)
+            .map(|n| n >= loc.gzip_min_length)
+            .unwrap_or(true)
+        && {
+            let ctype = header_value(&resp.raw, b"Content-Type:")
+                .map(|v| String::from_utf8_lossy(v).trim().to_string())
+                .unwrap_or_else(|| http.default_type.clone());
+            compressible(&ctype, loc)
+        };
+
+    if !eligible {
         return resp;
     }
-    if !accepts_gzip(req) {
-        return resp;
-    }
-    if req.headers.get("range").is_some() {
-        return resp;
-    }
-    if find_header(&resp.raw, b"Content-Encoding:").is_some() {
-        return resp;
-    }
-    let ctype = header_value(&resp.raw, b"Content-Type:")
-        .map(|v| String::from_utf8_lossy(v).trim().to_string())
-        .unwrap_or_else(|| http.default_type.clone());
-    if !compressible(&ctype, loc) {
+
+    let resp = if loc.gzip_vary { add_vary(resp) } else { resp };
+
+    if !accepts_gzip(req) || req.headers.get("range").is_some() {
         return resp;
     }
 
@@ -132,49 +170,56 @@ pub fn maybe_compress(req: &Request, resp: Response, loc: &LocCfg, http: &Http) 
     let min_len = loc.gzip_min_length;
 
     let (mut raw, body) = (resp.raw, resp.body);
-    let compressed: Option<Vec<u8>> = match &body {
-        Body::Bytes(b) => {
-            if b.len() as u64 >= min_len {
-                Some(gz(b, level))
-            } else {
-                None
-            }
-        }
-        Body::File { file, offset, len } => {
-            if *len >= min_len && *len <= MAX_INLINE {
-                let etag = header_value(&raw, b"ETag:")
-                    .map(|v| String::from_utf8_lossy(v).trim().to_string())
-                    .unwrap_or_default();
-                let last_modified = header_value(&raw, b"Last-Modified:")
-                    .map(|v| String::from_utf8_lossy(v).trim().to_string())
-                    .unwrap_or_default();
-                let key = (format!("{etag}|{last_modified}"), 0, *len, level);
-                if let Some(hit) = cache_get(&key) {
-                    Some(hit.as_ref().clone())
+    // A HEAD answer carries the gzip headers but no body; nginx runs the header
+    // filter and skips the body filter in that case.
+    let head_only = req.method == Method::Head;
+    let compressed: Option<Vec<u8>> = if head_only {
+        Some(Vec::new())
+    } else {
+        match &body {
+            Body::Bytes(b) => {
+                if b.len() as u64 >= min_len {
+                    Some(gz(b, level))
                 } else {
-                    use std::os::unix::fs::FileExt;
-                    let mut buf = vec![0u8; *len as usize];
-                    let mut read = 0usize;
-                    while read < buf.len() {
-                        match file.read_at(&mut buf[read..], offset + read as u64) {
-                            Ok(0) => break,
-                            Ok(n) => read += n,
-                            Err(_) => break,
+                    None
+                }
+            }
+            Body::File { file, offset, len } => {
+                if *len >= min_len && *len <= MAX_INLINE {
+                    let etag = header_value(&raw, b"ETag:")
+                        .map(|v| String::from_utf8_lossy(v).trim().to_string())
+                        .unwrap_or_default();
+                    let last_modified = header_value(&raw, b"Last-Modified:")
+                        .map(|v| String::from_utf8_lossy(v).trim().to_string())
+                        .unwrap_or_default();
+                    let key = (format!("{etag}|{last_modified}"), 0, *len, level);
+                    if let Some(hit) = cache_get(&key) {
+                        Some(hit.as_ref().clone())
+                    } else {
+                        use std::os::unix::fs::FileExt;
+                        let mut buf = vec![0u8; *len as usize];
+                        let mut read = 0usize;
+                        while read < buf.len() {
+                            match file.read_at(&mut buf[read..], offset + read as u64) {
+                                Ok(0) => break,
+                                Ok(n) => read += n,
+                                Err(_) => break,
+                            }
+                        }
+                        if read == 0 {
+                            None
+                        } else {
+                            let out = std::sync::Arc::new(gz(&buf[..read], level));
+                            cache_put(key, out.clone());
+                            Some(out.as_ref().clone())
                         }
                     }
-                    if read == 0 {
-                        None
-                    } else {
-                        let out = std::sync::Arc::new(gz(&buf[..read], level));
-                        cache_put(key, out.clone());
-                        Some(out.as_ref().clone())
-                    }
+                } else {
+                    None
                 }
-            } else {
-                None
             }
+            Body::Empty => None,
         }
-        Body::Empty => None,
     };
 
     let Some(payload) = compressed else {
@@ -199,9 +244,6 @@ pub fn maybe_compress(req: &Request, resp: Response, loc: &LocCfg, http: &Http) 
     // it instead of dropping it: `ETag: W/"..."`.
     weaken_etag(&mut raw);
     raw.extend_from_slice(b"Content-Encoding: gzip\r\n");
-    if loc.gzip_vary {
-        raw.extend_from_slice(b"Vary: Accept-Encoding\r\n");
-    }
 
     Response {
         status: resp.status,

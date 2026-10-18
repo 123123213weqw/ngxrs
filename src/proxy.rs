@@ -689,19 +689,13 @@ pub async fn handle(
     // A stored-but-stale entry is reported as EXPIRED (nginx does the same)
     // rather than MISS.
     let mut stale_entry: Option<crate::cache::Cached> = None;
+    let mut stale_sig: Option<String> = None;
     let key_is_updating = cache_key.as_deref().map(updating_test).unwrap_or(false);
     if let (Some(zone), Some(key)) = (zone, cache_key.as_ref()) {
         if !bypass {
-            let hit = crate::cache::load(zone, key).or_else(|| {
-                crate::cache::load_variant(zone, key, |name| match name {
-                    "accept-encoding" => req
-                        .headers
-                        .get_joined("accept-encoding")
-                        .unwrap_or_default(),
-                    other => req.headers.get_joined(other).unwrap_or_default(),
-                })
-            });
-            if let Some(entry) = hit {
+            let get = |name: &str| req.headers.get_joined(name).unwrap_or_default();
+            let hit = crate::cache::lookup(zone, key, get);
+            if let Some((entry, sig)) = hit {
                 let now = crate::cache::now();
                 let fresh = entry.is_fresh(now);
                 // nginx's decision table (ngx_http_upstream_cache):
@@ -725,6 +719,7 @@ pub async fn handle(
                 };
                 if !fresh && !serve_stale {
                     stale_entry = Some(entry.clone());
+                    stale_sig = sig.clone();
                 }
                 if (fresh || serve_stale) && entry.error.is_some() {
                     // A cached error replays through `error_page` instead of
@@ -791,7 +786,8 @@ pub async fn handle(
         let deadline = Instant::now() + loc.proxy_cache_lock_timeout;
         loop {
             // Someone else may have filled the entry while we waited.
-            if let Some(entry) = crate::cache::load(z, key) {
+            let get = |name: &str| req.headers.get_joined(name).unwrap_or_default();
+            if let Some((entry, _sig)) = crate::cache::lookup(z, key, get) {
                 if entry.is_fresh(crate::cache::now()) {
                     let mut raw = Vec::with_capacity(entry.body.len() + 256);
                     for (k, v) in &entry.headers {
@@ -885,6 +881,14 @@ pub async fn handle(
     } else {
         None
     };
+    // The key the expired entry was stored under. A revalidated variant has to
+    // go back to its own variant key; writing it to the base key would replace
+    // whichever representation happened to be there (proxy_cache_vary.t).
+    let reval_sig: Option<String> = if reval_entry.is_some() {
+        stale_sig.clone()
+    } else {
+        None
+    };
 
     let mut used_pooled = false;
     let mut last_err = None;
@@ -961,6 +965,7 @@ pub async fn handle(
                     key: cache_key.as_deref(),
                     status: cache_status,
                     reval: reval_entry,
+                    reval_sig: reval_sig.as_deref(),
                     stale: stale_entry.as_ref(),
                     no_store: lock_timed_out,
                     min_uses_ok,
@@ -1184,6 +1189,8 @@ struct CacheCtx<'a> {
     status: &'a str,
     /// Expired entry that may be revalidated with `If-None-Match` / `If-Modified-Since`.
     reval: Option<&'a crate::cache::Cached>,
+    /// Variant signature of `reval`, when it was stored as a variant.
+    reval_sig: Option<&'a str>,
     /// Expired entry kept for `proxy_cache_use_stale`: if the upstream answers
     /// with a status the directive lists, this is served instead.
     stale: Option<&'a crate::cache::Cached>,
@@ -1647,7 +1654,7 @@ async fn exchange(
                     stored_at: now,
                     ..entry.clone()
                 };
-                let _ = crate::cache::store(zone, key, &refreshed);
+                let _ = crate::cache::restore(zone, key, cache.reval_sig, &refreshed);
 
                 let mut raw = Vec::with_capacity(entry.body.len() + 256);
                 for (k, v) in &entry.headers {
@@ -1922,20 +1929,18 @@ async fn exchange(
                         valid_for: valid.as_secs(),
                         error: None,
                     };
-                    let names = if loc.proxy_cache_ignore.vary {
-                        Vec::new()
-                    } else {
-                        crate::cache::vary_names(&stored_headers)
-                    };
-                    if names.is_empty() {
-                        // A response without `Vary` replaces every variant.
-                        crate::cache::clear_variants(zone, key);
-                        let _ = crate::cache::store(zone, key, &entry);
-                    } else {
-                        let sig = crate::cache::vary_signature(&names, |n| {
-                            req.headers.get_joined(n).unwrap_or_default()
-                        });
-                        let _ = crate::cache::store_variant(zone, key, &sig, &entry);
+                    // `Vary: *` says the representation may depend on anything
+                    // about the request, so nginx does not store it at all.
+                    if loc.proxy_cache_ignore.vary || !crate::cache::vary_star(&stored_headers) {
+                        let get = |n: &str| req.headers.get_joined(n).unwrap_or_default();
+                        let _ = crate::cache::store_repr(
+                            zone,
+                            key,
+                            &stored_headers,
+                            get,
+                            &entry,
+                            loc.proxy_cache_ignore.vary,
+                        );
                     }
                 }
             }
@@ -2406,20 +2411,16 @@ pub async fn fetch(
         } else {
             // Vary-aware, exactly like the streaming path: a stored response
             // with `Vary` is indexed per request-header signature.
-            let hit = crate::cache::load(z, key).or_else(|| {
-                crate::cache::load_variant(z, key, |name| {
-                    req.headers.get_joined(name).unwrap_or_default()
-                })
-            });
-            match hit {
-                Some(entry) if entry.is_fresh(crate::cache::now()) => {
+            let get = |name: &str| req.headers.get_joined(name).unwrap_or_default();
+            match crate::cache::lookup(z, key, get) {
+                Some((entry, _)) if entry.is_fresh(crate::cache::now()) => {
                     if entry.error.is_none() {
                         return Some(cached_response(entry, loc, "HIT"));
                     }
                     cache_status = "HIT";
                     stale_entry = Some(entry);
                 }
-                Some(entry) => {
+                Some((entry, _)) => {
                     cache_status = "EXPIRED";
                     stale_entry = Some(entry);
                 }
@@ -2597,19 +2598,18 @@ pub async fn fetch(
                             stored_at: crate::cache::now(),
                             valid_for: ttl.as_secs(),
                         };
-                        let names = if loc.proxy_cache_ignore.vary {
-                            Vec::new()
-                        } else {
-                            crate::cache::vary_names(&upstream_headers)
-                        };
-                        if names.is_empty() {
-                            crate::cache::clear_variants(z, key);
-                            let _ = crate::cache::store(z, key, &entry);
-                        } else {
-                            let sig = crate::cache::vary_signature(&names, |n| {
-                                req.headers.get_joined(n).unwrap_or_default()
-                            });
-                            let _ = crate::cache::store_variant(z, key, &sig, &entry);
+                        if loc.proxy_cache_ignore.vary
+                            || !crate::cache::vary_star(&upstream_headers)
+                        {
+                            let get = |n: &str| req.headers.get_joined(n).unwrap_or_default();
+                            let _ = crate::cache::store_repr(
+                                z,
+                                key,
+                                &upstream_headers,
+                                get,
+                                &entry,
+                                loc.proxy_cache_ignore.vary,
+                            );
                         }
                     }
                 }

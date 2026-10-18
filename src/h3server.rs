@@ -209,6 +209,7 @@ fn synthesize(req: &H3Request, authority: Option<&str>, path: &str, query: &str)
         host: authority.map(|a| InStr::new(&normalize_host(a))),
         expect_continue: false,
         tls: None,
+        started: std::time::Instant::now(),
     }
 }
 

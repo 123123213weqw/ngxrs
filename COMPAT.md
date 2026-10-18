@@ -555,3 +555,37 @@ CONTENT，所以 ACCESS 必须先求值。
   （`normalize first`、`vary asterisk second`）。
 - `proxy_cache_use_stale.t`：25/36（上一轮 26/36），差集主要是 `updating` /
   `revalidated` 事件，两者都还没有实现。
+
+## 本轮修复（proxy_cache_vary 回归）
+
+上一轮报告的 `proxy_cache_vary.t` 48/54 回归已修复，现在 **53/54，与 nginx 一致**
+（唯一失败项是该用例自带的 TODO `normalize order`，nginx 同样失败）。根因不止一个：
+
+1. `Vary` 归一化（RFC 7234 §4.1）缺失：只按逗号切分并去空白/空项。
+   `foo, bar`、`foo,bar`、`foo,,  ,bar , ` 必须等价。
+2. 主键查询顺序错误：`load(base) || load_variant(...)` 让一个没有 `Vary` 的旧条目
+   命中所有后续请求。nginx 先读主条目的 vary 名单，有名单才去查变体。
+3. `Vary: *` 必须完全不缓存（RFC 7231 §7.1.4）。
+4. `gzip_vary` 只在真正压缩时才发 `Vary: Accept-Encoding`；nginx 在
+   "可 gzip"（状态/类型/长度达标）阶段就发，与客户端是否接受 gzip 无关。
+   这一点会直接改变上游返回的头，从而改变缓存的键。
+5. 变体索引文件的多进程读-改-写没有加锁（`flock`），并发写会丢行。
+6. `proxy_cache_revalidate` 的 304 刷新写回主键而不是变体键。
+
+另外两个与本用例无关但被它暴露出来的真问题：
+
+7. **退出时不删除 pid 文件**（nginx 的 `ngx_delete_pidfile`）。官方 harness 的
+   `run()` 轮询 pid 文件判断"已启动"，残留的旧文件让它在 socket 尚未 bind 时
+   就发请求，表现为 `undef`。这一条同时影响所有 `$t->stop(); $t->run();` 的用例。
+8. **优雅退出不关闭空闲 keepalive 连接**：`$t->stop()` 要等到 `keepalive_timeout`
+   才返回（实测 20s+，现在 0.1s）。nginx 的 `ngx_close_idle_connections` 立即关闭。
+9. `limit_req` 的延迟用 `std::thread::sleep` 在 async 路径上**阻塞 runtime 线程**。
+   多 worker 时被掩盖，单 worker 时整个服务器被串行化（`limit_conn.t` 因此从 9/10
+   掉到 5/10）。改为 `tokio::time::sleep` 后恢复 9/10。
+
+顺带：`worker_processes` 默认值改为 1（nginx 的默认值；`auto` 仍是 CPU 数），
+补上 `$request_time`，`gzip` 对 HEAD 也应发 `Content-Encoding: gzip`（已用 nginx 探测确认）。
+
+已知未完成：`proxy_cache_use_stale.t` 27/36（缺 `updating`/`revalidated` 事件），
+`limit_req_delay.t` 4/6（`delay=N` 的排队语义），`limit_conn.t` 9/10（客户端一断开
+就要立刻释放名额）。

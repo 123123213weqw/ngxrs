@@ -288,6 +288,7 @@ fn synthesize_request(
         host: authority.map(|a| InStr::new(&crate::http::request::normalize_host(a))),
         expect_continue: false,
         tls: None,
+        started: std::time::Instant::now(),
     }
 }
 

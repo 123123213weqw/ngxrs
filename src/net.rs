@@ -387,6 +387,7 @@ pub fn serve(cfg: Config) -> io::Result<()> {
     // graceful shutdown). Bounded so a stuck client cannot block exit.
     // Flipping this makes already-running responses advertise `Connection: close`.
     crate::http::SHUTTING_DOWN.store(true, Ordering::SeqCst);
+    crate::http::shutdown_notify().notify_waiters();
     stopping.store(true, Ordering::SeqCst);
     let _ = shutdown_tx.send(true);
     for t in threads {
@@ -411,6 +412,14 @@ pub fn serve(cfg: Config) -> io::Result<()> {
     }
     if let Some(t) = stream_thread {
         let _ = t.join();
+    }
+    // nginx unlinks its pid file when the master exits (`ngx_delete_pidfile`).
+    // Leaving a stale one makes the official harness believe the server is up
+    // the moment `run()` is called again: it polls for the file, finds the old
+    // one, and sends the next request before the new process has bound its
+    // sockets, which surfaces as `undef` in the test output.
+    if let Some(pid_path) = &pid_path {
+        let _ = std::fs::remove_file(pid_path);
     }
     Ok(())
 }

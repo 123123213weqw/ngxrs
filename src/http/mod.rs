@@ -140,6 +140,19 @@ pub static ACTIVE_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 /// `Connection: close` so clients know the connection is going away.
 pub static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Wakes connection tasks that are blocked waiting for the next request on a
+/// keepalive connection, so a graceful shutdown does not have to wait for
+/// `keepalive_timeout` on every idle client.
+static SHUTDOWN_NOTIFY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+
+pub fn shutdown_notify() -> &'static tokio::sync::Notify {
+    SHUTDOWN_NOTIFY.get_or_init(tokio::sync::Notify::new)
+}
+
+pub fn is_shutting_down() -> bool {
+    SHUTTING_DOWN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// RAII guard so the counter stays balanced even on early return.
 pub struct ActiveGuard;
 
@@ -204,13 +217,25 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
             keepalive_timeout
         };
         // NGXRS_NO_IDLE_TIMER=1 disables the keepalive timeout (measurement only).
-        let read = if NO_IDLE_TIMER.with(|v| *v) {
-            Ok(conn.read_request(MAX_REQUEST_LINE, MAX_HEADER_BYTES).await)
+        // An idle keepalive connection is closed as soon as a graceful shutdown
+        // starts -- nginx's `ngx_close_idle_connections`. Waiting for the
+        // timeout instead keeps the process (and its pid) alive for as long as
+        // any client idles, which stalls `stop()` in the official test harness
+        // and made a restart look like a cache miss.
+        let idle_shutdown = is_shutting_down() && conn.buffered().is_empty();
+        let read = if idle_shutdown {
+            Err(())
+        } else if NO_IDLE_TIMER.with(|v| *v) {
+            tokio::select! {
+                _ = shutdown_notify().notified(), if conn.buffered().is_empty() => Err(()),
+                r = conn.read_request(MAX_REQUEST_LINE, MAX_HEADER_BYTES) => Ok(r),
+            }
         } else {
             idle.as_mut()
                 .reset(tokio::time::Instant::now() + read_timeout);
             tokio::select! {
                 _ = idle.as_mut() => Err(()),
+                _ = shutdown_notify().notified(), if conn.buffered().is_empty() => Err(()),
                 r = conn.read_request(MAX_REQUEST_LINE, MAX_HEADER_BYTES) => Ok(r),
             }
         };
@@ -218,6 +243,10 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
         #[allow(unused_mut)]
         let mut req = match read {
             Err(_elapsed) => {
+                // A shutdown closes the connection without a 408.
+                if is_shutting_down() {
+                    break;
+                }
                 if served == 0 {
                     let _ = send_error(&mut conn, 408, true, served == 0, false).await;
                 }
@@ -240,6 +269,7 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
                     host: None,
                     expect_continue: false,
                     tls: None,
+                    started: std::time::Instant::now(),
                 };
                 let mut resp = error_response(e.status, default_server.server_tokens);
                 let mut custom: std::collections::HashMap<String, String> =
@@ -2086,6 +2116,12 @@ impl<'a> ServerVars<'a> {
                 .unwrap_or_default(),
             "connection_requests" => self.connection_requests.to_string(),
             "connection_time" => self.connection_time.to_string(),
+            // Second with millisecond precision, as nginx formats it
+            // (`%T.%03M` from the request start).
+            "request_time" => {
+                let d = self.req.started.elapsed();
+                format!("{}.{:03}", d.as_secs(), d.subsec_millis())
+            }
             "hostname" => "ngxrs".to_string(),
             "nginx_version" => crate::COMPAT_VERSION.to_string(),
             _ => {
@@ -2824,7 +2860,7 @@ fn limit_key(spec: &str, vars: &ServerVars<'_>) -> String {
 /// Apply `limit_req` / `limit_conn`. Returns a response when the request must
 /// be rejected; `limit_conn` slots are pushed into `guards` so they are held
 /// until the response has been written.
-fn check_limits(
+async fn check_limits(
     loc: &LocCfg,
     http: &Http,
     vars: &ServerVars<'_>,
@@ -2856,9 +2892,11 @@ fn check_limits(
                 return Some(error_response(loc.limit_req_status, true));
             }
             Some(delay) if !delay.is_zero() => {
-                // nginx holds the request for the computed delay. Blocking here
-                // is intentional: the delay is bounded by burst/rate.
-                std::thread::sleep(delay.min(std::time::Duration::from_secs(10)));
+                // nginx holds the request for the computed delay, without
+                // blocking its worker. Sleeping the thread here stalls every
+                // other connection multiplexed on that runtime thread; with a
+                // single worker it serialises the whole server.
+                tokio::time::sleep(delay.min(std::time::Duration::from_secs(10))).await;
             }
             _ => {}
         }
@@ -3508,7 +3546,7 @@ async fn dispatch(
             connection_time: state.elapsed_secs(),
             sent: &[],
         };
-        if let Some(reject) = check_limits(loc, http, &limit_vars, guards) {
+        if let Some(reject) = check_limits(loc, http, &limit_vars, guards).await {
             let status = reject.status;
             let sent = split_head(&reject.raw);
             let bytes = write_response(

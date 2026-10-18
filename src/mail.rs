@@ -167,6 +167,29 @@ struct Conn {
 
 async fn handle(client: TcpStream, peer: SocketAddr, server: Arc<MailServer>) -> io::Result<()> {
     let mut conn = Conn::default();
+
+    // `listen ... ssl`: TLS starts before the greeting. The greeting is only
+    // suppressed for a `STARTTLS` upgrade, so `resumed` stays false here.
+    if server.ssl {
+        let cfg = match server.tls.as_ref() {
+            Some(c) => c.clone(),
+            None => {
+                eprintln!(
+                    "ngxrs: [error] mail {} wants TLS but has no certificate",
+                    server.listen
+                );
+                return Ok(());
+            }
+        };
+        let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+        let tls = acceptor.accept(client).await?;
+        let (rd, wr) = tokio::io::split(tls);
+        let mut reader = BufReader::new(rd);
+        let mut writer = BufWriter::new(wr);
+        conn.tls = true;
+        return run(&mut reader, &mut writer, &peer, &server, &mut conn).await;
+    }
+
     let (rd, wr) = client.into_split();
     let mut reader = BufReader::new(rd);
     let mut writer = BufWriter::new(wr);

@@ -551,8 +551,11 @@ pub struct MailServer {
     pub starttls: StarttlsCfg,
     /// `{imap,pop3,smtp}_capabilities`: replaces the protocol's default list.
     pub capabilities: Option<Vec<String>>,
-    /// Certificates from the mail block, used by `STLS` / `STARTTLS`.
+    /// Certificates for this listener, used by `STLS` / `STARTTLS` and by
+    /// implicit TLS.
     pub tls: Option<std::sync::Arc<rustls::ServerConfig>>,
+    /// `listen ... ssl`: the connection is TLS from the first byte.
+    pub ssl: bool,
 }
 
 /// `starttls` in a mail server.
@@ -596,6 +599,7 @@ impl Default for MailServer {
             starttls: StarttlsCfg::Off,
             capabilities: None,
             tls: None,
+            ssl: false,
         }
     }
 }
@@ -1338,6 +1342,8 @@ impl Builder {
                 sem(&sd.file, sd.line, "mail server requires a block")
             })?;
             let mut srv = defaults.clone();
+            let mut srv_cert: Option<PathBuf> = None;
+            let mut srv_key: Option<PathBuf> = None;
             let mut srv_pop3: Option<AuthSet> = None;
             let mut srv_imap: Option<AuthSet> = None;
             let mut srv_smtp: Option<AuthSet> = None;
@@ -1353,6 +1359,9 @@ impl Builder {
                             sem(&child.file, child.line, format!("invalid listen \"{v}\""))
                         })?;
                         for extra in &child.args[1..] {
+                            if extra == "ssl" {
+                                srv.ssl = true;
+                            }
                             if let Some(p) = mail_protocol(extra) {
                                 srv.protocol = p;
                             }
@@ -1407,9 +1416,19 @@ impl Builder {
                     "pop3_capabilities" | "imap_capabilities" | "smtp_capabilities" => {
                         srv.capabilities = Some(child.args.clone());
                     }
+                    "ssl_certificate" => {
+                        if let Some(v) = child.args.first() {
+                            srv_cert = Some(self.prefix.join(v));
+                        }
+                    }
+                    "ssl_certificate_key" => {
+                        if let Some(v) = child.args.first() {
+                            srv_key = Some(self.prefix.join(v));
+                        }
+                    }
                     // Accepted, not yet plumbed.
                     "proxy_buffer" | "xclient" | "smtp_greeting_delay"
-                    | "ssl_certificate" | "ssl_certificate_key" | "ssl_protocols"
+                    | "ssl_protocols"
                     | "ssl_ciphers" | "ssl_prefer_server_ciphers" | "ssl_session_cache"
                     | "ssl_session_timeout" | "auth_http_header" | "proxy_protocol"
                     | "max_errors" | "smtp_client_buffer" | "smtp_auth_methods"
@@ -1422,6 +1441,18 @@ impl Builder {
                     }
                 }
             }
+            // A `mail server` may carry its own certificate; otherwise the
+            // one from the `mail` block is inherited.
+            if let (Some(c), Some(k)) = (srv_cert.as_ref(), srv_key.as_ref()) {
+                match crate::tls::build_mail_config(c, k) {
+                    Ok(cfg) => srv.tls = Some(cfg),
+                    Err(e) => self.warnings.push(format!(
+                        "cannot load mail certificate {}: {e}",
+                        c.display()
+                    )),
+                }
+            }
+
             // Apply the set belonging to this server's protocol.
             let set = match srv.protocol {
                 crate::mail::Protocol::Pop3 => srv_pop3.unwrap_or(dflt_pop3),

@@ -221,11 +221,21 @@
 nginx 逐字节一致；`STLS` / `STARTTLS` 执行**真实的 TLS 升级**（rustls），
 已用 `openssl s_client -starttls imap|pop3|smtp` 三种协议验证握手成功。
 
+**隐式 TLS**：`listen ... ssl` 从第一个字节起就是 TLS（在问候之前完成握手），
+且 mail `server` 内的 `ssl_certificate` 覆盖 mail 块的证书。已实测：明文连接
+拿不到问候，TLS 连接拿到 `* OK IMAP4 ready`。
+
 **实测（nginx 1.28 对照）：**
 
 | 用例 | ngxrs | nginx |
 |---|---|---|
 | `mail_capability.t` | **19/19** | 19/19 |
+| `mail_pop3.t` | **30/30** | 30/30 |
+| `mail_imap.t` | **33/33** | 33/33 |
+| `mail_smtp.t` | **43/43** | 43/43 |
+
+`mail_ssl.t` / `mail_imap_ssl.t` 在 **nginx 自己**上也只跑到 2 条断言就中止
+（依赖 `ssl_password_file` 等），因此**不作为兼容性证据**。
 
 ### 本轮修掉的真缺陷
 

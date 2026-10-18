@@ -512,12 +512,61 @@ async fn route_content(
     server: &Server,
     http: &Http,
 ) -> Response {
-    if !req.method.is_read() {
-        return error_response(405, server.server_tokens);
-    }
     match static_file::respond(req, path, query, loc, http) {
         Ok(r) => r,
         Err(_) => error_response(404, server.server_tokens),
+    }
+}
+
+/// Run an `auth_request` subrequest and map its status the way nginx does.
+///
+/// 2xx allows the request, 401 and 403 are propagated, and anything else is
+/// reported as 500 — nginx treats an auth server that answers 404 or 5xx as a
+/// broken access check rather than a decision.
+/// `None` when the auth server allowed the request, otherwise the status to
+/// report. Boxed because the subrequest re-enters `resolve_response`, which
+/// would otherwise make it infinitely sized.
+fn auth_request_status<'a>(
+    req: &'a Request,
+    target: &'a str,
+    server: &'a Server,
+    http: &'a Http,
+    vars: &'a ServerVars<'a>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<u16>> + Send + 'a>> {
+    Box::pin(auth_request_status_inner(req, target, server, http, vars))
+}
+
+async fn auth_request_status_inner(
+    req: &Request,
+    target: &str,
+    server: &Server,
+    http: &Http,
+    vars: &ServerVars<'_>,
+) -> Option<u16> {
+    let (ipath, iquery) = match target.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (target.to_string(), String::new()),
+    };
+    let aloc = server.locate(&ipath);
+    // The subrequest inherits the client's address but carries no body: nginx
+    // answers "header only" and any body read here would consume the main
+    // request's.
+    let sub = resolve_response(
+        req,
+        &ipath,
+        &iquery,
+        server,
+        aloc,
+        http,
+        vars.peer_ip,
+        vars.server_port,
+    )
+    .await;
+    match sub.status {
+        200..=299 => None,
+        401 => Some(401),
+        403 => Some(403),
+        _ => Some(500),
     }
 }
 
@@ -537,11 +586,19 @@ async fn route(
         .parse()
         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
 
-    // ngx_http_access_module runs in the ACCESS phase, before the content
-    // phase can reject the method with 405.
-    if crate::config::access_denied(&loc.access, peer_addr) {
-        return error_response(403, server.server_tokens);
-    }
+    // ---- ACCESS phase -------------------------------------------------
+    //
+    // `allow`/`deny`, `auth_basic` and `auth_request` are three handlers of the
+    // same nginx phase, combined by `satisfy`:
+    //
+    //   satisfy all (default) - the first failure wins, and later handlers do
+    //                           not get to override it.
+    //   satisfy any            - one success is enough; when everything fails
+    //                           401 outranks 403.
+    //
+    // Both rules come from auth_request_satisfy.t, which asserts e.g. that
+    // `deny all` next to an auth server answering 401 yields 403 under `all`
+    // but 401 under `any`.
     for le in &loc.limit_except {
         // `limit_except` applies to every method *except* the listed ones.
         let m = req.method.as_str();
@@ -551,8 +608,62 @@ async fn route(
         }
     }
 
-    if !req.method.is_read() {
-        return error_response(405, server.server_tokens);
+    let access_code: u16 = if crate::config::access_denied(&loc.access, peer_addr) {
+        403
+    } else {
+        0
+    };
+    let basic_on = loc.auth_basic.enabled();
+    let request_on = loc.auth_request.is_some();
+
+    // Only handlers that are actually configured take part: an absent
+    // `allow`/`deny` must not count as a passing check, or `satisfy any` would
+    // always succeed.
+    let access_on = !loc.access.is_empty();
+    if access_code != 0 || basic_on || request_on {
+        // 0 marks a passing check; anything else is the status it produced.
+        let mut codes: Vec<u16> = Vec::new();
+        if access_on {
+            codes.push(access_code);
+        }
+        if basic_on {
+            let header = req.headers.get("authorization");
+            codes.push(match crate::auth::check(&loc.auth_basic, header) {
+                crate::auth::Verdict::Ok => 0,
+                crate::auth::Verdict::Reject => 401,
+            });
+        }
+        if let Some(target) = &loc.auth_request {
+            let st = auth_request_status(req, target, server, http, vars).await;
+            codes.push(st.unwrap_or(0));
+        }
+
+        let status = if loc.satisfy_any {
+            if codes.iter().any(|c| *c == 0) {
+                None
+            } else if codes.contains(&401) {
+                Some(401)
+            } else {
+                Some(codes.iter().copied().find(|c| *c != 0).unwrap_or(403))
+            }
+        } else {
+            codes.iter().copied().find(|c| *c != 0)
+        };
+
+        if let Some(status) = status {
+            let mut resp = error_response(status, server.server_tokens);
+            if status == 401 {
+                let realm = loc
+                    .auth_basic
+                    .realm
+                    .clone()
+                    .unwrap_or_else(|| "restricted".to_string());
+                let mut extra = Vec::new();
+                crate::auth::www_authenticate(&realm, &mut extra);
+                resp.raw.splice(0..0, extra);
+            }
+            return resp;
+        }
     }
 
     // A location named `/foo/` makes `/foo` redirect to `/foo/`.
@@ -2299,6 +2410,13 @@ pub async fn render_resolved_vars(
     local_addr: &str,
     set_vars: &std::collections::HashMap<String, String>,
 ) -> Response {
+    // TRACE is rejected during config lookup, which in nginx happens *before*
+    // the rewrite phase — so a `return 200` in the location never runs and the
+    // client sees 405. Handling it here (before the rewrite walk) reproduces
+    // that ordering.
+    if req.method == Method::Trace {
+        return error_response(405, server.server_tokens);
+    }
     let mut custom: std::collections::HashMap<String, String> = set_vars.clone();
     for (k, v) in captures {
         custom.insert(k.clone(), v.clone());

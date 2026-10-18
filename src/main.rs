@@ -5,6 +5,7 @@ mod alloccnt;
 #[global_allocator]
 static GLOBAL: alloccnt::Counting = alloccnt::Counting;
 
+mod auth;
 mod cache;
 mod config;
 mod conn;
@@ -85,7 +86,15 @@ fn real_main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             "-s" => signal = Some(args.next().ok_or("-s requires a signal")?),
             "-q" => {}
             "-v" | "-V" => {
-                println!("{VERSION}");
+                // Test::Nginx parses this line with the regex
+                // `^nginx version: nginx/(\d+\.\d+\.\d+)` and derives feature
+                // availability from the number (IPv6, for one, is built in from
+                // 1.3.4 onwards). Without the nginx-format first line the
+                // version is unparseable and every version-gated suite reports
+                // "not supported" instead of running. The compatibility level
+                // is the nginx release this server reproduces, which is also
+                // what the `Server:` header advertises.
+                println!("nginx version: nginx/1.28.0 ({VERSION})");
                 if a == "-V" {
                     // Test::Nginx decides which suites can run by matching this
                     // text: known features use a regex from its own table, and
@@ -105,9 +114,9 @@ fn real_main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                          --with-http_v2_module --with-stream --with-stream_ssl_module \
             --with-http_v3_module \
                          --with-http_grpc_module --with-http_ssi_module \
-                         --without-http_auth_request_module --without-http_sub_module \
+                         --with-http_auth_request_module --with-http_auth_basic_module --without-http_sub_module \
                          --without-http_dav_module --without-http_slice_module \
-                         --with-mail --with-mail_ssl_module --without-http_memcached_module \
+                         --with-mail --with-mail_ssl_module --with-ipv6 --without-http_memcached_module \
                          --without-http_flv_module --without-http_mp4_module \
                          --without-http_geoip_module --without-http_image_filter_module \
                          --without-http_xslt_module --without-http_perl_module \

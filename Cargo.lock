@@ -526,6 +526,7 @@ dependencies = [
  "pkcs8",
  "quinn",
  "regex",
+ "ring",
  "rustls",
  "rustls-pemfile",
  "rustls-webpki",

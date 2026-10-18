@@ -70,6 +70,12 @@ pub struct LocCfg {
     pub access: Vec<AccessRule>,
     /// `limit_except METHOD... { allow/deny ... }` blocks.
     pub limit_except: Vec<LimitExcept>,
+    /// `auth_basic` realm plus `auth_basic_user_file`.
+    pub auth_basic: crate::auth::BasicAuth,
+    /// `auth_request URI` / `off`; `None` when not configured.
+    pub auth_request: Option<String>,
+    /// `satisfy all|any`: how `auth_basic` and `auth_request` combine.
+    pub satisfy_any: bool,
     /// `proxy_bind ADDR[:PORT]` / `off`; empty means "not configured".
     pub proxy_bind: Option<String>,
     pub limit_reqs: Vec<LimitReq>,
@@ -208,6 +214,9 @@ impl LocCfg {
             server_name: String::new(),
             access: Vec::new(),
             limit_except: Vec::new(),
+            auth_basic: crate::auth::BasicAuth::default(),
+            auth_request: None,
+            satisfy_any: false,
             proxy_bind: None,
             limit_reqs: Vec::new(),
             limit_conns: Vec::new(),
@@ -1741,6 +1750,43 @@ impl Builder {
                 cfg.autoindex = parse_on_off(v).ok_or_else(|| {
                     sem(&d.file, d.line, format!("invalid autoindex value \"{v}\""))
                 })?;
+            }
+            "auth_basic" => {
+                // The realm may contain spaces, so join every argument.
+                let realm = d.args.join(" ");
+                cfg.auth_basic.realm = Some(realm);
+            }
+            "auth_basic_user_file" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "auth_basic_user_file requires a path"))?;
+                cfg.auth_basic.user_file = Some(PathBuf::from(v));
+            }
+            "auth_request" => {
+                let v = d.args.first().map(|s| s.as_str()).unwrap_or("");
+                cfg.auth_request = if v.is_empty() || v == "off" {
+                    None
+                } else {
+                    Some(v.to_string())
+                };
+            }
+            "satisfy" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "satisfy requires all|any"))?;
+                cfg.satisfy_any = match v.as_str() {
+                    "any" => true,
+                    "all" => false,
+                    other => {
+                        return Err(sem(
+                            &d.file,
+                            d.line,
+                            format!("invalid satisfy value \"{other}\""),
+                        ))
+                    }
+                };
             }
             "ssi" => {
                 let v = d
@@ -3634,8 +3680,18 @@ pub fn build(
                     });
                 }
             }
-            "root" | "index" | "autoindex" | "ssi" | "add_header" | "add_trailer"
-            | "error_page" | "expires" => {
+            "root"
+            | "index"
+            | "autoindex"
+            | "ssi"
+            | "add_header"
+            | "add_trailer"
+            | "error_page"
+            | "auth_basic"
+            | "auth_basic_user_file"
+            | "auth_request"
+            | "satisfy"
+            | "expires" => {
                 b.apply_loc(d, &mut http.default_loc)?;
             }
             "upstream" => {

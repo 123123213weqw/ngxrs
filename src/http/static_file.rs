@@ -48,6 +48,17 @@ pub fn respond_fs(
     loc: &LocCfg,
     http: &Http,
 ) -> io::Result<Response> {
+    // nginx splits the method check in two. Anything outside GET/HEAD/POST is
+    // rejected *before* the path is resolved, so TRACE or DELETE to a missing
+    // file is 405 rather than 404. POST is only rejected once the target is
+    // known to exist, so POST to a missing file is 404.
+    if !matches!(
+        req.method,
+        crate::http::Method::Get | crate::http::Method::Head | crate::http::Method::Post
+    ) {
+        return Ok(Response::empty(405));
+    }
+
     // Open first, then fstat: one syscall less than statx+open, and no TOCTOU
     // window (nginx does the same).
     let file = match File::open(fs_path) {
@@ -60,6 +71,15 @@ pub fn respond_fs(
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Ok(Response::empty(403)),
         Err(_) => return Ok(Response::empty(404)),
     };
+
+    // POST is only known to be disallowed now that the target exists; a
+    // directory answers 403 (no index, autoindex off) before that check.
+    if !req.method.is_read() {
+        if meta.is_dir() {
+            return Ok(Response::empty(403));
+        }
+        return Ok(Response::empty(405));
+    }
 
     if meta.is_dir() {
         if !uri.ends_with('/') {

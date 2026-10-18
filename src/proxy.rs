@@ -1762,10 +1762,22 @@ async fn exchange(
         Some(vars),
     );
     apply_cookie_rules(&mut raw, loc, vars);
+    // `add_trailer` forces chunked framing even when the upstream sent a
+    // Content-Length: nginx sets `r->expect_trailers` and the header filter
+    // drops the length in favour of `Transfer-Encoding: chunked`.
+    // Only the *decision* is made here — nginx sets `expect_trailers` before the
+    // values are known. The values themselves are evaluated after the body,
+    // which matters for time-dependent ones like `$msec`.
+    let (expect_trailers, _) = crate::http::eval_trailers(&loc.trailers, head.status, vars);
+    if expect_trailers && !head.chunked {
+        raw = strip_length_headers(&mut raw);
+        raw.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+    }
     let sent_headers = crate::http::split_head(&raw);
     write_head(conn, head.status, &raw, req.keepalive, tokens).await?;
 
     let mut sent = 0u64;
+    let mut pacer = Pacer::new(loc.proxy_limit_rate);
     if req.method == Method::Head {
         // Converted HEAD: drain (and discard) the body we asked for.
         return Ok(written(Outcome {
@@ -1776,7 +1788,7 @@ async fn exchange(
         }));
     }
     if head.chunked {
-        sent = stream_chunked(conn, &mut up, buf, loc.proxy_read_timeout).await?;
+        sent = stream_chunked(conn, &mut up, buf, loc.proxy_read_timeout, &mut pacer).await?;
         if loc.proxy_buffering {
             let _ = reason(200);
         }
@@ -1789,7 +1801,16 @@ async fn exchange(
             }
             if !pending.is_empty() {
                 let take = (pending.len() as u64).min(remaining) as usize;
-                conn.write_all(&pending[..take]).await?;
+                pacer.tick(take as u64).await;
+                if expect_trailers {
+                    let mut framed = Vec::with_capacity(take + 16);
+                    framed.extend_from_slice(format!("{take:x}\r\n").as_bytes());
+                    framed.extend_from_slice(&pending[..take]);
+                    framed.extend_from_slice(b"\r\n");
+                    conn.write_all(&framed).await?;
+                } else {
+                    conn.write_all(&pending[..take]).await?;
+                }
                 sent += take as u64;
                 remaining -= take as u64;
                 pending.drain(..take);
@@ -1804,7 +1825,16 @@ async fn exchange(
             if n == 0 {
                 break;
             }
-            conn.write_all(&chunk[..n]).await?;
+            pacer.tick(n as u64).await;
+            if expect_trailers {
+                let mut framed = Vec::with_capacity(n + 16);
+                framed.extend_from_slice(format!("{n:x}\r\n").as_bytes());
+                framed.extend_from_slice(&chunk[..n]);
+                framed.extend_from_slice(b"\r\n");
+                conn.write_all(&framed).await?;
+            } else {
+                conn.write_all(&chunk[..n]).await?;
+            }
             sent += n as u64;
             remaining -= n as u64;
         }
@@ -1835,6 +1865,7 @@ async fn exchange(
             framed.extend_from_slice(&chunk[..n]);
             framed.extend_from_slice(b"\r\n");
             sent += n as u64;
+            pacer.tick(n as u64).await;
             conn.write_all(&framed).await?;
         }
         conn.write_all(b"0\r\n\r\n").await?;
@@ -1854,6 +1885,23 @@ async fn exchange(
             _ => 0,
         };
         checkin(pool_key, up, cap);
+    }
+
+    // Close out the chunked framing with the trailer block. Only the
+    // Content-Length path re-frames here; a chunked upstream already ends with
+    // its own terminator and its trailers are passed through verbatim.
+    if expect_trailers && !head.chunked {
+        let (_, trailer_list) = crate::http::eval_trailers(&loc.trailers, head.status, vars);
+        let mut tail = Vec::with_capacity(64);
+        tail.extend_from_slice(b"0\r\n");
+        for (k, v) in &trailer_list {
+            tail.extend_from_slice(k.as_bytes());
+            tail.extend_from_slice(b": ");
+            tail.extend_from_slice(v.as_bytes());
+            tail.extend_from_slice(b"\r\n");
+        }
+        tail.extend_from_slice(b"\r\n");
+        conn.write_all(&tail).await?;
     }
 
     Ok(written(Outcome {
@@ -1878,11 +1926,46 @@ pub fn init_keepalive(http: &Http) {
     let _ = UPSTREAM_KEEPALIVE.set(http.upstreams.iter().map(|u| u.keepalive).collect());
 }
 
+/// Paces the upstream→client copy for `proxy_limit_rate`.
+///
+/// nginx delays each read from the upstream pipe so the transfer as a whole
+/// runs at the configured rate; the client sees the same total elapsed time.
+struct Pacer {
+    /// Bytes per second; 0 disables pacing.
+    rate: u64,
+    started: Option<std::time::Instant>,
+    copied: u64,
+}
+
+impl Pacer {
+    fn new(rate: u64) -> Self {
+        Self { rate, started: None, copied: 0 }
+    }
+
+    /// Sleep until the next `n` bytes are allowed out, then count them.
+    ///
+    /// The delay must happen *before* the write: sleeping afterwards would let
+    /// the client see the whole body immediately and only the (already
+    /// finished) request would linger.
+    async fn tick(&mut self, n: u64) {
+        if self.rate == 0 || n == 0 {
+            return;
+        }
+        let start = *self.started.get_or_insert_with(std::time::Instant::now);
+        let due = Duration::from_secs_f64((self.copied + n) as f64 / self.rate as f64);
+        if let Some(wait) = due.checked_sub(start.elapsed()) {
+            tokio::time::sleep(wait).await;
+        }
+        self.copied += n;
+    }
+}
+
 async fn stream_chunked(
     conn: &mut crate::conn::Conn,
     up: &mut TcpStream,
     mut pending: Vec<u8>,
     read_timeout: Duration,
+    pacer: &mut Pacer,
 ) -> io::Result<u64> {
     let mut sent = 0u64;
     loop {
@@ -1930,6 +2013,7 @@ async fn stream_chunked(
             sent += end as u64;
             return Ok(sent);
         }
+        pacer.tick(size).await;
         conn.write_all(&pending[..need]).await?;
         sent += need as u64;
         size = 0;

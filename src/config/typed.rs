@@ -133,6 +133,9 @@ pub struct LocCfg {
     pub proxy_cache_revalidate: bool,
     /// `proxy_cache_background_update`: serve a stale entry while refreshing.
     pub proxy_cache_background_update: bool,
+    /// `proxy_limit_rate`: pace the upstream→client transfer, bytes/second
+    /// (0 = unlimited). nginx stores this on the upstream conf.
+    pub proxy_limit_rate: u64,
     /// `proxy_intercept_errors`: let `error_page` handle proxy error statuses.
     pub proxy_intercept_errors: bool,
     /// `add_trailer` entries, same shape as `headers`.
@@ -224,6 +227,7 @@ impl LocCfg {
             proxy_cache_background_update: false,
             trailers: Vec::new(),
             max_ranges: None,
+            proxy_limit_rate: 0,
             proxy_intercept_errors: false,
             proxy_force_ranges: false,
             proxy_cache_lock: false,
@@ -1632,6 +1636,14 @@ impl Builder {
             "proxy_cache_convert_head" => {
                 cfg.proxy_cache_convert_head =
                     d.args.first().map(|v| v != "off").unwrap_or(true);
+            }
+            "proxy_limit_rate" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "proxy_limit_rate requires a value"))?;
+                cfg.proxy_limit_rate = parse_size(v)
+                    .ok_or_else(|| sem(&d.file, d.line, format!("invalid proxy_limit_rate \"{v}\"")))?;
             }
             "proxy_intercept_errors" => {
                 cfg.proxy_intercept_errors =

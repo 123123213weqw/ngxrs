@@ -1444,6 +1444,13 @@ impl<'a> ServerVars<'a> {
             }
             "remote_addr" => self.peer_ip.to_string(),
             "remote_port" => self.peer_port.to_string(),
+            // nginx: current time with millisecond resolution, `sec.msec`.
+            "msec" => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                format!("{}.{:03}", now.as_secs(), now.subsec_millis())
+            }
             "remote_user" => self
                 .req
                 .headers

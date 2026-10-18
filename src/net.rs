@@ -88,13 +88,18 @@ fn daemonize(
             0 => {}
             _ => std::process::exit(0),
         }
+        // All three descriptors go to /dev/null, as nginx does in `ngx_daemon`.
+        // Leaving stderr attached to whatever the caller passed keeps that pipe
+        // open for the lifetime of the daemon: `prove` then blocks in select()
+        // waiting for EOF that never arrives, because this process outlives the
+        // test that started it. The error log is a separate file, opened by the
+        // logging module.
+        let _ = error_log;
         let devnull = libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDWR);
         if devnull >= 0 {
             libc::dup2(devnull, 0);
             libc::dup2(devnull, 1);
-            if error_log.is_none() {
-                libc::dup2(devnull, 2);
-            }
+            libc::dup2(devnull, 2);
             if devnull > 2 {
                 libc::close(devnull);
             }
@@ -303,9 +308,9 @@ pub fn serve(cfg: Config) -> io::Result<()> {
     // The original process (daemon parent) is blocked waiting for this.
     notify_parent_ready();
 
-    eprintln!(
-        "ngxrs: started {workers} workers, prefix {}",
-        cfg.prefix.display()
+    crate::log::log_global(
+        crate::log::Level::Notice,
+        &format!("started {workers} workers, prefix {}", cfg.prefix.display()),
     );
 
     // nginx runs stream and http side by side; give stream its own thread.
@@ -328,7 +333,10 @@ pub fn serve(cfg: Config) -> io::Result<()> {
                     {
                         Ok(rt) => rt,
                         Err(e) => {
-                            eprintln!("ngxrs: stream runtime failed: {e}");
+                            crate::log::log_global(
+                                crate::log::Level::Emerg,
+                                &format!("stream runtime failed: {e}"),
+                            );
                             return;
                         }
                     };
@@ -355,7 +363,10 @@ pub fn serve(cfg: Config) -> io::Result<()> {
                     {
                         Ok(rt) => rt,
                         Err(e) => {
-                            eprintln!("ngxrs: mail runtime failed: {e}");
+                            crate::log::log_global(
+                                crate::log::Level::Emerg,
+                                &format!("mail runtime failed: {e}"),
+                            );
                             return;
                         }
                     };
@@ -371,7 +382,7 @@ pub fn serve(cfg: Config) -> io::Result<()> {
     });
     block_on_shutdown(Some(reloader));
 
-    eprintln!("ngxrs: shutting down");
+    crate::log::log_global(crate::log::Level::Notice, "shutting down");
     // Stop accepting first, then let in-flight requests finish (nginx's
     // graceful shutdown). Bounded so a stuck client cannot block exit.
     // Flipping this makes already-running responses advertise `Connection: close`.
@@ -390,7 +401,10 @@ pub fn serve(cfg: Config) -> io::Result<()> {
     }
     let left = crate::http::ACTIVE_CONNS.load(Ordering::Relaxed);
     if left > 0 {
-        eprintln!("ngxrs: {left} connection(s) still active after 30s, exiting anyway");
+        crate::log::log_global(
+            crate::log::Level::Notice,
+            &format!("{left} connection(s) still active after 30s, exiting anyway"),
+        );
     }
     if let Some(tx) = stream_tx {
         let _ = tx.send(true);
@@ -474,18 +488,24 @@ fn worker_main(
                 match unix_bind(path) {
                     Ok(l) => {
                         if wid == 0 {
-                            eprintln!(
-                                "ngxrs: listening on unix:{} ({} server{})",
-                                path.display(),
-                                group.servers.len(),
-                                if group.servers.len() == 1 { "" } else { "s" }
+                            crate::log::log_global(
+                                crate::log::Level::Notice,
+                                &format!(
+                                    "listening on unix:{} ({} server{})",
+                                    path.display(),
+                                    group.servers.len(),
+                                    if group.servers.len() == 1 { "" } else { "s" }
+                                ),
                             );
                         }
                         unix_listeners.push((Arc::new(l), gi));
                     }
                     Err(e) => {
                         if wid == 0 {
-                            eprintln!("ngxrs: cannot bind unix:{}: {e}", path.display());
+                            crate::log::log_global(
+                                crate::log::Level::Emerg,
+                                &format!("cannot bind unix:{}: {e}", path.display()),
+                            );
                         }
                     }
                 }
@@ -494,11 +514,14 @@ fn worker_main(
             match bind(group.addr, true) {
                 Ok(l) => {
                     if wid == 0 {
-                        eprintln!(
-                            "ngxrs: listening on {} ({} server{})",
-                            group.addr,
-                            group.servers.len(),
-                            if group.servers.len() == 1 { "" } else { "s" }
+                        crate::log::log_global(
+                            crate::log::Level::Notice,
+                            &format!(
+                                "listening on {} ({} server{})",
+                                group.addr,
+                                group.servers.len(),
+                                if group.servers.len() == 1 { "" } else { "s" }
+                            ),
                         );
                     }
                     listeners.push((Arc::new(l), gi));
@@ -533,11 +556,14 @@ fn worker_main(
             for (gi, group) in cfg.http.quic_groups.iter().enumerate() {
                 match quic_bind(group.addr, &cfg.http, &group.servers) {
                     Ok(ep) => {
-                        eprintln!(
-                            "ngxrs: listening on {} (quic, {} server{})",
-                            group.addr,
-                            group.servers.len(),
-                            if group.servers.len() == 1 { "" } else { "s" }
+                        crate::log::log_global(
+                            crate::log::Level::Notice,
+                            &format!(
+                                "listening on {} (quic, {} server{})",
+                                group.addr,
+                                group.servers.len(),
+                                if group.servers.len() == 1 { "" } else { "s" }
+                            ),
                         );
                         let ctx2 = ctx.clone();
                         let idxs = group.servers.clone();
@@ -549,7 +575,10 @@ fn worker_main(
                         }));
                     }
                     Err(e) => {
-                        eprintln!("ngxrs: cannot bind {} (quic): {e}", group.addr);
+                        crate::log::log_global(
+                            crate::log::Level::Emerg,
+                            &format!("cannot bind {} (quic): {e}", group.addr),
+                        );
                     }
                 }
             }

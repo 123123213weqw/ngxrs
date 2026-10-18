@@ -154,6 +154,9 @@ pub struct LocCfg {
     /// `proxy_cache_use_stale` events. Only `updating` changes what a client
     /// sees today (it turns a concurrent background refresh into `UPDATING`).
     pub proxy_cache_use_stale_updating: bool,
+    /// `proxy_cache_use_stale ... http_404 http_500`: upstream statuses for
+    /// which an expired entry may be served instead of the upstream reply.
+    pub proxy_cache_use_stale_codes: Vec<u16>,
     /// `proxy_cache_revalidate`: send conditional headers upstream for an
     /// expired entry and reuse the cached body on `304`.
     pub proxy_cache_revalidate: bool,
@@ -265,6 +268,7 @@ impl LocCfg {
             proxy_cache_ignore: crate::cache::Ignore::default(),
             proxy_cache_convert_head: true,
             proxy_cache_use_stale_updating: false,
+            proxy_cache_use_stale_codes: Vec::new(),
             proxy_cache_revalidate: false,
             proxy_cache_background_update: false,
             trailers: Vec::new(),
@@ -1280,6 +1284,12 @@ pub fn proxy_upstream_name(url: &str) -> Option<String> {
         None => rest,
     };
     if authority.is_empty() || parse_listen(authority).is_some() {
+        return None;
+    }
+    // A variable names an upstream only at request time (`proxy_pass http://$b`),
+    // so there is nothing to resolve here -- nginx only looks the name up when
+    // the request is built. A `$` also covers `host:port` forms.
+    if authority.contains('$') {
         return None;
     }
     Some(authority.to_string())
@@ -2686,12 +2696,24 @@ impl Builder {
                 cfg.proxy_cache_revalidate = d.args.first().map(|v| v != "off").unwrap_or(true);
             }
             "proxy_cache_use_stale" => {
-                cfg.proxy_cache_use_stale_updating = d
-                    .args
-                    .iter()
-                    .any(|a| a.eq_ignore_ascii_case("updating") || a == "off");
+                cfg.proxy_cache_use_stale_updating =
+                    d.args.iter().any(|a| a.eq_ignore_ascii_case("updating"));
                 if d.args.iter().any(|a| a == "off") {
                     cfg.proxy_cache_use_stale_updating = false;
+                    cfg.proxy_cache_use_stale_codes.clear();
+                }
+                // `error` covers any 5xx; `timeout` / `invalid_header` are
+                // upstream-failure events rather than statuses. Named statuses
+                // arrive as `http_404`.
+                cfg.proxy_cache_use_stale_codes.clear();
+                for a in &d.args {
+                    if a.eq_ignore_ascii_case("error") {
+                        cfg.proxy_cache_use_stale_codes.extend(500..=599);
+                    } else if let Some(code) = a.strip_prefix("http_") {
+                        if let Ok(c) = code.parse::<u16>() {
+                            cfg.proxy_cache_use_stale_codes.push(c);
+                        }
+                    }
                 }
             }
             "proxy_cache_methods" => {

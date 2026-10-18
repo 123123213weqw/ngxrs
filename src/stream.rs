@@ -105,11 +105,17 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
     let listener = match bind_tcp(server.listen) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("ngxrs: [error] stream cannot bind {}: {e}", server.listen);
+            crate::log::log_global(
+                crate::log::Level::Emerg,
+                &format!("stream cannot bind {}: {e}", server.listen),
+            );
             return;
         }
     };
-    eprintln!("ngxrs: stream listening on {} (tcp)", server.listen);
+    crate::log::log_global(
+        crate::log::Level::Notice,
+        &format!("stream listening on {} (tcp)", server.listen),
+    );
 
     let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     loop {
@@ -388,7 +394,10 @@ async fn serve_udp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
             return;
         }
     };
-    eprintln!("ngxrs: stream listening on {} (udp)", server.listen);
+    crate::log::log_global(
+        crate::log::Level::Notice,
+        &format!("stream listening on {} (udp)", server.listen),
+    );
     let sock = Arc::new(sock);
 
     // Per-client upstream socket so replies can be matched back.

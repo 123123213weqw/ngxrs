@@ -43,7 +43,7 @@ fn cache_put(key: (String, i64, u64, u32), value: std::sync::Arc<Vec<u8>>) {
     });
 }
 
-fn accepts_gzip(req: &Request) -> bool {
+pub fn accepts_gzip(req: &Request) -> bool {
     let Some(ae) = req.headers.get("accept-encoding") else {
         return false;
     };
@@ -190,12 +190,15 @@ pub fn maybe_compress(req: &Request, resp: Response, loc: &LocCfg, http: &Http) 
         };
     };
 
+    // nginx compresses on the fly, so the length is unknown when the head is
+    // written and the reply is chunked. Verified against nginx 1.28: a gzipped
+    // static file answers `Transfer-Encoding: chunked` with no Content-Length.
     drop_header(&mut raw, b"Content-Length:");
-    drop_header(&mut raw, b"ETag:");
     drop_header(&mut raw, b"Accept-Ranges:");
-    raw.extend_from_slice(b"Content-Encoding: gzip\r\nContent-Length: ");
-    raw.extend_from_slice(payload.len().to_string().as_bytes());
-    raw.extend_from_slice(b"\r\n");
+    // The validator no longer describes the bytes being sent, so nginx weakens
+    // it instead of dropping it: `ETag: W/"..."`.
+    weaken_etag(&mut raw);
+    raw.extend_from_slice(b"Content-Encoding: gzip\r\n");
     if loc.gzip_vary {
         raw.extend_from_slice(b"Vary: Accept-Encoding\r\n");
     }
@@ -204,12 +207,45 @@ pub fn maybe_compress(req: &Request, resp: Response, loc: &LocCfg, http: &Http) 
         status: resp.status,
         headers: resp.headers,
         raw,
-        explicit_len: true,
+        // `write_response` treats `explicit_len: false` as "measure the body",
+        // so the chunked framing has to be requested the same way `add_trailer`
+        // does it: `expect_trailers` switches the message to chunked framing
+        // and, with no trailers queued, emits no trailer lines.
+        explicit_len: false,
         no_error_page: resp.no_error_page,
         trailers: resp.trailers,
-        expect_trailers: resp.expect_trailers,
+        expect_trailers: req.version_minor >= 1 || resp.expect_trailers,
         body: Body::Bytes(payload),
     }
+}
+
+/// Rewrite `ETag: "x"` into `ETag: W/"x"` in place, leaving anything already
+/// weak or absent alone.
+fn weaken_etag(raw: &mut Vec<u8>) {
+    let mut out = Vec::with_capacity(raw.len() + 2);
+    let mut start = 0usize;
+    let mut first = true;
+    while start < raw.len() {
+        let end = match memchr::memchr(b'\n', &raw[start..]) {
+            Some(p) => start + p + 1,
+            None => raw.len(),
+        };
+        let line = &raw[start..end];
+        let is_etag = line.len() > 5
+            && line[..5].eq_ignore_ascii_case(b"etag:")
+            && !line[5..].trim_ascii_start().starts_with(b"W/");
+        if is_etag && first {
+            first = false;
+            out.extend_from_slice(b"ETag: W/");
+            let rest = &line[5..];
+            let trimmed = rest.trim_ascii_start();
+            out.extend_from_slice(trimmed);
+        } else {
+            out.extend_from_slice(line);
+        }
+        start = end;
+    }
+    *raw = out;
 }
 
 fn gz(data: &[u8], level: u32) -> Vec<u8> {

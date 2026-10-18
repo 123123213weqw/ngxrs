@@ -125,14 +125,20 @@ async fn serve_one(server: MailServer, shutdown: &mut watch::Receiver<bool>) {
     let listener = match crate::stream::bind_tcp(server.listen) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("ngxrs: [error] mail cannot bind {}: {e}", server.listen);
+            crate::log::log_global(
+                crate::log::Level::Emerg,
+                &format!("mail cannot bind {}: {e}", server.listen),
+            );
             return;
         }
     };
-    eprintln!(
-        "ngxrs: mail listening on {} ({})",
-        server.listen,
-        server.protocol.name()
+    crate::log::log_global(
+        crate::log::Level::Notice,
+        &format!(
+            "mail listening on {} ({})",
+            server.listen,
+            server.protocol.name()
+        ),
     );
     let server = Arc::new(server);
     loop {

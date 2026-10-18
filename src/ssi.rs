@@ -13,8 +13,9 @@
 //!   everything outside printable ASCII; `&`, `+`, `:`, `/`, `=` and `?` are
 //!   left alone.
 //! * An undefined variable renders as `(none)`, an unknown command as
-//!   `[an error occurred while processing the directive]`, and a failed
-//!   `#include` as `[an error occurred while including <uri>]`.
+//!   `[an error occurred while processing the directive]`. A failed `#include`
+//!   gets no placeholder at all: nginx inlines the subrequest's own output,
+//!   so a 404 contributes its error page body.
 //! * `$arg_*` values are **not** URL-decoded.
 
 use std::collections::HashMap;
@@ -285,7 +286,13 @@ pub trait Host {
     /// Render a variable as nginx's SSI module would, honouring `timefmt`.
     fn var(&self, name: &str, ctx: &Ctx) -> Option<String>;
     /// Perform `#include virtual="<uri>"` and return the subrequest body.
-    fn include(&mut self, uri: &str) -> Option<Vec<u8>>;
+    ///
+    /// `has_stub` tells the host that a `stub="name"` was given: a failed
+    /// subrequest must then keep reporting failure so the stub keeps standing in
+    /// for it, instead of inlining the error page. nginx's stub is a
+    /// post-subrequest handler that replaces the output on failure, so the
+    /// stub wins over the subrequest body.
+    fn include(&mut self, uri: &str, has_stub: bool) -> Option<Vec<u8>>;
 }
 
 /// Render `body` with SSI directives evaluated.
@@ -593,7 +600,8 @@ fn directive(
                 return;
             };
             let target = expand_vars(uri, ctx, host);
-            match host.include(&target) {
+            let has_stub = param(&p, "stub").is_some();
+            match host.include(&target, has_stub) {
                 Some(b) => out.extend_from_slice(&b),
                 None => {
                     // A `stub` names a `#block` whose rendered body replaces
@@ -605,11 +613,7 @@ fn directive(
                             return;
                         }
                     }
-                    let msg = ctx
-                        .errmsg
-                        .clone()
-                        .unwrap_or_else(|| format!("[an error occurred while including {target}]"));
-                    out.extend_from_slice(msg.as_bytes());
+                    out.extend_from_slice(ctx.errmsg.as_deref().unwrap_or("").as_bytes());
                 }
             }
         }
@@ -695,7 +699,7 @@ mod tests {
             }
             self.vars.get(name).cloned()
         }
-        fn include(&mut self, _uri: &str) -> Option<Vec<u8>> {
+        fn include(&mut self, _uri: &str, _has_stub: bool) -> Option<Vec<u8>> {
             self.include.clone()
         }
     }

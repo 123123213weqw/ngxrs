@@ -147,8 +147,17 @@ fn real_main() -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     let cfg = config::load_global(&conf, prefix.as_deref(), &globals, error_log.as_deref())?;
 
+    // Config-time warnings belong in error_log, exactly as nginx puts them
+    // there. Printing them on stderr corrupted the TAP stream of the official
+    // test harness (the daemon inherits the descriptor) and is not what nginx
+    // does once a log destination exists.
     for w in &cfg.warnings {
-        eprintln!("ngxrs: [warn] {w}");
+        match cfg.error_log.as_ref().and_then(|p| p.to_str()) {
+            Some(dest) if dest != "stderr" => {
+                crate::log::error_log(dest, &format!("[warn] {w}"));
+            }
+            _ => eprintln!("ngxrs: [warn] {w}"),
+        }
     }
 
     if test {

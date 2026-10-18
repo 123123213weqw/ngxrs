@@ -364,7 +364,7 @@ pub async fn handle(
                 return Ok(Some(respond(conn, 502, tokens, req.keepalive).await?));
             }
             Err(_) => {
-                eprintln!("ngxrs: [error] fastcgi read timed out");
+                crate::log::log_global(crate::log::Level::Error, "fastcgi read timed out");
                 return Ok(Some(respond(conn, 504, tokens, req.keepalive).await?));
             }
         }

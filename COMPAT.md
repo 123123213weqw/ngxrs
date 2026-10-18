@@ -544,3 +544,14 @@ CONTENT，所以 ACCESS 必须先求值。
 - HTTP/3 与 nginx 的逐帧一致（本机无法建立基线）
 - `auth_request` 子请求缓存、`max_errors`、`stream`/`mail` 客户端证书校验
 - 高并发（c≥1024）吞吐约为 nginx 的 0.94–0.95×；64KB 尾延迟优于 nginx 一个数量级
+
+## 本轮已知回归（未修复）
+
+- `proxy_cache_vary.t`：手工跑 48/54，nginx 53/54；经 A/B 脚本跑时更会被判定为
+  UNRUN（脚本以 `prove -v > file` 运行，本次运行会卡住直到 150s 超时，TAP 输出丢失）。
+  已排除的原因：`serve_cached` 里的 gzip（关掉它之后 vary 仍然失败，只是
+  `proxy_cache.t` 从 17/17 掉到 15/17，已恢复）。根因尚未定位，失败集中在
+  需要重启服务器的用例（`cold first/second`）与 Vary 归一化用例
+  （`normalize first`、`vary asterisk second`）。
+- `proxy_cache_use_stale.t`：25/36（上一轮 26/36），差集主要是 `updating` /
+  `revalidated` 事件，两者都还没有实现。

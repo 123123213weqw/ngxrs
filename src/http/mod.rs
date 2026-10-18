@@ -3534,8 +3534,31 @@ async fn dispatch(
     // connection about to be closed would not carry `Connection: close`.
     keepalive_allowed = keepalive_allowed && keepalive_policy(req, loc, state);
 
+    // `ssi on` has to see the entire body before anything is written, so a
+    // proxied response is fetched whole and then run through the same filter
+    // as a static one. nginx's filter chain reaches the same effect: the SSI
+    // filter runs only after the upstream body is complete. Without this the
+    // proxy branch wrote straight to the socket and SSI never ran.
+    //
+    // gzip needs the whole body for the same reason: nginx compresses proxied
+    // responses as an output filter, and a streaming write cannot know the
+    // compressed length before the head goes out.
+    //
+    // A location that also uses `proxy_cache` keeps the streaming path: the
+    // cache decision table (Vary variants, revalidation, stale-while-revalidate,
+    // lock takeover) lives there, and routing those requests through the
+    // buffered fetcher would mean maintaining a second, weaker copy of it.
+    // Cached replies are still compressed, because `serve_cached` runs the gzip
+    // filter; only a cache *miss* on such a location goes out uncompressed.
+    let wants_buffered =
+        loc.ssi || (loc.gzip && crate::gzip::accepts_gzip(req) && loc.proxy_cache.is_none());
+    let mut ssi_proxied: Option<Response> = None;
+    if loc.proxy_pass.is_some() && wants_buffered && req.method != Method::Head {
+        ssi_proxied = crate::proxy::fetch(req, path, query, loc, http, client_ip).await;
+    }
+
     // ---- reverse proxy (streams to the socket, cannot be resolved first) ----
-    if loc.proxy_pass.is_some() {
+    if loc.proxy_pass.is_some() && ssi_proxied.is_none() {
         let proxy_root = loc.root.to_string_lossy().to_string();
         let proxy_vars = ServerVars {
             req,
@@ -3630,23 +3653,32 @@ async fn dispatch(
     }
 
     let peer_ip = conn.peer_ip_str();
-    let resp = render_resolved_vars(
-        req,
-        path,
-        query,
-        loc,
-        skip_return,
-        server,
-        http,
-        &peer_ip,
-        peer_port,
-        listen_port,
-        captures,
-        state,
-        local_addr,
-        &set_vars,
-    )
-    .await;
+    let resp = match ssi_proxied {
+        Some(r) => r,
+        None => {
+            render_resolved_vars(
+                req,
+                path,
+                query,
+                loc,
+                skip_return,
+                server,
+                http,
+                &peer_ip,
+                peer_port,
+                listen_port,
+                captures,
+                state,
+                local_addr,
+                &set_vars,
+            )
+            .await
+        }
+    };
+    // gzip is an output filter that runs after SSI, so a buffered proxied body
+    // is compressed here. Already-compressed replies and non-gzip locations
+    // fall straight through.
+    let resp = crate::gzip::maybe_compress(req, resp, loc, http);
     // `ssi on` rewrites the body before it is written. HEAD has no body to
     // process, and nginx skips the filter for non-200 replies.
     let resp = if loc.ssi && resp.status == 200 && req.method != Method::Head {
@@ -4210,7 +4242,7 @@ pub async fn write_response_ka(
 struct SsiHost<'a> {
     vars: &'a ServerVars<'a>,
     include_cache: std::collections::HashMap<String, Option<Vec<u8>>>,
-    wanted: Vec<String>,
+    wanted: Vec<(String, bool)>,
     /// Seconds since the epoch, for `$date_gmt` / `$date_local`.
     now: i64,
 }
@@ -4249,12 +4281,14 @@ impl crate::ssi::Host for SsiHost<'_> {
         }
     }
 
-    fn include(&mut self, uri: &str) -> Option<Vec<u8>> {
+    fn include(&mut self, uri: &str, has_stub: bool) -> Option<Vec<u8>> {
         match self.include_cache.get(uri) {
             Some(v) => v.clone(),
             None => {
-                if !self.wanted.iter().any(|w| w == uri) {
-                    self.wanted.push(uri.to_string());
+                if !self.wanted.iter().any(|(w, _)| w == uri) {
+                    self.wanted.push((uri.to_string(), has_stub));
+                } else if let Some(slot) = self.wanted.iter_mut().find(|(w, _)| w == uri) {
+                    slot.1 = has_stub;
                 }
                 None
             }
@@ -4330,7 +4364,7 @@ async fn apply_ssi_inner(
             break;
         }
         let batch = std::mem::take(&mut host.wanted);
-        for uri in batch {
+        for (uri, has_stub) in batch {
             if host.include_cache.contains_key(&uri) {
                 continue;
             }
@@ -4374,7 +4408,13 @@ async fn apply_ssi_inner(
                 sub = apply_ssi(req, sub, server, http, &ivars).await;
                 SSI_DEPTH.with(|d| d.set(d.get() - 1));
             }
-            let value = if sub.status >= 400 {
+            // A failed include is inlined verbatim -- nginx emits the
+            // subrequest's own output, so a 404 shows up as its error page body
+            // and the main response stays 200. Verified against nginx 1.28.
+            // With a `stub="name"`, though, the stub replaces the output on
+            // failure, so the include has to keep reporting failure and let the
+            // renderer emit the stub instead.
+            let value = if sub.status >= 400 && has_stub {
                 None
             } else {
                 Some(body_bytes(sub.body).await.unwrap_or_default())

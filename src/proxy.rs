@@ -658,9 +658,6 @@ pub async fn handle(
         }
     });
 
-    // Cacheable HEAD requests go upstream as GET (nginx's default).
-    let convert_head = req.method == Method::Head && loc.proxy_cache_convert_head && zone.is_some();
-
     // `proxy_cache_min_uses`: count this request against the key (nginx bumps
     // `fcn->uses` on every cache lookup) and refuse to store until it is met.
     let min_uses_ok = match (zone, cache_key.as_ref()) {
@@ -680,6 +677,14 @@ pub async fn handle(
         let e = e.trim();
         !e.is_empty() && e != "0"
     }) || !cache_range_allowed(loc, req, min_uses_ok);
+
+    // Cacheable HEAD requests go upstream as GET (nginx's default). A non-cacheable
+    // one -- `proxy_no_cache` matched, or a bypassed range -- is forwarded as HEAD:
+    // converting it would pull the whole entity at the backend's own pace for
+    // nothing. nginx decides this inside `ngx_http_upstream_cache`, after
+    // `u->cacheable` is known.
+    let convert_head =
+        req.method == Method::Head && loc.proxy_cache_convert_head && zone.is_some() && !bypass;
 
     // A stored-but-stale entry is reported as EXPIRED (nginx does the same)
     // rather than MISS.
@@ -749,75 +754,10 @@ pub async fn handle(
                     } else {
                         None
                     };
-                    let mut raw = Vec::with_capacity(entry.body.len() + 256);
-                    for (k, v) in &entry.headers {
-                        raw.extend_from_slice(k.as_bytes());
-                        raw.extend_from_slice(b": ");
-                        raw.extend_from_slice(v.as_bytes());
-                        raw.extend_from_slice(b"\r\n");
-                    }
-                    crate::http::apply_add_headers_upstream(
-                        &mut raw,
-                        &loc.headers,
-                        entry.status,
-                        hit_status,
-                        "",
-                    );
-                    // The stored headers may already carry a Content-Length.
-                    if !entry
-                        .headers
-                        .iter()
-                        .any(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-                    {
-                        raw.extend_from_slice(b"Content-Length: ");
-                        raw.extend_from_slice(entry.body.len().to_string().as_bytes());
-                        raw.extend_from_slice(b"\r\n");
-                    }
-                    // A range is served out of the cached body when the origin
-                    // advertised `Accept-Ranges: bytes` (nginx keeps that header
-                    // in the cache entry); `proxy_force_ranges` overrides it.
-                    let ranges_from_cache = loc.proxy_force_ranges
-                        || entry.headers.iter().any(|(k, v)| {
-                            k.eq_ignore_ascii_case("accept-ranges")
-                                && v.trim().eq_ignore_ascii_case("bytes")
-                        });
-                    let mut status = entry.status;
-                    let mut body = entry.body.clone();
-                    if ranges_from_cache {
-                        let (s2, raw2, body2) = apply_force_ranges(req, status, &mut raw, body);
-                        status = s2;
-                        raw = raw2;
-                        body = body2;
-                    }
-                    let resp = Response {
-                        status,
-                        headers: Vec::new(),
-                        raw,
-                        explicit_len: true,
-                        no_error_page: false,
-                        trailers: Vec::new(),
-                        expect_trailers: false,
-                        body: crate::http::Body::Bytes(body),
-                    };
-                    let bytes = crate::http::write_response(
-                        conn,
-                        resp,
-                        req.keepalive,
-                        tokens,
-                        req.method == Method::Head,
-                    )
-                    .await?;
-                    // Deliberately NOT awaiting `pending_update` here: doing so
-                    // held the client connection open for the whole refresh and
-                    // cost more assertions than it won (24 vs 26). The refresh
-                    // still lands a few milliseconds later.
+                    let written_out =
+                        serve_cached(conn, req, loc, http, tokens, &entry, hit_status).await?;
                     drop(pending_update);
-                    return Ok(Some(written(Outcome {
-                        status,
-                        bytes,
-                        close: false,
-                        sent: Vec::new(),
-                    })));
+                    return Ok(Some(written_out));
                 }
             }
         }
@@ -1021,12 +961,14 @@ pub async fn handle(
                     key: cache_key.as_deref(),
                     status: cache_status,
                     reval: reval_entry,
+                    stale: stale_entry.as_ref(),
                     no_store: lock_timed_out,
                     min_uses_ok,
                 },
                 &upstream_addr,
                 vars,
                 convert_head,
+                http,
             )
             .await;
 
@@ -1242,6 +1184,9 @@ struct CacheCtx<'a> {
     status: &'a str,
     /// Expired entry that may be revalidated with `If-None-Match` / `If-Modified-Since`.
     reval: Option<&'a crate::cache::Cached>,
+    /// Expired entry kept for `proxy_cache_use_stale`: if the upstream answers
+    /// with a status the directive lists, this is served instead.
+    stale: Option<&'a crate::cache::Cached>,
     /// Whether `proxy_cache_min_uses` has been reached for this key.
     min_uses_ok: bool,
     /// `proxy_cache_lock` was on but this request gave up waiting. nginx turns
@@ -1491,6 +1436,80 @@ fn build_upstream_head(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Write a stored cache entry to the client, reporting `hit_status` in
+/// `$upstream_cache_status`. Shared by the HIT/STALE/UPDATING path and by
+/// `proxy_cache_use_stale` when the upstream answers with a listed status.
+async fn serve_cached(
+    conn: &mut crate::conn::Conn,
+    req: &Request,
+    loc: &LocCfg,
+    http: &crate::config::Http,
+    tokens: bool,
+    entry: &crate::cache::Cached,
+    hit_status: &str,
+) -> io::Result<Proxied> {
+    let mut raw = Vec::with_capacity(entry.body.len() + 256);
+    for (k, v) in &entry.headers {
+        raw.extend_from_slice(k.as_bytes());
+        raw.extend_from_slice(b": ");
+        raw.extend_from_slice(v.as_bytes());
+        raw.extend_from_slice(b"\r\n");
+    }
+    crate::http::apply_add_headers_upstream(&mut raw, &loc.headers, entry.status, hit_status, "");
+    // The stored headers may already carry a Content-Length.
+    if !entry
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+    {
+        raw.extend_from_slice(b"Content-Length: ");
+        raw.extend_from_slice(entry.body.len().to_string().as_bytes());
+        raw.extend_from_slice(b"\r\n");
+    }
+    // A range is served out of the cached body when the origin advertised
+    // `Accept-Ranges: bytes` (nginx keeps that header in the cache entry);
+    // `proxy_force_ranges` overrides it.
+    let ranges_from_cache = loc.proxy_force_ranges
+        || entry.headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("accept-ranges") && v.trim().eq_ignore_ascii_case("bytes")
+        });
+    let mut status = entry.status;
+    let mut body = entry.body.clone();
+    if ranges_from_cache {
+        let (s2, raw2, body2) = apply_force_ranges(req, status, &mut raw, body);
+        status = s2;
+        raw = raw2;
+        body = body2;
+    }
+    let resp = Response {
+        status,
+        headers: Vec::new(),
+        raw,
+        explicit_len: true,
+        no_error_page: false,
+        trailers: Vec::new(),
+        expect_trailers: false,
+        body: crate::http::Body::Bytes(body),
+    };
+    // gzip is an output filter in nginx, so a served-from-cache body goes
+    // through it exactly like a fresh one.
+    let resp = crate::gzip::maybe_compress(req, resp, loc, http);
+    let bytes = crate::http::write_response(
+        conn,
+        resp,
+        req.keepalive,
+        tokens,
+        req.method == Method::Head,
+    )
+    .await?;
+    Ok(written(Outcome {
+        status,
+        bytes,
+        close: false,
+        sent: Vec::new(),
+    }))
+}
+
 async fn exchange(
     conn: &mut crate::conn::Conn,
     req: &Request,
@@ -1508,6 +1527,7 @@ async fn exchange(
     upstream_addr: &str,
     vars: &crate::http::ServerVars<'_>,
     convert_head: bool,
+    http: &crate::config::Http,
 ) -> io::Result<Proxied> {
     // ---- request head ----
     // The cache only helps a ranged request if it can hold the whole entity, so
@@ -1602,6 +1622,16 @@ async fn exchange(
         buf = rest[pos + 4..].to_vec();
         head = parse_upstream_head(&next)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad upstream response"))?;
+    }
+
+    // ---- `proxy_cache_use_stale` on an upstream status ----
+    // An expired entry may stand in for the upstream reply when the directive
+    // lists that status (`... http_404 http_500`). nginx makes this decision
+    // where the upstream headers are parsed, which is here.
+    if let Some(entry) = cache.stale {
+        if loc.proxy_cache_use_stale_codes.contains(&head.status) {
+            return serve_cached(conn, req, loc, http, tokens, entry, "STALE").await;
+        }
     }
 
     // ---- 304 on a revalidated entry: serve the cached body as REVALIDATED ----
@@ -2351,10 +2381,49 @@ pub async fn fetch(
     } else {
         None
     };
+    // `proxy_cache_bypass` turns every `$upstream_cache_status` into BYPASS;
+    // otherwise the status has to distinguish a hit from an expired entry the
+    // way the streaming path does (nginx reports EXPIRED, not MISS).
+    let bypass_spec = Vars {
+        req,
+        peer_ip,
+        scheme: "http",
+        host: req.host.as_ref().map(|h| h.as_str()).unwrap_or(""),
+        uri: path,
+        args: query,
+        server_port: 0,
+    };
+    let bypass = loc.proxy_cache_bypass.iter().any(|v| {
+        let e = expand(v, &bypass_spec);
+        let e = e.trim();
+        !e.is_empty() && e != "0"
+    });
+    let mut cache_status = "MISS";
+    let mut stale_entry: Option<crate::cache::Cached> = None;
     if let (Some(z), Some(key)) = (zone, cache_key.as_deref()) {
-        if let Some(entry) = crate::cache::load(z, key) {
-            if entry.is_fresh(crate::cache::now()) {
-                return Some(cached_response(entry, loc, "HIT"));
+        if bypass {
+            cache_status = "BYPASS";
+        } else {
+            // Vary-aware, exactly like the streaming path: a stored response
+            // with `Vary` is indexed per request-header signature.
+            let hit = crate::cache::load(z, key).or_else(|| {
+                crate::cache::load_variant(z, key, |name| {
+                    req.headers.get_joined(name).unwrap_or_default()
+                })
+            });
+            match hit {
+                Some(entry) if entry.is_fresh(crate::cache::now()) => {
+                    if entry.error.is_none() {
+                        return Some(cached_response(entry, loc, "HIT"));
+                    }
+                    cache_status = "HIT";
+                    stale_entry = Some(entry);
+                }
+                Some(entry) => {
+                    cache_status = "EXPIRED";
+                    stale_entry = Some(entry);
+                }
+                None => cache_status = "MISS",
             }
         }
     }
@@ -2498,27 +2567,51 @@ pub async fn fetch(
             &mut raw,
             &loc.headers,
             head.status,
-            "BYPASS",
+            cache_status,
             &upstream_addr_display,
             &upstream_headers,
         );
 
+        // `proxy_cache_use_stale`: an expired entry may stand in for an
+        // upstream status the directive lists.
+        if let Some(entry) = stale_entry {
+            if loc.proxy_cache_use_stale_codes.contains(&head.status) {
+                return Some(cached_response(entry, loc, "STALE"));
+            }
+        }
+
         // Store for the next request, following the same rules as the
-        // streaming path (status validity, Cache-Control, Vary).
-        if let (Some(z), Some(key)) = (zone, cache_key.as_deref()) {
-            if let Some(ttl) =
-                crate::cache::ttl(loc, head.status, &upstream_headers, loc.proxy_cache_ignore)
-            {
-                if !ttl.is_zero() {
-                    let entry = crate::cache::Cached {
-                        status: head.status,
-                        error: None,
-                        headers: upstream_headers.clone(),
-                        body: body.clone(),
-                        stored_at: crate::cache::now(),
-                        valid_for: ttl.as_secs(),
-                    };
-                    let _ = crate::cache::store(z, key, &entry);
+        // streaming path (status validity, Cache-Control, Vary). A bypassed
+        // request must not seed an entry.
+        if cache_status != "BYPASS" {
+            if let (Some(z), Some(key)) = (zone, cache_key.as_deref()) {
+                if let Some(ttl) =
+                    crate::cache::ttl(loc, head.status, &upstream_headers, loc.proxy_cache_ignore)
+                {
+                    if !ttl.is_zero() {
+                        let entry = crate::cache::Cached {
+                            status: head.status,
+                            error: None,
+                            headers: upstream_headers.clone(),
+                            body: body.clone(),
+                            stored_at: crate::cache::now(),
+                            valid_for: ttl.as_secs(),
+                        };
+                        let names = if loc.proxy_cache_ignore.vary {
+                            Vec::new()
+                        } else {
+                            crate::cache::vary_names(&upstream_headers)
+                        };
+                        if names.is_empty() {
+                            crate::cache::clear_variants(z, key);
+                            let _ = crate::cache::store(z, key, &entry);
+                        } else {
+                            let sig = crate::cache::vary_signature(&names, |n| {
+                                req.headers.get_joined(n).unwrap_or_default()
+                            });
+                            let _ = crate::cache::store_variant(z, key, &sig, &entry);
+                        }
+                    }
                 }
             }
         }

@@ -242,7 +242,7 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
                     tls: None,
                 };
                 let mut resp = error_response(e.status, default_server.server_tokens);
-                let custom: std::collections::HashMap<String, String> =
+                let mut custom: std::collections::HashMap<String, String> =
                     std::collections::HashMap::new();
                 let resp = finalize_response(
                     &synthetic,
@@ -255,7 +255,7 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
                     conn.peer.port(),
                     group.addr.port(),
                     &[],
-                    &custom,
+                    &mut custom,
                     ConnState {
                         requests: 0,
                         started: std::time::Instant::now(),
@@ -518,93 +518,43 @@ async fn route_content(
     }
 }
 
-/// Run an `auth_request` subrequest and map its status the way nginx does.
+/// The ACCESS phase: `allow`/`deny`, `auth_basic` and `auth_request`, combined
+/// by `satisfy`.
 ///
-/// 2xx allows the request, 401 and 403 are propagated, and anything else is
-/// reported as 500 — nginx treats an auth server that answers 404 or 5xx as a
-/// broken access check rather than a decision.
-/// `None` when the auth server allowed the request, otherwise the status to
-/// report. Boxed because the subrequest re-enters `resolve_response`, which
-/// would otherwise make it infinitely sized.
-fn auth_request_status<'a>(
-    req: &'a Request,
-    target: &'a str,
-    server: &'a Server,
-    http: &'a Http,
-    vars: &'a ServerVars<'a>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<u16>> + Send + 'a>> {
-    Box::pin(auth_request_status_inner(req, target, server, http, vars))
-}
-
-async fn auth_request_status_inner(
-    req: &Request,
-    target: &str,
-    server: &Server,
-    http: &Http,
-    vars: &ServerVars<'_>,
-) -> Option<u16> {
-    let (ipath, iquery) = match target.split_once('?') {
-        Some((p, q)) => (p.to_string(), q.to_string()),
-        None => (target.to_string(), String::new()),
-    };
-    let aloc = server.locate(&ipath);
-    // The subrequest inherits the client's address but carries no body: nginx
-    // answers "header only" and any body read here would consume the main
-    // request's.
-    let sub = resolve_response(
-        req,
-        &ipath,
-        &iquery,
-        server,
-        aloc,
-        http,
-        vars.peer_ip,
-        vars.server_port,
-    )
-    .await;
-    match sub.status {
-        200..=299 => None,
-        401 => Some(401),
-        403 => Some(403),
-        _ => Some(500),
-    }
-}
-
+/// These are three handlers of one nginx phase:
+///
+///   satisfy all (default) - the first failure wins, and later handlers do not
+///                           get to override it.
+///   satisfy any            - one success is enough; when everything fails 401
+///                            outranks 403.
+///
+/// Both rules come from auth_request_satisfy.t, which asserts that `deny all`
+/// next to an auth server answering 401 yields 403 under `all` but 401 under
+/// `any`.
+///
+/// Returns `None` when the request may proceed, otherwise the response to send.
+/// On success the `auth_request_set` assignments are written into `custom`,
+/// which is why this takes the map mutably instead of living inside `route`.
 #[allow(clippy::too_many_arguments)]
-async fn route(
+async fn access_phase(
     req: &Request,
-    path: &str,
-    query: &str,
     loc: &LocCfg,
     server: &Server,
     http: &Http,
-    allow_internal: bool,
     vars: &ServerVars<'_>,
-) -> Response {
+    sets: &mut Vec<(String, String)>,
+) -> Option<Response> {
     let peer_addr: std::net::IpAddr = vars
         .peer_ip
         .parse()
         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
 
-    // ---- ACCESS phase -------------------------------------------------
-    //
-    // `allow`/`deny`, `auth_basic` and `auth_request` are three handlers of the
-    // same nginx phase, combined by `satisfy`:
-    //
-    //   satisfy all (default) - the first failure wins, and later handlers do
-    //                           not get to override it.
-    //   satisfy any            - one success is enough; when everything fails
-    //                           401 outranks 403.
-    //
-    // Both rules come from auth_request_satisfy.t, which asserts e.g. that
-    // `deny all` next to an auth server answering 401 yields 403 under `all`
-    // but 401 under `any`.
     for le in &loc.limit_except {
         // `limit_except` applies to every method *except* the listed ones.
         let m = req.method.as_str();
         if !le.methods.iter().any(|x| x == m) && crate::config::access_denied(&le.rules, peer_addr)
         {
-            return error_response(403, server.server_tokens);
+            return Some(error_response(403, server.server_tokens));
         }
     }
 
@@ -620,6 +570,8 @@ async fn route(
     // `allow`/`deny` must not count as a passing check, or `satisfy any` would
     // always succeed.
     let access_on = !loc.access.is_empty();
+    // Response headers of the auth subrequest, for `auth_request_set`.
+    let mut auth_headers: Vec<(String, String)> = Vec::new();
     if access_code != 0 || basic_on || request_on {
         // 0 marks a passing check; anything else is the status it produced.
         let mut codes: Vec<u16> = Vec::new();
@@ -634,8 +586,9 @@ async fn route(
             });
         }
         if let Some(target) = &loc.auth_request {
-            let st = auth_request_status(req, target, server, http, vars).await;
+            let (st, hdrs) = auth_request_status(req, target, server, http, vars).await;
             codes.push(st.unwrap_or(0));
+            auth_headers = hdrs;
         }
 
         let status = if loc.satisfy_any {
@@ -662,9 +615,224 @@ async fn route(
                 crate::auth::www_authenticate(&realm, &mut extra);
                 resp.raw.splice(0..0, extra);
             }
-            return resp;
+            return Some(resp);
         }
     }
+
+    // The auth subrequest succeeded: apply its `auth_request_set` values. They
+    // are visible to `add_header`, to a later `proxy_pass` target (`$args`) and
+    // across an `error_page` internal redirect, which is what
+    // auth_request_set.t checks.
+    if request_on {
+        for (name, value) in &loc.auth_request_set {
+            // `$upstream_http_*` names the auth subrequest's own headers; other
+            // variables come from the main request.
+            let expanded = if value.contains("$upstream_http_") {
+                let mut out = String::with_capacity(value.len());
+                let mut rest = value.as_str();
+                while let Some(pos) = rest.find('$') {
+                    out.push_str(&rest[..pos]);
+                    let tail = &rest[pos + 1..];
+                    let end = tail
+                        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .unwrap_or(tail.len());
+                    let name = &tail[..end];
+                    match name.strip_prefix("upstream_http_") {
+                        Some(suffix) => {
+                            let want = format!("upstream_http_{}", suffix.to_ascii_lowercase());
+                            out.push_str(
+                                auth_headers
+                                    .iter()
+                                    .find(|(k, _)| *k == want)
+                                    .map(|(_, v)| v.as_str())
+                                    .unwrap_or(""),
+                            );
+                        }
+                        None => out.push_str(&vars.expand(&format!("${name}"))),
+                    }
+                    rest = &tail[end..];
+                }
+                out.push_str(rest);
+                out
+            } else {
+                vars.expand(value)
+            };
+            sets.push((name.clone(), expanded));
+        }
+    }
+    None
+}
+
+/// Run an `auth_request` subrequest and map its status the way nginx does.
+///
+/// 2xx allows the request, 401 and 403 are propagated, and anything else is
+/// reported as 500 — nginx treats an auth server that answers 404 or 5xx as a
+/// broken access check rather than a decision.
+/// `None` when the auth server allowed the request, otherwise the status to
+/// report. Boxed because the subrequest re-enters `resolve_response`, which
+/// would otherwise make it infinitely sized.
+fn auth_request_status<'a>(
+    req: &'a Request,
+    target: &'a str,
+    server: &'a Server,
+    http: &'a Http,
+    vars: &'a ServerVars<'a>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = (Option<u16>, Vec<(String, String)>)> + Send + 'a>,
+> {
+    Box::pin(auth_request_status_inner(req, target, server, http, vars))
+}
+
+async fn auth_request_status_inner(
+    req: &Request,
+    target: &str,
+    server: &Server,
+    http: &Http,
+    vars: &ServerVars<'_>,
+) -> (Option<u16>, Vec<(String, String)>) {
+    let (ipath, iquery) = match target.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (target.to_string(), String::new()),
+    };
+    let aloc = server.locate(&ipath);
+    // The subrequest inherits the client's address but carries no body: nginx
+    // answers "header only" and any body read here would consume the main
+    // request's.
+    let sub = resolve_response(
+        req,
+        &ipath,
+        &iquery,
+        server,
+        aloc,
+        http,
+        vars.peer_ip,
+        vars.server_port,
+    )
+    .await;
+    // The subrequest's response headers are exposed as `$upstream_http_*` to
+    // the `auth_request_set` expressions that follow, which is how
+    // auth_request_set.t extracts an authenticated user name.
+    // Headers may live in `raw` (rendered) or in `headers` (dynamic), depending
+    // on which content handler produced the subrequest response.
+    let mut headers: Vec<(String, String)> = sub
+        .headers
+        .iter()
+        // nginx spells a header variable with `_` where the header has `-`.
+        .map(|(k, v)| {
+            (
+                format!("upstream_http_{}", k.to_ascii_lowercase().replace('-', "_")),
+                v.clone(),
+            )
+        })
+        .collect();
+    headers.extend(sub.raw.split(|b| *b == b'\n').filter_map(|line| {
+        let line = std::str::from_utf8(line).ok()?.trim_end_matches('\r');
+        let (k, v) = line.split_once(':')?;
+        if k.is_empty() || line.starts_with(|c: char| c.is_whitespace()) {
+            return None;
+        }
+        Some((
+            format!("upstream_http_{}", k.to_ascii_lowercase().replace('-', "_")),
+            v.trim().to_string(),
+        ))
+    }));
+    let code = match sub.status {
+        200..=299 => None,
+        401 => Some(401),
+        403 => Some(403),
+        _ => Some(500),
+    };
+    (code, headers)
+}
+
+/// ACCESS phase followed by the content phase, so every entry point (initial
+/// dispatch, `error_page` file target, `error_page` named location) runs the
+/// same checks in nginx's order.
+///
+/// The `ServerVars` view is built here, from the pieces, rather than passed in:
+/// the access phase needs `&mut` access to the variable map to apply
+/// `auth_request_set`, which cannot coexist with a borrowed view.
+#[allow(clippy::too_many_arguments)]
+async fn access_then_route(
+    req: &Request,
+    path: &str,
+    query: &str,
+    loc: &LocCfg,
+    server: &Server,
+    http: &Http,
+    allow_internal: bool,
+    peer_ip: &str,
+    peer_port: u16,
+    server_port: u16,
+    state: ConnState,
+    custom: &mut std::collections::HashMap<String, String>,
+) -> Response {
+    let root = loc.root.to_string_lossy().to_string();
+    // A macro rather than a closure: the borrow of `custom` has to be reborrowed
+    // for each use, and a closure would pin it to one lifetime.
+    macro_rules! view {
+        ($c:expr) => {
+            ServerVars {
+                req,
+                path,
+                query,
+                server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
+                server_port,
+                peer_ip,
+                peer_port,
+                scheme: if req.tls.is_some() { "https" } else { "http" },
+                document_root: &root,
+                upstream_cache_status: "",
+                custom: $c,
+                connection_requests: state.requests,
+                connection_time: state.elapsed_secs(),
+                sent: &[],
+            }
+        };
+    }
+    // The assignments are collected first and applied after the borrow of the
+    // map by `ServerVars` ends.
+    let mut sets: Vec<(String, String)> = Vec::new();
+    let check = access_phase(req, loc, server, http, &view!(custom), &mut sets).await;
+    if let Some(denied) = check {
+        return denied;
+    }
+    for (name, value) in sets {
+        custom.insert(name, value);
+    }
+    // `auth_request_set $args ...` rewrites the request arguments, so the
+    // content phase (and any `proxy_pass` target) sees the new value. nginx
+    // stores one string for `$args`, and setting it updates `r->args`.
+    let rewritten = custom.get("args").cloned();
+    let query = rewritten.as_deref().unwrap_or(query);
+    route(
+        req,
+        path,
+        query,
+        loc,
+        server,
+        http,
+        allow_internal,
+        &view!(custom),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn route(
+    req: &Request,
+    path: &str,
+    query: &str,
+    loc: &LocCfg,
+    server: &Server,
+    http: &Http,
+    allow_internal: bool,
+    vars: &ServerVars<'_>,
+) -> Response {
+    let peer_addr: std::net::IpAddr = vars
+        .peer_ip
+        .parse()
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
 
     // A location named `/foo/` makes `/foo` redirect to `/foo/`.
     if let Some(location) = server.auto_redirect(path) {
@@ -2129,7 +2297,7 @@ pub async fn resolve_response_local(
                 peer_port,
                 server_port,
                 captures,
-                &custom,
+                &mut custom,
                 state,
                 local_addr,
             )
@@ -2151,7 +2319,7 @@ pub async fn resolve_response_local(
                 peer_port,
                 server_port,
                 captures,
-                &custom,
+                &mut custom,
                 state,
                 local_addr,
             )
@@ -2191,7 +2359,7 @@ pub async fn resolve_response_local(
         peer_port,
         server_port,
         captures,
-        &custom,
+        &mut custom,
         state,
         local_addr,
     )
@@ -2240,7 +2408,7 @@ pub async fn resolve_response_state(
                 peer_port,
                 server_port,
                 captures,
-                &custom,
+                &mut custom,
                 state,
                 local_addr,
             )
@@ -2281,7 +2449,7 @@ pub async fn resolve_response_state(
         peer_port,
         server_port,
         captures,
-        &custom,
+        &mut custom,
         state,
         local_addr,
     )
@@ -2442,7 +2610,21 @@ pub async fn render_resolved_vars(
                 connection_time: state.elapsed_secs(),
                 sent: &[],
             };
-            route(req, path, query, loc, server, http, false, &vars).await
+            access_then_route(
+                req,
+                path,
+                query,
+                loc,
+                server,
+                http,
+                false,
+                peer_ip,
+                peer_port,
+                server_port,
+                state,
+                &mut custom,
+            )
+            .await
         };
         finalize_response(
             req,
@@ -2455,7 +2637,7 @@ pub async fn render_resolved_vars(
             peer_port,
             server_port,
             captures,
-            &custom,
+            &mut custom,
             state,
             local_addr,
         )
@@ -2578,7 +2760,7 @@ async fn finalize_response(
     peer_port: u16,
     server_port: u16,
     _captures: &[(String, String)],
-    custom: &std::collections::HashMap<String, String>,
+    custom: &mut std::collections::HashMap<String, String>,
     state: ConnState,
     local_addr: &str,
 ) -> Response {
@@ -2633,7 +2815,7 @@ async fn finalize_response(
                 scheme: "http",
                 document_root: &root_str,
                 upstream_cache_status: "",
-                custom,
+                custom: &custom,
                 connection_requests: state.requests,
                 connection_time: state.elapsed_secs(),
                 sent: &[],
@@ -2665,7 +2847,7 @@ async fn finalize_response(
                 scheme: "http",
                 document_root: &root_str,
                 upstream_cache_status: "",
-                custom,
+                custom: &custom,
                 connection_requests: state.requests,
                 connection_time: state.elapsed_secs(),
                 sent: &[],
@@ -2689,13 +2871,26 @@ async fn finalize_response(
                 scheme: "http",
                 document_root: &root_str,
                 upstream_cache_status: "",
-                custom,
+                custom: &custom,
                 connection_requests: state.requests,
                 connection_time: state.elapsed_secs(),
                 sent: &[],
             };
-            let redirected =
-                route(req, &cur_path, &cur_query, named, server, http, true, &vars).await;
+            let redirected = access_then_route(
+                req,
+                &cur_path,
+                &cur_query,
+                named,
+                server,
+                http,
+                true,
+                peer_ip,
+                peer_port,
+                server_port,
+                state,
+                custom,
+            )
+            .await;
             let redirected_status = redirected.status;
             *resp = redirected;
             resp.status = if use_target_status {
@@ -2734,7 +2929,21 @@ async fn finalize_response(
                     connection_time: state.elapsed_secs(),
                     sent: &[],
                 };
-                route(req, &cur_path, &cur_query, l, server, http, true, &vars).await
+                access_then_route(
+                    req,
+                    &cur_path,
+                    &cur_query,
+                    l,
+                    server,
+                    http,
+                    true,
+                    peer_ip,
+                    peer_port,
+                    server_port,
+                    state,
+                    custom,
+                )
+                .await
             }
         };
         // A redirect generated while serving the error page (directory
@@ -2921,7 +3130,7 @@ async fn dispatch(
             peer_port,
             listen_port,
             captures,
-            &custom,
+            &mut custom,
             state,
             local_addr,
         )
@@ -2983,6 +3192,7 @@ async fn dispatch(
             crate::grpc::fetch(http, loc, req, path, query, client_ip, Some(&grpc_vars)).await
         {
             let mut resp = resp;
+            let mut set_vars_mut = set_vars.clone();
             let resp = finalize_response(
                 req,
                 &mut resp,
@@ -2994,7 +3204,7 @@ async fn dispatch(
                 peer_port,
                 listen_port,
                 captures,
-                &set_vars,
+                &mut set_vars_mut,
                 state,
                 local_addr,
             )
@@ -3135,6 +3345,7 @@ async fn dispatch(
                 let mut resp = error_response(status, false);
                 let preserved = headers;
                 let peer_ip = conn.peer.ip().to_string();
+                let mut set_vars_owned = set_vars.clone();
                 resp = finalize_response(
                     req,
                     &mut resp,
@@ -3146,7 +3357,7 @@ async fn dispatch(
                     peer_port,
                     listen_port,
                     captures,
-                    &set_vars,
+                    &mut set_vars_owned,
                     state,
                     local_addr,
                 )

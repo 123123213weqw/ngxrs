@@ -74,6 +74,9 @@ pub struct LocCfg {
     pub auth_basic: crate::auth::BasicAuth,
     /// `auth_request URI` / `off`; `None` when not configured.
     pub auth_request: Option<String>,
+    /// `auth_request_set $var <complex value>`, applied after a successful
+    /// auth subrequest. Ordered, because later assignments may read earlier.
+    pub auth_request_set: Vec<(String, String)>,
     /// `satisfy all|any`: how `auth_basic` and `auth_request` combine.
     pub satisfy_any: bool,
     /// `proxy_bind ADDR[:PORT]` / `off`; empty means "not configured".
@@ -216,6 +219,7 @@ impl LocCfg {
             limit_except: Vec::new(),
             auth_basic: crate::auth::BasicAuth::default(),
             auth_request: None,
+            auth_request_set: Vec::new(),
             satisfy_any: false,
             proxy_bind: None,
             limit_reqs: Vec::new(),
@@ -1770,6 +1774,18 @@ impl Builder {
                 } else {
                     Some(v.to_string())
                 };
+            }
+            "auth_request_set" => {
+                let var = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "auth_request_set requires a variable"))?;
+                let value = d
+                    .args
+                    .get(1)
+                    .ok_or_else(|| sem(&d.file, d.line, "auth_request_set requires a value"))?;
+                let name = var.trim_start_matches('$').to_string();
+                cfg.auth_request_set.push((name, value.clone()));
             }
             "satisfy" => {
                 let v = d

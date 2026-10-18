@@ -145,6 +145,10 @@ pub struct Request {
     pub keepalive: bool,
     pub host: Option<InStr>,
     pub expect_continue: bool,
+    /// TLS facts for the connection this request arrived on. Carried on the
+    /// request (rather than threaded through every render helper) so `$scheme`
+    /// and the `$ssl_*` family can be answered anywhere a `Request` is in scope.
+    pub tls: Option<std::sync::Arc<crate::conn::TlsInfo>>,
 }
 
 impl Drop for Request {
@@ -173,7 +177,7 @@ fn is_absolute_form(target: &str) -> bool {
 
 /// Lowercase, strip the port, a stray colon and trailing dots — nginx's
 /// `$host` value (`www.example.com.:80` becomes `www.example.com`).
-fn normalize_host(host: &str) -> String {
+pub fn normalize_host(host: &str) -> String {
     let no_port = strip_port(host);
     let trimmed = no_port.strip_suffix(':').unwrap_or(no_port);
     trimmed.trim_end_matches('.').to_ascii_lowercase()
@@ -232,7 +236,7 @@ pub fn validate_host_name(host: &str) -> Result<(), ()> {
 ///
 /// nginx truncates the value at the first `:` and does not check the port, so
 /// `example.com:notaport` is accepted (only the host part is validated).
-fn validate_host_header(host: &str) -> Result<(), ()> {
+pub fn validate_host_header(host: &str) -> Result<(), ()> {
     let host_part = if host.starts_with('[') {
         host
     } else {
@@ -248,7 +252,7 @@ fn validate_host_header(host: &str) -> Result<(), ()> {
 ///
 /// Stricter than the header path: the request-line parser only allows digits in
 /// the port, so `host:1:2` is malformed here even though the header form is not.
-fn validate_authority(authority: &str) -> Result<(), ()> {
+pub fn validate_authority(authority: &str) -> Result<(), ()> {
     if !authority.starts_with('[') {
         if let Some((name, port)) = authority.split_once(':') {
             if port.contains(':') || !port.bytes().all(|b| b.is_ascii_digit()) {
@@ -508,6 +512,7 @@ impl Request {
             keepalive,
             host,
             expect_continue,
+            tls: None,
         })
     }
 }

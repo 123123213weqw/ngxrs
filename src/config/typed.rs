@@ -544,6 +544,11 @@ pub struct Server {
     pub ssl: bool,
     pub ssl_certificate: Option<PathBuf>,
     pub ssl_certificate_key: Option<PathBuf>,
+    /// `ssl_verify_client`: 0 = off, 1 = on, 2 = optional, 3 = optional_no_ca.
+    /// Same encoding as nginx's `sscf->verify`.
+    pub ssl_verify_client: u8,
+    /// `ssl_client_certificate`: the CA bundle client certs are checked against.
+    pub ssl_client_certificate: Option<PathBuf>,
     pub http2: bool,
 }
 
@@ -1891,6 +1896,8 @@ impl Builder {
         let mut header_bufs = http_header_bufs;
         let mut ssl_certificate: Option<PathBuf> = None;
         let mut ssl_certificate_key: Option<PathBuf> = None;
+        let mut ssl_verify_client: u8 = 0;
+        let mut ssl_client_certificate: Option<PathBuf> = None;
 
         for child in block {
             match child.name.as_str() {
@@ -1968,20 +1975,40 @@ impl Builder {
                 }
                 "ssl_certificate" => {
                     if let Some(v) = child.args.first() {
+                        // Certs only populate the store; TLS is enabled by
+                        // `listen ... ssl`, exactly as in nginx.
                         ssl_certificate = Some(resolve_path(&self.prefix, v));
-                        ssl = true;
                     }
                 }
                 "ssl_certificate_key" => {
                     if let Some(v) = child.args.first() {
                         ssl_certificate_key = Some(resolve_path(&self.prefix, v));
-                        ssl = true;
+                    }
+                }
+                "ssl_verify_client" => {
+                    ssl_verify_client = match child.args.first().map(|s| s.as_str()) {
+                        Some("on") => 1,
+                        Some("optional") => 2,
+                        Some("optional_no_ca") => 3,
+                        Some("off") | None => 0,
+                        Some(other) => {
+                            return Err(sem(
+                                &child.file,
+                                child.line,
+                                &format!("invalid ssl_verify_client value \"{other}\" (must be on, off, optional or optional_no_ca)"),
+                            ))
+                        }
+                    };
+                }
+                "ssl_client_certificate" => {
+                    if let Some(v) = child.args.first() {
+                        ssl_client_certificate = Some(resolve_path(&self.prefix, v));
                     }
                 }
                 "ssl_protocols" | "ssl_ciphers" | "ssl_prefer_server_ciphers"
                 | "ssl_session_cache" | "ssl_session_timeout" | "ssl_session_tickets"
                 | "ssl_dhparam" | "ssl_ecdh_curve" | "ssl_stapling" | "ssl_stapling_verify"
-                | "ssl_buffer_size" | "ssl_verify_client" | "ssl_client_certificate"
+                | "ssl_buffer_size"
                 | "ssl_trusted_certificate" | "ssl_early_data" | "ssl_conf_command"
                 | "http2_max_field_size" | "http2_max_header_size" | "http2_idle_timeout"
                 | "http2_body_preread_size" | "http2_chunk_size" | "http2_max_concurrent_streams"
@@ -2081,6 +2108,8 @@ impl Builder {
                 ssl,
                 ssl_certificate,
                 ssl_certificate_key,
+                ssl_verify_client,
+                ssl_client_certificate,
                 http2,
             },
             listens,

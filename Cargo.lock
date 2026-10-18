@@ -219,6 +219,7 @@ dependencies = [
  "regex",
  "rustls",
  "rustls-pemfile",
+ "rustls-webpki",
  "socket2 0.5.10",
  "tokio",
  "tokio-rustls",

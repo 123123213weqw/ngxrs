@@ -122,6 +122,8 @@
 | HTTP/2（多路复用、`:authority` 选虚拟主机、头部规范化） | 🟡 | 功能可用；帧级已对齐到 `h2.t` **116/145**、`h2_headers.t` **71/112**（此前都是 0）。剩余差异见下方「HTTP/2 残余差异」 |
 | `http2 on`（http/server 级，nginx 1.25.1+） | ✅ | 含 http→server 继承 |
 | h2c prior-knowledge（明文 HTTP/2） | ✅ | 探测连接前言，仅在该组配置了 `http2 on` 时启用 |
+| `$scheme` | ✅ | 此前恒为 `http`，TLS 连接上也报 `http`；现按连接推导 |
+| `ssl_verify_client` / `ssl_client_certificate` | 🟡 | 12/16，见下节 |
 | `large_client_header_buffers` | ✅ | http/server 级；h1 用 `size`，h2 用 `size` 做单字段上限、`size*num` 做整块上限（与 `ngx_http_v2_state_header_complete` 一致，按 `name.len+value.len` 计，含伪头） |
 | HTTP/2 SETTINGS / WINDOW_UPDATE 帧 | ✅ | 与 nginx 逐字节一致：`MAX_CONCURRENT_STREAMS=128`、`INITIAL_WINDOW_SIZE=65536`、`MAX_FRAME_SIZE=16777215`，外加连接级 `WINDOW_UPDATE 0x7fff0000` |
 | HTTP/2 上的反向代理 | ⬜ | 目前 proxy 需要 socket 写入；h2 请求走 proxy 会返回 502 |
@@ -170,12 +172,31 @@
 |---|---|---|
 | `h2.t` | **116/145** | 145/145 |
 | `h2_headers.t` | **71/112** | 112/112 |
-| `h2_host.t` | 12/62 | 62/62 |
+| `h2_host.t` | **52/62** | 48/62 |
 | `h2_keepalive.t` | 12/21 | 21/21 |
 | `h2_error_page.t` | 3/4 | 4/4 |
 | `h2_proxy_cache.t` | 10/11 | 11/11 |
 | `ssl_sni.t` | 4/10 | 10/10 |
-| `ssl_verify_client.t` | 2/16 | 16/16 |
+| `ssl_verify_client.t` | **12/16** | 16/16 |
+
+## TLS 客户端证书
+
+`ssl_verify_client on|off|optional|optional_no_ca`、`ssl_client_certificate`、
+`$ssl_client_verify` / `$ssl_client_cert` / `$ssl_protocol` / `$ssl_cipher` /
+`$ssl_server_name` 均已实现。`ssl_verify_client.t` 从 2/16 提升到 **12/16**
+（nginx 16/16）。
+
+设计要点：nginx 在客户端证书不合格时**不中断握手**，而是回一个 400
+（内部码 495/496）。rustls 的 `WebPkiClientVerifier` 会在握手中直接拒绝，
+客户端只会看到 TLS alert。因此这里用一个「请求但不拒绝」的验证器，把判定推迟到
+HTTP 层、按请求命中的 virtual host 做，与 `ngx_http_process_request_headers`
+里读 `sscf->verify` 的做法一致。
+
+**剩余 3 条无法达标的原因**：nginx-tests 生成的证书是 **X.509 v1**，而
+rustls/webpki 直接拒绝 v1（`UnsupportedCertVersion`）；OpenSSL 没有这个限制。
+握手层已容忍（否则带客户端证书的连接完全不可用），但链校验仍会如实失败，
+所以 `$ssl_client_verify` 报 `FAILED:...` 而非 `SUCCESS`——不会把没验证过的
+证书说成已验证。
 
 ## HTTP/2 残余差异
 

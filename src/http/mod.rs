@@ -182,6 +182,9 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
     // request that was just served (nginx stores it in c->keepalive_timeout).
     let mut keepalive_timeout = first_server.keepalive_timeout;
     let mut served: u64 = 0;
+    // Captured once: TLS facts do not change over the life of a connection.
+    let tls_info = conn.tls_info().map(std::sync::Arc::new);
+    let scheme = if tls_info.is_some() { "https" } else { "http" };
     let conn_started = std::time::Instant::now();
     // One timer per connection, reset after each request: registering a fresh
     // timer per request costs more than the request itself at 400k rps.
@@ -207,7 +210,8 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
             }
         };
 
-        let req = match read {
+        #[allow(unused_mut)]
+        let mut req = match read {
             Err(_elapsed) => {
                 if served == 0 {
                     let _ = send_error(&mut conn, 408, true, served == 0, false).await;
@@ -230,6 +234,7 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
                     keepalive: false,
                     host: None,
                     expect_continue: false,
+                    tls: None,
                 };
                 let mut resp = error_response(e.status, default_server.server_tokens);
                 let custom: std::collections::HashMap<String, String> =
@@ -276,9 +281,78 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
                 break;
             }
             Ok(Ok(None)) => break,
-            Ok(Ok(Some(r))) => r,
+            Ok(Ok(Some(req0))) => {
+                let mut r = req0;
+                // Attach the connection's TLS facts once per request so `$scheme`
+                // and `$ssl_*` can be answered from any `Request` in scope.
+                r.tls = tls_info.clone();
+                r
+            }
         };
         served += 1;
+
+        // nginx checks `ssl_verify_client` here, against the server conf the
+        // request resolved to (`ngx_http_process_request_headers`), and answers
+        // 495/496 — which render as a 400 status line.
+        if let Some(ti) = &tls_info {
+            let mut verify_reason: Option<String> = None;
+            let sni = ti.server_name.as_deref();
+            let srv = select_server(http, &group.servers, group.default_server, sni);
+            if srv.ssl_verify_client != 0 {
+                let chain = conn.peer_chain();
+                let mismatch = match &chain {
+                    Some(c) if !c.is_empty() => {
+                        match crate::tls::verify_client_chain(
+                            srv.ssl_client_certificate.as_deref(),
+                            c,
+                        ) {
+                            // `optional_no_ca` tolerates a chain it cannot
+                            // validate, but still reports FAILED.
+                            Ok(()) => None,
+                            Err(reason) => {
+                                if srv.ssl_verify_client == 3 {
+                                    verify_reason = Some(reason);
+                                    None
+                                } else {
+                                    Some((495u16, "The SSL certificate error"))
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        if srv.ssl_verify_client == 1 {
+                            Some((496u16, "No required SSL certificate was sent"))
+                        } else {
+                            None
+                        }
+                    }
+                };
+                // Reflect the outcome through `$ssl_client_verify`.
+                if let Some(mut info) = tls_info.as_deref().cloned() {
+                    info.client_verify = match (&verify_reason, &mismatch) {
+                        (Some(reason), _) => format!("FAILED:{reason}"),
+                        (None, Some(_)) => "NONE".to_string(),
+                        (None, None) => {
+                            if info.client_cert.is_empty() {
+                                "NONE".to_string()
+                            } else {
+                                "SUCCESS".to_string()
+                            }
+                        }
+                    };
+                    req.tls = Some(std::sync::Arc::new(info));
+                }
+                if let Some((_code, text)) = mismatch {
+                    let body = format!(
+                        "<html>\r\n<head><title>400 {text}</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<center>{text}</center>\r\n</html>\r\n"
+                    );
+                    let mut resp = Response::empty(400);
+                    resp.raw = body.into_bytes();
+                    let _ = write_response(&mut conn, resp, false, srv.server_tokens, false).await;
+                    break;
+                }
+            }
+        }
 
         let (path, query) = match util::parse_target(&req.raw_target) {
             Ok(v) => v,
@@ -1350,6 +1424,7 @@ pub struct ServerVars<'a> {
     pub connection_time: u64,
     /// Response headers already produced for this reply; backs `$sent_http_*`.
     pub sent: &'a [(String, String)],
+
 }
 
 thread_local! {
@@ -1406,6 +1481,7 @@ impl<'a> ServerVars<'a> {
         if let Some(v) = self.geo_var(name) {
             return v;
         }
+        let tls = self.req.tls.as_deref();
         match name {
             "host" => self
                 .req
@@ -1432,7 +1508,33 @@ impl<'a> ServerVars<'a> {
                 }
             }
             "request_method" => self.req.method.as_str().to_string(),
-            "scheme" => self.scheme.to_string(),
+            // Derive from the connection rather than each call site's default:
+            // the same `ServerVars` must answer correctly for TLS connections.
+            "scheme" => {
+                if self.req.tls.is_some() {
+                    "https".to_string()
+                } else {
+                    self.scheme.to_string()
+                }
+            }
+            // `$ssl_*` come straight from the TLS session. On plaintext they are
+            // empty, which is also nginx's behaviour.
+            "ssl_protocol" => tls.map(|t| t.version.clone()).unwrap_or_default(),
+            "ssl_cipher" => tls.map(|t| t.cipher.clone()).unwrap_or_default(),
+            "ssl_server_name" => tls
+                .and_then(|t| t.server_name.clone())
+                .unwrap_or_default(),
+            "ssl_client_verify" => tls.map(|t| t.client_verify.clone()).unwrap_or_default(),
+            "ssl_client_cert" => tls.map(|t| t.client_cert.clone()).unwrap_or_default(),
+            "ssl_client_s_dn" => tls.map(|t| t.client_s_dn.clone()).unwrap_or_default(),
+            "ssl_client_i_dn" => tls.map(|t| t.client_i_dn.clone()).unwrap_or_default(),
+            "ssl_client_serial" => tls.map(|t| t.client_serial.clone()).unwrap_or_default(),
+            "ssl_client_fingerprint" => tls
+                .map(|t| t.client_fingerprint.clone())
+                .unwrap_or_default(),
+            "ssl_client_v_start" => tls.map(|t| t.client_v_start.clone()).unwrap_or_default(),
+            "ssl_client_v_end" => tls.map(|t| t.client_v_end.clone()).unwrap_or_default(),
+            "ssl_client_v_remain" => "0".to_string(),
             "server_name" => self.server_name.trim_start_matches('.').to_string(),
             "server_port" => self.server_port.to_string(),
             "server_protocol" => {

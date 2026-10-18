@@ -58,17 +58,59 @@ where
             Err(_) => break,
         };
 
+        // The effective host is `:authority` when present, otherwise the
+        // `Host` header — nginx's `$host` accepts either over HTTP/2.
+        let mut host_headers = request.headers().get_all("host").iter();
+        let first_host = host_headers
+            .next()
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let duplicate_host = host_headers.next().is_some();
+
         let authority = request
             .uri()
             .authority()
             .map(|a| a.as_str().to_string())
-            .or_else(|| {
-                request
-                    .headers()
-                    .get("host")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string())
-            });
+            .or_else(|| first_host.clone());
+
+        // Empty, duplicated or structurally invalid authority is a 400, exactly
+        // as on HTTP/1. The check runs on the *raw* value: normalizing first
+        // would strip the port and trailing dots that make `a.b..:98` invalid,
+        // so a normalized-only check accepts hosts nginx rejects.
+        //
+        // `:authority` follows the stricter absolute-form rules (port must be
+        // digits), while a `Host` header is truncated at the first ':' like
+        // `ngx_http_validate_host`.
+        let authority_from_header = request.uri().authority().is_none();
+        let bad_host = duplicate_host
+            || match authority.as_deref() {
+                None => false,
+                Some(a) => {
+                    if authority_from_header {
+                        crate::http::request::validate_host_header(a).is_err()
+                    } else {
+                        crate::http::request::validate_authority(a).is_err()
+                    }
+                }
+            };
+        if bad_host {
+            let mut b = H2Response::builder().status(StatusCode::BAD_REQUEST);
+            if let Some(h) = b.headers_mut() {
+                if let Ok(v) = http::header::HeaderValue::from_str(if tokens {
+                    "nginx/1.28.0"
+                } else {
+                    "nginx"
+                }) {
+                    h.insert(http::header::SERVER, v);
+                }
+            }
+            if let Ok(r) = b.body(()) {
+                if let Ok(mut send) = respond.send_response(r, true) {
+                    let _ = send.send_data(Bytes::new(), true);
+                }
+            }
+            continue;
+        }
 
         let server: &Server =
             crate::http::select_server(http, server_idxs, default_server, authority.as_deref());
@@ -243,8 +285,12 @@ fn synthesize_request(
         body_len: 0,
         chunked: false,
         keepalive: true,
-        host: authority.map(InStr::new),
+        // nginx's `$host` is normalized: lowercase, port and stray colon
+        // dropped, trailing dots removed — same as the HTTP/1 parser.
+        host: authority
+            .map(|a| InStr::new(&crate::http::request::normalize_host(a))),
         expect_continue: false,
+        tls: None,
     }
 }
 

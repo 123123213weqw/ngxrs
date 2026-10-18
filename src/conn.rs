@@ -91,6 +91,42 @@ impl AsyncWrite for Stream {
     }
 }
 
+/// Per-connection TLS facts nginx exposes as `$ssl_*` variables.
+#[derive(Clone, Debug, Default)]
+pub struct TlsInfo {
+    /// `TLSv1.2` / `TLSv1.3`, as `$ssl_protocol` spells it.
+    pub version: String,
+    /// IANA suite name, e.g. `TLS13_AES_256_GCM_SHA384`.
+    pub cipher: String,
+    /// SNI name the client sent, if any.
+    pub server_name: Option<String>,
+    /// `SUCCESS`, `NONE` or `FAILED:<reason>` — `$ssl_client_verify`.
+    pub client_verify: String,
+    /// PEM of the presented client certificate.
+    pub client_cert: String,
+    /// `/CN=...` subject and issuer of the client certificate.
+    pub client_s_dn: String,
+    pub client_i_dn: String,
+    pub client_serial: String,
+    pub client_fingerprint: String,
+    pub client_v_start: String,
+    pub client_v_end: String,
+}
+
+impl Conn {
+    /// The client certificate chain as presented in the handshake, if any.
+    pub fn peer_chain(&self) -> Option<Vec<rustls::pki_types::CertificateDer<'static>>> {
+        let Stream::Tls(tls) = &self.stream else {
+            return None;
+        };
+        tls.get_ref()
+            .1
+            .peer_certificates()
+            .filter(|c| !c.is_empty())
+            .map(|c| c.iter().cloned().collect())
+    }
+}
+
 pub struct Conn {
     stream: Stream,
     pub peer: SocketAddr,
@@ -103,6 +139,42 @@ pub struct Conn {
 }
 
 impl Conn {
+    /// TLS facts for this connection, or `None` for plaintext.
+    pub fn tls_info(&self) -> Option<TlsInfo> {
+        let Stream::Tls(tls) = &self.stream else {
+            return None;
+        };
+        let (_, conn) = tls.get_ref();
+        let version = match conn.protocol_version() {
+            Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
+            Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2",
+            Some(rustls::ProtocolVersion::TLSv1_1) => "TLSv1.1",
+            Some(rustls::ProtocolVersion::TLSv1_0) => "TLSv1.0",
+            _ => "",
+        };
+        let cipher = conn
+            .negotiated_cipher_suite()
+            .and_then(|c| c.suite().as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        // A presented client certificate: recorded here, judged per virtual
+        // host later (the CA bundle lives in that server's config).
+        let mut info = TlsInfo {
+            version: version.to_string(),
+            cipher,
+            server_name: conn.server_name().map(|s| s.to_string()),
+            ..TlsInfo::default()
+        };
+        match conn.peer_certificates() {
+            Some(chain) if !chain.is_empty() => {
+                info.client_verify = "NONE".to_string();
+                info.client_cert = crate::tls::der_to_pem(chain[0].as_ref());
+            }
+            _ => info.client_verify = "NONE".to_string(),
+        }
+        Some(info)
+    }
+
     pub fn new(stream: Stream, peer: SocketAddr, tcp_nopush: bool) -> Self {
         Conn {
             stream,

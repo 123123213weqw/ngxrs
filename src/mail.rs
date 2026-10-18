@@ -81,6 +81,8 @@ struct Session {
     replay: Vec<u8>,
     /// IMAP command tag of the command being authorised.
     tag: String,
+    /// `MAIL FROM` / `RCPT TO` address, sent as `Auth-SMTP-To`.
+    smtp_to: String,
 }
 
 impl Session {
@@ -224,6 +226,9 @@ async fn auth_request(
         req.extend_from_slice(format!("Auth-Salt: {}\r\n", session.salt).as_bytes());
     }
     req.extend_from_slice(format!("Auth-Protocol: {}\r\n", server.protocol.name()).as_bytes());
+    if !session.smtp_to.is_empty() {
+        req.extend_from_slice(format!("Auth-SMTP-To: {}\r\n", session.smtp_to).as_bytes());
+    }
     req.extend_from_slice(b"Auth-Login-Attempt: 1\r\n");
     req.extend_from_slice(format!("Client-IP: {}\r\n", peer.ip()).as_bytes());
     req.extend_from_slice(format!("Client-Host: {}\r\n", peer.ip()).as_bytes());
@@ -375,7 +380,7 @@ where
             }
             "USER" => {
                 s.user = rest;
-                s.method = "USER";
+                s.method = "user";
                 s.replay.extend_from_slice(line.as_bytes());
                 s.replay.extend_from_slice(b"\r\n");
                 have_user = true;
@@ -399,7 +404,7 @@ where
                 let mut parts = rest.splitn(2, ' ');
                 s.user = parts.next().unwrap_or("").to_string();
                 s.passwd = parts.next().unwrap_or("").to_string();
-                s.method = "APOP";
+                s.method = "apop";
                 s.salt = apop_salt.clone();
                 s.replay.extend_from_slice(line.as_bytes());
                 s.replay.extend_from_slice(b"\r\n");
@@ -437,6 +442,16 @@ where
             }
         }
     }
+}
+
+/// The address inside `MAIL FROM:<...>` / `RCPT TO:<...>`.
+fn smtp_address(line: &str) -> String {
+    let start = match line.find('<') {
+        Some(i) => i + 1,
+        None => return String::new(),
+    };
+    let end = line[start..].find('>').map(|e| start + e).unwrap_or(line.len());
+    line[start..end].to_string()
 }
 
 /// `<pid.seq@host>`, the shape nginx uses for its APOP banner.
@@ -517,7 +532,7 @@ where
                 writer.flush().await?;
                 return Ok(None);
             }
-            s.method = "PLAIN";
+            s.method = "plain";
             s.user = fields[fields.len() - 2].to_string();
             s.passwd = fields[fields.len() - 1].to_string();
             s.replay
@@ -559,7 +574,7 @@ where
             )
             .to_string();
 
-            s.method = "LOGIN";
+            s.method = "login";
             s.user = user;
             s.passwd = pass;
             s.replay
@@ -587,7 +602,7 @@ where
             let mut it = decoded.splitn(2, ' ');
             s.user = it.next().unwrap_or("").to_string();
             s.passwd = it.next().unwrap_or("").to_string();
-            s.method = "CRAM-MD5";
+            s.method = "cram-md5";
             s.salt = String::from_utf8_lossy(&crate::util::base64_decode(&challenge).unwrap_or_default()).to_string();
             s.replay
                 .extend_from_slice(format!("AUTH CRAM-MD5\r\n{resp}\r\n").as_bytes());
@@ -615,7 +630,7 @@ where
                     replay.push_str(&r);
                 }
             }
-            s.method = "EXTERNAL";
+            s.method = "external";
             s.replay.extend_from_slice(format!("{replay}\r\n").as_bytes());
             Ok(Some(()))
         }
@@ -691,7 +706,7 @@ where
                 }
                 s.user = imap_arg(u);
                 s.passwd = imap_arg(p.unwrap_or(""));
-                s.method = "LOGIN";
+                s.method = "login";
                 s.tag = tag.clone();
                 s.replay
                     .extend_from_slice(format!("{line}\r\n").as_bytes());
@@ -700,7 +715,20 @@ where
                 }
             }
             "AUTHENTICATE" => {
-                let mech = rest.to_ascii_uppercase();
+                // `AUTHENTICATE <mech> [initial-response]`: only the mechanism
+                // name is case-insensitive, so split before upper-casing.
+                let mut mp = rest.splitn(2, ' ');
+                let mech = mp.next().unwrap_or("").to_ascii_uppercase();
+                // `AUTHENTICATE` without a mechanism is a syntax error.
+                if mech.is_empty() {
+                    writer
+                        .write_all(format!("{tag} BAD invalid arguments\r\n").as_bytes())
+                        .await?;
+                    writer.flush().await?;
+                    continue;
+                }
+                // An inline initial response replaces the `+` continuation.
+                let inline = mp.next().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
                 s.method = match mech.as_str() {
                     "PLAIN" => "PLAIN",
                     "LOGIN" => "LOGIN",
@@ -719,9 +747,14 @@ where
                     .extend_from_slice(format!("{line}\r\n").as_bytes());
                 match s.method {
                     "PLAIN" => {
-                        writer.write_all(b"+ \r\n").await?;
-                        writer.flush().await?;
-                        let resp = read_line(reader).await?;
+                        let resp = match inline.clone() {
+                            Some(v) => v,
+                            None => {
+                                writer.write_all(b"+ \r\n").await?;
+                                writer.flush().await?;
+                                read_line(reader).await?
+                            }
+                        };
                         let text = String::from_utf8_lossy(
                             &crate::util::base64_decode(&resp).unwrap_or_default(),
                         )
@@ -735,9 +768,14 @@ where
                             .extend_from_slice(format!("{resp}\r\n").as_bytes());
                     }
                     "LOGIN" => {
-                        writer.write_all(b"+ VXNlcm5hbWU6\r\n").await?;
-                        writer.flush().await?;
-                        let u = read_line(reader).await?;
+                        let u = match inline.clone() {
+                            Some(v) => v,
+                            None => {
+                                writer.write_all(b"+ VXNlcm5hbWU6\r\n").await?;
+                                writer.flush().await?;
+                                read_line(reader).await?
+                            }
+                        };
                         s.user = String::from_utf8_lossy(
                             &crate::util::base64_decode(&u).unwrap_or_default(),
                         )
@@ -808,8 +846,6 @@ fn imap_arg(s: &str) -> String {
     }
 }
 
-const SMTP_GREETING: &[u8] = b"220 ESMTP ready\r\n";
-
 async fn smtp<R, W>(
     reader: &mut BufReader<R>,
     writer: &mut BufWriter<W>,
@@ -820,7 +856,10 @@ where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    writer.write_all(SMTP_GREETING).await?;
+    // nginx puts its own `server_name` in the banner.
+    writer
+        .write_all(format!("220 {} ESMTP ready\r\n", server.name).as_bytes())
+        .await?;
     writer.flush().await?;
 
     let mut s = Session::new();
@@ -841,22 +880,13 @@ where
                 return Ok(());
             }
             "EHLO" | "HELO" => {
-                let mut caps = String::from("250-ESMTP\r\n");
-                if server.auth_plain || server.auth_login || server.auth_cram_md5 {
-                    let mut mechs = Vec::new();
-                    if server.auth_plain {
-                        mechs.push("PLAIN");
-                    }
-                    if server.auth_login {
-                        mechs.push("LOGIN");
-                    }
-                    if server.auth_cram_md5 {
-                        mechs.push("CRAM-MD5");
-                    }
-                    caps.push_str(&format!("250-AUTH {}\r\n", mechs.join(" ")));
+                let mechs = smtp_mechanisms(server);
+                let mut out = format!("250-{}\r\n", server.name);
+                if !mechs.is_empty() {
+                    out.push_str(&format!("250-AUTH {}\r\n", mechs.join(" ")));
                 }
-                caps.push_str("250 8BITMIME\r\n");
-                writer.write_all(caps.as_bytes()).await?;
+                out.push_str("250 8BITMIME\r\n");
+                writer.write_all(out.as_bytes()).await?;
                 writer.flush().await?;
             }
             "AUTH" => {
@@ -877,71 +907,180 @@ where
                         let text = String::from_utf8_lossy(&d).to_string();
                         let f: Vec<&str> = text.split('\0').collect();
                         if f.len() < 3 {
-                            writer.write_all(b"501 bad response\r\n").await?;
+                            writer.write_all(b"501 5.5.2 bad response\r\n").await?;
                             writer.flush().await?;
                             continue;
                         }
-                        s.method = "PLAIN";
+                        s.method = "plain";
                         s.user = f[f.len() - 2].to_string();
                         s.passwd = f[f.len() - 1].to_string();
-                        s.replay
-                            .extend_from_slice(format!("AUTH PLAIN {data}\r\n").as_bytes());
-                        if let Some(o) =
-                            authorise(writer, &s, server, peer, Protocol::Smtp).await?
-                        {
-                            return proxy(o, reader, writer, &s.replay, server, Protocol::Smtp).await;
+                        // nginx does not replay AUTH to the backend.
+                        s.replay.clear();
+                        match authorise(writer, &s, server, peer, Protocol::Smtp).await? {
+                            Some(o) => {
+                                writer.write_all(b"235 2.0.0 OK\r\n").await?;
+                                writer.flush().await?;
+                                return proxy(o, reader, writer, &s.replay, server, Protocol::Smtp)
+                                    .await;
+                            }
+                            None => continue,
                         }
                     }
                     "LOGIN" => {
-                        writer.write_all(b"334 VXNlcm5hbWU6\r\n").await?;
-                        writer.flush().await?;
-                        let u = read_line(reader).await?;
-                        s.user = String::from_utf8_lossy(
-                            &crate::util::base64_decode(&u).unwrap_or_default(),
-                        )
-                        .to_string();
+                        let user_b64 = match arg {
+                            Some(a) if !a.is_empty() => a,
+                            _ => {
+                                writer.write_all(b"334 VXNlcm5hbWU6\r\n").await?;
+                                writer.flush().await?;
+                                read_line(reader).await?
+                            }
+                        };
                         writer.write_all(b"334 UGFzc3dvcmQ6\r\n").await?;
                         writer.flush().await?;
                         let p = read_line(reader).await?;
+                        s.method = "login";
+                        s.user = String::from_utf8_lossy(
+                            &crate::util::base64_decode(&user_b64).unwrap_or_default(),
+                        )
+                        .to_string();
                         s.passwd = String::from_utf8_lossy(
                             &crate::util::base64_decode(&p).unwrap_or_default(),
                         )
                         .to_string();
-                        s.method = "LOGIN";
-                        s.replay
-                            .extend_from_slice(format!("AUTH LOGIN\r\n{u}\r\n{p}\r\n").as_bytes());
-                        if let Some(o) =
-                            authorise(writer, &s, server, peer, Protocol::Smtp).await?
-                        {
-                            return proxy(o, reader, writer, &s.replay, server, Protocol::Smtp).await;
+                        s.replay.clear();
+                        match authorise(writer, &s, server, peer, Protocol::Smtp).await? {
+                            Some(o) => {
+                                writer.write_all(b"235 2.0.0 OK\r\n").await?;
+                                writer.flush().await?;
+                                return proxy(o, reader, writer, &s.replay, server, Protocol::Smtp)
+                                    .await;
+                            }
+                            None => continue,
+                        }
+                    }
+                    "CRAM-MD5" => {
+                        let challenge = crate::util::base64_encode(b"<1@ngxrs>");
+                        writer
+                            .write_all(format!("334 {challenge}\r\n").as_bytes())
+                            .await?;
+                        writer.flush().await?;
+                        let r = read_line(reader).await?;
+                        let d = String::from_utf8_lossy(
+                            &crate::util::base64_decode(&r).unwrap_or_default(),
+                        )
+                        .to_string();
+                        let mut sp = d.splitn(2, ' ');
+                        s.user = sp.next().unwrap_or("").to_string();
+                        s.passwd = sp.next().unwrap_or("").to_string();
+                        s.method = "cram-md5";
+                        // The decoded challenge is what auth_http sees as the salt.
+                        s.salt = String::from_utf8_lossy(
+                            &crate::util::base64_decode(&challenge).unwrap_or_default(),
+                        )
+                        .to_string();
+                        s.replay.clear();
+                        match authorise(writer, &s, server, peer, Protocol::Smtp).await? {
+                            Some(o) => {
+                                writer.write_all(b"235 2.0.0 OK\r\n").await?;
+                                writer.flush().await?;
+                                return proxy(o, reader, writer, &s.replay, server, Protocol::Smtp)
+                                    .await;
+                            }
+                            None => continue,
+                        }
+                    }
+                    "EXTERNAL" => {
+                        // The prompt is the username challenge, base64 "Username:".
+                        let user_b64 = match arg {
+                            Some(a) if !a.is_empty() => a,
+                            _ => {
+                                writer.write_all(b"334 VXNlcm5hbWU6\r\n").await?;
+                                writer.flush().await?;
+                                read_line(reader).await?
+                            }
+                        };
+                        s.method = "external";
+                        s.user = String::from_utf8_lossy(
+                            &crate::util::base64_decode(&user_b64).unwrap_or_default(),
+                        )
+                        .to_string();
+                        s.replay.clear();
+                        match authorise(writer, &s, server, peer, Protocol::Smtp).await? {
+                            Some(o) => {
+                                writer.write_all(b"235 2.0.0 OK\r\n").await?;
+                                writer.flush().await?;
+                                return proxy(o, reader, writer, &s.replay, server, Protocol::Smtp)
+                                    .await;
+                            }
+                            None => continue,
                         }
                     }
                     _ => {
-                        writer
-                            .write_all(b"504 unsupported mechanism\r\n")
-                            .await?;
+                        writer.write_all(b"504 5.5.4 unsupported mechanism\r\n").await?;
                         writer.flush().await?;
                     }
                 }
             }
-            _ => {
-                if server.auth_none {
-                    // `smtp_auth none`: nginx still asks auth_http where the
-                    // mailbox is, but with no credentials and method `none`.
-                    s.method = "none";
-                    s.replay.extend_from_slice(format!("{line}\r\n").as_bytes());
-                    if let Some(o) =
-                        authorise(writer, &s, server, peer, Protocol::Smtp).await?
-                    {
-                        return proxy(o, reader, writer, &s.replay, server, Protocol::Smtp).await;
-                    }
-                    continue;
+            // With `smtp_auth none` nginx answers `MAIL FROM` optimistically and
+            // only then starts proxying; the backend's reply to that one command
+            // is swallowed, so the client sees exactly one answer per command.
+            // Before a proxy exists `RSET` is answered by nginx itself; once the
+            // session is spliced the backend sees it instead (see auth none tests).
+            "RSET" if server.auth_none => {
+                writer.write_all(b"250 2.0.0 OK\r\n").await?;
+                writer.flush().await?;
+            }
+            "MAIL" | "RCPT" if server.auth_none => {
+                let optimistic = cmd == "MAIL";
+                if optimistic {
+                    writer.write_all(b"250 2.0.0 OK\r\n").await?;
+                    writer.flush().await?;
                 }
-                writer.write_all(b"500 unknown command\r\n").await?;
+                s.method = "none";
+                s.replay.clear();
+                s.replay.extend_from_slice(format!("{line}\r\n").as_bytes());
+                // The `auth_http` endpoint routes on where the mail is going.
+                s.smtp_to = smtp_address(trimmed);
+                match authorise(writer, &s, server, peer, Protocol::Smtp).await? {
+                    Some(o) => {
+                        let discard = usize::from(optimistic);
+                        return proxy_n(
+                            o,
+                            reader,
+                            writer,
+                            &s.replay,
+                            server,
+                            Protocol::Smtp,
+                            discard,
+                        )
+                        .await;
+                    }
+                    None => continue,
+                }
+            }
+            _ => {
+                writer.write_all(b"500 5.5.2 unrecognized command\r\n").await?;
                 writer.flush().await?;
             }
         }
     }
+}
+
+/// Mechanisms advertised in the EHLO reply. LOGIN is always present, matching
+/// nginx where only plain/apop/cram-md5/external are configurable.
+fn smtp_mechanisms(server: &MailServer) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if server.auth_plain {
+        out.push("PLAIN");
+    }
+    out.push("LOGIN");
+    if server.auth_cram_md5 {
+        out.push("CRAM-MD5");
+    }
+    if server.auth_external {
+        out.push("EXTERNAL");
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1049,13 +1188,32 @@ fn render_failure(protocol: Protocol, tag: &str) -> String {
 /// nginx consumes the client's credentials during the auth phase, so they are
 /// replayed to the backend first — the mailbox server re-authenticates the same
 /// session against its own user database.
+#[allow(clippy::too_many_arguments)]
 async fn proxy<R, W>(
+    up: Upstream,
+    reader: &mut BufReader<R>,
+    writer: &mut BufWriter<W>,
+    replay: &[u8],
+    server: &MailServer,
+    protocol: Protocol,
+) -> io::Result<()>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    proxy_n(up, reader, writer, replay, server, protocol, 0).await
+}
+
+/// Same, but swallow `discard` replies the client has already been given.
+#[allow(clippy::too_many_arguments)]
+async fn proxy_n<R, W>(
     up: Upstream,
     reader: &mut BufReader<R>,
     writer: &mut BufWriter<W>,
     _replay: &[u8],
     server: &MailServer,
     protocol: Protocol,
+    discard: usize,
 ) -> io::Result<()>
 where
     R: AsyncReadExt + Unpin,
@@ -1080,7 +1238,7 @@ where
     // the `235` the client is waiting for.
     if protocol == Protocol::Smtp {
         let _greeting = read_line_plain(&mut brd).await.unwrap_or_default();
-        bwr.write_all(b"HELO ngxrs\r\n").await?;
+        bwr.write_all(format!("EHLO {}\r\n", server.name).as_bytes()).await?;
         bwr.flush().await?;
         let _helo = read_line_plain(&mut brd).await.unwrap_or_default();
     }
@@ -1088,6 +1246,10 @@ where
     if !up.replay.is_empty() {
         bwr.write_all(&up.replay).await?;
         bwr.flush().await?;
+        // Replies the client has already been given must not be repeated.
+        for _ in 0..discard {
+            let _ = read_line_plain(&mut brd).await;
+        }
     }
 
     // Relay by hand rather than with `copy`: the client side is a `BufWriter`,

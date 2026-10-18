@@ -492,6 +492,9 @@ pub struct CacheZone {
 #[derive(Debug, Clone)]
 pub struct MailServer {
     pub listen: SocketAddr,
+    /// `server_name` in a mail block; nginx defaults it to the hostname and
+    /// uses it for the banner and the EHLO we send upstream.
+    pub name: String,
     pub protocol: crate::mail::Protocol,
     pub auth_http: Option<crate::mail::AuthHttp>,
     pub auth_http_timeout: std::time::Duration,
@@ -513,6 +516,7 @@ impl Default for MailServer {
     fn default() -> Self {
         MailServer {
             listen: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 110)),
+            name: hostname(),
             protocol: crate::mail::Protocol::Pop3,
             auth_http: None,
             auth_http_timeout: std::time::Duration::from_secs(60),
@@ -837,6 +841,16 @@ pub fn parse_size(s: &str) -> Option<u64> {
 /// `200ms` is read as `200m` + `s`, fails to parse, and the caller silently
 /// keeps the directive's default. That bug made `proxy_cache_lock_timeout
 /// 200ms` behave like its 5 s default.
+/// The machine's host name, nginx's default for `server_name`.
+pub fn hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_else(|| "localhost".to_string())
+}
+
 /// `pop3` / `imap` / `smtp`, case-insensitively.
 fn mail_protocol(v: &str) -> Option<crate::mail::Protocol> {
     match v.to_ascii_lowercase().as_str() {
@@ -1192,10 +1206,34 @@ impl Builder {
                     }
                 }
                 "server" => servers_dirs.push(d),
-                // Accepted, not yet plumbed.
+                // `pop3_auth` / `imap_auth` / `smtp_auth` are valid in the mail
+                // main context as well; there they set the server defaults.
+                "pop3_auth" | "imap_auth" | "smtp_auth" => {
+                    defaults.auth_plain = false;
+                    defaults.auth_apop = false;
+                    defaults.auth_none = false;
+                    defaults.auth_cram_md5 = false;
+                    defaults.auth_external = false;
+                    for a in &d.args {
+                        match a.as_str() {
+                            "plain" => defaults.auth_plain = true,
+                            "apop" => defaults.auth_apop = true,
+                            "none" => defaults.auth_none = true,
+                            "cram-md5" => defaults.auth_cram_md5 = true,
+                            "external" => defaults.auth_external = true,
+                            _ => {}
+                        }
+                    }
+                }
+                // Accepted, not yet plumbed (starttls is unimplemented).
                 "proxy_buffer" | "auth_http_header" | "resolver" | "resolver_timeout"
                 | "error_log" | "log_format" | "timeout" | "proxy_protocol"
-                | "max_errors" | "protocol" => {}
+                | "max_errors" | "protocol" | "ssl_certificate" | "ssl_certificate_key"
+                | "ssl_protocols" | "ssl_ciphers" | "ssl_prefer_server_ciphers"
+                | "ssl_session_cache" | "ssl_session_timeout" | "ssl_conf_command"
+                | "starttls" | "xclient" | "smtp_greeting_delay"
+                | "pop3_capabilities" | "imap_capabilities" | "smtp_capabilities"
+                | "smtp_auth_methods" | "smtp_client_buffer" | "worker_aio_requests" => {}
                 other => {
                     self.warnings.push(format!(
                         "{}:{}: unknown directive \"{other}\" in mail; ignored",
@@ -1225,6 +1263,11 @@ impl Builder {
                             if let Some(p) = mail_protocol(extra) {
                                 srv.protocol = p;
                             }
+                        }
+                    }
+                    "server_name" => {
+                        if let Some(v) = child.args.first() {
+                            srv.name = v.clone();
                         }
                     }
                     "protocol" => {

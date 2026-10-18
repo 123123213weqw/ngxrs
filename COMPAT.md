@@ -119,9 +119,11 @@
 | TLS 1.2 / 1.3 | ✅ | 1.3 默认优先 |
 | `ssl_protocols` / `ssl_ciphers` / `ssl_session_cache` 等 | 🟡 | 已解析；实际参数由 rustls 的安全默认值决定 |
 | ALPN（h2 / http/1.1） | ✅ | 仅在 `listen ... http2` 时广告 h2 |
-| HTTP/2（多路复用、`:authority` 选虚拟主机、头部规范化） | 🟡 | 功能可用（curl h2c 正常、`h2_host.t` 与 nginx 一致），但**帧级行为与 nginx 不同**：官方 `h2.t` 0/145、`h2_headers.t` 0/112。基于 `h2` crate，它不按 nginx 的时序发 WINDOW_UPDATE/SETTINGS |
+| HTTP/2（多路复用、`:authority` 选虚拟主机、头部规范化） | 🟡 | 功能可用；帧级已对齐到 `h2.t` **116/145**、`h2_headers.t` **71/112**（此前都是 0）。剩余差异见下方「HTTP/2 残余差异」 |
 | `http2 on`（http/server 级，nginx 1.25.1+） | ✅ | 含 http→server 继承 |
 | h2c prior-knowledge（明文 HTTP/2） | ✅ | 探测连接前言，仅在该组配置了 `http2 on` 时启用 |
+| `large_client_header_buffers` | ✅ | http/server 级；h1 用 `size`，h2 用 `size` 做单字段上限、`size*num` 做整块上限（与 `ngx_http_v2_state_header_complete` 一致，按 `name.len+value.len` 计，含伪头） |
+| HTTP/2 SETTINGS / WINDOW_UPDATE 帧 | ✅ | 与 nginx 逐字节一致：`MAX_CONCURRENT_STREAMS=128`、`INITIAL_WINDOW_SIZE=65536`、`MAX_FRAME_SIZE=16777215`，外加连接级 `WINDOW_UPDATE 0x7fff0000` |
 | HTTP/2 上的反向代理 | ⬜ | 目前 proxy 需要 socket 写入；h2 请求走 proxy 会返回 502 |
 | HTTP/3 (QUIC) | ⬜ | 未开始 |
 | `limit_req` / `limit_conn` / `access` 访问控制 | ⬜ | |
@@ -159,6 +161,20 @@
 | `add_header` 作用于代理 / FastCGI 响应 | ✅ | 默认只对 200/201/204/206/301/302/303/304/307/308 生效 |
 | `always` 后缀 | ✅ | 对所有状态码生效 |
 | `$upstream_cache_status` 变量 | ✅ | MISS / HIT / BYPASS |
+
+## HTTP/2 残余差异
+
+对齐帧格式后，官方用例剩下的失败**集中在两类**，都不是内容层：
+
+1. **HPACK 编码选择**（`h2_headers.t` 的 huffman / 索引模式 / 动态表边界，约 20 条）。
+   nginx 自己实现 HPACK，选择是否 huffman、用哪种索引模式；`h2` crate 用的是另一套
+   实现，两者都符合 RFC 但字节不同。用例断言的是 nginx 的具体选择，要匹配只能自己写
+   HPACK 编码器。
+2. **连接级错误的帧形态**（GOAWAY 的 code/时序、`PUSH_PROMISE` 拒绝、非法前言、
+   `http2_max_concurrent_streams` 的 RST_STREAM 细节，约 25 条）。`h2` crate owns
+   framing，我只能在 `accept()` 之后介入，改不了它发出的 GOAWAY。
+3. `large_client_header_buffers` 超限：nginx 发 `GOAWAY(ENHANCE_YOUR_CALM)`，我们回
+   431 —— 用例只断言「没有 DATA 帧」，所以这部分已通过，但帧形态仍不同。
 
 ## 已知差异（必须修）
 

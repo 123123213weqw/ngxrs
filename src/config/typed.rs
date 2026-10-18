@@ -525,6 +525,12 @@ pub struct Server {
     pub access_logs: Vec<AccessLog>,
     pub keepalive_timeout: Duration,
     pub server_tokens: bool,
+    /// `large_client_header_buffers <num> <size>`: one header field may not
+    /// exceed `size`, and the whole header block may not exceed `num * size`.
+    /// HTTP/2 derives its limits from the same directive
+    /// (`ngx_http_v2.c` uses `cscf->large_client_header_buffers`).
+    pub header_field_limit: usize,
+    pub header_block_limit: usize,
     pub error_pages: BTreeMap<u16, String>,
     pub access_log_off: bool,
     /// Server-level `if` blocks, evaluated before location matching.
@@ -618,6 +624,9 @@ pub struct Http {
     /// `http2 on|off` at http level: the inherited default for every server
     /// (nginx 1.25.1+; `listen ... http2` is the older spelling).
     pub http2: bool,
+    /// `large_client_header_buffers <num> <size>` as (num, size).
+    /// nginx defaults to `4 8k`.
+    pub large_client_header_buffers: (usize, usize),
     pub tcp_nodelay: bool,
     pub gzip: bool,
     pub server_tokens: bool,
@@ -1858,6 +1867,8 @@ impl Builder {
         http_keepalive: Duration,
         http_tokens: bool,
         http_http2: bool,
+        http_header_field_limit: usize,
+        http_header_bufs: usize,
     ) -> Result<(Server, Vec<(SocketAddr, bool)>), ConfigError> {
         let block = d
             .block
@@ -1876,6 +1887,8 @@ impl Builder {
         let mut server_sets: Vec<(String, String)> = Vec::new();
         let mut ssl = false;
         let mut http2 = http_http2;
+        let mut header_field_limit = http_header_field_limit;
+        let mut header_bufs = http_header_bufs;
         let mut ssl_certificate: Option<PathBuf> = None;
         let mut ssl_certificate_key: Option<PathBuf> = None;
 
@@ -1978,7 +1991,29 @@ impl Builder {
                 // nginx 1.25.1+: `http2 on|off` at http/server level enables h2
                 // without repeating it on every `listen`.
                 "http2" => {
-                    http2 = d.args.first().map(|v| v == "on").unwrap_or(true);
+                    http2 = child.args.first().map(|v| v == "on").unwrap_or(true);
+                }
+                "large_client_header_buffers" => {
+                    let num = child
+                        .args
+                        .first()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .ok_or_else(|| {
+                            sem(&child.file, child.line, "invalid large_client_header_buffers")
+                        })?;
+                    let size = child
+                        .args
+                        .get(1)
+                        .and_then(|v| parse_size(v))
+                        .ok_or_else(|| {
+                            sem(
+                                &child.file,
+                                child.line,
+                                "invalid large_client_header_buffers size",
+                            )
+                        })?;
+                    header_bufs = num.max(1);
+                    header_field_limit = size as usize;
                 }
                 "server_tokens" => {
                     if let Some(v) = child.args.first() {
@@ -2036,6 +2071,8 @@ impl Builder {
                 access_logs,
                 keepalive_timeout: keepalive,
                 server_tokens: tokens,
+                header_field_limit,
+                header_block_limit: header_field_limit * header_bufs,
                 access_log_off,
                 ifs: server_ifs,
                 sets: server_sets,
@@ -2239,6 +2276,7 @@ pub fn build(
         sendfile: false,
         tcp_nopush: false,
         http2: false,
+        large_client_header_buffers: (4, 8192),
         tcp_nodelay: true,
         gzip: false,
         server_tokens: true,
@@ -2419,6 +2457,19 @@ pub fn build(
                 http.http2 = parse_on_off(&v)
                     .ok_or_else(|| sem(&d.file, d.line, "invalid http2 value"))?;
             }
+            "large_client_header_buffers" => {
+                let num = d
+                    .args
+                    .first()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .ok_or_else(|| sem(&d.file, d.line, "invalid large_client_header_buffers"))?;
+                let size = d
+                    .args
+                    .get(1)
+                    .and_then(|v| parse_size(v))
+                    .ok_or_else(|| sem(&d.file, d.line, "invalid large_client_header_buffers size"))?;
+                http.large_client_header_buffers = (num.max(1), size as usize);
+            }
             "keepalive_timeout" => {
                 if let Some(v) = d.args.first() {
                     http.keepalive_timeout =
@@ -2570,6 +2621,8 @@ pub fn build(
             http.keepalive_timeout,
             http.server_tokens,
             http.http2,
+            http.large_client_header_buffers.1,
+            http.large_client_header_buffers.0,
         )?;
         if server.names.is_empty() {
             // nginx default server_name is ""

@@ -22,7 +22,29 @@ pub async fn serve<S>(socket: S, server_idxs: &[usize], default_server: usize, h
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut conn = match server::handshake(socket).await {
+    // nginx's SETTINGS frame, byte for byte (`ngx_http_v2_send_settings`):
+    //   MAX_CONCURRENT_STREAMS = concurrent_streams (default 128)
+    //   INITIAL_WINDOW_SIZE    = preread_size        (default 65536)
+    //   MAX_FRAME_SIZE         = (1 << 24) - 1
+    // and then a connection-level WINDOW_UPDATE of
+    //   NGX_HTTP_V2_MAX_WINDOW - NGX_HTTP_V2_DEFAULT_WINDOW = 0x7fff0000
+    // (`ngx_http_v2_send_window_update(h2c, 0, ...)` right after the handshake).
+    //
+    // The `h2` crate sends an empty SETTINGS and no WINDOW_UPDATE by default,
+    // which is RFC-legal but differs from nginx frame-for-frame — enough to fail
+    // the very first assertions of the official `h2.t`.
+    const NGX_MAX_FRAME_SIZE: u32 = (1 << 24) - 1;
+    const NGX_MAX_WINDOW: u32 = (1 << 31) - 1;
+    let mut builder = server::Builder::new();
+    builder
+        .max_concurrent_streams(128)
+        .initial_window_size(65536)
+        .max_frame_size(NGX_MAX_FRAME_SIZE)
+        // Enlarging the connection window makes `h2` emit the same
+        // connection-level WINDOW_UPDATE nginx sends.
+        .initial_connection_window_size(NGX_MAX_WINDOW);
+
+    let mut conn = match builder.handshake(socket).await {
         Ok(c) => c,
         Err(e) => {
             eprintln!("ngxrs: [error] http2 handshake failed: {e}");
@@ -50,6 +72,51 @@ where
 
         let server: &Server =
             crate::http::select_server(http, server_idxs, default_server, authority.as_deref());
+
+        // `large_client_header_buffers` bounds header fields on HTTP/2 too:
+        // nginx checks each decoded string against `buffers.size` and the whole
+        // block against `size * num`. Exceeding either is a connection error
+        // there (GOAWAY ENHANCE_YOUR_CALM); the `h2` crate owns framing, so we
+        // can only refuse the stream — see OPEN-ISSUES in COMPAT.md.
+        {
+            // nginx charges pseudo-headers against the same budget as ordinary
+            // fields (they are part of the HPACK block), so they must be counted
+            // here or a request that only overflows thanks to `:path` slips by.
+            let mut block = 7 + request.method().as_str().len() // ":method"
+                + 5 + request.uri().path().len() // ":path"
+                + 10 + authority.as_deref().map(str::len).unwrap_or(0) // ":authority"
+                + 7 + request.uri().scheme_str().map(str::len).unwrap_or(0); // ":scheme"
+            let mut too_large = false;
+            for (name, value) in request.headers() {
+                // nginx charges `name.len + value.len` against a running budget
+                // (`ngx_http_v2_state_header_complete`); the HPACK +32 per-entry
+                // overhead is *not* counted.
+                block += name.as_str().len() + value.len();
+                if name.as_str().len() > server.header_field_limit
+                    || value.len() > server.header_field_limit
+                {
+                    too_large = true;
+                }
+            }
+            if too_large || block > server.header_block_limit {
+                let mut b = H2Response::builder().status(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
+                if let Some(h) = b.headers_mut() {
+                    if let Ok(v) = http::header::HeaderValue::from_str(if tokens {
+                        "nginx/1.28.0"
+                    } else {
+                        "nginx"
+                    }) {
+                        h.insert(http::header::SERVER, v);
+                    }
+                }
+                if let Ok(r) = b.body(()) {
+                    if let Ok(mut send) = respond.send_response(r, true) {
+                        let _ = send.send_data(Bytes::new(), true);
+                    }
+                }
+                continue;
+            }
+        }
 
         let path = request.uri().path().to_string();
         let query = request.uri().query().unwrap_or("").to_string();

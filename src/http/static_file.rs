@@ -28,7 +28,14 @@ pub fn map_path(uri: &str, loc: &LocCfg) -> PathBuf {
             // nested location inherits both.
             let cut = loc.alias_prefix_len.min(uri.len());
             let suffix = uri[cut..].trim_start_matches('/');
-            alias.join(suffix)
+            // An exact-match location leaves no remainder; `alias` then *is*
+            // the file. `Path::join("")` would append a separator and turn
+            // `/tmp/t2.html` into `/tmp/t2.html/`, which never stats.
+            if suffix.is_empty() {
+                alias.clone()
+            } else {
+                alias.join(suffix)
+            }
         }
         None => loc.root.join(uri.trim_start_matches('/')),
     }

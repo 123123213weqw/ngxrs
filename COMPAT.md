@@ -206,10 +206,9 @@ http/proxy/upstream/range/fastcgi/scgi/uwsgi/stream/limit 各类用例，
 
 | | 数量 |
 |---|---|
-| 与 nginx 断言数**完全一致** | **34** |
+| 与 nginx 断言数**完全一致** | **34**（含 `proxy_cache_lock` 19/19、`proxy_cache_lock_age` 6/6、`proxy_cache_max_range_offset` 9/9、`h2_host`） |
 | **优于** nginx | **3**（`http_headers_multi` 49 vs 48、`http_host` 58 vs 62、`proxy_cache_range` 9 vs 8） |
-| 更差 | 2（`proxy_cache_lock` -1、`proxy_cache_max_range_offset` -1） |
-| **落后断言合计** | **2** |
+| 更差 | 0 |
 
 > **上述数字不完整（已发现并修正）**：`-V` 之前只打印版本号，而 Test::Nginx 用
 > `-V` 文本判断哪些用例能跑——未知特性按**字面子串**匹配。于是 `http_v2`、`ssl`、

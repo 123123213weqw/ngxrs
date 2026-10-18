@@ -456,6 +456,31 @@ async fn accept_loop(
                             let tls = ctx.tls.get(group_idx).cloned().flatten();
                             match tls {
                                 None => {
+                                    // h2c with prior knowledge: the client opens
+                                    // with the HTTP/2 connection preface. Only
+                                    // take that path when the group actually has
+                                    // `http2 on`, mirroring nginx.
+                                    let mut head = [0u8; 24];
+                                    let is_h2c = matches!(
+                                        stream.peek(&mut head).await,
+                                        Ok(n) if n == 24
+                                            && &head[..] == b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+                                    ) && cfg.http.groups[group_idx]
+                                        .servers
+                                        .iter()
+                                        .any(|s| cfg.http.server(*s).http2);
+                                    if is_h2c {
+                                        let group = &cfg.http.groups[group_idx];
+                                        crate::h2server::serve(
+                                            stream,
+                                            &group.servers,
+                                            group.default_server,
+                                            &cfg.http,
+                                            cfg.http.server(group.default_server).server_tokens,
+                                        )
+                                        .await;
+                                        return;
+                                    }
                                     let conn = Conn::new(
                                         Stream::Plain(stream),
                                         peer,

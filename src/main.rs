@@ -74,6 +74,38 @@ fn real_main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             "-q" => {}
             "-v" | "-V" => {
                 println!("{VERSION}");
+                if a == "-V" {
+                    // Test::Nginx decides which suites can run by matching this
+                    // text: known features use a regex from its own table, and
+                    // anything else is matched as a literal substring. Printing
+                    // only the version made it skip TLS/HTTP2/stream suites
+                    // silently, so they read as "0/0, both skipped" instead of
+                    // showing a real gap.
+                    //
+                    // Only modules that are actually implemented are listed.
+                    // Absent upstream modules are named explicitly with
+                    // `--without-`, which is how nginx reports a build that
+                    // lacks them.
+                    println!("built by ngxrs (Rust)");
+                    println!("TLS SNI support enabled");
+                    println!(
+                        "configure arguments: --with-http_ssl_module \
+                         --with-http_v2_module --with-stream \
+                         --without-http_grpc_module --without-http_ssi_module \
+                         --without-http_auth_request_module --without-http_sub_module \
+                         --without-http_dav_module --without-http_slice_module \
+                         --without-mail --without-http_memcached_module \
+                         --without-http_flv_module --without-http_mp4_module \
+                         --without-http_geoip_module --without-http_image_filter_module \
+                         --without-http_xslt_module --without-http_perl_module \
+                         --without-http_random_index_module \
+                         --without-http_secure_link_module --without-http_stub_status_module \
+                         --without-http_gzip_static_module --without-http_userid_module \
+                         --without-http_split_clients_module --without-http_referer_module \
+                         --without-http_browser_module --without-http_mirror_module \
+                         --without-http_empty_gif_module"
+                    );
+                }
                 println!("nginx compatibility target: {COMPAT_VERSION}");
                 return Ok(ExitCode::SUCCESS);
             }

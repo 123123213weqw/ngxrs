@@ -150,6 +150,8 @@ pub struct LocCfg {
     /// `proxy_force_ranges`: honour `Range` even if the upstream never
     /// advertised `Accept-Ranges`.
     pub proxy_force_ranges: bool,
+    /// `proxy_cache_min_uses`: requests needed before a response is cached.
+    pub proxy_cache_min_uses: u32,
     pub proxy_cache_lock: bool,
     pub proxy_cache_lock_timeout: Duration,
     pub proxy_cache_lock_age: Duration,
@@ -235,6 +237,7 @@ impl LocCfg {
             proxy_limit_rate: 0,
             proxy_intercept_errors: false,
             proxy_force_ranges: false,
+            proxy_cache_min_uses: 1,
             proxy_cache_lock: false,
             proxy_cache_lock_timeout: Duration::from_secs(5),
             proxy_cache_lock_age: Duration::from_secs(5),
@@ -454,7 +457,16 @@ pub struct CacheZone {
     pub inactive: Duration,
     pub levels: Option<String>,
     /// `proxy_cache_lock`: only one request may populate a key at a time.
-    pub lock: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// `proxy_cache_lock` ownership per cache key: the instant the current
+    /// holder's `lock_age` runs out (`node->lock_time` in nginx). A waiter may
+    /// take over once that passes.
+    pub lock: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    >,
+    /// `proxy_cache_min_uses` support: how many times each key has been asked
+    /// for (`ngx_http_file_cache_node_t.uses`). The first `min_uses - 1`
+    /// requests are served but never stored.
+    pub uses: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -603,6 +615,9 @@ pub struct Http {
     pub keepalive_requests: u64,
     pub sendfile: bool,
     pub tcp_nopush: bool,
+    /// `http2 on|off` at http level: the inherited default for every server
+    /// (nginx 1.25.1+; `listen ... http2` is the older spelling).
+    pub http2: bool,
     pub tcp_nodelay: bool,
     pub gzip: bool,
     pub server_tokens: bool,
@@ -735,7 +750,24 @@ pub fn parse_size(s: &str) -> Option<u64> {
     num.parse::<u64>().ok().map(|v| v * mult)
 }
 
+/// nginx time value: `ms`, `s`, `m`, `h`, `d`, `w`, `M`, `y`, or a bare
+/// number meaning seconds.
+///
+/// The `ms` suffix *must* be checked before the single-letter units: otherwise
+/// `200ms` is read as `200m` + `s`, fails to parse, and the caller silently
+/// keeps the directive's default. That bug made `proxy_cache_lock_timeout
+/// 200ms` behave like its 5 s default.
 pub fn parse_time(s: &str) -> Option<Duration> {
+    if let Some(num) = s.strip_suffix("ms") {
+        // Bare "ms" has no numeric part.
+        if num.is_empty() {
+            return None;
+        }
+        return num
+            .parse::<u64>()
+            .ok()
+            .map(Duration::from_millis);
+    }
     let b = s.as_bytes();
     let (num, mult) = match b.last()? {
         b's' => (&s[..s.len() - 1], 1000u64),
@@ -747,6 +779,9 @@ pub fn parse_time(s: &str) -> Option<Duration> {
         b'y' => (&s[..s.len() - 1], 365 * 86400 * 1000),
         _ => (s, 1000),
     };
+    if num.is_empty() {
+        return None;
+    }
     num.parse::<u64>()
         .ok()
         .map(|v| Duration::from_millis(v.saturating_mul(mult)))
@@ -1686,8 +1721,17 @@ impl Builder {
                     cfg.proxy_cache_use_stale_updating = false;
                 }
             }
-            "proxy_cache_methods" | "proxy_cache_min_uses" => {
-                // Accepted; behavioural parity for these is not implemented.
+            "proxy_cache_methods" => {
+                // Accepted; only GET/HEAD are cached, which is the default.
+            }
+            "proxy_cache_min_uses" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "proxy_cache_min_uses requires a value"))?;
+                cfg.proxy_cache_min_uses = v
+                    .parse::<u32>()
+                    .map_err(|_| sem(&d.file, d.line, format!("invalid proxy_cache_min_uses \"{v}\"")))?;
             }
             "proxy_cache_valid" => {
                 // proxy_cache_valid [code ...] time;
@@ -1813,6 +1857,7 @@ impl Builder {
         log_formats: &HashMap<String, String>,
         http_keepalive: Duration,
         http_tokens: bool,
+        http_http2: bool,
     ) -> Result<(Server, Vec<(SocketAddr, bool)>), ConfigError> {
         let block = d
             .block
@@ -1830,7 +1875,7 @@ impl Builder {
         let mut server_ifs: Vec<IfBlock> = Vec::new();
         let mut server_sets: Vec<(String, String)> = Vec::new();
         let mut ssl = false;
-        let mut http2 = false;
+        let mut http2 = http_http2;
         let mut ssl_certificate: Option<PathBuf> = None;
         let mut ssl_certificate_key: Option<PathBuf> = None;
 
@@ -1925,8 +1970,15 @@ impl Builder {
                 | "ssl_dhparam" | "ssl_ecdh_curve" | "ssl_stapling" | "ssl_stapling_verify"
                 | "ssl_buffer_size" | "ssl_verify_client" | "ssl_client_certificate"
                 | "ssl_trusted_certificate" | "ssl_early_data" | "ssl_conf_command"
-                | "http2_max_field_size" | "http2_max_header_size" | "http2_idle_timeout" => {
-                    // Parsed and accepted; rustls picks safe defaults.
+                | "http2_max_field_size" | "http2_max_header_size" | "http2_idle_timeout"
+                | "http2_body_preread_size" | "http2_chunk_size" | "http2_max_concurrent_streams"
+                | "http2_recv_buffer_size" => {
+                    // Parsed and accepted; rustls/h2 pick safe defaults.
+                }
+                // nginx 1.25.1+: `http2 on|off` at http/server level enables h2
+                // without repeating it on every `listen`.
+                "http2" => {
+                    http2 = d.args.first().map(|v| v == "on").unwrap_or(true);
                 }
                 "server_tokens" => {
                     if let Some(v) = child.args.first() {
@@ -2186,6 +2238,7 @@ pub fn build(
         keepalive_requests: 1000,
         sendfile: false,
         tcp_nopush: false,
+        http2: false,
         tcp_nodelay: true,
         gzip: false,
         server_tokens: true,
@@ -2361,6 +2414,11 @@ pub fn build(
                 http.tcp_nodelay = parse_on_off(&v)
                     .ok_or_else(|| sem(&d.file, d.line, "invalid tcp_nodelay value"))?;
             }
+            "http2" => {
+                let v = d.args.first().cloned().unwrap_or_default();
+                http.http2 = parse_on_off(&v)
+                    .ok_or_else(|| sem(&d.file, d.line, "invalid http2 value"))?;
+            }
             "keepalive_timeout" => {
                 if let Some(v) = d.args.first() {
                     http.keepalive_timeout =
@@ -2451,7 +2509,10 @@ pub fn build(
                     .ok_or_else(|| sem(&d.file, d.line, "proxy_cache_path requires a path"))?;
                 let mut zone = CacheZone {
                     lock: std::sync::Arc::new(std::sync::Mutex::new(
-                        std::collections::HashSet::new(),
+                        std::collections::HashMap::new(),
+                    )),
+                    uses: std::sync::Arc::new(std::sync::Mutex::new(
+                        std::collections::HashMap::new(),
                     )),
                     name: String::new(),
                     path: resolve_path(prefix, path_arg),
@@ -2508,6 +2569,7 @@ pub fn build(
             &http.log_formats,
             http.keepalive_timeout,
             http.server_tokens,
+            http.http2,
         )?;
         if server.names.is_empty() {
             // nginx default server_name is ""

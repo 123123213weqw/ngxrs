@@ -596,13 +596,25 @@ pub async fn handle(
         && loc.proxy_cache_convert_head
         && zone.is_some();
 
+    // `proxy_cache_min_uses`: count this request against the key (nginx bumps
+    // `fcn->uses` on every cache lookup) and refuse to store until it is met.
+    let min_uses_ok = match (zone, cache_key.as_ref()) {
+        (Some(z), Some(key)) => {
+            let mut map = z.uses.lock().unwrap_or_else(|e| e.into_inner());
+            let uses = map.entry(key.clone()).or_insert(0);
+            *uses += 1;
+            *uses >= u64::from(loc.proxy_cache_min_uses.max(1))
+        }
+        _ => true,
+    };
+
     // nginx: bypass when any value expands to something that is neither empty
     // nor "0".
     let bypass = loc.proxy_cache_bypass.iter().any(|v| {
         let e = vars.expand(v);
         let e = e.trim();
         !e.is_empty() && e != "0"
-    }) || !cache_range_allowed(loc, req);
+    }) || !cache_range_allowed(loc, req, min_uses_ok);
 
     // A stored-but-stale entry is reported as EXPIRED (nginx does the same)
     // rather than MISS.
@@ -748,15 +760,28 @@ pub async fn handle(
     // `proxy_cache_lock`: only the first request for a key may populate the
     // cache. Latecomers wait for it to land, then serve the fresh entry.
     // RAII: releases the lock on every exit path.
-    struct CacheLock(std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>, String);
+    /// Owns a cache key until `lock_age` runs out or we finish. `Drop` only
+    /// clears the entry if it is still ours: after a takeover the key belongs to
+    /// another request and the original holder must not release it.
+    struct CacheLock(
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Instant>>>,
+        String,
+        Instant,
+    );
     impl Drop for CacheLock {
         fn drop(&mut self) {
-            let mut set = self.0.lock().unwrap_or_else(|e| e.into_inner());
-            set.remove(&self.1);
+            let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            if map.get(&self.1) == Some(&self.2) {
+                map.remove(&self.1);
+            }
         }
     }
 
     let mut _cache_lock_held: Option<CacheLock> = None;
+    // Set when the lock could not be taken before its timeout. nginx marks the
+    // response uncacheable in that case (`ngx_http_file_cache_lock_wait` zeroes
+    // `lock_timeout`, `ngx_http_file_cache_lock` then reports CACHE_SCARCE).
+    let mut lock_timed_out = false;
     if let (Some(z), Some(key), true) = (zone, cache_key.as_ref(), loc.proxy_cache_lock) {
         let deadline = Instant::now() + loc.proxy_cache_lock_timeout;
         loop {
@@ -807,21 +832,30 @@ pub async fn handle(
                 }
             }
 
-            let taken = {
-                let mut set = z.lock.lock().unwrap_or_else(|e| e.into_inner());
-                if set.contains(key) {
-                    false
-                } else {
-                    set.insert(key.clone());
-                    true
+            // nginx's ngx_http_file_cache_lock: a key is held until
+            // `node->lock_time` (= now + lock_age) passes. Past that a waiter
+            // takes over instead of waiting forever, so a stalled or very slow
+            // upstream cannot serialise every later request behind one lock.
+            let mine = {
+                let mut map = z.lock.lock().unwrap_or_else(|e| e.into_inner());
+                let now = Instant::now();
+                match map.get(key) {
+                    Some(&held) if held > now => None,
+                    _ => {
+                        let until = now + loc.proxy_cache_lock_age;
+                        map.insert(key.clone(), until);
+                        Some(until)
+                    }
                 }
             };
-            if taken {
-                _cache_lock_held = Some(CacheLock(z.lock.clone(), key.clone()));
+            if let Some(until) = mine {
+                _cache_lock_held = Some(CacheLock(z.lock.clone(), key.clone(), until));
                 break;
             }
             if Instant::now() >= deadline {
-                // nginx stops waiting and goes to the upstream itself.
+                // nginx stops waiting and goes to the upstream itself, but the
+                // reply it gets this way is not stored.
+                lock_timed_out = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -914,6 +948,8 @@ pub async fn handle(
                     key: cache_key.as_deref(),
                     status: cache_status,
                     reval: reval_entry,
+                    no_store: lock_timed_out,
+                    min_uses_ok,
                 },
                 &upstream_addr,
                 vars,
@@ -1118,6 +1154,12 @@ struct CacheCtx<'a> {
     status: &'a str,
     /// Expired entry that may be revalidated with `If-None-Match` / `If-Modified-Since`.
     reval: Option<&'a crate::cache::Cached>,
+    /// Whether `proxy_cache_min_uses` has been reached for this key.
+    min_uses_ok: bool,
+    /// `proxy_cache_lock` was on but this request gave up waiting. nginx turns
+    /// that into `NGX_HTTP_CACHE_SCARCE` and clears `u->cacheable`, so the
+    /// response is served but never stored.
+    no_store: bool,
 }
 
 /// Result of one proxy attempt.
@@ -1142,7 +1184,12 @@ pub enum Proxied {
 ///
 /// `false` means the request bypasses the cache (and keeps its `Range` header),
 /// which nginx signals with NGX_DECLINED.
-fn cache_range_allowed(loc: &LocCfg, req: &Request) -> bool {
+fn cache_range_allowed(loc: &LocCfg, req: &Request, min_uses_ok: bool) -> bool {
+    // Below `proxy_cache_min_uses` nothing is stored, so the cache cannot serve
+    // a later range request either; let the Range header through to the origin.
+    if !min_uses_ok {
+        return false;
+    }
     let Some(header) = req.headers.get("range") else {
         return true;
     };
@@ -1632,7 +1679,11 @@ async fn exchange(
     let wants_ranges = (loc.proxy_force_ranges || drop_range)
         && req.headers.get("range").is_some()
         && !is_upgrade;
-    let cacheable = cache.zone.is_some() && cache.key.is_some() && !is_upgrade;
+    let cacheable = cache.zone.is_some()
+        && cache.key.is_some()
+        && !is_upgrade
+        && !cache.no_store
+        && cache.min_uses_ok;
     // `proxy_buffering on` (the default) makes nginx absorb a chunked upstream
     // reply and re-send it with a Content-Length, so the client never sees the
     // upstream's chunk framing (`proxy_chunked.t` checks the raw bytes).

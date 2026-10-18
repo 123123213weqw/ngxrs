@@ -119,7 +119,9 @@
 | TLS 1.2 / 1.3 | ✅ | 1.3 默认优先 |
 | `ssl_protocols` / `ssl_ciphers` / `ssl_session_cache` 等 | 🟡 | 已解析；实际参数由 rustls 的安全默认值决定 |
 | ALPN（h2 / http/1.1） | ✅ | 仅在 `listen ... http2` 时广告 h2 |
-| HTTP/2（多路复用、`:authority` 选虚拟主机、头部规范化） | ✅ | 复用 http/1 的路由表，静态/return/error_page/gzip 行为一致 |
+| HTTP/2（多路复用、`:authority` 选虚拟主机、头部规范化） | 🟡 | 功能可用（curl h2c 正常、`h2_host.t` 与 nginx 一致），但**帧级行为与 nginx 不同**：官方 `h2.t` 0/145、`h2_headers.t` 0/112。基于 `h2` crate，它不按 nginx 的时序发 WINDOW_UPDATE/SETTINGS |
+| `http2 on`（http/server 级，nginx 1.25.1+） | ✅ | 含 http→server 继承 |
+| h2c prior-knowledge（明文 HTTP/2） | ✅ | 探测连接前言，仅在该组配置了 `http2 on` 时启用 |
 | HTTP/2 上的反向代理 | ⬜ | 目前 proxy 需要 socket 写入；h2 请求走 proxy 会返回 502 |
 | HTTP/3 (QUIC) | ⬜ | 未开始 |
 | `limit_req` / `limit_conn` / `access` 访问控制 | ⬜ | |
@@ -209,8 +211,12 @@ http/proxy/upstream/range/fastcgi/scgi/uwsgi/stream/limit 各类用例，
 | 更差 | 2（`proxy_cache_lock` -1、`proxy_cache_max_range_offset` -1） |
 | **落后断言合计** | **2** |
 
-两个剩余差距：`proxy_cache_lock` 的 lock timeout 边界；`proxy_cache_max_range_offset`
-的 `proxy_cache_min_uses` 分支（该指令目前只解析未生效）。
+> **上述数字不完整（已发现并修正）**：`-V` 之前只打印版本号，而 Test::Nginx 用
+> `-V` 文本判断哪些用例能跑——未知特性按**字面子串**匹配。于是 `http_v2`、`ssl`、
+> `stream` 相关套件被静默 skip，在扫描里表现为「双方都跳过」，把真实差距藏了起来。
+> 现在 `-V` 会输出 `configure arguments:`（只列真正实现的模块，缺失的用
+> `--without-` 明确标出）。放开后立刻暴露：`h2.t` **0/145**（nginx 145/145）、
+> `h2_headers.t` **0/112**。这些数字必须计入，不能只报「34/39 一致」。
 
 完全一致的用例（断言数与 nginx 相同）：`http_location` 16/16、`http_uri` 21/21、
 `http_server_name` 22/22、`http_method` 4/6、`http_try_files` 12/12、

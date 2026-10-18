@@ -574,7 +574,15 @@ fn eval_cond(cond: &IfCond, v: &RwVars<'_>) -> bool {
         }
         IfCond::Equals(var, rhs, eq) => {
             let lhs = get_var(var, v);
-            let res = lhs == *rhs || lhs == get_var(rhs, v);
+            // The right-hand side is only a variable when it actually contains
+            // `$`. Treating a bare literal as a variable made it expand to the
+            // empty string, so `if ($args = "novary")` matched an empty `$args`.
+            let rhs_val = if rhs.contains('$') {
+                get_var(rhs, v)
+            } else {
+                rhs.clone()
+            };
+            let res = lhs == rhs_val;
             if *eq {
                 res
             } else {

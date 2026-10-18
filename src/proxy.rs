@@ -580,7 +580,15 @@ pub async fn handle(
     let mut stale_hit = false;
     if let (Some(zone), Some(key)) = (zone, cache_key.as_ref()) {
         if !bypass {
-            if let Some(entry) = crate::cache::load(zone, key) {
+            let hit = crate::cache::load(zone, key).or_else(|| {
+                crate::cache::load_variant(zone, key, |name| {
+                    match name {
+                        "accept-encoding" => req.headers.get_joined("accept-encoding").unwrap_or_default(),
+                        other => req.headers.get_joined(other).unwrap_or_default(),
+                    }
+                })
+            });
+            if let Some(entry) = hit {
                 let fresh = entry.is_fresh(crate::cache::now());
                 // With `proxy_cache_background_update` nginx serves the stale
                 // copy and refreshes it behind the client's back.
@@ -617,9 +625,16 @@ pub async fn handle(
                         hit_status,
                         "",
                     );
-                    raw.extend_from_slice(b"Content-Length: ");
-                    raw.extend_from_slice(entry.body.len().to_string().as_bytes());
-                    raw.extend_from_slice(b"\r\n");
+                    // The stored headers may already carry a Content-Length.
+                    if !entry
+                        .headers
+                        .iter()
+                        .any(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                    {
+                        raw.extend_from_slice(b"Content-Length: ");
+                        raw.extend_from_slice(entry.body.len().to_string().as_bytes());
+                        raw.extend_from_slice(b"\r\n");
+                    }
                     // A range is served out of the cached body.
                     let mut status = entry.status;
                     let mut body = entry.body.clone();
@@ -1368,12 +1383,26 @@ async fn exchange(
             {
                 let entry = crate::cache::Cached {
                     status: head.status,
-                    headers: stored_headers,
+                    headers: stored_headers.clone(),
                     body: payload.clone(),
                     stored_at: crate::cache::now(),
                     valid_for: valid.as_secs(),
                 };
-                let _ = crate::cache::store(zone, key, &entry);
+                let names = if loc.proxy_cache_ignore.vary {
+                    Vec::new()
+                } else {
+                    crate::cache::vary_names(&stored_headers)
+                };
+                if names.is_empty() {
+                    // A response without `Vary` replaces every variant.
+                    crate::cache::clear_variants(zone, key);
+                    let _ = crate::cache::store(zone, key, &entry);
+                } else {
+                    let sig = crate::cache::vary_signature(&names, |n| {
+                        req.headers.get_joined(n).unwrap_or_default()
+                    });
+                    let _ = crate::cache::store_variant(zone, key, &sig, &entry);
+                }
             }
             }
         }

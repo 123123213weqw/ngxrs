@@ -1600,6 +1600,7 @@ impl Builder {
                         "Expires" => cfg.proxy_cache_ignore.expires = true,
                         "X-Accel-Expires" => cfg.proxy_cache_ignore.x_accel_expires = true,
                         "Set-Cookie" => cfg.proxy_cache_ignore.set_cookie = true,
+                        "Vary" => cfg.proxy_cache_ignore.vary = true,
                         _ => {}
                     }
                 }

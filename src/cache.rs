@@ -176,6 +176,9 @@ pub struct Ignore {
     pub expires: bool,
     pub x_accel_expires: bool,
     pub set_cookie: bool,
+    /// `proxy_ignore_headers Vary`: cache one representation regardless of the
+    /// request headers named by the response.
+    pub vary: bool,
 }
 
 /// How long a response may be cached.
@@ -399,3 +402,106 @@ pub fn now() -> i64 {
     now_secs()
 }
 
+
+// ---------------------------------------------------------------------------
+// `Vary` support
+//
+// nginx stores one representation per `Vary` combination and looks a request up
+// by comparing the stored request-header values with the incoming ones. We keep
+// a sidecar index at `<base>|vary` listing `sig` lines, where each line reads
+// `header=value|header=value` using the Vary names of the stored response.
+// ---------------------------------------------------------------------------
+
+/// Build the variant signature for a request given the response's `Vary` names.
+pub fn vary_signature(
+    var_names: &[String],
+    get: impl Fn(&str) -> String,
+) -> String {
+    var_names
+        .iter()
+        .map(|n| format!("{}={}", n.to_ascii_lowercase(), get(n)))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// `Vary` header names of a response, lower-cased, `*` excluded.
+pub fn vary_names(headers: &[(String, String)]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for (k, v) in headers {
+        if !k.eq_ignore_ascii_case("vary") {
+            continue;
+        }
+        for part in v.split(',') {
+            let n = part.trim();
+            if n.is_empty() || n == "*" {
+                continue;
+            }
+            let n = n.to_ascii_lowercase();
+            if !names.contains(&n) {
+                names.push(n);
+            }
+        }
+    }
+    names
+}
+
+fn vary_index_path(zone: &CacheZone, base: &str) -> PathBuf {
+    entry_path(zone, &format!("{base}\u{1}vary"))
+}
+
+fn variant_key(base: &str, sig: &str) -> String {
+    format!("{base}\u{1}{:016x}", key_hash(sig))
+}
+
+/// Store a variant plus its index line. Any previous entry for the same
+/// signature is replaced (nginx keeps at most one entry per variant).
+pub fn store_variant(zone: &CacheZone, base: &str, sig: &str, entry: &Cached) -> io::Result<()> {
+    store(zone, &variant_key(base, sig), entry)?;
+    let path = vary_index_path(zone, base);
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let mut lines: Vec<String> = fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty() && !l.ends_with(&format!("\t{sig}")))
+        .map(|l| l.to_string())
+        .collect();
+    lines.push(sig.to_string());
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, lines.join("\n"))?;
+    fs::rename(&tmp, &path)
+}
+
+/// Drop every stored variant for `base` (a response without `Vary` replaces
+/// all previously cached representations, as in `proxy_cache_vary.t`).
+pub fn clear_variants(zone: &CacheZone, base: &str) {
+    let path = vary_index_path(zone, base);
+    if let Ok(text) = fs::read_to_string(&path) {
+        for sig in text.lines().filter(|l| !l.is_empty()) {
+            let _ = fs::remove_file(entry_path(zone, &variant_key(base, sig)));
+        }
+    }
+    let _ = fs::remove_file(&path);
+}
+
+/// Find the stored variant matching the current request.
+pub fn load_variant(
+    zone: &CacheZone,
+    base: &str,
+    get: impl Fn(&str) -> String,
+) -> Option<Cached> {
+    let text = fs::read_to_string(vary_index_path(zone, base)).ok()?;
+    for sig in text.lines().filter(|l| !l.is_empty()) {
+        let matches = sig.split('|').all(|pair| match pair.split_once('=') {
+            Some((name, want)) => get(name) == want,
+            None => false,
+        });
+        if matches {
+            if let Some(e) = load(zone, &variant_key(base, sig)) {
+                return Some(e);
+            }
+        }
+    }
+    None
+}

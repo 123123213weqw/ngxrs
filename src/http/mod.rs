@@ -2347,7 +2347,7 @@ async fn dispatch(
     guards: &mut Vec<crate::limit::ConnGuard>,
 ) -> io::Result<Outcome> {
     let head_only = req.method == Method::Head;
-    let keepalive_allowed = keepalive_policy(req, loc, state);
+    let mut keepalive_allowed = keepalive_policy(req, loc, state);
     let ka_header = loc.keepalive_timeout.and_then(|(_, h)| h);
 
     // Rewrite/try_files may point at a different location; resolve it before
@@ -2463,6 +2463,12 @@ async fn dispatch(
             });
         }
     }
+
+    // `limit_req` delays run above, so a request can survive into a graceful
+    // shutdown. nginx decides keepalive once the request is finished
+    // (`ngx_http_set_keepalive`), so re-check after the delay; otherwise a
+    // connection about to be closed would not carry `Connection: close`.
+    keepalive_allowed = keepalive_allowed && keepalive_policy(req, loc, state);
 
     // ---- reverse proxy (streams to the socket, cannot be resolved first) ----
     if loc.proxy_pass.is_some() {

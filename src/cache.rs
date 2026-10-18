@@ -21,6 +21,10 @@ pub const CACHE_STATUS_KEY: &str = "X-Cache-Status";
 #[derive(Clone)]
 pub struct Cached {
     pub status: u16,
+    /// nginx's `c->error`: a cached *error* carries no body, only the status
+    /// that produced it. Later requests replay it through `error_page` even if
+    /// the upstream resource has since appeared (nginx ticket #827).
+    pub error: Option<u16>,
     /// Header lines as `Name: value`.
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
@@ -292,12 +296,16 @@ pub fn load(zone: &CacheZone, key: &str) -> Option<Cached> {
 }
 
 fn parse(data: &[u8]) -> Option<Cached> {
-    // Format: "NGXRS-CACHE 1\n" then headers, then "\n", then body.
-    let magic = b"NGXRS-CACHE 1\n";
-    if !data.starts_with(magic) {
+    // v2 layout: magic, status, "stored_at valid_for", error ("-" or a code),
+    // header lines, blank line, body. v1 had no error line and is still
+    // readable so an upgrade does not throw the cache away.
+    let (rest, version) = if let Some(r) = data.strip_prefix(b"NGXRS-CACHE 2\n".as_slice()) {
+        (r, 2u8)
+    } else if let Some(r) = data.strip_prefix(b"NGXRS-CACHE 1\n".as_slice()) {
+        (r, 1u8)
+    } else {
         return None;
-    }
-    let rest = &data[magic.len()..];
+    };
     let sep = memchr::memmem::find(rest, b"\n\n")?;
     let head = &rest[..sep];
     let body = rest[sep + 2..].to_vec();
@@ -310,6 +318,13 @@ fn parse(data: &[u8]) -> Option<Cached> {
     let stored_at: i64 = it.next()?.parse().ok()?;
     let valid_for: u64 = it.next().unwrap_or("0").parse().unwrap_or(0);
 
+    let error = if version >= 2 {
+        let line = lines.next()?;
+        line.parse::<u16>().ok()
+    } else {
+        None
+    };
+
     let mut headers = Vec::new();
     for line in lines {
         if let Some((k, v)) = line.split_once(": ") {
@@ -318,6 +333,7 @@ fn parse(data: &[u8]) -> Option<Cached> {
     }
     Some(Cached {
         status,
+        error,
         headers,
         body,
         stored_at,
@@ -332,12 +348,17 @@ pub fn store(zone: &CacheZone, key: &str, entry: &Cached) -> io::Result<()> {
     }
 
     let mut out = Vec::with_capacity(entry.body.len() + 512);
-    out.extend_from_slice(b"NGXRS-CACHE 1\n");
+    out.extend_from_slice(b"NGXRS-CACHE 2\n");
     out.extend_from_slice(entry.status.to_string().as_bytes());
     out.push(b'\n');
     out.extend_from_slice(
         format!("{} {}", entry.stored_at, entry.valid_for).as_bytes(),
     );
+    out.push(b'\n');
+    match entry.error {
+        Some(code) => out.extend_from_slice(code.to_string().as_bytes()),
+        None => out.push(b'-'),
+    }
     out.push(b'\n');
     for (k, v) in &entry.headers {
         out.extend_from_slice(k.as_bytes());

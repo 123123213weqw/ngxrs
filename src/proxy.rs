@@ -643,6 +643,14 @@ pub async fn handle(
                 if !fresh && !serve_stale {
                     stale_entry = Some(entry.clone());
                 }
+                if (fresh || serve_stale) && entry.error.is_some() {
+                    // A cached error replays through `error_page` instead of
+                    // producing a body (nginx's `c->error`).
+                    return Ok(Some(Proxied::Intercept {
+                        status: entry.error.unwrap_or(entry.status),
+                        headers: Vec::new(),
+                    }));
+                }
                 if fresh || serve_stale {
                     let hit_status = if fresh {
                         "HIT"
@@ -1503,6 +1511,26 @@ async fn exchange(
         } else {
             Vec::new()
         };
+        // Record the error in the cache so later requests replay it, even if
+        // the upstream resource shows up in the meantime (nginx ticket #827).
+        if let (Some(zone), Some(key)) = (cache.zone, cache.key) {
+            // `proxy_cache_bypass` means "do not use the cache at all", so such
+            // a request must not seed an error entry either.
+            if cache.status != "BYPASS" {
+                if let Some(valid) = crate::cache::ttl(loc, head.status, &[], loc.proxy_cache_ignore)
+                {
+                    let entry = crate::cache::Cached {
+                        status: head.status,
+                        error: Some(head.status),
+                        headers: Vec::new(),
+                        body: Vec::new(),
+                        stored_at: crate::cache::now(),
+                        valid_for: valid.as_secs(),
+                    };
+                    let _ = crate::cache::store(zone, key, &entry);
+                }
+            }
+        }
         return Ok(Proxied::Intercept {
             status: head.status,
             headers: preserved,
@@ -1645,6 +1673,7 @@ async fn exchange(
                     body: payload.clone(),
                     stored_at: crate::cache::now(),
                     valid_for: valid.as_secs(),
+                    error: None,
                 };
                 let names = if loc.proxy_cache_ignore.vary {
                     Vec::new()
@@ -2334,6 +2363,7 @@ pub fn spawn_background_update(
                 body,
                 stored_at: crate::cache::now(),
                 valid_for: valid.as_secs(),
+                error: None,
             };
             let _ = crate::cache::store(&zone, &key, &entry);
         }

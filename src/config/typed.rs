@@ -979,6 +979,10 @@ pub struct StreamServerCfg {
     pub proxy_connect_timeout: Duration,
     /// `error_log` directives of this stream server.
     pub error_logs: Vec<LogSpec>,
+    /// `listen ... ssl`: terminate TLS before proxying.
+    pub ssl: bool,
+    pub ssl_certificate: Option<PathBuf>,
+    pub ssl_certificate_key: Option<PathBuf>,
 }
 
 impl Http {
@@ -2681,6 +2685,9 @@ impl Builder {
 fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, ConfigError> {
     let mut section = StreamSection::default();
     let mut server_dirs: Vec<&Directive> = Vec::new();
+    // Certificates at `stream {}` level are inherited by every server.
+    let mut stream_cert: Option<PathBuf> = None;
+    let mut stream_key: Option<PathBuf> = None;
 
     for d in dirs {
         match d.name.as_str() {
@@ -2716,10 +2723,20 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             "log_format" | "access_log" | "error_log" | "resolver" | "map" | "geo"
             | "split_clients" | "limit_conn_zone" | "limit_req_zone" | "variables_hash_max_size"
             | "variables_hash_bucket_size" | "proxy_protocol" | "preread_buffer_size"
-            | "preread_timeout" | "ssl_certificate" | "ssl_certificate_key" | "ssl_protocols"
+            | "preread_timeout" | "ssl_password_file" | "ssl_protocols"
             | "ssl_ciphers" | "ssl_session_cache" | "ssl_session_timeout" | "ssl_dhparam"
             | "ssl_prefer_server_ciphers" | "ssl_handshake_timeout" | "ssl_ecdh_curve" => {}
             "error_log" => {}
+            "ssl_certificate" => {
+                if let Some(p) = d.args.first() {
+                    stream_cert = Some(b.prefix.join(p));
+                }
+            }
+            "ssl_certificate_key" => {
+                if let Some(p) = d.args.first() {
+                    stream_key = Some(b.prefix.join(p));
+                }
+            }
             other => b.warn(d, format!("unknown directive \"{other}\" in stream context; ignored")),
         }
     }
@@ -2730,6 +2747,9 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             udp: false,
             proxy_pass: None,
             error_logs: Vec::new(),
+            ssl: false,
+            ssl_certificate: None,
+            ssl_certificate_key: None,
             proxy_timeout: Duration::from_secs(600),
             proxy_connect_timeout: Duration::from_secs(60),
         };
@@ -2746,6 +2766,9 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                     })?;
                     if child.args[1..].iter().any(|p| p == "udp") {
                         cfg.udp = true;
+                    }
+                    if child.args[1..].iter().any(|p| p == "ssl") {
+                        cfg.ssl = true;
                     }
                     have_listen = true;
                 }
@@ -2773,8 +2796,18 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                         cfg.error_logs.push(spec);
                     }
                 }
+                "ssl_certificate" => {
+                    if let Some(p) = child.args.first() {
+                        cfg.ssl_certificate = Some(b.prefix.join(p));
+                    }
+                }
+                "ssl_certificate_key" => {
+                    if let Some(p) = child.args.first() {
+                        cfg.ssl_certificate_key = Some(b.prefix.join(p));
+                    }
+                }
                 "proxy_protocol" | "proxy_buffer_size" | "proxy_responses" | "preread_buffer_size"
-                | "preread_timeout" | "ssl_certificate" | "ssl_certificate_key" | "set"
+                | "preread_timeout" | "ssl_password_file" | "set"
                 | "if" | "proxy_ssl_server_name" | "proxy_ssl_verify" | "proxy_requests" => {}
                 other => {
                     return Err(sem(
@@ -2787,6 +2820,12 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
         }
         if !have_listen {
             return Err(sem(&sd.file, sd.line, "stream server has no listen"));
+        }
+        if cfg.ssl_certificate.is_none() {
+            cfg.ssl_certificate = stream_cert.clone();
+        }
+        if cfg.ssl_certificate_key.is_none() {
+            cfg.ssl_certificate_key = stream_key.clone();
         }
         section.servers.push(cfg);
     }

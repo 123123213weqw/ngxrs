@@ -260,6 +260,7 @@ pub fn serve(cfg: Config) -> io::Result<()> {
             proxy_timeout: sc.proxy_timeout,
             proxy_connect_timeout: sc.proxy_connect_timeout,
             sinks: crate::config::typed::open_sinks(&sc.error_logs),
+            tls: stream_tls(&sc),
         });
     }
     let stream_cfg = Arc::new(stream_cfg);
@@ -380,6 +381,30 @@ pub fn serve(cfg: Config) -> io::Result<()> {
         let _ = t.join();
     }
     Ok(())
+}
+
+/// Build the TLS terminator for a `stream` server that has `listen ... ssl`.
+fn stream_tls(sc: &crate::config::typed::StreamServerCfg) -> Option<Arc<rustls::ServerConfig>> {
+    if !sc.ssl {
+        return None;
+    }
+    let (cert, key) = match (&sc.ssl_certificate, &sc.ssl_certificate_key) {
+        (Some(c), Some(k)) => (c, k),
+        _ => {
+            eprintln!("ngxrs: [error] stream {} ssl without certificate", sc.listen);
+            return None;
+        }
+    };
+    match crate::tls::build_mail_config(cert, key) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!(
+                "ngxrs: [error] stream TLS for {}: {e}",
+                sc.listen
+            );
+            None
+        }
+    }
 }
 
 /// `host:port` or `port` in stream context (no scheme).

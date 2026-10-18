@@ -26,6 +26,8 @@ pub struct StreamServer {
     pub proxy_connect_timeout: Duration,
     /// `error_log` destinations of this stream server.
     pub sinks: Vec<std::sync::Arc<crate::log::Sink>>,
+    /// Termination config when `listen ... ssl` is set.
+    pub tls: Option<std::sync::Arc<rustls::ServerConfig>>,
 }
 
 pub struct StreamConfig {
@@ -128,6 +130,7 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                 }
                 let backends = server.backends.clone();
                 let timeout = server.proxy_timeout;
+                let tls = server.tls.clone();
                 let connect_timeout = server.proxy_connect_timeout;
                 let counter = counter.clone();
                 tokio::spawn(async move {
@@ -144,7 +147,17 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                         _ => return,
                     };
                     let _ = upstream.set_nodelay(true);
-                    proxy_tcp(client, upstream, timeout, peer).await;
+                    // `listen ... ssl` terminates TLS here, before the splice.
+                    match tls {
+                        Some(cfg) => {
+                            let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+                            match acceptor.accept(client).await {
+                                Ok(t) => proxy_io(t, upstream, timeout, peer).await,
+                                Err(_) => {}
+                            }
+                        }
+                        None => proxy_tcp(client, upstream, timeout, peer).await,
+                    }
                 });
             }
         }
@@ -157,6 +170,16 @@ fn pick_backend(backends: &[SocketAddr], counter: &std::sync::atomic::AtomicUsiz
     }
     let i = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % backends.len();
     Some(backends[i])
+}
+
+/// Splice a TLS-terminated client to a plaintext upstream.
+async fn proxy_io<C>(mut client: C, mut upstream: TcpStream, _idle: Duration, _peer: SocketAddr)
+where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+    let _ = client.shutdown().await;
+    let _ = upstream.shutdown().await;
 }
 
 async fn proxy_tcp(mut client: TcpStream, mut upstream: TcpStream, _idle: Duration, _peer: SocketAddr) {

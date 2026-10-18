@@ -93,7 +93,7 @@ fn real_main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                     println!("TLS SNI support enabled");
                     println!(
                         "configure arguments: --with-http_ssl_module \
-                         --with-http_v2_module --with-stream \
+                         --with-http_v2_module --with-stream --with-stream_ssl_module \
                          --with-http_grpc_module --without-http_ssi_module \
                          --without-http_auth_request_module --without-http_sub_module \
                          --without-http_dav_module --without-http_slice_module \

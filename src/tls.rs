@@ -105,8 +105,13 @@ fn decrypt_pkcs8(pem: &[u8], passwords: &[String]) -> io::Result<Option<Vec<u8>>
         .unwrap_or_default();
     let der = crate::util::base64_decode(&body)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad base64 in encrypted key"))?;
-    let info = <pkcs8::EncryptedPrivateKeyInfo as pkcs8::der::Decode>::from_der(&der)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad encrypted key: {e}")))?;
+    let info =
+        <pkcs8::EncryptedPrivateKeyInfo as pkcs8::der::Decode>::from_der(&der).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("bad encrypted key: {e}"),
+            )
+        })?;
     let mut last = String::from("no password matched");
     for pw in passwords {
         // `pkcs8` handles PBES2 (PBKDF2 + AES-CBC or 3DES) and yields plain
@@ -140,7 +145,10 @@ fn load_raw_identity(
     let key_pem = std::fs::read(key_path).map_err(|e| {
         io::Error::new(
             e.kind(),
-            format!("cannot read ssl_certificate_key {}: {e}", key_path.display()),
+            format!(
+                "cannot read ssl_certificate_key {}: {e}",
+                key_path.display()
+            ),
         )
     })?;
 
@@ -282,11 +290,13 @@ pub fn build_config(http: &Http, server_idxs: &[usize]) -> io::Result<Arc<Server
                             // contents makes OpenSSL fail with
                             // `asn1_check_tlen:wrong tag` while parsing CA names
                             // and abort the handshake.
-                            let name =
-                                rustls::DistinguishedName::from(der_sequence(anchor.subject.as_ref()));
-                            if !hints.iter().any(|h: &rustls::DistinguishedName| {
-                                h.as_ref() == name.as_ref()
-                            }) {
+                            let name = rustls::DistinguishedName::from(der_sequence(
+                                anchor.subject.as_ref(),
+                            ));
+                            if !hints
+                                .iter()
+                                .any(|h: &rustls::DistinguishedName| h.as_ref() == name.as_ref())
+                            {
                                 hints.push(name);
                             }
                         }
@@ -315,10 +325,7 @@ pub fn build_config(http: &Http, server_idxs: &[usize]) -> io::Result<Arc<Server
 ///
 /// No SNI: a mail `server {}` has no `server_name`, so nginx presents the one
 /// certificate from its `mail` block for every connection.
-pub fn build_mail_config(
-    cert: &Path,
-    key: &Path,
-) -> io::Result<Arc<ServerConfig>> {
+pub fn build_mail_config(cert: &Path, key: &Path) -> io::Result<Arc<ServerConfig>> {
     build_mail_config_with(cert, key, &[])
 }
 
@@ -396,8 +403,7 @@ impl rustls::server::danger::ClientCertVerifier for PermissiveClientVerifier {
         );
         match r {
             Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::BadEncoding
-                | rustls::CertificateError::Other(_),
+                rustls::CertificateError::BadEncoding | rustls::CertificateError::Other(_),
             )) => Ok(rustls::client::danger::HandshakeSignatureValid::assertion()),
             other => other,
         }
@@ -423,8 +429,7 @@ impl rustls::server::danger::ClientCertVerifier for PermissiveClientVerifier {
         // reported as verified that was not.
         match r {
             Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::BadEncoding
-                | rustls::CertificateError::Other(_),
+                rustls::CertificateError::BadEncoding | rustls::CertificateError::Other(_),
             )) => Ok(rustls::client::danger::HandshakeSignatureValid::assertion()),
             other => other,
         }
@@ -451,13 +456,16 @@ pub fn der_to_pem(der: &[u8]) -> String {
 }
 
 mod base64_encode {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     pub fn encode(input: &[u8]) -> String {
         let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
         for chunk in input.chunks(3) {
-            let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
             let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
             out.push(ALPHABET[(n >> 18) as usize & 63] as char);
             out.push(ALPHABET[(n >> 12) as usize & 63] as char);
@@ -535,8 +543,8 @@ pub fn verify_client_chain(
     }
 
     let der: CertificateDer<'static> = chain[0].clone();
-    let ee = webpki::EndEntityCert::try_from(&der)
-        .map_err(|e| format!("invalid certificate: {e}"))?;
+    let ee =
+        webpki::EndEntityCert::try_from(&der).map_err(|e| format!("invalid certificate: {e}"))?;
     let intermediates: Vec<CertificateDer<'static>> = chain[1..].to_vec();
     let now = UnixTime::now();
     ee.verify_for_usage(
@@ -570,10 +578,19 @@ mod tests {
         let wildcard = HashMap::from([("example.com".to_string(), 2u8)]);
         let default = Some(3u8);
 
-        assert_eq!(select(&exact, &wildcard, &default, Some("A.Example.COM")), Some(&1));
-        assert_eq!(select(&exact, &wildcard, &default, Some("b.example.com")), Some(&2));
+        assert_eq!(
+            select(&exact, &wildcard, &default, Some("A.Example.COM")),
+            Some(&1)
+        );
+        assert_eq!(
+            select(&exact, &wildcard, &default, Some("b.example.com")),
+            Some(&2)
+        );
         // a wildcard covers exactly one label
-        assert_eq!(select(&exact, &wildcard, &default, Some("x.b.example.com")), Some(&3));
+        assert_eq!(
+            select(&exact, &wildcard, &default, Some("x.b.example.com")),
+            Some(&3)
+        );
         assert_eq!(select(&exact, &wildcard, &default, None), Some(&3));
     }
 

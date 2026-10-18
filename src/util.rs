@@ -500,7 +500,10 @@ mod tests {
 
     #[test]
     fn targets() {
-        assert_eq!(parse_target("/a%20b?x=1").unwrap(), ("/a b".to_string(), "x=1".to_string()));
+        assert_eq!(
+            parse_target("/a%20b?x=1").unwrap(),
+            ("/a b".to_string(), "x=1".to_string())
+        );
         assert_eq!(
             parse_target("http://example.com/x").unwrap(),
             ("/x".to_string(), "".to_string())
@@ -592,7 +595,15 @@ mod base64_tests {
 
     #[test]
     fn round_trips() {
-        for s in ["", "f", "fo", "foo", "secret", "test@example.com", "\0user\0pass"] {
+        for s in [
+            "",
+            "f",
+            "fo",
+            "foo",
+            "secret",
+            "test@example.com",
+            "\0user\0pass",
+        ] {
             let e = base64_encode(s.as_bytes());
             assert_eq!(base64_decode(&e).unwrap(), s.as_bytes(), "{s}");
         }
@@ -604,4 +615,70 @@ mod base64_tests {
         assert_eq!(base64_encode(b"Username:"), "VXNlcm5hbWU6");
         assert_eq!(base64_encode(b"Password:"), "UGFzc3dvcmQ6");
     }
+}
+
+/// Append a decimal integer without going through `to_string`.
+#[inline]
+pub fn push_u64(out: &mut Vec<u8>, mut v: u64) {
+    if v == 0 {
+        out.push(b'0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    out.extend_from_slice(&buf[i..]);
+}
+
+/// Append a lowercase hex integer without going through `format!`.
+#[inline]
+pub fn push_hex_u64(out: &mut Vec<u8>, mut v: u64) {
+    if v == 0 {
+        out.push(b'0');
+        return;
+    }
+    let mut buf = [0u8; 16];
+    let mut i = buf.len();
+    while v > 0 {
+        let d = (v & 0xf) as u8;
+        i -= 1;
+        buf[i] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+        v >>= 4;
+    }
+    out.extend_from_slice(&buf[i..]);
+}
+
+/// Write lowercase hex into `buf`, returning the byte count.
+#[inline]
+pub fn write_hex_u64(buf: &mut [u8], mut v: u64) -> usize {
+    if v == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut tmp = [0u8; 16];
+    let mut i = tmp.len();
+    while v > 0 {
+        let d = (v & 0xf) as u8;
+        i -= 1;
+        tmp[i] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+        v >>= 4;
+    }
+    let n = tmp.len() - i;
+    buf[..n].copy_from_slice(&tmp[i..]);
+    n
+}
+
+/// Owned hex rendering of one integer into caller-provided storage, so callers
+/// can compare it as a `&str` without allocating.
+#[inline]
+pub fn hex_u64_into(buf: &mut [u8; 16], v: u64) -> &str {
+    let mut tmp = Vec::new();
+    push_hex_u64(&mut tmp, v);
+    let n = tmp.len().min(buf.len());
+    buf[..n].copy_from_slice(&tmp[..n]);
+    std::str::from_utf8(&buf[..n]).unwrap_or("0")
 }

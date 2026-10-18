@@ -295,7 +295,10 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
     }
 }
 
-fn pick_backend(backends: &[SocketAddr], counter: &std::sync::atomic::AtomicUsize) -> Option<SocketAddr> {
+fn pick_backend(
+    backends: &[SocketAddr],
+    counter: &std::sync::atomic::AtomicUsize,
+) -> Option<SocketAddr> {
     if backends.is_empty() {
         return None;
     }
@@ -361,7 +364,12 @@ fn expand(text: &str, reused: bool) -> String {
     text.replace("$ssl_session_reused", if reused { "r" } else { "." })
 }
 
-async fn proxy_tcp(mut client: TcpStream, mut upstream: TcpStream, _idle: Duration, _peer: SocketAddr) {
+async fn proxy_tcp(
+    mut client: TcpStream,
+    mut upstream: TcpStream,
+    _idle: Duration,
+    _peer: SocketAddr,
+) {
     // `copy_bidirectional` already returns when either side closes; enforcing
     // proxy_timeout with an outer timeout would also cut long-lived transfers.
     let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
@@ -373,7 +381,10 @@ async fn serve_udp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
     let sock = match bind_udp(server.listen) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("ngxrs: [error] stream cannot bind {} (udp): {e}", server.listen);
+            eprintln!(
+                "ngxrs: [error] stream cannot bind {} (udp): {e}",
+                server.listen
+            );
             return;
         }
     };

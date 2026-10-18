@@ -139,7 +139,11 @@ fn compile_regex(key: &str) -> Option<regex::Regex> {
     } else {
         return None;
     };
-    let pat = if ci { format!("(?i){pat}") } else { pat.to_string() };
+    let pat = if ci {
+        format!("(?i){pat}")
+    } else {
+        pat.to_string()
+    };
     regex::Regex::new(&pat).ok()
 }
 

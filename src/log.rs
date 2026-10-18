@@ -119,7 +119,12 @@ impl Sink {
         })
     }
 
-    pub fn syslog(addr: std::net::SocketAddr, facility: u8, tag: String, level: Level) -> std::io::Result<Arc<Sink>> {
+    pub fn syslog(
+        addr: std::net::SocketAddr,
+        facility: u8,
+        tag: String,
+        level: Level,
+    ) -> std::io::Result<Arc<Sink>> {
         // Bind an ephemeral local port; the connect() makes send() cheap.
         let bind: std::net::SocketAddr = if addr.is_ipv4() {
             "0.0.0.0:0".parse().unwrap()
@@ -169,8 +174,7 @@ impl Sink {
                 // which is why the syslog body carries the same `[level]`
                 // token as the file destinations.
                 let host = crate::config::typed::hostname().to_ascii_lowercase();
-                let packet =
-                    format!("<{pri}>{mon} {mday} {hms} {host} {tag}: {line}");
+                let packet = format!("<{pri}>{mon} {mday} {hms} {host} {tag}: {line}");
                 if let Ok(s) = socket.lock() {
                     let _ = s.send(packet.as_bytes());
                 }
@@ -209,8 +213,7 @@ fn now_parts() -> (String, String, String, String) {
     (stamp, mon.to_string(), mday, hms)
 }
 
-static GLOBAL: std::sync::OnceLock<std::sync::Mutex<Vec<Arc<Sink>>>> =
-    std::sync::OnceLock::new();
+static GLOBAL: std::sync::OnceLock<std::sync::Mutex<Vec<Arc<Sink>>>> = std::sync::OnceLock::new();
 
 fn global() -> &'static std::sync::Mutex<Vec<Arc<Sink>>> {
     GLOBAL.get_or_init(|| std::sync::Mutex::new(Vec::new()))

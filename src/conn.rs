@@ -39,7 +39,6 @@ impl Stream {
         }
     }
 
-
     pub fn is_tls(&self) -> bool {
         matches!(self, Stream::Tls(_))
     }
@@ -274,7 +273,11 @@ impl Conn {
     }
 
     /// Read one parsed request head. Returns `None` on a clean EOF.
-    pub async fn read_request(&mut self, max_line: usize, max_total: usize) -> Result<Option<Request>, RecvError> {
+    pub async fn read_request(
+        &mut self,
+        max_line: usize,
+        max_total: usize,
+    ) -> Result<Option<Request>, RecvError> {
         loop {
             if let Some(pos) = find_header_end(self.buffered()) {
                 let head = &self.buffered()[..pos];
@@ -317,7 +320,10 @@ impl Conn {
             let want = remaining.min(tmp.len() as u64) as usize;
             let n = self.stream.read(&mut tmp[..want]).await?;
             if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "body truncated"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "body truncated",
+                ));
             }
             remaining -= n as u64;
         }
@@ -347,7 +353,10 @@ impl Conn {
             let need = size + 2;
             while (self.buffered().len() as u64) < need {
                 if self.fill().await? == 0 {
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "chunk truncated"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "chunk truncated",
+                    ));
                 }
             }
             self.consume(need as usize);
@@ -396,7 +405,10 @@ impl Conn {
             };
             out.truncate(before + n);
             if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "body truncated"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "body truncated",
+                ));
             }
             if n > remaining {
                 // over-read: keep the surplus for the next request
@@ -490,7 +502,12 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 }
 
 #[cfg(target_os = "linux")]
-async fn send_file_impl(stream: &mut TcpStream, file: &File, offset: u64, len: u64) -> io::Result<u64> {
+async fn send_file_impl(
+    stream: &mut TcpStream,
+    file: &File,
+    offset: u64,
+    len: u64,
+) -> io::Result<u64> {
     use std::os::fd::AsRawFd;
     let sock = stream.as_raw_fd();
     let fd = file.as_raw_fd();
@@ -538,7 +555,12 @@ async fn send_file_impl(stream: &mut TcpStream, file: &File, offset: u64, len: u
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn send_file_impl(stream: &mut TcpStream, file: &File, offset: u64, len: u64) -> io::Result<u64> {
+async fn send_file_impl(
+    stream: &mut TcpStream,
+    file: &File,
+    offset: u64,
+    len: u64,
+) -> io::Result<u64> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = file.try_clone()?;
     f.seek(SeekFrom::Start(offset))?;

@@ -6,10 +6,9 @@ pub mod typed;
 
 pub use parser::{ConfigError, Directive};
 pub use typed::{
-    AccessLog, CacheZone, Config, FastcgiParam, FastcgiPass, Http, IfBlock, IfCond, LbMethod,
-    access_denied, parse_time, AccessRule, KeepaliveDisable, ListenGroup, LocCfg, ScgiPass, UwsgiPass,
-    Match, ProxyPass, ProxyTarget, Rewrite, RewriteFlag, Server, Step,
-    Upstream, UpstreamServer,
+    access_denied, parse_time, AccessLog, AccessRule, CacheZone, Config, FastcgiParam, FastcgiPass,
+    Http, IfBlock, IfCond, KeepaliveDisable, LbMethod, ListenGroup, LocCfg, Match, ProxyPass,
+    ProxyTarget, Rewrite, RewriteFlag, ScgiPass, Server, Step, Upstream, UpstreamServer, UwsgiPass,
 };
 
 use std::path::{Path, PathBuf};
@@ -32,7 +31,6 @@ pub fn load_full(conf: &Path, prefix: Option<&Path>) -> Result<Config, ConfigErr
     let tree = parser::expand_includes(tree, &prefix, 0)?;
     typed::build(tree, &prefix, conf_path)
 }
-
 
 /// Load with `-g` global directives prepended and `-e` overriding error_log.
 pub fn load_global(
@@ -133,7 +131,10 @@ pub fn dump(cfg: &Config) -> String {
         if let Some(c) = &srv.ssl_certificate {
             out.push_str(&format!("        ssl_certificate {};\n", c.display()));
         }
-        out.push_str(&format!("        root {};\n", srv.default_loc.root.display()));
+        out.push_str(&format!(
+            "        root {};\n",
+            srv.default_loc.root.display()
+        ));
         for loc in &srv.locations {
             out.push_str(&format!("        location {} {{\n", loc.pattern()));
             out.push_str("        }\n");

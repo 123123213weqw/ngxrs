@@ -125,7 +125,11 @@ pub fn split_host_port(s: &str, ssl: bool) -> Option<(String, u16)> {
         let host = &rest[..close];
         let after = &rest[close + 1..];
         let port = if after.is_empty() {
-            if ssl { 443 } else { 80 }
+            if ssl {
+                443
+            } else {
+                80
+            }
         } else {
             after.strip_prefix(':')?.parse().ok()?
         };
@@ -225,7 +229,12 @@ pub async fn fetch(
         // HTTP/2 forbids these; the transport supplies them.
         if matches!(
             n.as_str(),
-            "host" | "connection" | "transfer-encoding" | "keep-alive" | "upgrade" | "proxy-connection"
+            "host"
+                | "connection"
+                | "transfer-encoding"
+                | "keep-alive"
+                | "upgrade"
+                | "proxy-connection"
         ) {
             continue;
         }
@@ -268,7 +277,8 @@ pub async fn fetch(
             continue;
         }
         if let Ok(v) = value.to_str() {
-            resp.headers.push((name.as_str().to_string(), v.to_string()));
+            resp.headers
+                .push((name.as_str().to_string(), v.to_string()));
         }
     }
     resp.body = crate::http::Body::Bytes(body);
@@ -328,7 +338,10 @@ mod tests {
         assert_eq!(split_host_port("h", false).unwrap(), ("h".into(), 80));
         assert_eq!(split_host_port("h", true).unwrap(), ("h".into(), 443));
         assert_eq!(split_host_port("h:9", false).unwrap(), ("h".into(), 9));
-        assert_eq!(split_host_port("[::1]:7", false).unwrap(), ("::1".into(), 7));
+        assert_eq!(
+            split_host_port("[::1]:7", false).unwrap(),
+            ("::1".into(), 7)
+        );
         assert_eq!(split_host_port("[::1]", true).unwrap(), ("::1".into(), 443));
     }
 }

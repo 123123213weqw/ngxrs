@@ -18,8 +18,13 @@ use crate::http::request::{Headers, Method, Request};
 use crate::instr::InStr;
 
 /// Serve one HTTP/2 connection (ALPN already negotiated `h2`).
-pub async fn serve<S>(socket: S, server_idxs: &[usize], default_server: usize, http: &Http, tokens: bool)
-where
+pub async fn serve<S>(
+    socket: S,
+    server_idxs: &[usize],
+    default_server: usize,
+    http: &Http,
+    tokens: bool,
+) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     // nginx's SETTINGS frame, byte for byte (`ngx_http_v2_send_settings`):
@@ -141,7 +146,8 @@ where
                 }
             }
             if too_large || block > server.header_block_limit {
-                let mut b = H2Response::builder().status(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
+                let mut b =
+                    H2Response::builder().status(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
                 if let Some(h) = b.headers_mut() {
                     if let Ok(v) = http::header::HeaderValue::from_str(if tokens {
                         "nginx/1.28.0"
@@ -166,17 +172,9 @@ where
         let h1 = synthesize_request(&request, authority.as_deref(), &path, &query);
         let head_only = h1.method == Method::Head;
 
-        let resp = crate::http::resolve_response(
-            &h1,
-            &path,
-            &query,
-            server,
-            loc,
-            http,
-            "127.0.0.1",
-            443,
-        )
-        .await;
+        let resp =
+            crate::http::resolve_response(&h1, &path, &query, server, loc, http, "127.0.0.1", 443)
+                .await;
 
         let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let mut builder = H2Response::builder().status(status);
@@ -287,8 +285,7 @@ fn synthesize_request(
         keepalive: true,
         // nginx's `$host` is normalized: lowercase, port and stray colon
         // dropped, trailing dots removed — same as the HTTP/1 parser.
-        host: authority
-            .map(|a| InStr::new(&crate::http::request::normalize_host(a))),
+        host: authority.map(|a| InStr::new(&crate::http::request::normalize_host(a))),
         expect_continue: false,
         tls: None,
     }

@@ -1,26 +1,33 @@
+#[cfg(feature = "alloc-count")]
+mod alloccnt;
+
+#[cfg(feature = "alloc-count")]
+#[global_allocator]
+static GLOBAL: alloccnt::Counting = alloccnt::Counting;
+
 mod cache;
 mod config;
 mod conn;
-mod http;
-mod limit;
 mod cookie;
-mod geo;
-mod log;
-mod mail;
-mod mapping;
 mod fastcgi;
+mod geo;
+mod grpc;
 mod gzip;
 mod h2server;
 mod h3server;
+mod http;
 mod instr;
+mod limit;
+mod log;
+mod mail;
+mod mapping;
 mod net;
-mod tls;
-mod grpc;
 mod proxy;
 mod resolver;
 mod stream;
-mod uwsgi_scgi;
+mod tls;
 mod util;
+mod uwsgi_scgi;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -154,7 +161,11 @@ fn real_main() -> Result<ExitCode, Box<dyn std::error::Error>> {
 }
 
 /// `-s stop|quit|reload`: nginx reads the pid file and signals that process.
-fn send_signal(conf: &std::path::Path, prefix: Option<&std::path::Path>, sig: &str) -> Result<ExitCode, Box<dyn std::error::Error>> {
+fn send_signal(
+    conf: &std::path::Path,
+    prefix: Option<&std::path::Path>,
+    sig: &str,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let cfg = config::load_light(conf, prefix)?;
     let pid_path = cfg
         .pid

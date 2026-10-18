@@ -13,10 +13,10 @@ use h3_quinn::Connection as QuicConnection;
 use http::{Method as H3Method, StatusCode};
 
 use crate::config::typed::{Config, Http, Server};
-use crate::http::Ctx;
 use crate::http::request::{normalize_host, Headers, Method, Request};
-use crate::instr::InStr;
 use crate::http::Body;
+use crate::http::Ctx;
+use crate::instr::InStr;
 
 type H3Request = http::Request<()>;
 type H3Response = http::Response<()>;
@@ -73,8 +73,15 @@ async fn handle_conn(
     // serialises the other streams on that connection (see COMPAT.md).
     while let Some(resolver) = h3.accept().await? {
         let (req, mut stream) = resolver.resolve_request().await?;
-        let _ = answer(req, &mut stream, &cfg.http, &server_idxs, default_server, server_port)
-            .await;
+        let _ = answer(
+            req,
+            &mut stream,
+            &cfg.http,
+            &server_idxs,
+            default_server,
+            server_port,
+        )
+        .await;
     }
     Ok(())
 }
@@ -150,7 +157,9 @@ async fn answer(
     let body = crate::http::body_bytes(resp.body).await.unwrap_or_default();
     let len = body.len();
     if let Some(headers) = builder.headers_mut() {
-        if !headers.contains_key(http::header::CONTENT_LENGTH) && resp.status != 204 && resp.status != 304
+        if !headers.contains_key(http::header::CONTENT_LENGTH)
+            && resp.status != 204
+            && resp.status != 304
         {
             if let Ok(v) = http::header::HeaderValue::from_str(&len.to_string()) {
                 headers.insert(http::header::CONTENT_LENGTH, v);

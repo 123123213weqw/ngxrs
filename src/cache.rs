@@ -194,7 +194,12 @@ pub struct Ignore {
 ///
 /// Returns `None` when the response must not be cached. A `Some(Duration::ZERO)`
 /// means "cache it, but it is already stale" (`@1` style `X-Accel-Expires`).
-pub fn ttl(loc: &LocCfg, status: u16, headers: &[(String, String)], ignore: Ignore) -> Option<Duration> {
+pub fn ttl(
+    loc: &LocCfg,
+    status: u16,
+    headers: &[(String, String)],
+    ignore: Ignore,
+) -> Option<Duration> {
     // All occurrences of one header, trimmed, in order.
     let all = |name: &str| -> Vec<String> {
         headers
@@ -351,9 +356,7 @@ pub fn store(zone: &CacheZone, key: &str, entry: &Cached) -> io::Result<()> {
     out.extend_from_slice(b"NGXRS-CACHE 2\n");
     out.extend_from_slice(entry.status.to_string().as_bytes());
     out.push(b'\n');
-    out.extend_from_slice(
-        format!("{} {}", entry.stored_at, entry.valid_for).as_bytes(),
-    );
+    out.extend_from_slice(format!("{} {}", entry.stored_at, entry.valid_for).as_bytes());
     out.push(b'\n');
     match entry.error {
         Some(code) => out.extend_from_slice(code.to_string().as_bytes()),
@@ -424,7 +427,6 @@ pub fn now() -> i64 {
     now_secs()
 }
 
-
 // ---------------------------------------------------------------------------
 // `Vary` support
 //
@@ -435,10 +437,7 @@ pub fn now() -> i64 {
 // ---------------------------------------------------------------------------
 
 /// Build the variant signature for a request given the response's `Vary` names.
-pub fn vary_signature(
-    var_names: &[String],
-    get: impl Fn(&str) -> String,
-) -> String {
+pub fn vary_signature(var_names: &[String], get: impl Fn(&str) -> String) -> String {
     var_names
         .iter()
         .map(|n| format!("{}={}", n.to_ascii_lowercase(), get(n)))
@@ -508,11 +507,7 @@ pub fn clear_variants(zone: &CacheZone, base: &str) {
 }
 
 /// Find the stored variant matching the current request.
-pub fn load_variant(
-    zone: &CacheZone,
-    base: &str,
-    get: impl Fn(&str) -> String,
-) -> Option<Cached> {
+pub fn load_variant(zone: &CacheZone, base: &str, get: impl Fn(&str) -> String) -> Option<Cached> {
     let text = fs::read_to_string(vary_index_path(zone, base)).ok()?;
     for sig in text.lines().filter(|l| !l.is_empty()) {
         let matches = sig.split('|').all(|pair| match pair.split_once('=') {

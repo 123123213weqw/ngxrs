@@ -29,6 +29,11 @@ h2 = "0.4"
 http = "1"
 bytes = "1"
 
+[features]
+# Counts global allocations. Measurement only: it perturbs the hot path, so it
+# must never be enabled in a benchmark build.
+alloc-count = []
+
 [profile.release]
 opt-level = 3
 lto = "thin"

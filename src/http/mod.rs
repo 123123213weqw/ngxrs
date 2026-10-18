@@ -8,7 +8,6 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-
 use crate::config::{Config, Http, IfCond, ListenGroup, LocCfg, RewriteFlag, Server};
 use crate::conn::{Conn, RecvError, MAX_HEADER_BYTES, MAX_REQUEST_LINE};
 use crate::log::Logger;
@@ -139,8 +138,7 @@ pub static ACTIVE_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 
 /// Set once a graceful shutdown begins: responses served after that carry
 /// `Connection: close` so clients know the connection is going away.
-pub static SHUTTING_DOWN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// RAII guard so the counter stays balanced even on early return.
 pub struct ActiveGuard;
@@ -189,8 +187,17 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
     // One timer per connection, reset after each request: registering a fresh
     // timer per request costs more than the request itself at 400k rps.
     let mut idle = Box::pin(tokio::time::sleep(keepalive_timeout));
+    // Peer and local addresses never change over a connection; rendering them
+    // per request cost two allocations each time.
+    let client_ip_owned = conn.peer.ip().to_string();
+    let local_ip_owned = conn
+        .local_addr()
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
 
     loop {
+        #[cfg(feature = "alloc-count")]
+        let mark0 = crate::alloccnt::mark(0);
         let read_timeout = if served == 0 {
             Duration::from_secs(60)
         } else {
@@ -198,9 +205,7 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
         };
         // NGXRS_NO_IDLE_TIMER=1 disables the keepalive timeout (measurement only).
         let read = if NO_IDLE_TIMER.with(|v| *v) {
-            Ok(conn
-                .read_request(MAX_REQUEST_LINE, MAX_HEADER_BYTES)
-                .await)
+            Ok(conn.read_request(MAX_REQUEST_LINE, MAX_HEADER_BYTES).await)
         } else {
             idle.as_mut()
                 .reset(tokio::time::Instant::now() + read_timeout);
@@ -255,14 +260,20 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
                         requests: 0,
                         started: std::time::Instant::now(),
                     },
-                    &conn.local_addr().map(|a| a.ip().to_string()).unwrap_or_default(),
+                    &conn
+                        .local_addr()
+                        .map(|a| a.ip().to_string())
+                        .unwrap_or_default(),
                 )
                 .await;
                 // A redirect produced by the error page still needs the
                 // absolute/port/server_name rewriting.
                 if matches!(resp.status, 301 | 302 | 303 | 307 | 308) {
                     let loc = default_server.default_loc.clone();
-                    let local = conn.local_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+                    let local = conn
+                        .local_addr()
+                        .map(|a| a.ip().to_string())
+                        .unwrap_or_default();
                     let _ = write_redirect(
                         &mut conn,
                         &synthetic,
@@ -378,8 +389,12 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
             }
         };
 
-        let (server, captures) =
-            select_server_ex(http, &group.servers, group.default_server, req.host.as_deref());
+        let (server, captures) = select_server_ex(
+            http,
+            &group.servers,
+            group.default_server,
+            req.host.as_deref(),
+        );
         let loc = server.locate(&path);
         if let Some((t, _)) = loc.keepalive_timeout {
             keepalive_timeout = t;
@@ -417,6 +432,11 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
             }
         }
 
+        #[cfg(feature = "alloc-count")]
+        let mark1 = {
+            crate::alloccnt::set_phase(0);
+            crate::alloccnt::mark(mark0)
+        };
         let started = SystemTime::now();
         let state = ConnState {
             requests: served,
@@ -424,13 +444,10 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
         };
         let mut guards_sink: Vec<crate::limit::ConnGuard> = Vec::new();
         let peer_port = conn.peer.port();
-        let client_ip = conn.peer.ip().to_string();
+        let client_ip = &client_ip_owned;
         // Local address of this connection (nginx uses it when the Host header
         // is missing or unusable).
-        let local_ip = conn
-            .local_addr()
-            .map(|a| a.ip().to_string())
-            .unwrap_or_else(|| "127.0.0.1".to_string());
+        let local_ip = &local_ip_owned;
         let outcome = dispatch(
             &mut conn,
             &req,
@@ -450,6 +467,11 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
         .await;
         let elapsed = started.elapsed().unwrap_or_default();
 
+        #[cfg(feature = "alloc-count")]
+        let mark2 = {
+            crate::alloccnt::set_phase(1);
+            crate::alloccnt::mark(mark1)
+        };
         // `limit_conn` slots are held until the response has been written.
         drop(guards_sink);
         let (status, bytes, close, sent) = match outcome {
@@ -457,11 +479,20 @@ pub async fn handle_conn(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx
             Err(_e) => (499, 0, true, Vec::new()),
         };
 
+        #[cfg(feature = "alloc-count")]
+        crate::alloccnt::set_phase(2);
         log_access(
             ctx, group, server, &req, &path, &query, status, bytes, elapsed, conn.peer, &sent,
         );
+        #[cfg(feature = "alloc-count")]
+        let _ = {
+            let m = crate::alloccnt::mark(mark2);
+            crate::alloccnt::set_phase(0);
+            m
+        };
 
-        if close || !req.keepalive || util::force_close(status) || served >= http.keepalive_requests {
+        if close || !req.keepalive || util::force_close(status) || served >= http.keepalive_requests
+        {
             break;
         }
     }
@@ -514,7 +545,8 @@ async fn route(
     for le in &loc.limit_except {
         // `limit_except` applies to every method *except* the listed ones.
         let m = req.method.as_str();
-        if !le.methods.iter().any(|x| x == m) && crate::config::access_denied(&le.rules, peer_addr) {
+        if !le.methods.iter().any(|x| x == m) && crate::config::access_denied(&le.rules, peer_addr)
+        {
             return error_response(403, server.server_tokens);
         }
     }
@@ -729,7 +761,18 @@ fn apply_rewrites_parts(
     server: &Server,
     default_type: &str,
 ) -> RewriteOutcome {
-    apply_rewrites_full(req, path, query, sets, ifs, steps, rewrites, server, default_type).0
+    apply_rewrites_full(
+        req,
+        path,
+        query,
+        sets,
+        ifs,
+        steps,
+        rewrites,
+        server,
+        default_type,
+    )
+    .0
 }
 
 /// Same, but also returns the variables `set` produced.
@@ -758,7 +801,11 @@ fn apply_rewrites_full(
             .iter()
             .enumerate()
             .map(|(i, _)| crate::config::Step::Set(i))
-            .chain(ifs.iter().enumerate().map(|(i, _)| crate::config::Step::If(i)))
+            .chain(
+                ifs.iter()
+                    .enumerate()
+                    .map(|(i, _)| crate::config::Step::If(i)),
+            )
             .collect();
         &default_order
     } else {
@@ -784,7 +831,15 @@ fn apply_rewrites_full(
                 let Some(ifb) = ifs.get(idx) else {
                     continue;
                 };
-                if let Some(out) = run_if(ifb, req, &mut uri, &mut args, &mut vars, rewrites, default_type) {
+                if let Some(out) = run_if(
+                    ifb,
+                    req,
+                    &mut uri,
+                    &mut args,
+                    &mut vars,
+                    rewrites,
+                    default_type,
+                ) {
                     return (out, vars);
                 }
             }
@@ -862,7 +917,11 @@ fn run_if(
 }
 
 /// Apply one rewrite rule; `None` means "keep scanning".
-fn apply_one(rw: &crate::config::Rewrite, uri: &mut String, args: &mut String) -> Option<RewriteOutcome> {
+fn apply_one(
+    rw: &crate::config::Rewrite,
+    uri: &mut String,
+    args: &mut String,
+) -> Option<RewriteOutcome> {
     if !rw.re.is_match(uri) {
         return None;
     }
@@ -883,7 +942,11 @@ fn apply_one(rw: &crate::config::Rewrite, uri: &mut String, args: &mut String) -
     }
     match rw.flag {
         RewriteFlag::Permanent | RewriteFlag::Redirect => {
-            let code = if rw.flag == RewriteFlag::Permanent { 301 } else { 302 };
+            let code = if rw.flag == RewriteFlag::Permanent {
+                301
+            } else {
+                302
+            };
             let mut location = target;
             if !args.is_empty() {
                 location.push('?');
@@ -962,6 +1025,15 @@ fn expand_captures(replacement: &str, caps: &regex::Captures<'_>) -> String {
 }
 
 /// Split rendered header lines back into (name, value) pairs.
+/// `$sent_http_*` is the only consumer of the sent-header list, and building it
+/// costs two `String`s per header line. With no access log configured that work
+/// is pure waste, so callers gate on this.
+#[inline]
+fn sent_headers_needed(server: &Server) -> bool {
+    !server.access_logs.is_empty()
+}
+
+/// Parse a rendered header block into `(name, value)` pairs.
 pub fn split_head(raw: &[u8]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for line in String::from_utf8_lossy(raw).split("\r\n") {
@@ -1141,7 +1213,6 @@ fn add_header_applies(status: u16, always: bool) -> bool {
 /// Append `add_header` lines to a rendered header block.
 /// Variant for the proxy paths: knows the cache status and `$upstream_addr`.
 
-
 /// Evaluate `add_trailer` for a response.
 ///
 /// Mirrors `ngx_http_headers_filter`: any directive whose status matches sets
@@ -1172,7 +1243,10 @@ pub fn eval_trailers(
         for (k, v) in &seen {
             custom.insert(k.clone(), v.clone());
         }
-        let scoped = ServerVars { custom: &custom, ..*vars };
+        let scoped = ServerVars {
+            custom: &custom,
+            ..*vars
+        };
         let expanded = scoped.expand(value);
         if expanded.is_empty() {
             continue;
@@ -1226,7 +1300,14 @@ pub fn apply_add_headers_upstream(
     upstream_cache_status: &str,
     upstream_addr: &str,
 ) {
-    apply_add_headers_full(raw, headers, status, upstream_cache_status, upstream_addr, &[])
+    apply_add_headers_full(
+        raw,
+        headers,
+        status,
+        upstream_cache_status,
+        upstream_addr,
+        &[],
+    )
 }
 
 /// Full variant, with the upstream response headers for `$upstream_http_*`.
@@ -1291,7 +1372,7 @@ pub fn apply_add_headers_ctx(
                 connection_requests: v.connection_requests,
                 connection_time: v.connection_time,
                 sent: &sent,
-        };
+            };
             expanded = local.expand(&expanded);
         }
         if expanded.is_empty() {
@@ -1471,7 +1552,6 @@ pub struct ServerVars<'a> {
     pub connection_time: u64,
     /// Response headers already produced for this reply; backs `$sent_http_*`.
     pub sent: &'a [(String, String)],
-
 }
 
 thread_local! {
@@ -1568,9 +1648,7 @@ impl<'a> ServerVars<'a> {
             // empty, which is also nginx's behaviour.
             "ssl_protocol" => tls.map(|t| t.version.clone()).unwrap_or_default(),
             "ssl_cipher" => tls.map(|t| t.cipher.clone()).unwrap_or_default(),
-            "ssl_server_name" => tls
-                .and_then(|t| t.server_name.clone())
-                .unwrap_or_default(),
+            "ssl_server_name" => tls.and_then(|t| t.server_name.clone()).unwrap_or_default(),
             "ssl_client_verify" => tls.map(|t| t.client_verify.clone()).unwrap_or_default(),
             "ssl_client_cert" => tls.map(|t| t.client_cert.clone()).unwrap_or_default(),
             "ssl_client_s_dn" => tls.map(|t| t.client_s_dn.clone()).unwrap_or_default(),
@@ -1604,10 +1682,7 @@ impl<'a> ServerVars<'a> {
                 .req
                 .headers
                 .get("authorization")
-                .and_then(|v| {
-                    v.strip_prefix("Basic ")
-                        .and_then(|b| base64_decode_user(b))
-                })
+                .and_then(|v| v.strip_prefix("Basic ").and_then(|b| base64_decode_user(b)))
                 .unwrap_or_default(),
             "document_root" => self.document_root.to_string(),
             "request_filename" => format!("{}{}", self.document_root, self.path),
@@ -1618,7 +1693,11 @@ impl<'a> ServerVars<'a> {
                 .get("content-length")
                 .unwrap_or("")
                 .to_string(),
-            "content_type" => self.req.headers.get_joined("content-type").unwrap_or_default(),
+            "content_type" => self
+                .req
+                .headers
+                .get_joined("content-type")
+                .unwrap_or_default(),
             "connection_requests" => self.connection_requests.to_string(),
             "connection_time" => self.connection_time.to_string(),
             "hostname" => "ngxrs".to_string(),
@@ -1707,7 +1786,16 @@ pub async fn resolve_response(
     server_port: u16,
 ) -> Response {
     resolve_response_caps(
-        req, path, query, server, loc, http, peer_ip, 0, server_port, &[],
+        req,
+        path,
+        query,
+        server,
+        loc,
+        http,
+        peer_ip,
+        0,
+        server_port,
+        &[],
     )
     .await
 }
@@ -1717,7 +1805,13 @@ pub async fn resolve_response(
 pub enum Target<'a> {
     /// Path, query, location, whether `rewrite ... break` skipped `return`,
     /// and the variables produced by `set`.
-    Loc(String, String, &'a LocCfg, bool, std::collections::HashMap<String, String>),
+    Loc(
+        String,
+        String,
+        &'a LocCfg,
+        bool,
+        std::collections::HashMap<String, String>,
+    ),
     Done(Response),
 }
 
@@ -1884,11 +1978,7 @@ pub async fn resolve_response_local(
             req,
             path,
             query,
-            server_name: server
-                .names
-                .first()
-                .map(|s| s.as_str())
-                .unwrap_or(""),
+            server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
             server_port,
             peer_ip,
             peer_port,
@@ -1900,16 +1990,8 @@ pub async fn resolve_response_local(
             connection_time: 0,
             sent: &[],
         };
-        if let Some(resp) = crate::grpc::fetch(
-            http,
-            loc,
-            req,
-            path,
-            query,
-            peer_ip,
-            Some(&grpc_vars),
-        )
-        .await
+        if let Some(resp) =
+            crate::grpc::fetch(http, loc, req, path, query, peer_ip, Some(&grpc_vars)).await
         {
             let mut resp = resp;
             return finalize_response(
@@ -1957,15 +2039,37 @@ pub async fn resolve_response_local(
         Target::Done(r) => r,
         Target::Loc(p, q, l, skip, set_vars) => {
             return render_resolved_state(
-                req, &p, &q, l, skip, server, http, peer_ip, peer_port, server_port, captures,
-                state, local_addr,
+                req,
+                &p,
+                &q,
+                l,
+                skip,
+                server,
+                http,
+                peer_ip,
+                peer_port,
+                server_port,
+                captures,
+                state,
+                local_addr,
             )
             .await
         }
     };
     finalize_response(
-        req, &mut resp, path, query, server, http, peer_ip, peer_port, server_port, captures,
-        &custom, state, local_addr,
+        req,
+        &mut resp,
+        path,
+        query,
+        server,
+        http,
+        peer_ip,
+        peer_port,
+        server_port,
+        captures,
+        &custom,
+        state,
+        local_addr,
     )
     .await
 }
@@ -2024,8 +2128,19 @@ pub async fn resolve_response_state(
         Target::Done(r) => r,
         Target::Loc(p, q, l, skip, set_vars) => {
             return render_resolved_state(
-                req, &p, &q, l, skip, server, http, peer_ip, peer_port, server_port, captures,
-                state, local_addr,
+                req,
+                &p,
+                &q,
+                l,
+                skip,
+                server,
+                http,
+                peer_ip,
+                peer_port,
+                server_port,
+                captures,
+                state,
+                local_addr,
             )
             .await;
         }
@@ -2102,8 +2217,19 @@ pub async fn render_resolved_ctx(
     local_addr: &str,
 ) -> Response {
     render_resolved_state(
-        req, path, query, loc, skip_return, server, http, peer_ip, peer_port, server_port,
-        captures, state, local_addr,
+        req,
+        path,
+        query,
+        loc,
+        skip_return,
+        server,
+        http,
+        peer_ip,
+        peer_port,
+        server_port,
+        captures,
+        state,
+        local_addr,
     )
     .await
 }
@@ -2125,8 +2251,20 @@ pub async fn render_resolved_state(
     local_addr: &str,
 ) -> Response {
     render_resolved_vars(
-        req, path, query, loc, skip_return, server, http, peer_ip, peer_port, server_port,
-        captures, state, local_addr, &std::collections::HashMap::new(),
+        req,
+        path,
+        query,
+        loc,
+        skip_return,
+        server,
+        http,
+        peer_ip,
+        peer_port,
+        server_port,
+        captures,
+        state,
+        local_addr,
+        &std::collections::HashMap::new(),
     )
     .await
 }
@@ -2172,7 +2310,7 @@ pub async fn render_resolved_vars(
                 connection_requests: state.requests,
                 connection_time: state.elapsed_secs(),
                 sent: &[],
-        };
+            };
             route(req, path, query, loc, server, http, false, &vars).await
         };
         finalize_response(
@@ -2252,11 +2390,7 @@ fn check_limits(
                 );
                 for spec in &loc.error_logs {
                     if let Some(sink) = crate::log::sink_cached(&spec.dest, spec.level) {
-                        crate::log::log_to(
-                            &[sink],
-                            loc.limit_req_log_level,
-                            &msg,
-                        );
+                        crate::log::log_to(&[sink], loc.limit_req_log_level, &msg);
                     }
                 }
                 if loc.error_logs.is_empty() {
@@ -2372,7 +2506,7 @@ async fn finalize_response(
                 connection_requests: state.requests,
                 connection_time: state.elapsed_secs(),
                 sent: &[],
-        };
+            };
             vars.expand(&cur_path)
         };
 
@@ -2404,7 +2538,7 @@ async fn finalize_response(
                 connection_requests: state.requests,
                 connection_time: state.elapsed_secs(),
                 sent: &[],
-        };
+            };
             cur_query = vars.expand(&cur_query);
         }
         // `error_page 404 = @fallback` jumps to a named location. Named
@@ -2429,7 +2563,8 @@ async fn finalize_response(
                 connection_time: state.elapsed_secs(),
                 sent: &[],
             };
-            let redirected = route(req, &cur_path, &cur_query, named, server, http, true, &vars).await;
+            let redirected =
+                route(req, &cur_path, &cur_query, named, server, http, true, &vars).await;
             let redirected_status = redirected.status;
             *resp = redirected;
             resp.status = if use_target_status {
@@ -2467,7 +2602,7 @@ async fn finalize_response(
                     connection_requests: state.requests,
                     connection_time: state.elapsed_secs(),
                     sent: &[],
-        };
+                };
                 route(req, &cur_path, &cur_query, l, server, http, true, &vars).await
             }
         };
@@ -2493,7 +2628,12 @@ async fn finalize_response(
         *resp = error_response(resp.status, server.server_tokens);
     }
 
-    let mut out = crate::gzip::maybe_compress(req, std::mem::replace(resp, Response::empty(200)), cur_loc, http);
+    let mut out = crate::gzip::maybe_compress(
+        req,
+        std::mem::replace(resp, Response::empty(200)),
+        cur_loc,
+        http,
+    );
 
     apply_expires(&mut out.raw, cur_loc);
 
@@ -2570,6 +2710,42 @@ async fn dispatch(
     client_ip: &str,
     guards: &mut Vec<crate::limit::ConnGuard>,
 ) -> io::Result<Outcome> {
+    // Measurement endpoint for `--features alloc-count`: reports the global
+    // allocation counters so a request's heap cost can be read, not guessed.
+    #[cfg(feature = "alloc-count")]
+    if path == "/_alloc" {
+        let a = crate::alloccnt::ALLOCS.load(std::sync::atomic::Ordering::Relaxed);
+        let b = crate::alloccnt::BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        let p: Vec<String> = (0..3)
+            .map(|i| {
+                crate::alloccnt::PHASE[i]
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .to_string()
+            })
+            .collect();
+        let body = format!("{a} {b} {}\n", p.join(" ")).into_bytes();
+        let len = body.len() as u64;
+        let mut resp = Response::bytes(200, "text/plain", body);
+        let sent = if sent_headers_needed(server) {
+            split_head(&resp.raw)
+        } else {
+            Vec::new()
+        };
+        let written = write_response(
+            conn,
+            resp,
+            true,
+            server.server_tokens,
+            req.method == Method::Head,
+        )
+        .await?;
+        return Ok(Outcome {
+            status: 200,
+            bytes: written,
+            close: false,
+            sent: sent,
+        });
+    }
     let head_only = req.method == Method::Head;
     let mut keepalive_allowed = keepalive_policy(req, loc, state);
     let ka_header = loc.keepalive_timeout.and_then(|(_, h)| h);
@@ -2578,10 +2754,21 @@ async fn dispatch(
     // choosing a content handler so `/x -> /fallback` can reach a proxy.
     let (resolved_path, resolved_query, resolved_loc, skip_return, pre, set_vars) =
         match resolve_target(req, path, query, server, loc, http) {
-            Target::Done(r) => (path.to_string(), query.to_string(), loc, false, Some(r), Default::default()),
+            Target::Done(r) => (
+                path.to_string(),
+                query.to_string(),
+                loc,
+                false,
+                Some(r),
+                Default::default(),
+            ),
             Target::Loc(p, q, l, skip, set_vars) => (p, q, l, skip, None, set_vars),
         };
-    let (path, query, loc) = (resolved_path.as_str(), resolved_query.as_str(), resolved_loc);
+    let (path, query, loc) = (
+        resolved_path.as_str(),
+        resolved_query.as_str(),
+        resolved_loc,
+    );
 
     // A response produced by `return`/`rewrite` still goes through error_page.
     if let Some(mut r) = pre {
@@ -2610,9 +2797,22 @@ async fn dispatch(
         .await;
         let status = resp.status;
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
-            return write_redirect(conn, req, resp, loc, listen_port, server.server_tokens, local_addr).await;
+            return write_redirect(
+                conn,
+                req,
+                resp,
+                loc,
+                listen_port,
+                server.server_tokens,
+                local_addr,
+            )
+            .await;
         }
-        let sent = split_head(&resp.raw);
+        let sent = if sent_headers_needed(server) {
+            split_head(&resp.raw)
+        } else {
+            Vec::new()
+        };
         let bytes = write_response_ka(
             conn,
             resp,
@@ -2669,7 +2869,11 @@ async fn dispatch(
             )
             .await;
             let status = resp.status;
-            let sent = split_head(&resp.raw);
+            let sent = if sent_headers_needed(server) {
+                split_head(&resp.raw)
+            } else {
+                Vec::new()
+            };
             let bytes = write_response_ka(
                 conn,
                 resp,
@@ -2690,7 +2894,9 @@ async fn dispatch(
 
     // ---- FastCGI ----
     if loc.fastcgi_pass.is_some() {
-        if let Some(o) = crate::fastcgi::handle(conn, req, path, query, loc, server.server_tokens).await? {
+        if let Some(o) =
+            crate::fastcgi::handle(conn, req, path, query, loc, server.server_tokens).await?
+        {
             return Ok(o);
         }
     }
@@ -2698,14 +2904,16 @@ async fn dispatch(
     // ---- uwsgi / scgi ----
     if loc.uwsgi_pass.is_some() {
         if let Some(o) =
-            crate::uwsgi_scgi::handle_uwsgi(conn, req, path, query, loc, server.server_tokens).await?
+            crate::uwsgi_scgi::handle_uwsgi(conn, req, path, query, loc, server.server_tokens)
+                .await?
         {
             return Ok(o);
         }
     }
     if loc.scgi_pass.is_some() {
         if let Some(o) =
-            crate::uwsgi_scgi::handle_scgi(conn, req, path, query, loc, server.server_tokens).await?
+            crate::uwsgi_scgi::handle_scgi(conn, req, path, query, loc, server.server_tokens)
+                .await?
         {
             return Ok(o);
         }
@@ -2734,9 +2942,14 @@ async fn dispatch(
         if let Some(reject) = check_limits(loc, http, &limit_vars, guards) {
             let status = reject.status;
             let sent = split_head(&reject.raw);
-            let bytes =
-                write_response(conn, reject, keepalive_allowed, server.server_tokens, head_only)
-                    .await?;
+            let bytes = write_response(
+                conn,
+                reject,
+                keepalive_allowed,
+                server.server_tokens,
+                head_only,
+            )
+            .await?;
             return Ok(Outcome {
                 status,
                 bytes,
@@ -2821,7 +3034,11 @@ async fn dispatch(
                     resp.raw = raw;
                 }
                 let status = resp.status;
-                let sent = split_head(&resp.raw);
+                let sent = if sent_headers_needed(server) {
+                    split_head(&resp.raw)
+                } else {
+                    Vec::new()
+                };
                 let bytes = write_response_ka(
                     conn,
                     resp,
@@ -2862,12 +3079,31 @@ async fn dispatch(
     .await;
     let status = resp.status;
     if matches!(status, 301 | 302 | 303 | 307 | 308) {
-        return write_redirect(conn, req, resp, loc, listen_port, server.server_tokens, local_addr).await;
+        return write_redirect(
+            conn,
+            req,
+            resp,
+            loc,
+            listen_port,
+            server.server_tokens,
+            local_addr,
+        )
+        .await;
     }
-    let sent = split_head(&resp.raw);
-    let bytes =
-        write_response_ka(conn, resp, keepalive_allowed, server.server_tokens, head_only, ka_header)
-            .await?;
+    let sent = if sent_headers_needed(server) {
+        split_head(&resp.raw)
+    } else {
+        Vec::new()
+    };
+    let bytes = write_response_ka(
+        conn,
+        resp,
+        keepalive_allowed,
+        server.server_tokens,
+        head_only,
+        ka_header,
+    )
+    .await?;
     Ok(Outcome {
         status,
         bytes,
@@ -2914,8 +3150,7 @@ fn keepalive_policy(req: &Request, loc: &LocCfg, state: ConnState) -> bool {
             if req.method != Method::Get {
                 if let Some(idx) = ua.to_ascii_lowercase().find("msie ") {
                     let rest = &ua[idx + 5..];
-                    let major: String =
-                        rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    let major: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
                     if let Ok(v) = major.parse::<u32>() {
                         if v <= 6 {
                             return false;
@@ -3033,7 +3268,14 @@ async fn write_redirect(
         expect_trailers: false,
         body: Body::Bytes(body),
     };
-    let bytes = write_response(conn, resp, req.keepalive, tokens, req.method == Method::Head).await?;
+    let bytes = write_response(
+        conn,
+        resp,
+        req.keepalive,
+        tokens,
+        req.method == Method::Head,
+    )
+    .await?;
     Ok(Outcome {
         status,
         bytes,
@@ -3135,7 +3377,7 @@ pub async fn send_error(
             raw
         },
         no_error_page: false,
-            explicit_len: true,
+        explicit_len: true,
         trailers: Vec::new(),
         expect_trailers: false,
         body: Body::Bytes(body),
@@ -3419,7 +3661,10 @@ pub fn select_server_ex<'a>(
     host: Option<&str>,
 ) -> (&'a Server, Vec<(String, String)>) {
     let Some(raw_host) = host else {
-        return (select_server(http, servers, default_server, None), Vec::new());
+        return (
+            select_server(http, servers, default_server, None),
+            Vec::new(),
+        );
     };
     let lowered = raw_host.to_ascii_lowercase();
     let host = strip_host_port(&lowered);

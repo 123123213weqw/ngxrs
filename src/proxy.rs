@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::config::{Http, LocCfg, LbMethod, ProxyTarget, Upstream};
+use crate::config::{Http, LbMethod, LocCfg, ProxyTarget, Upstream};
 use crate::http::request::{Method, Request};
 use crate::http::{write_head, Body, Outcome, Response};
 use crate::util::reason;
@@ -89,7 +89,10 @@ fn updating_clear(key: &str) {
 }
 
 fn updating_test(key: &str) -> bool {
-    updating_set().lock().map(|s| s.contains(key)).unwrap_or(false)
+    updating_set()
+        .lock()
+        .map(|s| s.contains(key))
+        .unwrap_or(false)
 }
 
 fn pool_key_of(c: &Chosen) -> (usize, u32) {
@@ -210,7 +213,9 @@ fn select_order(up: &Upstream, idx: usize, client_ip: &std::net::IpAddr) -> Opti
                 }
                 std::net::IpAddr::V6(v6) => {
                     let o = v6.octets();
-                    (0..16).fold(0u64, |acc, i| acc.wrapping_mul(31).wrapping_add(o[i] as u64))
+                    (0..16).fold(0u64, |acc, i| {
+                        acc.wrapping_mul(31).wrapping_add(o[i] as u64)
+                    })
                 }
             };
             let start = (h as usize) % pool.len();
@@ -388,7 +393,9 @@ fn parse_upstream_head(buf: &[u8]) -> Option<Head> {
             None => continue,
         };
         let name = &line[..colon];
-        let value = String::from_utf8_lossy(&line[colon + 1..]).trim().to_string();
+        let value = String::from_utf8_lossy(&line[colon + 1..])
+            .trim()
+            .to_string();
         let lname = String::from_utf8_lossy(name).to_ascii_lowercase();
 
         match lname.as_str() {
@@ -492,7 +499,9 @@ pub async fn handle(
     let peer_ip_owned = peer_ip.to_string();
     let peer_port = conn.peer.port();
     let Some(candidates) = choose(http, loc, &peer_ip) else {
-        return Ok(Some(written(respond_error(conn, 502, tokens, req.keepalive).await?)));
+        return Ok(Some(written(
+            respond_error(conn, 502, tokens, req.keepalive).await?,
+        )));
     };
 
     // `proxy_bind` applies to every candidate connection below.
@@ -507,7 +516,9 @@ pub async fn handle(
         Ok(b) => b,
         Err(()) => {
             crate::log::error_log("error", "invalid proxy_bind value");
-            return Ok(Some(written(respond_error(conn, 500, tokens, req.keepalive).await?)));
+            return Ok(Some(written(
+                respond_error(conn, 500, tokens, req.keepalive).await?,
+            )));
         }
     };
 
@@ -540,10 +551,7 @@ pub async fn handle(
     let zone_name = loc.proxy_cache.as_ref().map(|spec| vars.expand(spec));
     if let Some(name) = zone_name.as_deref() {
         if !name.is_empty() && !http.cache_zones.iter().any(|z| z.name == name) {
-            crate::log::error_log(
-                "error",
-                &format!("cache \"{name}\" is not found"),
-            );
+            crate::log::error_log("error", &format!("cache \"{name}\" is not found"));
             let resp = crate::http::error_response(500, http.server_tokens);
             let bytes = crate::http::write_response(
                 conn,
@@ -592,9 +600,7 @@ pub async fn handle(
     });
 
     // Cacheable HEAD requests go upstream as GET (nginx's default).
-    let convert_head = req.method == Method::Head
-        && loc.proxy_cache_convert_head
-        && zone.is_some();
+    let convert_head = req.method == Method::Head && loc.proxy_cache_convert_head && zone.is_some();
 
     // `proxy_cache_min_uses`: count this request against the key (nginx bumps
     // `fcn->uses` on every cache lookup) and refuse to store until it is met.
@@ -623,11 +629,12 @@ pub async fn handle(
     if let (Some(zone), Some(key)) = (zone, cache_key.as_ref()) {
         if !bypass {
             let hit = crate::cache::load(zone, key).or_else(|| {
-                crate::cache::load_variant(zone, key, |name| {
-                    match name {
-                        "accept-encoding" => req.headers.get_joined("accept-encoding").unwrap_or_default(),
-                        other => req.headers.get_joined(other).unwrap_or_default(),
-                    }
+                crate::cache::load_variant(zone, key, |name| match name {
+                    "accept-encoding" => req
+                        .headers
+                        .get_joined("accept-encoding")
+                        .unwrap_or_default(),
+                    other => req.headers.get_joined(other).unwrap_or_default(),
                 })
             });
             if let Some(entry) = hit {
@@ -718,8 +725,7 @@ pub async fn handle(
                     let mut status = entry.status;
                     let mut body = entry.body.clone();
                     if ranges_from_cache {
-                        let (s2, raw2, body2) =
-                            apply_force_ranges(req, status, &mut raw, body);
+                        let (s2, raw2, body2) = apply_force_ranges(req, status, &mut raw, body);
                         status = s2;
                         raw = raw2;
                         body = body2;
@@ -980,9 +986,14 @@ pub async fn handle(
     }
 
     if let Some(e) = &last_err {
-        eprintln!("ngxrs: [error] upstream failure for {}: {e}", req.raw_target);
+        eprintln!(
+            "ngxrs: [error] upstream failure for {}: {e}",
+            req.raw_target
+        );
     }
-    Ok(Some(written(respond_error(conn, 502, tokens, req.keepalive).await?)))
+    Ok(Some(written(
+        respond_error(conn, 502, tokens, req.keepalive).await?,
+    )))
 }
 
 async fn connect_timeout(addr: SocketAddr, dur: Duration) -> io::Result<TcpStream> {
@@ -1297,16 +1308,22 @@ fn build_upstream_head(
         let lk = k.to_ascii_lowercase();
         if matches!(
             lk.as_str(),
-            "host" | "connection" | "keep-alive" | "transfer-encoding" | "te" | "trailer"
-                | "upgrade" | "proxy-connection" | "content-length" | "expect"
+            "host"
+                | "connection"
+                | "keep-alive"
+                | "transfer-encoding"
+                | "te"
+                | "trailer"
+                | "upgrade"
+                | "proxy-connection"
+                | "content-length"
+                | "expect"
         ) {
             continue;
         }
         // When the cache is going to be used, nginx fetches the *whole* entity
         // so later range requests can be served from it.
-        if drop_range
-            && (lk == "range" || lk == "if-range")
-        {
+        if drop_range && (lk == "range" || lk == "if-range") {
             continue;
         }
         if set.contains_key(&lk) {
@@ -1374,9 +1391,11 @@ fn build_upstream_head(
         // headers already emitted from proxy_set_header
     } else if loc.proxy_http_version == 1 {
         out.extend_from_slice(b"Connection: ");
-        if loc.proxy_set_headers.iter().any(|(k, v)| {
-            k.eq_ignore_ascii_case("connection") && v.is_empty()
-        }) {
+        if loc
+            .proxy_set_headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.is_empty())
+        {
             out.extend_from_slice(b"\r\n");
         } else {
             out.extend_from_slice(b"close\r\n");
@@ -1417,16 +1436,26 @@ async fn exchange(
     // The cache only helps a ranged request if it can hold the whole entity, so
     // the Range header is withheld from the upstream while the cache is in play
     // (`ngx_http_proxy_create_request` + `ngx_http_upstream_cache_check_range`).
-    let drop_range = cache.zone.is_some()
-        && cache.key.is_some()
-        && cache.status != "BYPASS"
-        && !is_upgrade;
+    let drop_range =
+        cache.zone.is_some() && cache.key.is_some() && cache.status != "BYPASS" && !is_upgrade;
     let out = build_upstream_head(
-        req, target_uri, body, loc, pp, peer_ip, is_upgrade, convert_head, cache.reval, drop_range,
+        req,
+        target_uri,
+        body,
+        loc,
+        pp,
+        peer_ip,
+        is_upgrade,
+        convert_head,
+        cache.reval,
+        drop_range,
     );
 
     if std::env::var_os("NGXRS_DEBUG_PROXY").is_some() {
-        eprintln!("ngxrs: [debug] upstream request:\n{}", String::from_utf8_lossy(&out));
+        eprintln!(
+            "ngxrs: [debug] upstream request:\n{}",
+            String::from_utf8_lossy(&out)
+        );
     }
 
     if from_pool {
@@ -1450,13 +1479,17 @@ async fn exchange(
     let mut deadline = Instant::now() + loc.proxy_read_timeout;
     let head = loop {
         if let Some(pos) = find_head_end(&buf) {
-            let h = parse_upstream_head(&buf[..pos])
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad upstream response"))?;
+            let h = parse_upstream_head(&buf[..pos]).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "bad upstream response")
+            })?;
             buf = buf.split_off(pos);
             break h;
         }
         if buf.len() > 64 * 1024 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "upstream head too large"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "upstream head too large",
+            ));
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -1469,7 +1502,10 @@ async fn exchange(
             Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout")),
         };
         if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "upstream closed"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "upstream closed",
+            ));
         }
         buf.extend_from_slice(&chunk[..n]);
         if deadline.elapsed() > Duration::ZERO {
@@ -1538,8 +1574,7 @@ async fn exchange(
                 let mut status = entry.status;
                 let mut body = entry.body.clone();
                 if ranges_from_cache {
-                    let (s2, raw2, body2) =
-                        apply_force_ranges(req, status, &mut raw, body);
+                    let (s2, raw2, body2) = apply_force_ranges(req, status, &mut raw, body);
                     status = s2;
                     raw = raw2;
                     body = body2;
@@ -1563,10 +1598,8 @@ async fn exchange(
                 )
                 .await?;
                 // A 304 keeps the upstream usable, exactly like a normal reply.
-                let reuse = head.keepalive
-                    && !is_upgrade
-                    && loc.proxy_http_version == 1
-                    && !req.chunked;
+                let reuse =
+                    head.keepalive && !is_upgrade && loc.proxy_http_version == 1 && !req.chunked;
                 if reuse {
                     let cap = match pp.target {
                         crate::config::ProxyTarget::Upstream(i) => {
@@ -1610,7 +1643,8 @@ async fn exchange(
             // `proxy_cache_bypass` means "do not use the cache at all", so such
             // a request must not seed an error entry either.
             if cache.status != "BYPASS" {
-                if let Some(valid) = crate::cache::ttl(loc, head.status, &[], loc.proxy_cache_ignore)
+                if let Some(valid) =
+                    crate::cache::ttl(loc, head.status, &[], loc.proxy_cache_ignore)
                 {
                     let entry = crate::cache::Cached {
                         status: head.status,
@@ -1676,9 +1710,8 @@ async fn exchange(
     // Slicing is needed when `proxy_force_ranges` asks for it *or* when the
     // cache withheld the Range header upstream: then the body in hand is the
     // whole entity and the client still expects its range.
-    let wants_ranges = (loc.proxy_force_ranges || drop_range)
-        && req.headers.get("range").is_some()
-        && !is_upgrade;
+    let wants_ranges =
+        (loc.proxy_force_ranges || drop_range) && req.headers.get("range").is_some() && !is_upgrade;
     let cacheable = cache.zone.is_some()
         && cache.key.is_some()
         && !is_upgrade
@@ -1712,25 +1745,22 @@ async fn exchange(
                     Ok(Ok(0)) => break,
                     Ok(Ok(n)) => payload.extend_from_slice(&chunk[..n]),
                     Ok(Err(e)) => return Err(e),
-                    Err(_) => {
-                        return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout"))
-                    }
+                    Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout")),
                 }
             },
             (false, Some(len)) => {
                 while (payload.len() as u64) < len {
-                    let mut chunk =
-                        vec![0u8; (len - payload.len() as u64).min(64 * 1024) as usize];
-                    let n =
-                        match tokio::time::timeout(loc.proxy_read_timeout, up.read(&mut chunk)).await
-                        {
-                            Ok(Ok(0)) => break,
-                            Ok(Ok(n)) => n,
-                            Ok(Err(e)) => return Err(e),
-                            Err(_) => {
-                                return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout"))
-                            }
-                        };
+                    let mut chunk = vec![0u8; (len - payload.len() as u64).min(64 * 1024) as usize];
+                    let n = match tokio::time::timeout(loc.proxy_read_timeout, up.read(&mut chunk))
+                        .await
+                    {
+                        Ok(Ok(0)) => break,
+                        Ok(Ok(n)) => n,
+                        Ok(Err(e)) => return Err(e),
+                        Err(_) => {
+                            return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout"))
+                        }
+                    };
                     payload.extend_from_slice(&chunk[..n]);
                 }
             }
@@ -1740,9 +1770,7 @@ async fn exchange(
                     Ok(Ok(0)) => break,
                     Ok(Ok(n)) => payload.extend_from_slice(&chunk[..n]),
                     Ok(Err(e)) => return Err(e),
-                    Err(_) => {
-                        return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout"))
-                    }
+                    Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout")),
                 }
             },
         }
@@ -1755,42 +1783,42 @@ async fn exchange(
 
         if cacheable {
             if let (Some(zone), Some(key)) = (cache.zone, cache.key) {
-            let stored_headers: Vec<(String, String)> = crate::http::split_head(&raw)
-                .into_iter()
-                .filter(|(k, _)| {
-                    !k.eq_ignore_ascii_case("connection")
-                        && !k.eq_ignore_ascii_case("keep-alive")
-                        && !k.eq_ignore_ascii_case("transfer-encoding")
-                        && !k.eq_ignore_ascii_case("x-cache-status")
-                })
-                .collect();
-            if let Some(valid) =
-                crate::cache::ttl(loc, head.status, &stored_headers, loc.proxy_cache_ignore)
-            {
-                let entry = crate::cache::Cached {
-                    status: head.status,
-                    headers: stored_headers.clone(),
-                    body: payload.clone(),
-                    stored_at: crate::cache::now(),
-                    valid_for: valid.as_secs(),
-                    error: None,
-                };
-                let names = if loc.proxy_cache_ignore.vary {
-                    Vec::new()
-                } else {
-                    crate::cache::vary_names(&stored_headers)
-                };
-                if names.is_empty() {
-                    // A response without `Vary` replaces every variant.
-                    crate::cache::clear_variants(zone, key);
-                    let _ = crate::cache::store(zone, key, &entry);
-                } else {
-                    let sig = crate::cache::vary_signature(&names, |n| {
-                        req.headers.get_joined(n).unwrap_or_default()
-                    });
-                    let _ = crate::cache::store_variant(zone, key, &sig, &entry);
+                let stored_headers: Vec<(String, String)> = crate::http::split_head(&raw)
+                    .into_iter()
+                    .filter(|(k, _)| {
+                        !k.eq_ignore_ascii_case("connection")
+                            && !k.eq_ignore_ascii_case("keep-alive")
+                            && !k.eq_ignore_ascii_case("transfer-encoding")
+                            && !k.eq_ignore_ascii_case("x-cache-status")
+                    })
+                    .collect();
+                if let Some(valid) =
+                    crate::cache::ttl(loc, head.status, &stored_headers, loc.proxy_cache_ignore)
+                {
+                    let entry = crate::cache::Cached {
+                        status: head.status,
+                        headers: stored_headers.clone(),
+                        body: payload.clone(),
+                        stored_at: crate::cache::now(),
+                        valid_for: valid.as_secs(),
+                        error: None,
+                    };
+                    let names = if loc.proxy_cache_ignore.vary {
+                        Vec::new()
+                    } else {
+                        crate::cache::vary_names(&stored_headers)
+                    };
+                    if names.is_empty() {
+                        // A response without `Vary` replaces every variant.
+                        crate::cache::clear_variants(zone, key);
+                        let _ = crate::cache::store(zone, key, &entry);
+                    } else {
+                        let sig = crate::cache::vary_signature(&names, |n| {
+                            req.headers.get_joined(n).unwrap_or_default()
+                        });
+                        let _ = crate::cache::store_variant(zone, key, &sig, &entry);
+                    }
                 }
-            }
             }
         }
 
@@ -2068,7 +2096,11 @@ struct Pacer {
 
 impl Pacer {
     fn new(rate: u64) -> Self {
-        Self { rate, started: None, copied: 0 }
+        Self {
+            rate,
+            started: None,
+            copied: 0,
+        }
     }
 
     /// Sleep until the next `n` bytes are allowed out, then count them.
@@ -2114,7 +2146,9 @@ async fn stream_chunked(
             }
             pending.extend_from_slice(&chunk[..n]);
         };
-        let line = String::from_utf8_lossy(&pending[..line_end]).trim().to_string();
+        let line = String::from_utf8_lossy(&pending[..line_end])
+            .trim()
+            .to_string();
         let size_hex = line.split(';').next().unwrap_or("").trim().to_string();
         let mut size = u64::from_str_radix(&size_hex, 16)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad chunk"))?;
@@ -2198,7 +2232,6 @@ impl crate::conn::Conn {
     }
 }
 
-
 /// Buffered variant used by HTTP/2, where there is no socket to stream to.
 ///
 /// Returns `None` when the location does not proxy. The whole upstream reply is
@@ -2221,11 +2254,22 @@ pub async fn fetch(
             Chosen::Direct(_, a) => *a,
             Chosen::Upstream { addr, .. } => *addr,
         };
-        let mut up = match connect_bound(addr, resolve_bind(loc, &BindVars {
-            peer_ip,
-            peer_port: 0,
-            query,
-        }).ok().flatten(), loc.proxy_connect_timeout).await {
+        let mut up = match connect_bound(
+            addr,
+            resolve_bind(
+                loc,
+                &BindVars {
+                    peer_ip,
+                    peer_port: 0,
+                    query,
+                },
+            )
+            .ok()
+            .flatten(),
+            loc.proxy_connect_timeout,
+        )
+        .await
+        {
             Ok(s) => s,
             Err(e) => {
                 last_err = Some(e);
@@ -2233,8 +2277,18 @@ pub async fn fetch(
             }
         };
 
-        let out =
-            build_upstream_head(req, &target_uri, &[], loc, &pp, peer_ip, false, false, None, false);
+        let out = build_upstream_head(
+            req,
+            &target_uri,
+            &[],
+            loc,
+            &pp,
+            peer_ip,
+            false,
+            false,
+            None,
+            false,
+        );
         if up.write_all(&out).await.is_err() {
             continue;
         }
@@ -2276,7 +2330,10 @@ pub async fn fetch(
         }
 
         let Some(h) = head_end else {
-            last_err = Some(io::Error::new(io::ErrorKind::InvalidData, "no response head"));
+            last_err = Some(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "no response head",
+            ));
             continue;
         };
         let head = match parse_upstream_head(&buf[..h]) {
@@ -2329,9 +2386,16 @@ pub async fn fetch(
     }
 
     if let Some(e) = &last_err {
-        eprintln!("ngxrs: [error] h2 upstream failure for {}: {e}", req.raw_target);
+        eprintln!(
+            "ngxrs: [error] h2 upstream failure for {}: {e}",
+            req.raw_target
+        );
     }
-    Some(Response::bytes(502, "text/html", crate::http::error_body(502, true)))
+    Some(Response::bytes(
+        502,
+        "text/html",
+        crate::http::error_body(502, true),
+    ))
 }
 
 /// Strip chunked framing.
@@ -2357,11 +2421,7 @@ fn dechunk(input: &[u8]) -> Option<Vec<u8>> {
 /// Recompute the cache key exactly as the request path does.
 ///
 /// Used by the background refresh, which has no connection context.
-pub fn cache_key_for(
-    loc: &LocCfg,
-    req: &Request,
-    peer_ip: &str,
-) -> Option<String> {
+pub fn cache_key_for(loc: &LocCfg, req: &Request, peer_ip: &str) -> Option<String> {
     let pp = loc.proxy_pass.as_ref()?;
     let scheme = "http";
     let proxy_host = &pp.host_header;
@@ -2372,13 +2432,19 @@ pub fn cache_key_for(
     let host = req.host.as_ref().map(|h| h.as_str()).unwrap_or("");
     Some(match &loc.proxy_cache_key {
         Some(spec) => crate::cache::expand_key(
-            spec, scheme, proxy_host, host, &req.raw_target, &uri_only, &args_only, peer_ip,
+            spec,
+            scheme,
+            proxy_host,
+            host,
+            &req.raw_target,
+            &uri_only,
+            &args_only,
+            peer_ip,
             req.method.as_str(),
         ),
         None => crate::cache::default_key(scheme, proxy_host, &req.raw_target),
     })
 }
-
 
 /// Refresh a stale cache entry behind the client's back.
 ///
@@ -2409,10 +2475,14 @@ pub fn spawn_background_update(
     let Some(pp) = loc.proxy_pass.clone() else {
         return None;
     };
-    let Some(candidates) = choose(http, loc, &match peer_ip.parse() {
-        Ok(ip) => ip,
-        Err(_) => return None,
-    }) else {
+    let Some(candidates) = choose(
+        http,
+        loc,
+        &match peer_ip.parse() {
+            Ok(ip) => ip,
+            Err(_) => return None,
+        },
+    ) else {
         return None;
     };
     let addrs: Vec<SocketAddr> = candidates
@@ -2427,7 +2497,18 @@ pub fn spawn_background_update(
     // `location ~ /(reg)(?P<name>exp)` style `proxy_pass .../$1$name` keeps its
     // captures instead of being rebuilt from the raw URI.
     // The background refresh re-fetches the whole entity for the cache.
-    let head = build_upstream_head(req, target_uri, &[], loc, &pp, peer_ip, false, true, None, true);
+    let head = build_upstream_head(
+        req,
+        target_uri,
+        &[],
+        loc,
+        &pp,
+        peer_ip,
+        false,
+        true,
+        None,
+        true,
+    );
 
     let connect_timeout = loc.proxy_connect_timeout;
     let read_timeout = loc.proxy_read_timeout;
@@ -2453,12 +2534,9 @@ pub fn spawn_background_update(
         else {
             return;
         };
-        if let Some(valid) = crate::cache::ttl(
-            &loc_owned,
-            status,
-            &headers,
-            loc_owned.proxy_cache_ignore,
-        ) {
+        if let Some(valid) =
+            crate::cache::ttl(&loc_owned, status, &headers, loc_owned.proxy_cache_ignore)
+        {
             let entry = crate::cache::Cached {
                 status,
                 headers,
@@ -2495,7 +2573,9 @@ async fn refetch(
 ) -> Option<(u16, Vec<(String, String)>, Vec<u8>)> {
     let mut up = None;
     for addr in addrs {
-        if let Ok(Ok(s)) = tokio::time::timeout(connect_timeout, tokio::net::TcpStream::connect(addr)).await {
+        if let Ok(Ok(s)) =
+            tokio::time::timeout(connect_timeout, tokio::net::TcpStream::connect(addr)).await
+        {
             up = Some(s);
             break;
         }
@@ -2606,7 +2686,9 @@ fn apply_force_ranges(
                 .map(|(_, v)| v.clone())
         };
         let ok = if cond.trim().starts_with('"') || cond.trim().starts_with("W/") {
-            get("etag").map(|e| e.trim() == cond.trim()).unwrap_or(false)
+            get("etag")
+                .map(|e| e.trim() == cond.trim())
+                .unwrap_or(false)
         } else {
             match (
                 crate::util::parse_http_date(cond),
@@ -2656,8 +2738,13 @@ fn apply_force_ranges(
             } else {
                 // nginx picks the boundary from the request's address/size.
                 let boundary = format!("{:016X}", span_hash(req, size));
-                let mbody =
-                    crate::http::static_file::multipart_body(&boundary, &content_type, size, &spans, &body);
+                let mbody = crate::http::static_file::multipart_body(
+                    &boundary,
+                    &content_type,
+                    size,
+                    &spans,
+                    &body,
+                );
                 head.extend_from_slice(b"Content-Type: multipart/byteranges; boundary=");
                 head.extend_from_slice(boundary.as_bytes());
                 head.extend_from_slice(b"\r\nContent-Length: ");
@@ -2706,9 +2793,7 @@ fn strip_length_headers(raw: &mut Vec<u8>) -> Vec<u8> {
             "accept-ranges",
         ]
         .iter()
-        .any(|n| {
-            line.len() > n.len() && line[..n.len()].eq_ignore_ascii_case(n.as_bytes())
-        });
+        .any(|n| line.len() > n.len() && line[..n.len()].eq_ignore_ascii_case(n.as_bytes()));
         if keep {
             out.extend_from_slice(line);
             out.extend_from_slice(b"\r\n");

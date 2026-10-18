@@ -274,7 +274,12 @@ fn absolute_form_authority(target: &str) -> Option<&str> {
     if authority.is_empty() {
         return None;
     }
-    Some(authority.rsplit_once('@').map(|(_, a)| a).unwrap_or(authority))
+    Some(
+        authority
+            .rsplit_once('@')
+            .map(|(_, a)| a)
+            .unwrap_or(authority),
+    )
 }
 
 /// Host portion of an absolute-form target, ready for `$host`.
@@ -445,10 +450,7 @@ impl Request {
         let mut body_len = 0u64;
         let mut saw_len = false;
         for cl in headers.get_all("content-length") {
-            let n: u64 = cl
-                .trim()
-                .parse()
-                .map_err(|_| HttpError::new(400, true))?;
+            let n: u64 = cl.trim().parse().map_err(|_| HttpError::new(400, true))?;
             if saw_len && n != body_len {
                 return Err(HttpError::new(400, true));
             }
@@ -473,8 +475,8 @@ impl Request {
         // $host, which is what nginx's http_absolute_path tests check.
         // Absolute-form: the authority is validated by the request-line rules.
         if is_absolute_form(&target_str) {
-            let authority = absolute_form_authority(&target_str)
-                .ok_or_else(|| HttpError::new(400, true))?;
+            let authority =
+                absolute_form_authority(&target_str).ok_or_else(|| HttpError::new(400, true))?;
             validate_authority(authority).map_err(|_| HttpError::new(400, true))?;
         }
         let absolute_host = absolute_form_host(&target_str);
@@ -668,8 +670,10 @@ mod tests {
             "GET / HTTP/1.0\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n"
         )
         .is_err());
-        assert!(parse("GET / HTTP/1.0\r\nExpect: 100-continue\r\nExpect: 100-continue\r\n\r\n")
-            .is_err());
+        assert!(
+            parse("GET / HTTP/1.0\r\nExpect: 100-continue\r\nExpect: 100-continue\r\n\r\n")
+                .is_err()
+        );
     }
 
     #[test]
@@ -702,7 +706,10 @@ mod tests {
         let r = parse("POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
         assert!(r.chunked);
 
-        assert!(parse("POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n").is_err());
+        assert!(parse(
+            "POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n"
+        )
+        .is_err());
         assert!(parse("POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\n").is_err());
     }
 }

@@ -12,8 +12,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::config::{FastcgiParam, LocCfg};
-use crate::http::request::Request;
 use crate::conn::Conn;
+use crate::http::request::Request;
 use crate::http::{error_body, Body, Outcome, Response};
 
 // ---- protocol constants ---------------------------------------------------
@@ -229,7 +229,9 @@ fn parse_cgi_response(buf: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>, bool)
             continue;
         };
         let name = String::from_utf8_lossy(&line[..colon]).trim().to_string();
-        let value = String::from_utf8_lossy(&line[colon + 1..]).trim().to_string();
+        let value = String::from_utf8_lossy(&line[colon + 1..])
+            .trim()
+            .to_string();
         if name.eq_ignore_ascii_case("status") {
             status = value
                 .split_whitespace()
@@ -312,22 +314,18 @@ pub async fn handle(
     }
 
     // ---- send it ----
-    let mut stream = match tokio::time::timeout(
-        loc.fastcgi_connect_timeout,
-        TcpStream::connect(addr),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            eprintln!("ngxrs: [error] fastcgi connect {addr} failed: {e}");
-            return Ok(Some(respond(conn, 502, tokens, req.keepalive).await?));
-        }
-        Err(_) => {
-            eprintln!("ngxrs: [error] fastcgi connect {addr} timed out");
-            return Ok(Some(respond(conn, 504, tokens, req.keepalive).await?));
-        }
-    };
+    let mut stream =
+        match tokio::time::timeout(loc.fastcgi_connect_timeout, TcpStream::connect(addr)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                eprintln!("ngxrs: [error] fastcgi connect {addr} failed: {e}");
+                return Ok(Some(respond(conn, 502, tokens, req.keepalive).await?));
+            }
+            Err(_) => {
+                eprintln!("ngxrs: [error] fastcgi connect {addr} timed out");
+                return Ok(Some(respond(conn, 504, tokens, req.keepalive).await?));
+            }
+        };
     let _ = stream.set_nodelay(true);
 
     let req_id: u16 = 1;
@@ -356,7 +354,8 @@ pub async fn handle(
     let mut ended = false;
     let mut hdr = [0u8; 8];
     while !ended {
-        let read = tokio::time::timeout(loc.fastcgi_read_timeout, stream.read_exact(&mut hdr)).await;
+        let read =
+            tokio::time::timeout(loc.fastcgi_read_timeout, stream.read_exact(&mut hdr)).await;
         match read {
             Ok(Ok(_)) => {}
             Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => break,
@@ -375,7 +374,8 @@ pub async fn handle(
         let pad = hdr[6] as usize;
         let mut content = vec![0u8; len];
         if len > 0 {
-            match tokio::time::timeout(loc.fastcgi_read_timeout, stream.read_exact(&mut content)).await
+            match tokio::time::timeout(loc.fastcgi_read_timeout, stream.read_exact(&mut content))
+                .await
             {
                 Ok(Ok(_)) => {}
                 _ => break,
@@ -445,9 +445,14 @@ pub async fn handle(
         expect_trailers: false,
         body: Body::Bytes(body),
     };
-    let bytes =
-        crate::http::write_response(conn, resp, req.keepalive, tokens, req.method == crate::http::request::Method::Head)
-            .await?;
+    let bytes = crate::http::write_response(
+        conn,
+        resp,
+        req.keepalive,
+        tokens,
+        req.method == crate::http::request::Method::Head,
+    )
+    .await?;
     Ok(Some(Outcome {
         status,
         bytes,
@@ -456,7 +461,12 @@ pub async fn handle(
     }))
 }
 
-async fn respond(conn: &mut Conn, status: u16, tokens: bool, keepalive: bool) -> io::Result<Outcome> {
+async fn respond(
+    conn: &mut Conn,
+    status: u16,
+    tokens: bool,
+    keepalive: bool,
+) -> io::Result<Outcome> {
     let body = error_body(status, tokens);
     let mut raw = Vec::with_capacity(96);
     raw.extend_from_slice(b"Content-Type: text/html\r\nContent-Length: ");

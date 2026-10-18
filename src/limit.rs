@@ -155,7 +155,7 @@ mod tests {
     #[test]
     fn burst_then_reject() {
         let z = ReqZone::new(2.0); // 500 ms interval
-        // burst=1 means one in flight plus one queued: two accepted.
+                                   // burst=1 means one in flight plus one queued: two accepted.
         assert!(z.account("k", 1, true).is_some());
         assert!(z.account("k", 1, true).is_some());
         assert!(z.account("k", 1, true).is_none());

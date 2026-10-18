@@ -51,7 +51,10 @@ fn notify_parent_ready() {
 
 /// nginx's `daemon on` default: fork, detach from the session, redirect the
 /// standard descriptors, and let the parent exit once we are ready.
-fn daemonize(pid_path: Option<&std::path::Path>, error_log: Option<&std::path::Path>) -> io::Result<()> {
+fn daemonize(
+    pid_path: Option<&std::path::Path>,
+    error_log: Option<&std::path::Path>,
+) -> io::Result<()> {
     let mut fds = [0i32; 2];
     let have_pipe = unsafe { libc::pipe(fds.as_mut_ptr()) } == 0;
 
@@ -131,7 +134,10 @@ pub fn serve(cfg: Config) -> io::Result<()> {
         crate::log::set_global(sinks);
     }
     // nginx announces its build in the error log at `notice`.
-    crate::log::log_global(crate::log::Level::Notice, "using the \"epoll\" event method");
+    crate::log::log_global(
+        crate::log::Level::Notice,
+        "using the \"epoll\" event method",
+    );
     crate::log::log_global(
         crate::log::Level::Notice,
         &format!(
@@ -156,7 +162,11 @@ pub fn serve(cfg: Config) -> io::Result<()> {
             tls_by_group.push(None);
             continue;
         }
-        if !group.servers.iter().any(|&i| cfg.http.server(i).ssl_certificate.is_some()) {
+        if !group
+            .servers
+            .iter()
+            .any(|&i| cfg.http.server(i).ssl_certificate.is_some())
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("no ssl_certificate configured for {}", group.addr),
@@ -225,7 +235,11 @@ pub fn serve(cfg: Config) -> io::Result<()> {
             let ctx = ctx.clone();
             let shutdown = shutdown_rx.clone();
             let stopping = stopping.clone();
-            let ready = if wid == 0 { Some(ready_tx.clone()) } else { None };
+            let ready = if wid == 0 {
+                Some(ready_tx.clone())
+            } else {
+                None
+            };
             let handle = std::thread::Builder::new()
                 .name(format!("ngxrs-w{wid}"))
                 .spawn(move || worker_main(wid, ctx, shutdown, stopping, ready))?;
@@ -395,7 +409,10 @@ fn stream_tls(sc: &crate::config::typed::StreamServerCfg) -> Option<Arc<rustls::
     let (cert, key) = match (&sc.ssl_certificate, &sc.ssl_certificate_key) {
         (Some(c), Some(k)) => (c, k),
         _ => {
-            eprintln!("ngxrs: [error] stream {} ssl without certificate", sc.listen);
+            eprintln!(
+                "ngxrs: [error] stream {} ssl without certificate",
+                sc.listen
+            );
             return None;
         }
     };
@@ -406,10 +423,7 @@ fn stream_tls(sc: &crate::config::typed::StreamServerCfg) -> Option<Arc<rustls::
     match crate::tls::build_mail_config_with(cert, key, &pw) {
         Ok(c) => Some(c),
         Err(e) => {
-            eprintln!(
-                "ngxrs: [error] stream TLS for {}: {e}",
-                sc.listen
-            );
+            eprintln!("ngxrs: [error] stream TLS for {}: {e}", sc.listen);
             None
         }
     }
@@ -783,7 +797,6 @@ fn block_on_shutdown(reloader: Option<Arc<Reloader>>) {
     });
 }
 
-
 // ---------------------------------------------------------------------------
 // Shared-listener mode
 // ---------------------------------------------------------------------------
@@ -821,7 +834,10 @@ fn acceptor_main(
     for (gi, addr) in groups.iter().enumerate() {
         match bind_std(*addr) {
             Ok(l) => {
-                eprintln!("ngxrs: listening on {} (shared)", l.local_addr().unwrap_or(*addr));
+                eprintln!(
+                    "ngxrs: listening on {} (shared)",
+                    l.local_addr().unwrap_or(*addr)
+                );
                 listeners.push((l, gi));
             }
             Err(e) => {
@@ -968,6 +984,3 @@ fn shared_worker_main(
         }
     });
 }
-
-
-

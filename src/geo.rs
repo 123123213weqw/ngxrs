@@ -113,8 +113,7 @@ impl GeoDef {
             return;
         }
         if let Some((net, prefix)) = parse_cidr(key) {
-            self.cidrs
-                .retain(|c| !(c.net == net && c.prefix == prefix));
+            self.cidrs.retain(|c| !(c.net == net && c.prefix == prefix));
         }
     }
 
@@ -281,10 +280,7 @@ mod tests {
 
     #[test]
     fn delete_removes_entry() {
-        let mut g = geo(&[
-            ("127.0.0.0/8", "loopback"),
-            ("0.0.0.0/0", "world"),
-        ]);
+        let mut g = geo(&[("127.0.0.0/8", "loopback"), ("0.0.0.0/0", "world")]);
         g.delete("127.0.0.0/8");
         assert_eq!(g.lookup("127.0.0.1"), Some("world"));
     }

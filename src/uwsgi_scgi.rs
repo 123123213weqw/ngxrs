@@ -142,7 +142,9 @@ fn parse_cgi(buf: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>, bool) {
             continue;
         };
         let name = String::from_utf8_lossy(&line[..colon]).trim().to_string();
-        let value = String::from_utf8_lossy(&line[colon + 1..]).trim().to_string();
+        let value = String::from_utf8_lossy(&line[colon + 1..])
+            .trim()
+            .to_string();
         if name.eq_ignore_ascii_case("status") {
             status = value
                 .split_whitespace()
@@ -167,7 +169,12 @@ fn parse_cgi(buf: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>, bool) {
     (status, headers, body, had_length)
 }
 
-fn frame_response(status: u16, headers: &[(String, String)], payload: &[u8], had_length: bool) -> (Vec<u8>, Vec<u8>) {
+fn frame_response(
+    status: u16,
+    headers: &[(String, String)],
+    payload: &[u8],
+    had_length: bool,
+) -> (Vec<u8>, Vec<u8>) {
     let mut raw = Vec::with_capacity(256);
     for (k, v) in headers {
         raw.extend_from_slice(k.as_bytes());
@@ -346,7 +353,12 @@ fn content_length_of(head: &[u8]) -> Option<u64> {
     None
 }
 
-async fn error_out(conn: &mut Conn, status: u16, tokens: bool, keepalive: bool) -> io::Result<Outcome> {
+async fn error_out(
+    conn: &mut Conn,
+    status: u16,
+    tokens: bool,
+    keepalive: bool,
+) -> io::Result<Outcome> {
     let body = error_body(status, tokens);
     let mut raw = Vec::with_capacity(96);
     raw.extend_from_slice(b"Content-Type: text/html\r\nContent-Length: ");

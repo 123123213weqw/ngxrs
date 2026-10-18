@@ -136,27 +136,38 @@ fn serve_entry(
     loc: &LocCfg,
     http: &Http,
 ) -> io::Result<Response> {
-    let etag = format!("\"{:x}-{:x}\"", mtime, size);
-    let last_modified = http_date(mtime);
+    // Built into fixed storage: this is on the hot path for every static
+    // response, and `format!` + `http_date` cost two allocations per request.
+    let mut eb = [0u8; 40];
+    let mut n = 0usize;
+    eb[n] = b'"';
+    n += 1;
+    n += crate::util::write_hex_u64(&mut eb[n..], mtime as u64);
+    eb[n] = b'-';
+    n += 1;
+    n += crate::util::write_hex_u64(&mut eb[n..], size);
+    eb[n] = b'"';
+    n += 1;
+    let etag = std::str::from_utf8(&eb[..n]).unwrap_or("\"\"");
 
     // ---- preconditions ------------------------------------------------
     if let Some(inm) = req.headers.get("if-none-match") {
-        if etag_list_matches(inm, &etag) {
+        if etag_list_matches(inm, etag) {
             return Ok(Response::empty(304)
                 .header("ETag", etag)
-                .header("Last-Modified", last_modified));
+                .header("Last-Modified", http_date(mtime)));
         }
     } else if let Some(ims) = req.headers.get("if-modified-since") {
         if let Some(t) = parse_http_date(ims) {
             if mtime <= t {
                 return Ok(Response::empty(304)
                     .header("ETag", etag)
-                    .header("Last-Modified", last_modified));
+                    .header("Last-Modified", http_date(mtime)));
             }
         }
     }
     if let Some(im) = req.headers.get("if-match") {
-        if !etag_list_matches(im, &etag) {
+        if !etag_list_matches(im, etag) {
             if im.trim() != "*" {
                 return Ok(Response::empty(412).header("Content-Length", "0"));
             }
@@ -170,10 +181,30 @@ fn serve_entry(
         }
     }
 
-    let mime = http
-        .mime
-        .get(extension(name_for_mime).as_str())
-        .unwrap_or(http.default_type.as_str());
+    // Extension lookup without allocating: probed as-is first (nginx's mime
+    // table is lowercase and so are most filenames), falling back to a
+    // lowercased copy in stack storage.
+    let ext = extension(name_for_mime);
+    let mime = {
+        let mut lb = [0u8; 32];
+        if ext.bytes().any(|b| b.is_ascii_uppercase()) {
+            if ext.len() <= lb.len() {
+                for (i, b) in ext.bytes().enumerate() {
+                    lb[i] = b.to_ascii_lowercase();
+                }
+                let key = std::str::from_utf8(&lb[..ext.len()]).unwrap_or(ext);
+                http.mime.get(key).unwrap_or(http.default_type.as_str())
+            } else {
+                // Too long for stack storage: keep the old allocating path so
+                // case-insensitivity is preserved for unusual names.
+                http.mime
+                    .get(&ext.to_ascii_lowercase())
+                    .unwrap_or(http.default_type.as_str())
+            }
+        } else {
+            http.mime.get(ext).unwrap_or(http.default_type.as_str())
+        }
+    };
 
     // ---- range --------------------------------------------------------
     let mut status = 200u16;
@@ -220,25 +251,25 @@ fn serve_entry(
                     _ => {}
                 }
             } else {
-            match parse_range(range, size) {
-                RangeSpec::Single(start, end) => {
-                    status = 206;
-                    offset = start;
-                    len = end - start + 1;
-                    content_range = Some((start, end));
+                match parse_range(range, size) {
+                    RangeSpec::Single(start, end) => {
+                        status = 206;
+                        offset = start;
+                        len = end - start + 1;
+                        content_range = Some((start, end));
+                    }
+                    RangeSpec::Unsatisfiable => {
+                        let body = error_body(416, http.server_tokens);
+                        let mut raw = Vec::with_capacity(160);
+                        raw.extend_from_slice(b"Content-Type: text/html\r\nContent-Length: ");
+                        crate::util::push_u64(&mut raw, body.len() as u64);
+                        raw.extend_from_slice(b"\r\nContent-Range: bytes */");
+                        crate::util::push_u64(&mut raw, size);
+                        raw.extend_from_slice(b"\r\n");
+                        return Ok(Response::raw(416, raw, Body::Bytes(body)));
+                    }
+                    RangeSpec::Ignore => {}
                 }
-                RangeSpec::Unsatisfiable => {
-                    let body = error_body(416, http.server_tokens);
-                    let mut raw = Vec::with_capacity(160);
-                    raw.extend_from_slice(b"Content-Type: text/html\r\nContent-Length: ");
-                    raw.extend_from_slice(body.len().to_string().as_bytes());
-                    raw.extend_from_slice(b"\r\nContent-Range: bytes */");
-                    raw.extend_from_slice(size.to_string().as_bytes());
-                    raw.extend_from_slice(b"\r\n");
-                    return Ok(Response::raw(416, raw, Body::Bytes(body)));
-                }
-                RangeSpec::Ignore => {}
-            }
             }
         }
     }
@@ -255,7 +286,7 @@ fn serve_entry(
         None => raw.extend_from_slice(mime.as_bytes()),
     }
     raw.extend_from_slice(b"\r\nContent-Length: ");
-    raw.extend_from_slice(len.to_string().as_bytes());
+    crate::util::push_u64(&mut raw, len);
     raw.extend_from_slice(b"\r\nLast-Modified: ");
     push_http_date(&mut raw, mtime);
     raw.extend_from_slice(b"\r\nETag: ");
@@ -266,11 +297,11 @@ fn serve_entry(
     }
     if let Some((start, end)) = content_range {
         raw.extend_from_slice(b"Content-Range: bytes ");
-        raw.extend_from_slice(start.to_string().as_bytes());
+        crate::util::push_u64(&mut raw, start);
         raw.push(b'-');
-        raw.extend_from_slice(end.to_string().as_bytes());
+        crate::util::push_u64(&mut raw, end);
         raw.push(b'/');
-        raw.extend_from_slice(size.to_string().as_bytes());
+        crate::util::push_u64(&mut raw, size);
         raw.extend_from_slice(b"\r\n");
     }
 
@@ -279,7 +310,7 @@ fn serve_entry(
         headers: Vec::new(),
         raw,
         no_error_page: false,
-            explicit_len: true,
+        explicit_len: true,
         trailers: Vec::new(),
         expect_trailers: false,
         body: match multipart {
@@ -289,10 +320,10 @@ fn serve_entry(
     })
 }
 
-fn extension(name: &str) -> String {
+fn extension(name: &str) -> &str {
     match name.rfind('.') {
-        Some(i) if i + 1 < name.len() => name[i + 1..].to_ascii_lowercase(),
-        _ => String::new(),
+        Some(i) if i + 1 < name.len() => &name[i + 1..],
+        _ => "",
     }
 }
 
@@ -599,8 +630,14 @@ mod tests {
             RangeSpec::Single(s, e) => assert_eq!((s, e), (500, 999)),
             _ => panic!(),
         }
-        assert!(matches!(parse_range("bytes=1000-", 1000), RangeSpec::Unsatisfiable));
-        assert!(matches!(parse_range("bytes=0-1,3-4", 1000), RangeSpec::Ignore));
+        assert!(matches!(
+            parse_range("bytes=1000-", 1000),
+            RangeSpec::Unsatisfiable
+        ));
+        assert!(matches!(
+            parse_range("bytes=0-1,3-4", 1000),
+            RangeSpec::Ignore
+        ));
     }
 
     #[test]

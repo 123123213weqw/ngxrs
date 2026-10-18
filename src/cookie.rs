@@ -43,7 +43,10 @@ impl CookieRewrite {
         }
 
         let (from, to) = if is_domain {
-            (from.strip_prefix('.').unwrap_or(from), to.strip_prefix('.').unwrap_or(to))
+            (
+                from.strip_prefix('.').unwrap_or(from),
+                to.strip_prefix('.').unwrap_or(to),
+            )
         } else {
             (from, to)
         };
@@ -57,7 +60,12 @@ impl CookieRewrite {
     /// Apply to one attribute value.
     ///
     /// Returns `None` when the pattern does not match.
-    pub fn apply(&self, value: &str, is_domain: bool, expand: &dyn Fn(&str) -> String) -> Option<String> {
+    pub fn apply(
+        &self,
+        value: &str,
+        is_domain: bool,
+        expand: &dyn Fn(&str) -> String,
+    ) -> Option<String> {
         if let Some(re) = &self.regex {
             let caps = re.captures(value)?;
             let mut named: Vec<(usize, (usize, usize))> = Vec::new();
@@ -100,7 +108,11 @@ impl CookieRewrite {
     }
 }
 
-fn expand_caps(spec: &str, caps: &regex::Captures<'_>, _named: &[(usize, (usize, usize))]) -> String {
+fn expand_caps(
+    spec: &str,
+    caps: &regex::Captures<'_>,
+    _named: &[(usize, (usize, usize))],
+) -> String {
     let mut out = String::with_capacity(spec.len());
     let b = spec.as_bytes();
     let mut i = 0;
@@ -497,14 +509,18 @@ mod tests {
     fn path_regex_case_sensitivity() {
         let sensitive = CookieRewrite::parse(r"~^/regex/(.+)$", "/$1", false).unwrap();
         assert_eq!(
-            sensitive.apply("/regex/test.html", false, &no_vars).as_deref(),
+            sensitive
+                .apply("/regex/test.html", false, &no_vars)
+                .as_deref(),
             Some("/test.html")
         );
         assert_eq!(sensitive.apply("/REGEX/test.html", false, &no_vars), None);
 
         let caseless = CookieRewrite::parse(r"~*^/caseless/(.+)$", "/$1", false).unwrap();
         assert_eq!(
-            caseless.apply("/CASEless/test.html", false, &no_vars).as_deref(),
+            caseless
+                .apply("/CASEless/test.html", false, &no_vars)
+                .as_deref(),
             Some("/test.html")
         );
     }

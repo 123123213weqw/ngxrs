@@ -67,7 +67,12 @@ fn accepts_gzip(req: &Request) -> bool {
 }
 
 fn compressible(ctype: &str, loc: &LocCfg) -> bool {
-    let base = ctype.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let base = ctype
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     if base == "text/html" {
         return true;
     }
@@ -79,9 +84,7 @@ fn compressible(ctype: &str, loc: &LocCfg) -> bool {
 fn find_header(raw: &[u8], name: &[u8]) -> Option<usize> {
     let mut i = 0;
     while i + name.len() < raw.len() {
-        if raw[i..].starts_with(name)
-            && (i == 0 || raw[i - 1] == b'\n')
-        {
+        if raw[i..].starts_with(name) && (i == 0 || raw[i - 1] == b'\n') {
             return Some(i);
         }
         i += 1;
@@ -98,7 +101,9 @@ fn header_value<'a>(raw: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
 
 fn drop_header(raw: &mut Vec<u8>, name: &[u8]) {
     while let Some(pos) = find_header(raw, name) {
-        let end = memchr::memchr(b'\n', &raw[pos..]).map(|e| pos + e + 1).unwrap_or(raw.len());
+        let end = memchr::memchr(b'\n', &raw[pos..])
+            .map(|e| pos + e + 1)
+            .unwrap_or(raw.len());
         raw.drain(pos..end);
     }
 }
@@ -208,7 +213,10 @@ pub fn maybe_compress(req: &Request, resp: Response, loc: &LocCfg, http: &Http) 
 }
 
 fn gz(data: &[u8], level: u32) -> Vec<u8> {
-    let mut enc = GzEncoder::new(Vec::with_capacity(data.len() / 3 + 32), Compression::new(level));
+    let mut enc = GzEncoder::new(
+        Vec::with_capacity(data.len() / 3 + 32),
+        Compression::new(level),
+    );
     if enc.write_all(data).is_err() {
         return Vec::new();
     }

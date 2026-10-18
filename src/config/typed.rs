@@ -16,7 +16,11 @@ pub enum Match {
     Exact(String),
     Prefix(String),
     PrefixNoRegex(String),
-    Regex { re: regex::Regex, ci: bool, src: String },
+    Regex {
+        re: regex::Regex,
+        ci: bool,
+        src: String,
+    },
     Named(String),
 }
 
@@ -359,7 +363,9 @@ pub fn parse_cidr(s: &str) -> Option<Option<Cidr>> {
 
 /// `rate=2r/s`, `rate=1r/m`, `rate=10r/s`.
 fn parse_rate_spec(spec: &str) -> Option<f64> {
-    let rest = spec.strip_suffix("r/s").or_else(|| spec.strip_suffix("r/m"))?;
+    let rest = spec
+        .strip_suffix("r/s")
+        .or_else(|| spec.strip_suffix("r/m"))?;
     let per_minute = spec.ends_with("r/m");
     let n: f64 = rest.parse().ok()?;
     Some(if per_minute { n / 60.0 } else { n })
@@ -488,9 +494,8 @@ pub struct CacheZone {
     /// `proxy_cache_lock` ownership per cache key: the instant the current
     /// holder's `lock_age` runs out (`node->lock_time` in nginx). A waiter may
     /// take over once that passes.
-    pub lock: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
-    >,
+    pub lock:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
     /// `proxy_cache_min_uses` support: how many times each key has been asked
     /// for (`ngx_http_file_cache_node_t.uses`). The first `min_uses - 1`
     /// requests are served but never stored.
@@ -513,13 +518,27 @@ pub struct AuthSet {
 impl Default for AuthSet {
     fn default() -> Self {
         // nginx's default is `*_auth plain`; LOGIN is unconditional on top.
-        AuthSet { plain: true, apop: false, none: false, login: true, cram_md5: false, external: false }
+        AuthSet {
+            plain: true,
+            apop: false,
+            none: false,
+            login: true,
+            cram_md5: false,
+            external: false,
+        }
     }
 }
 
 impl AuthSet {
     fn from_args(args: &[String]) -> Self {
-        let mut set = AuthSet { plain: false, apop: false, none: false, login: true, cram_md5: false, external: false };
+        let mut set = AuthSet {
+            plain: false,
+            apop: false,
+            none: false,
+            login: true,
+            cram_md5: false,
+            external: false,
+        };
         for a in args {
             match a.as_str() {
                 "plain" => set.plain = true,
@@ -582,7 +601,10 @@ pub fn open_sinks(specs: &[LogSpec]) -> Vec<std::sync::Arc<crate::log::Sink>> {
 }
 
 /// `server=host:port[,facility=local7][,tag=nginx]`
-pub fn open_syslog_pub(rest: &str, level: crate::log::Level) -> Option<std::sync::Arc<crate::log::Sink>> {
+pub fn open_syslog_pub(
+    rest: &str,
+    level: crate::log::Level,
+) -> Option<std::sync::Arc<crate::log::Sink>> {
     open_syslog(rest, level)
 }
 
@@ -596,11 +618,26 @@ fn open_syslog(rest: &str, level: crate::log::Level) -> Option<std::sync::Arc<cr
             "server" => server = Some(v.to_string()),
             "facility" => {
                 facility = match v {
-                    "kern" => 0, "user" => 1, "mail" => 2, "daemon" => 3, "auth" => 4,
-                    "syslog" => 5, "lpr" => 6, "news" => 7, "uucp" => 8, "cron" => 9,
-                    "authpriv" => 10, "ftp" => 11,
-                    "local0" => 16, "local1" => 17, "local2" => 18, "local3" => 19,
-                    "local4" => 20, "local5" => 21, "local6" => 22, "local7" => 23,
+                    "kern" => 0,
+                    "user" => 1,
+                    "mail" => 2,
+                    "daemon" => 3,
+                    "auth" => 4,
+                    "syslog" => 5,
+                    "lpr" => 6,
+                    "news" => 7,
+                    "uucp" => 8,
+                    "cron" => 9,
+                    "authpriv" => 10,
+                    "ftp" => 11,
+                    "local0" => 16,
+                    "local1" => 17,
+                    "local2" => 18,
+                    "local3" => 19,
+                    "local4" => 20,
+                    "local5" => 21,
+                    "local6" => 22,
+                    "local7" => 23,
                     _ => 23,
                 }
             }
@@ -928,7 +965,9 @@ impl std::fmt::Debug for LimitReqZone {
 
 impl std::fmt::Debug for LimitConnZone {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LimitConnZone").field("name", &self.name).finish()
+        f.debug_struct("LimitConnZone")
+            .field("name", &self.name)
+            .finish()
     }
 }
 
@@ -1077,10 +1116,7 @@ pub fn parse_time(s: &str) -> Option<Duration> {
         if num.is_empty() {
             return None;
         }
-        return num
-            .parse::<u64>()
-            .ok()
-            .map(Duration::from_millis);
+        return num.parse::<u64>().ok().map(Duration::from_millis);
     }
     let b = s.as_bytes();
     let (num, mult) = match b.last()? {
@@ -1184,7 +1220,11 @@ fn parse_upstream(d: &Directive) -> Result<Upstream, ConfigError> {
                     .first()
                     .ok_or_else(|| sem(&child.file, child.line, "server requires an address"))?;
                 let mut addr = parse_listen(addr_arg).ok_or_else(|| {
-                    sem(&child.file, child.line, format!("invalid server address \"{addr_arg}\""))
+                    sem(
+                        &child.file,
+                        child.line,
+                        format!("invalid server address \"{addr_arg}\""),
+                    )
                 })?;
                 // upstream "host:port" without an IP is resolved later; here we
                 // accept IPv4/IPv6 literals and fall back to 127.0.0.1.
@@ -1218,7 +1258,8 @@ fn parse_upstream(d: &Directive) -> Result<Upstream, ConfigError> {
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(0);
             }
-            "keepalive_requests" | "keepalive_timeout" | "zone" | "hash" | "queue" | "resolver" => {}
+            "keepalive_requests" | "keepalive_timeout" | "zone" | "hash" | "queue" | "resolver" => {
+            }
             other => {
                 return Err(sem(
                     &child.file,
@@ -1372,12 +1413,8 @@ struct Builder {
 
 impl Builder {
     fn warn(&mut self, d: &Directive, msg: impl Into<String>) {
-        self.warnings.push(format!(
-            "{}:{}: {}",
-            d.file.display(),
-            d.line,
-            msg.into()
-        ));
+        self.warnings
+            .push(format!("{}:{}: {}", d.file.display(), d.line, msg.into()));
     }
 
     fn unknown(&mut self, d: &Directive, ctx: &str) {
@@ -1400,12 +1437,14 @@ impl Builder {
         for d in dirs {
             match d.name.as_str() {
                 "auth_http" => {
-                    let v = d.args.first().ok_or_else(|| {
-                        sem(&d.file, d.line, "auth_http requires a URL")
-                    })?;
-                    defaults.auth_http = Some(crate::mail::AuthHttp::parse(v).ok_or_else(|| {
-                        sem(&d.file, d.line, format!("invalid auth_http URL \"{v}\""))
-                    })?);
+                    let v = d
+                        .args
+                        .first()
+                        .ok_or_else(|| sem(&d.file, d.line, "auth_http requires a URL"))?;
+                    defaults.auth_http =
+                        Some(crate::mail::AuthHttp::parse(v).ok_or_else(|| {
+                            sem(&d.file, d.line, format!("invalid auth_http URL \"{v}\""))
+                        })?);
                 }
                 "auth_http_timeout" => {
                     if let Some(t) = d.args.first().and_then(|v| parse_time(v)) {
@@ -1429,13 +1468,25 @@ impl Builder {
                 "imap_auth" => dflt_imap = AuthSet::from_args(&d.args),
                 "smtp_auth" => dflt_smtp = AuthSet::from_args(&d.args),
                 // Accepted, not yet plumbed.
-                "proxy_buffer" | "auth_http_header" | "resolver" | "resolver_timeout"
-                | "log_format" | "timeout" | "proxy_protocol"
-                | "max_errors" | "protocol"
-                | "ssl_protocols" | "ssl_ciphers" | "ssl_prefer_server_ciphers"
-                | "ssl_session_cache" | "ssl_session_timeout" | "ssl_conf_command"
+                "proxy_buffer"
+                | "auth_http_header"
+                | "resolver"
+                | "resolver_timeout"
+                | "log_format"
+                | "timeout"
+                | "proxy_protocol"
+                | "max_errors"
+                | "protocol"
+                | "ssl_protocols"
+                | "ssl_ciphers"
+                | "ssl_prefer_server_ciphers"
+                | "ssl_session_cache"
+                | "ssl_session_timeout"
+                | "ssl_conf_command"
                 | "xclient"
-                | "smtp_auth_methods" | "smtp_client_buffer" | "worker_aio_requests" => {}
+                | "smtp_auth_methods"
+                | "smtp_client_buffer"
+                | "worker_aio_requests" => {}
                 "starttls" => {
                     if let Some(v) = d.args.first().and_then(|v| StarttlsCfg::parse(v)) {
                         defaults.starttls = v;
@@ -1488,17 +1539,17 @@ impl Builder {
             };
             match crate::tls::build_mail_config_with(c, k, &pw) {
                 Ok(cfg) => defaults.tls = Some(cfg),
-                Err(e) => self.warnings.push(format!(
-                    "cannot load mail certificate {}: {e}",
-                    c.display()
-                )),
+                Err(e) => self
+                    .warnings
+                    .push(format!("cannot load mail certificate {}: {e}", c.display())),
             }
         }
 
         for sd in servers_dirs {
-            let block = sd.block.as_ref().ok_or_else(|| {
-                sem(&sd.file, sd.line, "mail server requires a block")
-            })?;
+            let block = sd
+                .block
+                .as_ref()
+                .ok_or_else(|| sem(&sd.file, sd.line, "mail server requires a block"))?;
             let mut srv = defaults.clone();
             let mut srv_cert: Option<PathBuf> = None;
             let mut srv_key: Option<PathBuf> = None;
@@ -1548,7 +1599,11 @@ impl Builder {
                             sem(&child.file, child.line, "auth_http requires a URL")
                         })?;
                         srv.auth_http = Some(crate::mail::AuthHttp::parse(v).ok_or_else(|| {
-                            sem(&child.file, child.line, format!("invalid auth_http URL \"{v}\""))
+                            sem(
+                                &child.file,
+                                child.line,
+                                format!("invalid auth_http URL \"{v}\""),
+                            )
                         })?);
                     }
                     "auth_http_timeout" => {
@@ -1600,16 +1655,25 @@ impl Builder {
                         }
                     }
                     // Accepted, not yet plumbed.
-                    "proxy_buffer" | "xclient"
-| "ssl_protocols"
-                    | "ssl_ciphers" | "ssl_prefer_server_ciphers" | "ssl_session_cache"
-                    | "ssl_session_timeout" | "auth_http_header" | "proxy_protocol"
-                    | "max_errors" | "smtp_client_buffer" | "smtp_auth_methods"
-                    | "smtp_xclient" | "timeout" => {}
+                    "proxy_buffer"
+                    | "xclient"
+                    | "ssl_protocols"
+                    | "ssl_ciphers"
+                    | "ssl_prefer_server_ciphers"
+                    | "ssl_session_cache"
+                    | "ssl_session_timeout"
+                    | "auth_http_header"
+                    | "proxy_protocol"
+                    | "max_errors"
+                    | "smtp_client_buffer"
+                    | "smtp_auth_methods"
+                    | "smtp_xclient"
+                    | "timeout" => {}
                     other => {
                         self.warnings.push(format!(
                             "{}:{}: unknown directive \"{other}\" in mail server; ignored",
-                            child.file.display(), child.line
+                            child.file.display(),
+                            child.line
                         ));
                     }
                 }
@@ -1623,10 +1687,9 @@ impl Builder {
                 };
                 match crate::tls::build_mail_config_with(c, k, &pw) {
                     Ok(cfg) => srv.tls = Some(cfg),
-                    Err(e) => self.warnings.push(format!(
-                        "cannot load mail certificate {}: {e}",
-                        c.display()
-                    )),
+                    Err(e) => self
+                        .warnings
+                        .push(format!("cannot load mail certificate {}: {e}", c.display())),
                 }
             }
 
@@ -1650,11 +1713,17 @@ impl Builder {
     fn apply_loc(&mut self, d: &Directive, cfg: &mut LocCfg) -> Result<bool, ConfigError> {
         match d.name.as_str() {
             "root" => {
-                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "root requires a path"))?;
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "root requires a path"))?;
                 cfg.root = resolve_path(&self.prefix, v);
             }
             "alias" => {
-                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "alias requires a path"))?;
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "alias requires a path"))?;
                 cfg.alias = Some(resolve_path(&self.prefix, v));
                 cfg.alias_prefix_len = cfg.prefix_len;
             }
@@ -1662,34 +1731,52 @@ impl Builder {
                 cfg.index = d.args.clone();
             }
             "autoindex" => {
-                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "autoindex requires on|off"))?;
-                cfg.autoindex = parse_on_off(v)
-                    .ok_or_else(|| sem(&d.file, d.line, format!("invalid autoindex value \"{v}\"")))?;
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "autoindex requires on|off"))?;
+                cfg.autoindex = parse_on_off(v).ok_or_else(|| {
+                    sem(&d.file, d.line, format!("invalid autoindex value \"{v}\""))
+                })?;
             }
             "gzip" => {
-                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "gzip requires on|off"))?;
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "gzip requires on|off"))?;
                 cfg.gzip = parse_on_off(v)
                     .ok_or_else(|| sem(&d.file, d.line, format!("invalid gzip value \"{v}\"")))?;
             }
             "client_max_body_size" => {
-                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "client_max_body_size requires a size"))?;
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "client_max_body_size requires a size"))?;
                 cfg.client_max_body_size = if v == "0" {
                     u64::MAX
                 } else {
-                    parse_size(v).ok_or_else(|| sem(&d.file, d.line, format!("invalid size \"{v}\"")))?
+                    parse_size(v)
+                        .ok_or_else(|| sem(&d.file, d.line, format!("invalid size \"{v}\"")))?
                 };
             }
             "add_header" => {
                 if d.args.len() < 2 {
-                    return Err(sem(&d.file, d.line, "add_header requires at least 2 arguments"));
+                    return Err(sem(
+                        &d.file,
+                        d.line,
+                        "add_header requires at least 2 arguments",
+                    ));
                 }
                 // The value may contain spaces and a trailing `always`.
-                cfg.headers
-                    .push((d.args[0].clone(), d.args[1..].join(" ")));
+                cfg.headers.push((d.args[0].clone(), d.args[1..].join(" ")));
             }
             "add_trailer" => {
                 if d.args.len() < 2 {
-                    return Err(sem(&d.file, d.line, "add_trailer requires at least 2 arguments"));
+                    return Err(sem(
+                        &d.file,
+                        d.line,
+                        "add_trailer requires at least 2 arguments",
+                    ));
                 }
                 cfg.trailers
                     .push((d.args[0].clone(), d.args[1..].join(" ")));
@@ -1719,7 +1806,11 @@ impl Builder {
             }
             "rewrite" => {
                 if d.args.len() < 2 {
-                    return Err(sem(&d.file, d.line, "rewrite requires a regex and a replacement"));
+                    return Err(sem(
+                        &d.file,
+                        d.line,
+                        "rewrite requires a regex and a replacement",
+                    ));
                 }
                 let flag = match d.args.get(2).map(|s| s.as_str()) {
                     None => RewriteFlag::None,
@@ -1735,8 +1826,9 @@ impl Builder {
                         ))
                     }
                 };
-                let rw = compile_rewrite(&d.args[0], &d.args[1], flag)
-                    .ok_or_else(|| sem(&d.file, d.line, format!("invalid regex \"{}\"", d.args[0])))?;
+                let rw = compile_rewrite(&d.args[0], &d.args[1], flag).ok_or_else(|| {
+                    sem(&d.file, d.line, format!("invalid regex \"{}\"", d.args[0]))
+                })?;
                 cfg.rewrites.push(rw);
             }
             "set" => {
@@ -1785,13 +1877,10 @@ impl Builder {
                             }
                         }
                         "return" => {
-                            let code: u16 = child
-                                .args
-                                .first()
-                                .and_then(|c| c.parse().ok())
-                                .ok_or_else(|| {
-                                    sem(&child.file, child.line, "return requires a status")
-                                })?;
+                            let code: u16 =
+                                child.args.first().and_then(|c| c.parse().ok()).ok_or_else(
+                                    || sem(&child.file, child.line, "return requires a status"),
+                                )?;
                             ifb.ret = Some((code, child.args.get(1).cloned().unwrap_or_default()));
                         }
                         "set" => {
@@ -1829,7 +1918,11 @@ impl Builder {
             }
             "try_files" => {
                 if d.args.len() < 2 {
-                    return Err(sem(&d.file, d.line, "try_files requires at least 2 arguments"));
+                    return Err(sem(
+                        &d.file,
+                        d.line,
+                        "try_files requires at least 2 arguments",
+                    ));
                 }
                 cfg.try_files = d.args.clone();
             }
@@ -1877,8 +1970,14 @@ impl Builder {
                 cfg.limit_reqs.push(lr);
             }
             "limit_conn" => {
-                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "limit_conn needs zone and limit"))?;
-                let n = d.args.get(1).ok_or_else(|| sem(&d.file, d.line, "limit_conn needs a limit"))?;
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "limit_conn needs zone and limit"))?;
+                let n = d
+                    .args
+                    .get(1)
+                    .ok_or_else(|| sem(&d.file, d.line, "limit_conn needs a limit"))?;
                 cfg.limit_conns.push(LimitConn {
                     zone: v.clone(),
                     limit: n.parse().unwrap_or(0),
@@ -1895,21 +1994,23 @@ impl Builder {
                     }
                 }
             }
-            "limit_req_dry_run"
-            | "limit_conn_dry_run" => {
+            "limit_req_dry_run" | "limit_conn_dry_run" => {
                 // Accepted; dry-run bookkeeping is not implemented.
             }
             "proxy_bind" => {
-                let v = d.args.first().ok_or_else(|| {
-                    sem(&d.file, d.line, "proxy_bind requires an address")
-                })?;
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "proxy_bind requires an address"))?;
                 cfg.proxy_bind = Some(v.clone());
             }
             "allow" | "deny" => {
-                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "allow/deny requires an address"))?;
-                let net = parse_cidr(v).ok_or_else(|| {
-                    sem(&d.file, d.line, format!("invalid address \"{v}\""))
-                })?;
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "allow/deny requires an address"))?;
+                let net = parse_cidr(v)
+                    .ok_or_else(|| sem(&d.file, d.line, format!("invalid address \"{v}\"")))?;
                 cfg.access.push(AccessRule {
                     deny: d.name == "deny",
                     net,
@@ -1941,9 +2042,10 @@ impl Builder {
                 cfg.limit_except.push(le);
             }
             "absolute_redirect" | "server_name_in_redirect" | "port_in_redirect" => {
-                let v = d.args.first().ok_or_else(|| {
-                    sem(&d.file, d.line, format!("{} requires on|off", d.name))
-                })?;
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, format!("{} requires on|off", d.name)))?;
                 let on = parse_on_off(v).ok_or_else(|| {
                     sem(&d.file, d.line, format!("invalid {} value \"{v}\"", d.name))
                 })?;
@@ -1954,30 +2056,39 @@ impl Builder {
                 }
             }
             "keepalive_requests" => {
-                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "keepalive_requests requires a value"))?;
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "keepalive_requests requires a value"))?;
                 cfg.keepalive_requests = Some(
                     v.parse::<u64>()
                         .map_err(|_| sem(&d.file, d.line, "invalid keepalive_requests"))?,
                 );
             }
             "keepalive_timeout" => {
-                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "keepalive_timeout requires a value"))?;
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "keepalive_timeout requires a value"))?;
                 let timeout = parse_time(v)
                     .ok_or_else(|| sem(&d.file, d.line, "invalid keepalive_timeout"))?;
-                let header = d
-                    .args
-                    .get(1)
-                    .and_then(|h| h.parse::<u32>().ok());
+                let header = d.args.get(1).and_then(|h| h.parse::<u32>().ok());
                 cfg.keepalive_timeout = Some((timeout, header));
             }
             "keepalive_time" => {
-                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "keepalive_time requires a value"))?;
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "keepalive_time requires a value"))?;
                 cfg.keepalive_time = Some(
                     parse_time(v).ok_or_else(|| sem(&d.file, d.line, "invalid keepalive_time"))?,
                 );
             }
             "keepalive_disable" => {
-                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "keepalive_disable requires a value"))?;
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "keepalive_disable requires a value"))?;
                 cfg.keepalive_disable = match v.as_str() {
                     "msie6" => KeepaliveDisable::Msie6,
                     "safari" => KeepaliveDisable::Safari,
@@ -1992,12 +2103,18 @@ impl Builder {
                 };
             }
             "gzip_min_length" => {
-                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "gzip_min_length requires a size"))?;
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "gzip_min_length requires a size"))?;
                 cfg.gzip_min_length = parse_size(v)
                     .ok_or_else(|| sem(&d.file, d.line, format!("invalid size \"{v}\"")))?;
             }
             "gzip_comp_level" => {
-                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "gzip_comp_level requires a level"))?;
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "gzip_comp_level requires a level"))?;
                 cfg.gzip_comp_level = v
                     .parse::<u32>()
                     .ok()
@@ -2008,9 +2125,13 @@ impl Builder {
                 cfg.gzip_types = d.args.clone();
             }
             "gzip_vary" => {
-                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "gzip_vary requires on|off"))?;
-                cfg.gzip_vary = parse_on_off(v)
-                    .ok_or_else(|| sem(&d.file, d.line, format!("invalid gzip_vary value \"{v}\"")))?;
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "gzip_vary requires on|off"))?;
+                cfg.gzip_vary = parse_on_off(v).ok_or_else(|| {
+                    sem(&d.file, d.line, format!("invalid gzip_vary value \"{v}\""))
+                })?;
             }
             "grpc_pass" => {
                 let v = d
@@ -2022,33 +2143,45 @@ impl Builder {
                 cfg.grpc_pass = Some(v.clone());
             }
             "proxy_pass" => {
-                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "proxy_pass requires a URL"))?;
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "proxy_pass requires a URL"))?;
                 cfg.proxy_pass = Some(parse_proxy_pass(v).ok_or_else(|| {
                     sem(&d.file, d.line, format!("invalid proxy_pass URL \"{v}\""))
                 })?);
-                cfg.proxy_pass.as_mut().unwrap().target = cfg
-                    .proxy_pass
-                    .as_ref()
-                    .unwrap()
-                    .target
-                    .clone();
+                cfg.proxy_pass.as_mut().unwrap().target =
+                    cfg.proxy_pass.as_ref().unwrap().target.clone();
                 if let Some(name) = proxy_upstream_name(v) {
                     cfg.proxy_upstream_name = Some(name);
                 }
             }
             "proxy_set_header" => {
                 if d.args.len() < 2 {
-                    return Err(sem(&d.file, d.line, "proxy_set_header requires 2 arguments"));
+                    return Err(sem(
+                        &d.file,
+                        d.line,
+                        "proxy_set_header requires 2 arguments",
+                    ));
                 }
                 cfg.proxy_set_headers
                     .push((d.args[0].clone(), d.args[1..].join(" ")));
             }
             "proxy_http_version" => {
-                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "proxy_http_version requires a value"))?;
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "proxy_http_version requires a value"))?;
                 cfg.proxy_http_version = match v.as_str() {
                     "1.0" => 0,
                     "1.1" => 1,
-                    _ => return Err(sem(&d.file, d.line, format!("invalid proxy_http_version \"{v}\""))),
+                    _ => {
+                        return Err(sem(
+                            &d.file,
+                            d.line,
+                            format!("invalid proxy_http_version \"{v}\""),
+                        ))
+                    }
                 };
             }
             "proxy_connect_timeout" => {
@@ -2070,20 +2203,35 @@ impl Builder {
                 }
             }
             "proxy_buffering" => {
-                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "proxy_buffering requires on|off"))?;
-                cfg.proxy_buffering = parse_on_off(v)
-                    .ok_or_else(|| sem(&d.file, d.line, format!("invalid proxy_buffering \"{v}\"")))?;
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "proxy_buffering requires on|off"))?;
+                cfg.proxy_buffering = parse_on_off(v).ok_or_else(|| {
+                    sem(&d.file, d.line, format!("invalid proxy_buffering \"{v}\""))
+                })?;
             }
             "fastcgi_pass" => {
-                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "fastcgi_pass requires an address"))?;
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "fastcgi_pass requires an address"))?;
                 let addr = parse_listen(v).ok_or_else(|| {
-                    sem(&d.file, d.line, format!("invalid fastcgi_pass address \"{v}\""))
+                    sem(
+                        &d.file,
+                        d.line,
+                        format!("invalid fastcgi_pass address \"{v}\""),
+                    )
                 })?;
                 cfg.fastcgi_pass = Some(FastcgiPass { addr });
             }
             "fastcgi_param" => {
                 if d.args.len() < 2 {
-                    return Err(sem(&d.file, d.line, "fastcgi_param requires a name and a value"));
+                    return Err(sem(
+                        &d.file,
+                        d.line,
+                        "fastcgi_param requires a name and a value",
+                    ));
                 }
                 cfg.fastcgi_params.push(FastcgiParam {
                     name: d.args[0].clone(),
@@ -2094,7 +2242,9 @@ impl Builder {
                 cfg.fastcgi_index = d.args.first().cloned();
             }
             "fastcgi_split_path_info" => {
-                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "fastcgi_split_path_info requires a regex"))?;
+                let v = d.args.first().ok_or_else(|| {
+                    sem(&d.file, d.line, "fastcgi_split_path_info requires a regex")
+                })?;
                 cfg.fastcgi_split_path_info = Some(
                     regex::Regex::new(v)
                         .map_err(|_| sem(&d.file, d.line, format!("invalid regex \"{v}\"")))?,
@@ -2113,7 +2263,10 @@ impl Builder {
                 }
             }
             "uwsgi_pass" => {
-                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "uwsgi_pass requires an address"))?;
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "uwsgi_pass requires an address"))?;
                 let addr = parse_listen(v)
                     .ok_or_else(|| sem(&d.file, d.line, format!("invalid uwsgi_pass \"{v}\"")))?;
                 cfg.uwsgi_pass = Some(UwsgiPass {
@@ -2124,7 +2277,11 @@ impl Builder {
             }
             "uwsgi_param" => {
                 if d.args.len() < 2 {
-                    return Err(sem(&d.file, d.line, "uwsgi_param requires a name and a value"));
+                    return Err(sem(
+                        &d.file,
+                        d.line,
+                        "uwsgi_param requires a name and a value",
+                    ));
                 }
                 cfg.uwsgi_params.push(FastcgiParam {
                     name: d.args[0].clone(),
@@ -2144,7 +2301,10 @@ impl Builder {
                 }
             }
             "scgi_pass" => {
-                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "scgi_pass requires an address"))?;
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "scgi_pass requires an address"))?;
                 let addr = parse_listen(v)
                     .ok_or_else(|| sem(&d.file, d.line, format!("invalid scgi_pass \"{v}\"")))?;
                 cfg.scgi_pass = Some(ScgiPass {
@@ -2155,35 +2315,70 @@ impl Builder {
             }
             "scgi_param" => {
                 if d.args.len() < 2 {
-                    return Err(sem(&d.file, d.line, "scgi_param requires a name and a value"));
+                    return Err(sem(
+                        &d.file,
+                        d.line,
+                        "scgi_param requires a name and a value",
+                    ));
                 }
                 cfg.scgi_params.push(FastcgiParam {
                     name: d.args[0].clone(),
                     value: d.args[1..].join(" "),
                 });
             }
-            "scgi_connect_timeout" | "scgi_read_timeout" | "scgi_send_timeout"
-            | "scgi_buffer_size" | "scgi_buffers" | "scgi_busy_buffers_size"
-            | "scgi_temp_file_write_size" | "scgi_max_temp_file_size"
-            | "scgi_intercept_errors" | "scgi_pass_request_body"
-            | "scgi_pass_request_headers" | "scgi_store" | "scgi_store_access"
-            | "scgi_cache" | "scgi_cache_key" | "scgi_cache_valid"
-            | "uwsgi_send_timeout" | "uwsgi_buffer_size" | "uwsgi_buffers"
-            | "uwsgi_busy_buffers_size" | "uwsgi_temp_file_write_size"
-            | "uwsgi_max_temp_file_size" | "uwsgi_intercept_errors"
-            | "uwsgi_pass_request_body" | "uwsgi_pass_request_headers"
-            | "uwsgi_modifier1" | "uwsgi_modifier2" | "uwsgi_store"
-            | "uwsgi_store_access" | "uwsgi_cache" | "uwsgi_cache_key"
-            | "uwsgi_cache_valid" | "uwsgi_ssl_server_name" | "uwsgi_ssl_verify" => {
+            "scgi_connect_timeout"
+            | "scgi_read_timeout"
+            | "scgi_send_timeout"
+            | "scgi_buffer_size"
+            | "scgi_buffers"
+            | "scgi_busy_buffers_size"
+            | "scgi_temp_file_write_size"
+            | "scgi_max_temp_file_size"
+            | "scgi_intercept_errors"
+            | "scgi_pass_request_body"
+            | "scgi_pass_request_headers"
+            | "scgi_store"
+            | "scgi_store_access"
+            | "scgi_cache"
+            | "scgi_cache_key"
+            | "scgi_cache_valid"
+            | "uwsgi_send_timeout"
+            | "uwsgi_buffer_size"
+            | "uwsgi_buffers"
+            | "uwsgi_busy_buffers_size"
+            | "uwsgi_temp_file_write_size"
+            | "uwsgi_max_temp_file_size"
+            | "uwsgi_intercept_errors"
+            | "uwsgi_pass_request_body"
+            | "uwsgi_pass_request_headers"
+            | "uwsgi_modifier1"
+            | "uwsgi_modifier2"
+            | "uwsgi_store"
+            | "uwsgi_store_access"
+            | "uwsgi_cache"
+            | "uwsgi_cache_key"
+            | "uwsgi_cache_valid"
+            | "uwsgi_ssl_server_name"
+            | "uwsgi_ssl_verify" => {
                 // Accepted, not yet honoured.
             }
-            "fastcgi_send_timeout" | "fastcgi_buffer_size" | "fastcgi_buffers"
-            | "fastcgi_busy_buffers_size" | "fastcgi_temp_file_write_size"
-            | "fastcgi_max_temp_file_size" | "fastcgi_intercept_errors"
-            | "fastcgi_pass_request_body" | "fastcgi_pass_request_headers"
-            | "fastcgi_keep_conn" | "fastcgi_store" | "fastcgi_store_access"
-            | "fastcgi_cache" | "fastcgi_cache_key" | "fastcgi_cache_valid"
-            | "fastcgi_ignore_headers" | "fastcgi_hide_header" => {
+            "fastcgi_send_timeout"
+            | "fastcgi_buffer_size"
+            | "fastcgi_buffers"
+            | "fastcgi_busy_buffers_size"
+            | "fastcgi_temp_file_write_size"
+            | "fastcgi_max_temp_file_size"
+            | "fastcgi_intercept_errors"
+            | "fastcgi_pass_request_body"
+            | "fastcgi_pass_request_headers"
+            | "fastcgi_keep_conn"
+            | "fastcgi_store"
+            | "fastcgi_store_access"
+            | "fastcgi_cache"
+            | "fastcgi_cache_key"
+            | "fastcgi_cache_valid"
+            | "fastcgi_ignore_headers"
+            | "fastcgi_hide_header" => {
                 // Accepted, not yet honoured.
             }
             "proxy_cache" => {
@@ -2261,11 +2456,7 @@ impl Builder {
                 }
             }
             "proxy_cache_lock" => {
-                cfg.proxy_cache_lock = d
-                    .args
-                    .first()
-                    .map(|v| v == "on")
-                    .unwrap_or(false);
+                cfg.proxy_cache_lock = d.args.first().map(|v| v == "on").unwrap_or(false);
             }
             "proxy_cache_lock_timeout" | "proxy_cache_lock_age" => {
                 if let Some(t) = d.args.first().and_then(|v| parse_time(v)) {
@@ -2277,16 +2468,22 @@ impl Builder {
                 }
             }
             "proxy_cache_convert_head" => {
-                cfg.proxy_cache_convert_head =
-                    d.args.first().map(|v| v != "off").unwrap_or(true);
+                cfg.proxy_cache_convert_head = d.args.first().map(|v| v != "off").unwrap_or(true);
             }
             "proxy_cache_max_range_offset" => {
-                let v = d
-                    .args
-                    .first()
-                    .ok_or_else(|| sem(&d.file, d.line, "proxy_cache_max_range_offset requires a value"))?;
+                let v = d.args.first().ok_or_else(|| {
+                    sem(
+                        &d.file,
+                        d.line,
+                        "proxy_cache_max_range_offset requires a value",
+                    )
+                })?;
                 cfg.proxy_cache_max_range_offset = Some(parse_size(v).ok_or_else(|| {
-                    sem(&d.file, d.line, format!("invalid proxy_cache_max_range_offset \"{v}\""))
+                    sem(
+                        &d.file,
+                        d.line,
+                        format!("invalid proxy_cache_max_range_offset \"{v}\""),
+                    )
                 })?);
             }
             "proxy_limit_rate" => {
@@ -2294,12 +2491,12 @@ impl Builder {
                     .args
                     .first()
                     .ok_or_else(|| sem(&d.file, d.line, "proxy_limit_rate requires a value"))?;
-                cfg.proxy_limit_rate = parse_size(v)
-                    .ok_or_else(|| sem(&d.file, d.line, format!("invalid proxy_limit_rate \"{v}\"")))?;
+                cfg.proxy_limit_rate = parse_size(v).ok_or_else(|| {
+                    sem(&d.file, d.line, format!("invalid proxy_limit_rate \"{v}\""))
+                })?;
             }
             "proxy_intercept_errors" => {
-                cfg.proxy_intercept_errors =
-                    d.args.first().map(|v| v != "off").unwrap_or(true);
+                cfg.proxy_intercept_errors = d.args.first().map(|v| v != "off").unwrap_or(true);
             }
             "max_ranges" => {
                 cfg.max_ranges = d.args.first().and_then(|v| v.parse().ok());
@@ -2312,8 +2509,7 @@ impl Builder {
                     d.args.first().map(|v| v != "off").unwrap_or(true);
             }
             "proxy_cache_revalidate" => {
-                cfg.proxy_cache_revalidate =
-                    d.args.first().map(|v| v != "off").unwrap_or(true);
+                cfg.proxy_cache_revalidate = d.args.first().map(|v| v != "off").unwrap_or(true);
             }
             "proxy_cache_use_stale" => {
                 cfg.proxy_cache_use_stale_updating = d
@@ -2332,9 +2528,13 @@ impl Builder {
                     .args
                     .first()
                     .ok_or_else(|| sem(&d.file, d.line, "proxy_cache_min_uses requires a value"))?;
-                cfg.proxy_cache_min_uses = v
-                    .parse::<u32>()
-                    .map_err(|_| sem(&d.file, d.line, format!("invalid proxy_cache_min_uses \"{v}\"")))?;
+                cfg.proxy_cache_min_uses = v.parse::<u32>().map_err(|_| {
+                    sem(
+                        &d.file,
+                        d.line,
+                        format!("invalid proxy_cache_min_uses \"{v}\""),
+                    )
+                })?;
             }
             "proxy_cache_valid" => {
                 // proxy_cache_valid [code ...] time;
@@ -2366,18 +2566,28 @@ impl Builder {
             }
             "proxy_no_cache" => cfg.proxy_no_cache = d.args.clone(),
             "proxy_cache_bypass" => cfg.proxy_cache_bypass = d.args.clone(),
-            "proxy_next_upstream" | "proxy_next_upstream_tries" | "proxy_buffers"
-            | "proxy_buffer_size" | "proxy_busy_buffers_size" | "proxy_max_temp_file_size"
-            | "proxy_temp_file_write_size" | "proxy_redirect" | "proxy_cache"
-            | "proxy_cache_valid" | "proxy_cache_key" | "proxy_cache_bypass" | "proxy_no_cache"
-            | "proxy_pass_request_body" | "proxy_pass_request_headers"
-            | "proxy_ssl_server_name" | "proxy_ssl_verify" => {
+            "proxy_next_upstream"
+            | "proxy_next_upstream_tries"
+            | "proxy_buffers"
+            | "proxy_buffer_size"
+            | "proxy_busy_buffers_size"
+            | "proxy_max_temp_file_size"
+            | "proxy_temp_file_write_size"
+            | "proxy_redirect"
+            | "proxy_cache"
+            | "proxy_cache_valid"
+            | "proxy_cache_key"
+            | "proxy_cache_bypass"
+            | "proxy_no_cache"
+            | "proxy_pass_request_body"
+            | "proxy_pass_request_headers"
+            | "proxy_ssl_server_name"
+            | "proxy_ssl_verify" => {
                 // Accepted, not yet honoured.
             }
             "limit_rate" | "limit_rate_after" | "sendfile" | "tcp_nopush" | "tcp_nodelay"
-            | "server_tokens" | "default_type"
-            | "charset"
-            | "merge_slashes" | "log_not_found" | "open_file_cache" | "etag" | "msie_padding" => {
+            | "server_tokens" | "default_type" | "charset" | "merge_slashes" | "log_not_found"
+            | "open_file_cache" | "etag" | "msie_padding" => {
                 // Accepted at this scope but not yet plumbed through: handled at
                 // http/server level where relevant, otherwise silently accepted.
                 return Ok(true);
@@ -2387,11 +2597,7 @@ impl Builder {
         Ok(true)
     }
 
-    fn parse_location(
-        &mut self,
-        d: &Directive,
-        parent: &LocCfg,
-    ) -> Result<Location, ConfigError> {
+    fn parse_location(&mut self, d: &Directive, parent: &LocCfg) -> Result<Location, ConfigError> {
         let block = d
             .block
             .as_ref()
@@ -2551,24 +2757,25 @@ impl Builder {
                             Some(p) => p,
                             None => continue,
                         };
-                        let format = match child.args.get(1).map(|s| s.as_str()).unwrap_or("combined")
-                        {
-                            "combined" => "combined".to_string(),
-                            name => log_formats
-                                .get(name)
-                                .cloned()
-                                .unwrap_or_else(|| "combined".to_string()),
-                        };
+                        let format =
+                            match child.args.get(1).map(|s| s.as_str()).unwrap_or("combined") {
+                                "combined" => "combined".to_string(),
+                                name => log_formats
+                                    .get(name)
+                                    .cloned()
+                                    .unwrap_or_else(|| "combined".to_string()),
+                            };
                         access_logs.push(AccessLog {
                             path: resolve_path(&self.prefix, path),
                             format,
                         });
-                        }
+                    }
                 }
                 "keepalive_timeout" => {
                     if let Some(v) = child.args.first() {
-                        keepalive = parse_time(v)
-                            .ok_or_else(|| sem(&child.file, child.line, "invalid keepalive_timeout"))?;
+                        keepalive = parse_time(v).ok_or_else(|| {
+                            sem(&child.file, child.line, "invalid keepalive_timeout")
+                        })?;
                         // Locations inherit this, and the second argument is the
                         // value for the `Keep-Alive: timeout=` header.
                         self.apply_loc(child, &mut default_loc)?;
@@ -2611,13 +2818,26 @@ impl Builder {
                         ssl_client_certificate = Some(resolve_path(&self.prefix, v));
                     }
                 }
-                "ssl_protocols" | "ssl_ciphers" | "ssl_prefer_server_ciphers"
-                | "ssl_session_cache" | "ssl_session_timeout" | "ssl_session_tickets"
-                | "ssl_dhparam" | "ssl_ecdh_curve" | "ssl_stapling" | "ssl_stapling_verify"
+                "ssl_protocols"
+                | "ssl_ciphers"
+                | "ssl_prefer_server_ciphers"
+                | "ssl_session_cache"
+                | "ssl_session_timeout"
+                | "ssl_session_tickets"
+                | "ssl_dhparam"
+                | "ssl_ecdh_curve"
+                | "ssl_stapling"
+                | "ssl_stapling_verify"
                 | "ssl_buffer_size"
-                | "ssl_trusted_certificate" | "ssl_early_data" | "ssl_conf_command"
-                | "http2_max_field_size" | "http2_max_header_size" | "http2_idle_timeout"
-                | "http2_body_preread_size" | "http2_chunk_size" | "http2_max_concurrent_streams"
+                | "ssl_trusted_certificate"
+                | "ssl_early_data"
+                | "ssl_conf_command"
+                | "http2_max_field_size"
+                | "http2_max_header_size"
+                | "http2_idle_timeout"
+                | "http2_body_preread_size"
+                | "http2_chunk_size"
+                | "http2_max_concurrent_streams"
                 | "http2_recv_buffer_size" => {
                     // Parsed and accepted; rustls/h2 pick safe defaults.
                 }
@@ -2632,7 +2852,11 @@ impl Builder {
                         .first()
                         .and_then(|v| v.parse::<usize>().ok())
                         .ok_or_else(|| {
-                            sem(&child.file, child.line, "invalid large_client_header_buffers")
+                            sem(
+                                &child.file,
+                                child.line,
+                                "invalid large_client_header_buffers",
+                            )
                         })?;
                     let size = child
                         .args
@@ -2686,7 +2910,6 @@ impl Builder {
             }
         }
 
-
         let mut regex_names = Vec::new();
         let mut regex_names_src = Vec::new();
         for n in &names {
@@ -2701,7 +2924,12 @@ impl Builder {
         }
 
         if listens.is_empty() {
-            listens.push((SocketAddr::from((Ipv4Addr::UNSPECIFIED, 80)), false, ssl, false));
+            listens.push((
+                SocketAddr::from((Ipv4Addr::UNSPECIFIED, 80)),
+                false,
+                ssl,
+                false,
+            ));
         }
 
         Ok((
@@ -2762,12 +2990,15 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                     if child.name != "server" {
                         continue;
                     }
-                    let a = child
-                        .args
-                        .first()
-                        .ok_or_else(|| sem(&child.file, child.line, "server requires an address"))?;
+                    let a = child.args.first().ok_or_else(|| {
+                        sem(&child.file, child.line, "server requires an address")
+                    })?;
                     let mut addr = parse_listen(a).ok_or_else(|| {
-                        sem(&child.file, child.line, format!("invalid server address \"{a}\""))
+                        sem(
+                            &child.file,
+                            child.line,
+                            format!("invalid server address \"{a}\""),
+                        )
                     })?;
                     if !a.contains(':') {
                         addr = SocketAddr::new(addr.ip(), 80);
@@ -2780,12 +3011,27 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                 section.upstreams.push(StreamUpstream { name, backends });
             }
             "server" => server_dirs.push(d),
-            "log_format" | "access_log" | "error_log" | "resolver" | "map" | "geo"
-            | "split_clients" | "limit_conn_zone" | "limit_req_zone" | "variables_hash_max_size"
-            | "variables_hash_bucket_size" | "proxy_protocol" | "preread_buffer_size"
+            "log_format"
+            | "access_log"
+            | "error_log"
+            | "resolver"
+            | "map"
+            | "geo"
+            | "split_clients"
+            | "limit_conn_zone"
+            | "limit_req_zone"
+            | "variables_hash_max_size"
+            | "variables_hash_bucket_size"
+            | "proxy_protocol"
+            | "preread_buffer_size"
             | "ssl_protocols"
-            | "ssl_ciphers" | "ssl_session_cache" | "ssl_session_timeout" | "ssl_dhparam"
-            | "ssl_prefer_server_ciphers" | "ssl_handshake_timeout" | "ssl_ecdh_curve" => {}
+            | "ssl_ciphers"
+            | "ssl_session_cache"
+            | "ssl_session_timeout"
+            | "ssl_dhparam"
+            | "ssl_prefer_server_ciphers"
+            | "ssl_handshake_timeout"
+            | "ssl_ecdh_curve" => {}
             "error_log" => {}
             "ssl_certificate" => {
                 if let Some(p) = d.args.first() {
@@ -2824,10 +3070,14 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             }
             "proxy_timeout" => {
                 if let Some(v) = d.args.first() {
-                    stream_proxy_timeout = crate::config::parse_time(v).unwrap_or(stream_proxy_timeout);
+                    stream_proxy_timeout =
+                        crate::config::parse_time(v).unwrap_or(stream_proxy_timeout);
                 }
             }
-            other => b.warn(d, format!("unknown directive \"{other}\" in stream context; ignored")),
+            other => b.warn(
+                d,
+                format!("unknown directive \"{other}\" in stream context; ignored"),
+            ),
         }
     }
 
@@ -2854,12 +3104,15 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
         for child in sd.block.as_ref().map(|x| x.as_slice()).unwrap_or(&[]) {
             match child.name.as_str() {
                 "listen" => {
-                    let a = child
-                        .args
-                        .first()
-                        .ok_or_else(|| sem(&child.file, child.line, "listen requires an address"))?;
+                    let a = child.args.first().ok_or_else(|| {
+                        sem(&child.file, child.line, "listen requires an address")
+                    })?;
                     cfg.listen = parse_listen(a).ok_or_else(|| {
-                        sem(&child.file, child.line, format!("invalid listen address \"{a}\""))
+                        sem(
+                            &child.file,
+                            child.line,
+                            format!("invalid listen address \"{a}\""),
+                        )
                     })?;
                     if child.args[1..].iter().any(|p| p == "udp") {
                         cfg.udp = true;
@@ -2931,12 +3184,26 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                         cfg.proxy_ssl_name = Some(v.clone());
                     }
                 }
-                "proxy_protocol" | "proxy_buffer_size" | "proxy_responses" | "preread_buffer_size"
-                | "preread_timeout" | "set" | "ssl_session_cache" | "ssl_session_timeout"
-                | "ssl_prefer_server_ciphers" | "ssl_ciphers" | "ssl_protocols"
-                | "if" | "proxy_ssl_server_name" | "proxy_ssl_verify" | "proxy_requests"
-                | "proxy_ssl_certificate" | "proxy_ssl_certificate_key" | "proxy_ssl_protocols"
-                | "proxy_ssl_ciphers" | "proxy_ssl_trusted_certificate" => {}
+                "proxy_protocol"
+                | "proxy_buffer_size"
+                | "proxy_responses"
+                | "preread_buffer_size"
+                | "preread_timeout"
+                | "set"
+                | "ssl_session_cache"
+                | "ssl_session_timeout"
+                | "ssl_prefer_server_ciphers"
+                | "ssl_ciphers"
+                | "ssl_protocols"
+                | "if"
+                | "proxy_ssl_server_name"
+                | "proxy_ssl_verify"
+                | "proxy_requests"
+                | "proxy_ssl_certificate"
+                | "proxy_ssl_certificate_key"
+                | "proxy_ssl_protocols"
+                | "proxy_ssl_ciphers"
+                | "proxy_ssl_trusted_certificate" => {}
                 other => {
                     return Err(sem(
                         &child.file,
@@ -3000,7 +3267,10 @@ pub fn build(
     for d in tree {
         match d.name.as_str() {
             "worker_processes" => {
-                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "worker_processes requires a value"))?;
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "worker_processes requires a value"))?;
                 worker_processes = if v == "auto" {
                     0
                 } else {
@@ -3009,8 +3279,12 @@ pub fn build(
                 };
             }
             "daemon" => {
-                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "daemon requires on|off"))?;
-                daemon = parse_on_off(v).ok_or_else(|| sem(&d.file, d.line, "invalid daemon value"))?;
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "daemon requires on|off"))?;
+                daemon =
+                    parse_on_off(v).ok_or_else(|| sem(&d.file, d.line, "invalid daemon value"))?;
             }
             "pid" => {
                 if let Some(p) = d.args.first() {
@@ -3027,8 +3301,13 @@ pub fn build(
                     error_logs.push(spec);
                 }
             }
-            "events" | "worker_rlimit_nofile" | "worker_connections" | "use" | "accept_mutex"
-            | "multi_accept" | "worker_aio_requests" => {}
+            "events"
+            | "worker_rlimit_nofile"
+            | "worker_connections"
+            | "use"
+            | "accept_mutex"
+            | "multi_accept"
+            | "worker_aio_requests" => {}
             "http" => {
                 if saw_http {
                     return Err(sem(&d.file, d.line, "\"http\" directive is duplicate"));
@@ -3097,10 +3376,7 @@ pub fn build(
                 // geo [$source] $result { ... }
                 let (source, var) = match d.args.as_slice() {
                     [v] => (None, v.trim_start_matches('$').to_string()),
-                    [src, v] => (
-                        Some(src.clone()),
-                        v.trim_start_matches('$').to_string(),
-                    ),
+                    [src, v] => (Some(src.clone()), v.trim_start_matches('$').to_string()),
                     _ => return Err(sem(&d.file, d.line, "geo needs $variable")),
                 };
                 let mut def = crate::geo::GeoDef::new(source, var);
@@ -3154,11 +3430,7 @@ pub fn build(
                             // `key value;` — the lexer already unescaped `\k`.
                             if let Some(v) = c.args.first() {
                                 // `\include` escapes a directive-looking key.
-                                let key = c
-                                    .name
-                                    .strip_prefix('\\')
-                                    .unwrap_or(&c.name)
-                                    .to_string();
+                                let key = c.name.strip_prefix('\\').unwrap_or(&c.name).to_string();
                                 def.entries.push(crate::mapping::Entry {
                                     key,
                                     value: v.clone(),
@@ -3205,8 +3477,13 @@ pub fn build(
                 }
             }
             "limit_req_status" | "limit_conn_status" => {
-                let v = d.args.first().ok_or_else(|| sem(&d.file, d.line, "status required"))?;
-                let code: u16 = v.parse().map_err(|_| sem(&d.file, d.line, "invalid status"))?;
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "status required"))?;
+                let code: u16 = v
+                    .parse()
+                    .map_err(|_| sem(&d.file, d.line, "invalid status"))?;
                 if d.name == "limit_req_status" {
                     http.default_loc.limit_req_status = code;
                 } else {
@@ -3244,8 +3521,8 @@ pub fn build(
             }
             "http2" => {
                 let v = d.args.first().cloned().unwrap_or_default();
-                http.http2 = parse_on_off(&v)
-                    .ok_or_else(|| sem(&d.file, d.line, "invalid http2 value"))?;
+                http.http2 =
+                    parse_on_off(&v).ok_or_else(|| sem(&d.file, d.line, "invalid http2 value"))?;
             }
             "resolver" => {
                 http.resolver = crate::resolver::Resolver::parse(&d.args, prefix);
@@ -3274,20 +3551,18 @@ pub fn build(
                     .first()
                     .and_then(|v| v.parse::<usize>().ok())
                     .ok_or_else(|| sem(&d.file, d.line, "invalid large_client_header_buffers"))?;
-                let size = d
-                    .args
-                    .get(1)
-                    .and_then(|v| parse_size(v))
-                    .ok_or_else(|| sem(&d.file, d.line, "invalid large_client_header_buffers size"))?;
+                let size = d.args.get(1).and_then(|v| parse_size(v)).ok_or_else(|| {
+                    sem(&d.file, d.line, "invalid large_client_header_buffers size")
+                })?;
                 http.large_client_header_buffers = (num.max(1), size as usize);
             }
             "keepalive_timeout" => {
                 if let Some(v) = d.args.first() {
-                    http.keepalive_timeout =
-                        parse_time(v).ok_or_else(|| sem(&d.file, d.line, "invalid keepalive_timeout"))?;
+                    http.keepalive_timeout = parse_time(v)
+                        .ok_or_else(|| sem(&d.file, d.line, "invalid keepalive_timeout"))?;
                 }
             }
-"keepalive_requests" => {
+            "keepalive_requests" => {
                 if let Some(v) = d.args.first() {
                     http.keepalive_requests = v
                         .parse()
@@ -3296,8 +3571,8 @@ pub fn build(
             }
             "gzip" => {
                 let v = d.args.first().cloned().unwrap_or_default();
-                http.gzip = parse_on_off(&v)
-                    .ok_or_else(|| sem(&d.file, d.line, "invalid gzip value"))?;
+                http.gzip =
+                    parse_on_off(&v).ok_or_else(|| sem(&d.file, d.line, "invalid gzip value"))?;
                 b.apply_loc(d, &mut http.default_loc)?;
             }
             "gzip_min_length" | "gzip_comp_level" | "gzip_types" | "gzip_vary" => {
@@ -3355,7 +3630,11 @@ pub fn build(
             "upstream" => {
                 let mut up = parse_upstream(d)?;
                 if http.upstreams.iter().any(|u| u.name == up.name) {
-                    return Err(sem(&d.file, d.line, format!("duplicate upstream \"{}\"", up.name)));
+                    return Err(sem(
+                        &d.file,
+                        d.line,
+                        format!("duplicate upstream \"{}\"", up.name),
+                    ));
                 }
                 // preserve declaration order for stable round-robin indices
                 up.name = up.name.clone();
@@ -3398,18 +3677,39 @@ pub fn build(
                     }
                 }
                 if zone.name.is_empty() {
-                    return Err(sem(&d.file, d.line, "proxy_cache_path requires keys_zone=name:size"));
+                    return Err(sem(
+                        &d.file,
+                        d.line,
+                        "proxy_cache_path requires keys_zone=name:size",
+                    ));
                 }
                 http.cache_zones.push(zone);
             }
-            "location" | "if" | "map" | "resolver" | "geo" | "split_clients"
-            | "limit_req_zone" | "limit_conn_zone" | "proxy_cache_path" | "charset"
-            | "log_format_escape" | "types_hash_max_size" | "server_names_hash_bucket_size"
-            | "open_file_cache" | "access_log_off" | "default_type_off" => {
-                if d.name == "map" || d.name == "limit_req_zone"
-                    || d.name == "geo" || d.name == "split_clients"
+            "location"
+            | "if"
+            | "map"
+            | "resolver"
+            | "geo"
+            | "split_clients"
+            | "limit_req_zone"
+            | "limit_conn_zone"
+            | "proxy_cache_path"
+            | "charset"
+            | "log_format_escape"
+            | "types_hash_max_size"
+            | "server_names_hash_bucket_size"
+            | "open_file_cache"
+            | "access_log_off"
+            | "default_type_off" => {
+                if d.name == "map"
+                    || d.name == "limit_req_zone"
+                    || d.name == "geo"
+                    || d.name == "split_clients"
                 {
-                    b.warn(d, format!("directive \"{}\" is not implemented yet; ignored", d.name));
+                    b.warn(
+                        d,
+                        format!("directive \"{}\" is not implemented yet; ignored", d.name),
+                    );
                 }
             }
             _ => {
@@ -3471,7 +3771,11 @@ pub fn build(
 
     for (idx, listens) in listens_by_server {
         for (addr, is_default, listen_ssl, listen_quic) in listens {
-            let table = if listen_quic { &mut quic_groups } else { &mut groups };
+            let table = if listen_quic {
+                &mut quic_groups
+            } else {
+                &mut groups
+            };
             let group = table.entry(addr.port()).or_insert_with(|| ListenGroup {
                 addr,
                 servers: Vec::new(),
@@ -3665,12 +3969,18 @@ mod tests {
 
     #[test]
     fn listen_forms() {
-        assert_eq!(parse_listen("8080"), Some(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 8080))));
+        assert_eq!(
+            parse_listen("8080"),
+            Some(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 8080)))
+        );
         assert_eq!(
             parse_listen("127.0.0.1:8081"),
             Some(SocketAddr::from(([127, 0, 0, 1], 8081)))
         );
-        assert_eq!(parse_listen("*:8082"), Some(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 8082))));
+        assert_eq!(
+            parse_listen("*:8082"),
+            Some(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 8082)))
+        );
         assert_eq!(
             parse_listen("[::]:8083"),
             Some(SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 8083)))

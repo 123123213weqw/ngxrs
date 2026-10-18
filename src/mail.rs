@@ -355,10 +355,7 @@ async fn resolve(host: &str, port: u16) -> Option<SocketAddr> {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return Some(SocketAddr::new(ip, port));
     }
-    tokio::net::lookup_host((host, port))
-        .await
-        .ok()?
-        .next()
+    tokio::net::lookup_host((host, port)).await.ok()?.next()
 }
 
 /// Turn the response headers into a decision.
@@ -504,7 +501,11 @@ where
 {
     // With APOP enabled nginx appends `<pid.seq@host>` to the greeting so the
     // client can digest it; the authenticator then sees it as `Auth-Salt`.
-    let apop_salt = if server.auth_apop { make_salt() } else { String::new() };
+    let apop_salt = if server.auth_apop {
+        make_salt()
+    } else {
+        String::new()
+    };
     if !conn.resumed {
         if apop_salt.is_empty() {
             writer.write_all(POP3_GREETING).await?;
@@ -599,9 +600,7 @@ where
                 if rest.is_empty() {
                     writer.write_all(b"+OK\r\n").await?;
                     for m in pop3_mechanisms(server) {
-                        writer
-                            .write_all(format!("{m}\r\n").as_bytes())
-                            .await?;
+                        writer.write_all(format!("{m}\r\n").as_bytes()).await?;
                     }
                     writer.write_all(b".\r\n").await?;
                     writer.flush().await?;
@@ -609,10 +608,10 @@ where
                 }
                 match pop3_auth(reader, writer, &rest, &mut s, server).await? {
                     Some(()) => {
-                        if let Some(o) =
-                            authorise(writer, &s, server, peer, Protocol::Pop3).await?
+                        if let Some(o) = authorise(writer, &s, server, peer, Protocol::Pop3).await?
                         {
-                            return proxy(o, reader, writer, &s.replay, server, Protocol::Pop3).await;
+                            return proxy(o, reader, writer, &s.replay, server, Protocol::Pop3)
+                                .await;
                         }
                     }
                     None => continue,
@@ -632,7 +631,10 @@ fn smtp_address(line: &str) -> String {
         Some(i) => i + 1,
         None => return String::new(),
     };
-    let end = line[start..].find('>').map(|e| start + e).unwrap_or(line.len());
+    let end = line[start..]
+        .find('>')
+        .map(|e| start + e)
+        .unwrap_or(line.len());
     line[start..end].to_string()
 }
 
@@ -743,18 +745,16 @@ where
                     l
                 }
             };
-            let user = String::from_utf8_lossy(
-                &crate::util::base64_decode(&user_b64).unwrap_or_default(),
-            )
-            .to_string();
+            let user =
+                String::from_utf8_lossy(&crate::util::base64_decode(&user_b64).unwrap_or_default())
+                    .to_string();
 
             writer.write_all(b"+ UGFzc3dvcmQ6\r\n").await?;
             writer.flush().await?;
             let pass_b64 = read_line(reader).await?;
-            let pass = String::from_utf8_lossy(
-                &crate::util::base64_decode(&pass_b64).unwrap_or_default(),
-            )
-            .to_string();
+            let pass =
+                String::from_utf8_lossy(&crate::util::base64_decode(&pass_b64).unwrap_or_default())
+                    .to_string();
 
             s.method = "login";
             s.user = user;
@@ -785,7 +785,10 @@ where
             s.user = it.next().unwrap_or("").to_string();
             s.passwd = it.next().unwrap_or("").to_string();
             s.method = "cram-md5";
-            s.salt = String::from_utf8_lossy(&crate::util::base64_decode(&challenge).unwrap_or_default()).to_string();
+            s.salt = String::from_utf8_lossy(
+                &crate::util::base64_decode(&challenge).unwrap_or_default(),
+            )
+            .to_string();
             s.replay
                 .extend_from_slice(format!("AUTH CRAM-MD5\r\n{resp}\r\n").as_bytes());
             Ok(Some(()))
@@ -807,10 +810,9 @@ where
                 }
             };
             s.method = "external";
-            s.user = String::from_utf8_lossy(
-                &crate::util::base64_decode(&ident).unwrap_or_default(),
-            )
-            .to_string();
+            s.user =
+                String::from_utf8_lossy(&crate::util::base64_decode(&ident).unwrap_or_default())
+                    .to_string();
             s.passwd.clear();
             Ok(Some(()))
         }
@@ -926,8 +928,7 @@ where
                 s.passwd = imap_arg(p.unwrap_or(""));
                 s.method = "login";
                 s.tag = tag.clone();
-                s.replay
-                    .extend_from_slice(format!("{line}\r\n").as_bytes());
+                s.replay.extend_from_slice(format!("{line}\r\n").as_bytes());
                 if let Some(o) = authorise(writer, &s, server, peer, Protocol::Imap).await? {
                     return proxy_n(
                         o,
@@ -956,7 +957,10 @@ where
                     continue;
                 }
                 // An inline initial response replaces the `+` continuation.
-                let inline = mp.next().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+                let inline = mp
+                    .next()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty());
                 s.method = match mech.as_str() {
                     "PLAIN" => "plain",
                     "LOGIN" => "login",
@@ -971,8 +975,7 @@ where
                     }
                 };
                 s.tag = tag.clone();
-                s.replay
-                    .extend_from_slice(format!("{line}\r\n").as_bytes());
+                s.replay.extend_from_slice(format!("{line}\r\n").as_bytes());
                 match s.method {
                     "plain" => {
                         let resp = match inline.clone() {
@@ -992,8 +995,7 @@ where
                             s.user = f[f.len() - 2].to_string();
                             s.passwd = f[f.len() - 1].to_string();
                         }
-                        s.replay
-                            .extend_from_slice(format!("{resp}\r\n").as_bytes());
+                        s.replay.extend_from_slice(format!("{resp}\r\n").as_bytes());
                     }
                     "login" => {
                         let u = match inline.clone() {
@@ -1424,7 +1426,9 @@ where
                         }
                     }
                     _ => {
-                        writer.write_all(b"504 5.5.4 unsupported mechanism\r\n").await?;
+                        writer
+                            .write_all(b"504 5.5.4 unsupported mechanism\r\n")
+                            .await?;
                         writer.flush().await?;
                     }
                 }
@@ -1468,7 +1472,9 @@ where
                 }
             }
             _ => {
-                writer.write_all(b"500 5.5.2 unrecognized command\r\n").await?;
+                writer
+                    .write_all(b"500 5.5.2 unrecognized command\r\n")
+                    .await?;
                 writer.flush().await?;
             }
         }
@@ -1684,7 +1690,8 @@ where
     // nginx re-runs an SMTP dialogue with the backend, so the reply to our own
     // EHLO is also consumed.
     if protocol == Protocol::Smtp {
-        bwr.write_all(format!("EHLO {}\r\n", server.name).as_bytes()).await?;
+        bwr.write_all(format!("EHLO {}\r\n", server.name).as_bytes())
+            .await?;
         bwr.flush().await?;
         let _helo = read_line_plain(&mut brd).await.unwrap_or_default();
     }
@@ -1753,4 +1760,3 @@ where
     }
     Ok(())
 }
-

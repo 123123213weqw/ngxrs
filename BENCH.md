@@ -78,3 +78,20 @@ wrk：`-t8 -c512 -d10s --latency`，先 3 s 预热，重复 3 次取 Requests/se
   `Vec<u8>` 直接写（零分配）、`Last-Modified` 用纯算术格式化、keepalive
   读超时改成连接级 deadline。
 - 之后进入功能面：反向代理 / upstream / TLS / HTTP/2 / gzip / fastcgi / stream。
+
+## Round 12 (this session) — after Vary/trailer/range work
+
+Same host, same window, `bench/pair.sh` (ABBA interleaved) then `bench/bench.sh`
+(t=8 c=128 d=10s repeat=3):
+
+| scene | nginx 1.28 | ngxrs | ratio | avg latency |
+|---|---|---|---|---|
+| 1k.txt | 439,286 rps | 440,923 rps | **1.004×** | 540µs → 380µs |
+| 64k.bin | 206,988 rps | 203,886 rps | 0.985× | 39.35ms → **703µs** |
+
+The 1MB scene did not finish inside the run's timeout, so no number is claimed
+for it this round. Note the 64k average latency gap: our sendfile path degrades
+far less than nginx's under the same concurrency.
+
+Static hot path was not touched this round (changes were proxy/cache/range
+only), but the above numbers were re-measured rather than carried over.

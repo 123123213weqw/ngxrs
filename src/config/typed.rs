@@ -473,6 +473,41 @@ pub struct CacheZone {
     pub uses: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
 }
 
+/// One `mail { server { ... } }` listener.
+#[derive(Debug, Clone)]
+pub struct MailServer {
+    pub listen: SocketAddr,
+    pub protocol: crate::mail::Protocol,
+    pub auth_http: Option<crate::mail::AuthHttp>,
+    pub auth_http_timeout: std::time::Duration,
+    /// `proxy_pass_error_message`: show the authenticator's text verbatim.
+    pub pass_error_message: bool,
+    pub proxy_timeout: std::time::Duration,
+    /// Mechanisms enabled by `pop3_auth` / `imap_auth` / `smtp_auth`.
+    pub auth_plain: bool,
+    pub auth_login: bool,
+    pub auth_cram_md5: bool,
+    pub auth_external: bool,
+}
+
+impl Default for MailServer {
+    fn default() -> Self {
+        MailServer {
+            listen: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 110)),
+            protocol: crate::mail::Protocol::Pop3,
+            auth_http: None,
+            auth_http_timeout: std::time::Duration::from_secs(60),
+            pass_error_message: false,
+            proxy_timeout: std::time::Duration::from_secs(24 * 3600),
+            // nginx enables every mechanism by default.
+            auth_plain: true,
+            auth_login: true,
+            auth_cram_md5: true,
+            auth_external: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ProxyTarget {
     /// `proxy_pass http://127.0.0.1:8080` or with an explicit host name.
@@ -710,6 +745,8 @@ pub struct Config {
     pub error_log: Option<PathBuf>,
     pub http: Http,
     pub stream: StreamSection,
+    /// `mail {}` listeners (a top-level section, like stream, not part of http).
+    pub mail_servers: Vec<MailServer>,
     pub warnings: Vec<String>,
 }
 
@@ -777,6 +814,16 @@ pub fn parse_size(s: &str) -> Option<u64> {
 /// `200ms` is read as `200m` + `s`, fails to parse, and the caller silently
 /// keeps the directive's default. That bug made `proxy_cache_lock_timeout
 /// 200ms` behave like its 5 s default.
+/// `pop3` / `imap` / `smtp`, case-insensitively.
+fn mail_protocol(v: &str) -> Option<crate::mail::Protocol> {
+    match v.to_ascii_lowercase().as_str() {
+        "pop3" => Some(crate::mail::Protocol::Pop3),
+        "imap" => Some(crate::mail::Protocol::Imap),
+        "smtp" => Some(crate::mail::Protocol::Smtp),
+        _ => None,
+    }
+}
+
 pub fn parse_time(s: &str) -> Option<Duration> {
     if let Some(num) = s.strip_suffix("ms") {
         // Bare "ms" has no numeric part.
@@ -1088,6 +1135,140 @@ impl Builder {
 
     fn unknown(&mut self, d: &Directive, ctx: &str) {
         self.warn(d, format!("unknown directive \"{}\" in {}", d.name, ctx));
+    }
+
+    /// Parse `mail { ... }`.
+    fn parse_mail(&mut self, dirs: &[Directive]) -> Result<Vec<MailServer>, ConfigError> {
+        let mut defaults = MailServer::default();
+        let mut servers: Vec<MailServer> = Vec::new();
+        let mut servers_dirs: Vec<&Directive> = Vec::new();
+
+        for d in dirs {
+            match d.name.as_str() {
+                "auth_http" => {
+                    let v = d.args.first().ok_or_else(|| {
+                        sem(&d.file, d.line, "auth_http requires a URL")
+                    })?;
+                    defaults.auth_http = Some(crate::mail::AuthHttp::parse(v).ok_or_else(|| {
+                        sem(&d.file, d.line, format!("invalid auth_http URL \"{v}\""))
+                    })?);
+                }
+                "auth_http_timeout" => {
+                    if let Some(t) = d.args.first().and_then(|v| parse_time(v)) {
+                        defaults.auth_http_timeout = t;
+                    }
+                }
+                "proxy_timeout" => {
+                    if let Some(t) = d.args.first().and_then(|v| parse_time(v)) {
+                        defaults.proxy_timeout = t;
+                    }
+                }
+                "proxy_pass_error_message" => {
+                    if let Some(v) = d.args.first() {
+                        defaults.pass_error_message = parse_on_off(v).unwrap_or(false);
+                    }
+                }
+                "server" => servers_dirs.push(d),
+                // Accepted, not yet plumbed.
+                "proxy_buffer" | "auth_http_header" | "resolver" | "resolver_timeout"
+                | "error_log" | "log_format" | "timeout" | "proxy_protocol"
+                | "max_errors" | "protocol" => {}
+                other => {
+                    self.warnings.push(format!(
+                        "{}:{}: unknown directive \"{other}\" in mail; ignored",
+                        d.file.display(), d.line
+                    ));
+                }
+            }
+        }
+
+        for sd in servers_dirs {
+            let block = sd.block.as_ref().ok_or_else(|| {
+                sem(&sd.file, sd.line, "mail server requires a block")
+            })?;
+            let mut srv = defaults.clone();
+            // `listen <addr> [pop3|imap|smtp]`
+            srv.listen = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 110));
+            for child in block {
+                match child.name.as_str() {
+                    "listen" => {
+                        let v = child.args.first().ok_or_else(|| {
+                            sem(&child.file, child.line, "listen requires an address")
+                        })?;
+                        srv.listen = parse_listen(v).ok_or_else(|| {
+                            sem(&child.file, child.line, format!("invalid listen \"{v}\""))
+                        })?;
+                        for extra in &child.args[1..] {
+                            if let Some(p) = mail_protocol(extra) {
+                                srv.protocol = p;
+                            }
+                        }
+                    }
+                    "protocol" => {
+                        let v = child.args.first().ok_or_else(|| {
+                            sem(&child.file, child.line, "protocol requires a value")
+                        })?;
+                        srv.protocol = mail_protocol(v).ok_or_else(|| {
+                            sem(&child.file, child.line, format!("invalid protocol \"{v}\""))
+                        })?;
+                    }
+                    "pop3_auth" | "imap_auth" | "smtp_auth" => {
+                        srv.auth_plain = false;
+                        srv.auth_login = false;
+                        srv.auth_cram_md5 = false;
+                        srv.auth_external = false;
+                        for a in &child.args {
+                            match a.as_str() {
+                                "plain" => srv.auth_plain = true,
+                                "login" => srv.auth_login = true,
+                                "cram-md5" => srv.auth_cram_md5 = true,
+                                "external" => srv.auth_external = true,
+                                _ => {}
+                            }
+                        }
+                    }
+                    "auth_http" => {
+                        let v = child.args.first().ok_or_else(|| {
+                            sem(&child.file, child.line, "auth_http requires a URL")
+                        })?;
+                        srv.auth_http = Some(crate::mail::AuthHttp::parse(v).ok_or_else(|| {
+                            sem(&child.file, child.line, format!("invalid auth_http URL \"{v}\""))
+                        })?);
+                    }
+                    "auth_http_timeout" => {
+                        if let Some(t) = child.args.first().and_then(|v| parse_time(v)) {
+                            srv.auth_http_timeout = t;
+                        }
+                    }
+                    "proxy_timeout" => {
+                        if let Some(t) = child.args.first().and_then(|v| parse_time(v)) {
+                            srv.proxy_timeout = t;
+                        }
+                    }
+                    "proxy_pass_error_message" => {
+                        if let Some(v) = child.args.first() {
+                            srv.pass_error_message = parse_on_off(v).unwrap_or(false);
+                        }
+                    }
+                    // Accepted, not yet plumbed.
+                    "proxy_buffer" | "xclient" | "smtp_greeting_delay" | "starttls"
+                    | "ssl_certificate" | "ssl_certificate_key" | "ssl_protocols"
+                    | "ssl_ciphers" | "ssl_prefer_server_ciphers" | "ssl_session_cache"
+                    | "ssl_session_timeout" | "pop3_capabilities" | "imap_capabilities"
+                    | "smtp_capabilities" | "auth_http_header" | "proxy_protocol"
+                    | "max_errors" | "smtp_client_buffer" | "smtp_auth_methods"
+                    | "smtp_xclient" | "timeout" => {}
+                    other => {
+                        self.warnings.push(format!(
+                            "{}:{}: unknown directive \"{other}\" in mail server; ignored",
+                            child.file.display(), child.line
+                        ));
+                    }
+                }
+            }
+            servers.push(srv);
+        }
+        Ok(servers)
     }
 
     fn apply_loc(&mut self, d: &Directive, cfg: &mut LocCfg) -> Result<bool, ConfigError> {
@@ -2261,6 +2442,7 @@ pub fn build(
     let mut error_log: Option<PathBuf> = None;
     let mut http_roots: Vec<Directive> = Vec::new();
     let mut stream_dirs: Vec<Directive> = Vec::new();
+    let mut mail_dirs: Vec<Directive> = Vec::new();
     let mut saw_http = false;
 
     for d in tree {
@@ -2303,7 +2485,7 @@ pub fn build(
                 stream_dirs = d.block.clone().unwrap_or_default();
             }
             "mail" => {
-                b.warn(&d, "module \"mail\" is not implemented yet; section ignored");
+                mail_dirs = d.block.clone().unwrap_or_default();
             }
             other => {
                 b.warn(
@@ -2750,6 +2932,7 @@ pub fn build(
         error_log,
         http,
         stream,
+        mail_servers: b.parse_mail(&mail_dirs)?,
         warnings: b.warnings,
     })
 }

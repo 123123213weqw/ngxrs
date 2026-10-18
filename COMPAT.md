@@ -180,6 +180,35 @@
 | `ssl_sni.t` | 4/10 | 10/10 |
 | `ssl_verify_client.t` | **12/16** | 16/16 |
 
+## mail（进行中，未达对等）
+
+已实现 `mail {}` 段：`server{}`、`listen ... [pop3|imap|smtp]`、`protocol`、
+`auth_http`、`auth_http_timeout`、`proxy_timeout`、`proxy_pass_error_message`、
+`pop3_auth` / `imap_auth` / `smtp_auth`，以及三种协议的认证阶段
+（USER/PASS、APOP、AUTH PLAIN/LOGIN/CRAM-MD5/EXTERNAL）、auth_http 的
+HTTP/1.0 请求与 `Auth-Status/Server/Port/Pass/User/Error-Code` 解析、
+认证成功后的后端拼接。
+
+**实测 `mail_pop3.t`：11/30**（nginx 30/30）。**未达标**，仍在调试。
+
+为了让 mail 有对照基线，重新编译了参考版 nginx 加
+`--with-mail --with-mail_ssl_module`（此前完全没有 mail 模块，16 个 mail
+用例对 nginx 也全是 skip，等于没有参照）。现在这套用例是真正可比的。
+
+阻塞点已定位到一个**与 mail 无关的既有缺陷**，复现如下：
+
+| 配置 | 结果 |
+|---|---|
+| `if ($http_auth_user ~ "^u$")` | 命中 |
+| `set $q "u"; if ($q ~ "^u$")` | 命中 |
+| `set $p "u:p"; if ($p ~ "^u:p$")` | **不命中** |
+| `add_header X "^test@example.com:secret$"` | 值正确，冒号保留 |
+
+即：**`if` 的 regex 模式里含 `:` 时匹配失败**，同样的串放进 `add_header`
+却完好。mail 用例的 auth 端点正是 `if ($userpass ~ '^test@example.com:secret$')`，
+所以认证永远返回 `Auth-Status: ERROR`，后续所有断言连带失败。这是下一步的
+第一优先。
+
 ## gRPC
 
 `grpc_pass` 已实现：`grpc://`（h2c）、`grpcs://`（TLS + ALPN h2）、直接写

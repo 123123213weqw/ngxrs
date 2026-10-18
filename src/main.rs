@@ -6,6 +6,7 @@ mod limit;
 mod cookie;
 mod geo;
 mod log;
+mod mail;
 mod mapping;
 mod fastcgi;
 mod gzip;
@@ -96,7 +97,7 @@ fn real_main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                          --with-http_grpc_module --without-http_ssi_module \
                          --without-http_auth_request_module --without-http_sub_module \
                          --without-http_dav_module --without-http_slice_module \
-                         --without-mail --without-http_memcached_module \
+                         --with-mail --with-mail_ssl_module --without-http_memcached_module \
                          --without-http_flv_module --without-http_mp4_module \
                          --without-http_geoip_module --without-http_image_filter_module \
                          --without-http_xslt_module --without-http_perl_module \

@@ -36,7 +36,7 @@ impl StreamConfig {
     }
 }
 
-pub(crate) fn bind_tcp(addr: SocketAddr) -> io::Result<TcpListener> {
+pub fn bind_tcp(addr: SocketAddr) -> io::Result<TcpListener> {
     let domain = if addr.is_ipv4() {
         Domain::IPV4
     } else {

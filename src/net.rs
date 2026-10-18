@@ -231,6 +231,7 @@ pub fn serve(cfg: Config) -> io::Result<()> {
         });
     }
     let stream_cfg = Arc::new(stream_cfg);
+    let mail_servers = cfg.mail_servers.clone();
     crate::proxy::init(&cfg.http);
     crate::proxy::init_keepalive(&cfg.http);
 
@@ -276,6 +277,33 @@ pub fn serve(cfg: Config) -> io::Result<()> {
                         }
                     };
                     rt.block_on(crate::stream::serve(cfg, rx));
+                })?,
+        );
+    }
+
+    // `mail {}` listeners get their own thread, like stream.
+    let mut mail_thread = None;
+    let mut mail_tx: Option<watch::Sender<bool>> = None;
+    if !mail_servers.is_empty() {
+        let servers = mail_servers.clone();
+        let (tx, rx) = watch::channel(false);
+        mail_tx = Some(tx);
+        mail_thread = Some(
+            std::thread::Builder::new()
+                .name("ngxrs-mail".to_string())
+                .spawn(move || {
+                    let rt = match tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2)
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            eprintln!("ngxrs: mail runtime failed: {e}");
+                            return;
+                        }
+                    };
+                    rt.block_on(crate::mail::serve(servers, rx));
                 })?,
         );
     }

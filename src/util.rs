@@ -532,3 +532,76 @@ mod tests {
         assert!(parse_http_date("Sunday, 18-Oct-26 00:25:25 GMT").is_some());
     }
 }
+
+/// Standard base64 with padding (RFC 4648 §4), as used by the mail AUTH
+/// mechanisms.
+pub fn base64_encode(input: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for c in input.chunks(3) {
+        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Decode standard base64, ignoring whitespace and tolerating missing padding.
+pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        } as u32)
+    }
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for &c in input.as_bytes() {
+        if c.is_ascii_whitespace() || c == b'=' {
+            continue;
+        }
+        acc = (acc << 6) | val(c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod base64_tests {
+    use super::*;
+
+    #[test]
+    fn round_trips() {
+        for s in ["", "f", "fo", "foo", "secret", "test@example.com", "\0user\0pass"] {
+            let e = base64_encode(s.as_bytes());
+            assert_eq!(base64_decode(&e).unwrap(), s.as_bytes(), "{s}");
+        }
+    }
+
+    #[test]
+    fn known_values() {
+        // The two challenges nginx sends for POP3/IMAP/SMTP LOGIN.
+        assert_eq!(base64_encode(b"Username:"), "VXNlcm5hbWU6");
+        assert_eq!(base64_encode(b"Password:"), "UGFzc3dvcmQ6");
+    }
+}

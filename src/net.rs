@@ -261,6 +261,10 @@ pub fn serve(cfg: Config) -> io::Result<()> {
             proxy_connect_timeout: sc.proxy_connect_timeout,
             sinks: crate::config::typed::open_sinks(&sc.error_logs),
             tls: stream_tls(&sc),
+            return_text: sc.return_text.clone(),
+            proxy_ssl: sc.proxy_ssl,
+            proxy_ssl_session_reuse: sc.proxy_ssl_session_reuse,
+            proxy_ssl_name: sc.proxy_ssl_name.clone(),
         });
     }
     let stream_cfg = Arc::new(stream_cfg);

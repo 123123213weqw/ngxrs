@@ -998,6 +998,14 @@ pub struct StreamServerCfg {
     pub ssl_certificate: Option<PathBuf>,
     pub ssl_certificate_key: Option<PathBuf>,
     pub ssl_password_file: Option<PathBuf>,
+    /// `proxy_ssl`: speak TLS to the upstream.
+    pub proxy_ssl: bool,
+    /// `proxy_ssl_session_reuse`.
+    pub proxy_ssl_session_reuse: bool,
+    /// `proxy_ssl_name`: upstream SNI.
+    pub proxy_ssl_name: Option<String>,
+    /// `return <text>` in a stream server.
+    pub return_text: Option<String>,
 }
 
 impl Http {
@@ -2735,6 +2743,11 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
     let mut stream_cert: Option<PathBuf> = None;
     let mut stream_key: Option<PathBuf> = None;
     let mut stream_password: Option<PathBuf> = None;
+    let mut stream_proxy_ssl = false;
+    let mut stream_session_reuse = true;
+    let mut stream_connect_timeout = std::time::Duration::from_secs(60);
+    // nginx's stream default proxy_timeout is 10m.
+    let mut stream_proxy_timeout = std::time::Duration::from_secs(600);
 
     for d in dirs {
         match d.name.as_str() {
@@ -2770,7 +2783,7 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             "log_format" | "access_log" | "error_log" | "resolver" | "map" | "geo"
             | "split_clients" | "limit_conn_zone" | "limit_req_zone" | "variables_hash_max_size"
             | "variables_hash_bucket_size" | "proxy_protocol" | "preread_buffer_size"
-            | "preread_timeout" | "ssl_protocols"
+            | "ssl_protocols"
             | "ssl_ciphers" | "ssl_session_cache" | "ssl_session_timeout" | "ssl_dhparam"
             | "ssl_prefer_server_ciphers" | "ssl_handshake_timeout" | "ssl_ecdh_curve" => {}
             "error_log" => {}
@@ -2789,11 +2802,38 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                     stream_password = Some(b.prefix.join(p));
                 }
             }
+            "proxy_ssl" => {
+                if let Some(v) = d.args.first() {
+                    match v.as_str() {
+                        "on" => stream_proxy_ssl = true,
+                        "off" => stream_proxy_ssl = false,
+                        _ => return Err(sem(&d.file, d.line, "invalid proxy_ssl value")),
+                    }
+                }
+            }
+            "proxy_ssl_session_reuse" => {
+                if let Some(v) = d.args.first() {
+                    stream_session_reuse = v != "off";
+                }
+            }
+            "proxy_connect_timeout" => {
+                if let Some(v) = d.args.first() {
+                    stream_connect_timeout =
+                        crate::config::parse_time(v).unwrap_or(stream_connect_timeout);
+                }
+            }
+            "proxy_timeout" => {
+                if let Some(v) = d.args.first() {
+                    stream_proxy_timeout = crate::config::parse_time(v).unwrap_or(stream_proxy_timeout);
+                }
+            }
             other => b.warn(d, format!("unknown directive \"{other}\" in stream context; ignored")),
         }
     }
 
     for sd in server_dirs {
+        let mut per_server_timeout = false;
+        let mut per_server_proxy_timeout = false;
         let mut cfg = StreamServerCfg {
             listen: SocketAddr::from(([0, 0, 0, 0], 0)),
             udp: false,
@@ -2803,7 +2843,11 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             ssl_certificate: None,
             ssl_certificate_key: None,
             ssl_password_file: None,
-            proxy_timeout: Duration::from_secs(600),
+            proxy_ssl: false,
+            proxy_ssl_session_reuse: true,
+            proxy_ssl_name: None,
+            return_text: None,
+            proxy_timeout: stream_proxy_timeout,
             proxy_connect_timeout: Duration::from_secs(60),
         };
         let mut have_listen = false;
@@ -2832,6 +2876,7 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                     if let Some(v) = child.args.first() {
                         cfg.proxy_timeout = parse_time(v)
                             .ok_or_else(|| sem(&child.file, child.line, "invalid proxy_timeout"))?;
+                        per_server_proxy_timeout = true;
                     }
                 }
                 "proxy_connect_timeout" => {
@@ -2839,10 +2884,11 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                         cfg.proxy_connect_timeout = parse_time(v).ok_or_else(|| {
                             sem(&child.file, child.line, "invalid proxy_connect_timeout")
                         })?;
+                        per_server_timeout = true;
                     }
                 }
                 "return" => {
-                    // Parsed but not executed yet (see COMPAT.md).
+                    cfg.return_text = Some(child.args.join(" "));
                 }
                 "error_log" => {
                     if let Some(spec) = parse_log_spec(&b.prefix.clone(), &child.args) {
@@ -2864,9 +2910,33 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                         cfg.ssl_password_file = Some(b.prefix.join(p));
                     }
                 }
+                "proxy_ssl" => {
+                    if let Some(v) = child.args.first() {
+                        match v.as_str() {
+                            "on" => cfg.proxy_ssl = true,
+                            "off" => cfg.proxy_ssl = false,
+                            _ => {
+                                return Err(sem(&child.file, child.line, "invalid proxy_ssl value"))
+                            }
+                        }
+                    }
+                }
+                "proxy_ssl_session_reuse" => {
+                    if let Some(v) = child.args.first() {
+                        cfg.proxy_ssl_session_reuse = v != "off";
+                    }
+                }
+                "proxy_ssl_name" => {
+                    if let Some(v) = child.args.first() {
+                        cfg.proxy_ssl_name = Some(v.clone());
+                    }
+                }
                 "proxy_protocol" | "proxy_buffer_size" | "proxy_responses" | "preread_buffer_size"
-                | "preread_timeout" | "set"
-                | "if" | "proxy_ssl_server_name" | "proxy_ssl_verify" | "proxy_requests" => {}
+                | "preread_timeout" | "set" | "ssl_session_cache" | "ssl_session_timeout"
+                | "ssl_prefer_server_ciphers" | "ssl_ciphers" | "ssl_protocols"
+                | "if" | "proxy_ssl_server_name" | "proxy_ssl_verify" | "proxy_requests"
+                | "proxy_ssl_certificate" | "proxy_ssl_certificate_key" | "proxy_ssl_protocols"
+                | "proxy_ssl_ciphers" | "proxy_ssl_trusted_certificate" => {}
                 other => {
                     return Err(sem(
                         &child.file,
@@ -2887,6 +2957,20 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
         }
         if cfg.ssl_password_file.is_none() {
             cfg.ssl_password_file = stream_password.clone();
+        }
+        if !cfg.proxy_ssl {
+            cfg.proxy_ssl = stream_proxy_ssl;
+        }
+        if stream_session_reuse == false {
+            cfg.proxy_ssl_session_reuse = false;
+        }
+        // `proxy_connect_timeout` / `proxy_timeout` set at `stream {}` level
+        // apply to every server that did not override them.
+        if !per_server_timeout {
+            cfg.proxy_connect_timeout = stream_connect_timeout;
+        }
+        if !per_server_proxy_timeout {
+            cfg.proxy_timeout = stream_proxy_timeout;
         }
         section.servers.push(cfg);
     }

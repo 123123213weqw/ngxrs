@@ -259,7 +259,21 @@ nginx 逐字节一致；`STLS` / `STARTTLS` 执行**真实的 TLS 升级**（rus
   这条**会偶发通过**（曾出现过 10/10），连跑三次稳定为 9/10，因此按 9/10 记录
 - **`stream` 的 TLS 终止已实现**（`listen ... ssl`，证书可从 `stream {}` 继承），
   `stream_ssl.t` **7/7 与 nginx 完全一致**
-- `stream_proxy_ssl.t`（上游 TLS）、`stream_ssl_verify_client.t` 未实现，仍为 UNRUN
+- **`stream` 上游 TLS 已实现**：`proxy_ssl on`、`proxy_ssl_session_reuse`
+  （rustls 的 resumption 缓存按 SNI 共享，所以第二次连接会复用会话）、
+  `proxy_ssl_name`，以及 stream server 的 `return <text>`（会展开
+  `$ssl_session_reused` → `.` / `r`）。
+
+| 用例 | ngxrs | nginx |
+|---|---|---|
+| `stream_ssl.t` | **7/7** | 7/7 |
+| `stream_proxy_ssl.t` | **8/8** | 8/8 |
+| `stream_error_log.t` | **36/36** | 36/36 |
+
+`stream {}` 级的 `proxy_connect_timeout` / `proxy_timeout` 之前是
+「接受但忽略」，现在真正生效并按 server 覆盖（默认 60s / 10m，与 nginx 一致）。
+
+- `stream_ssl_verify_client.t`（stream 侧客户端证书校验）未实现，仍为 UNRUN
 - 「因未声明模块而被静默跳过」的用例现在会被 harness 显式标成 **UNRUN**，
   不再混进 SAME
 

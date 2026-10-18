@@ -296,6 +296,28 @@ fn parse_auth_reply(head: &[u8]) -> AuthReply {
     }
 }
 
+/// Read one line from an arbitrary reader (used for the upstream dialogue).
+async fn read_line_plain<R: AsyncReadExt + Unpin>(reader: &mut R) -> io::Result<String> {
+    let mut buf = Vec::with_capacity(128);
+    loop {
+        let mut byte = [0u8; 1];
+        let n = reader.read(&mut byte).await?;
+        if n == 0 {
+            break;
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        if byte[0] != b'\r' {
+            buf.push(byte[0]);
+        }
+        if buf.len() > 8192 {
+            break;
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).to_string())
+}
+
 // ---------------------------------------------------------------------------
 // POP3
 // ---------------------------------------------------------------------------
@@ -312,7 +334,16 @@ where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    writer.write_all(POP3_GREETING).await?;
+    // With APOP enabled nginx appends `<pid.seq@host>` to the greeting so the
+    // client can digest it; the authenticator then sees it as `Auth-Salt`.
+    let apop_salt = if server.auth_apop { make_salt() } else { String::new() };
+    if apop_salt.is_empty() {
+        writer.write_all(POP3_GREETING).await?;
+    } else {
+        writer
+            .write_all(format!("+OK POP3 ready {apop_salt}\r\n").as_bytes())
+            .await?;
+    }
     writer.flush().await?;
 
     let mut s = Session::new();
@@ -361,7 +392,7 @@ where
                 s.replay.extend_from_slice(line.as_bytes());
                 s.replay.extend_from_slice(b"\r\n");
                 if let Some(o) = authorise(writer, &s, server, peer, Protocol::Pop3).await? {
-                    return proxy(o, reader, writer, &s.replay, server).await;
+                    return proxy(o, reader, writer, &s.replay, server, Protocol::Pop3).await;
                 }
             }
             "APOP" => {
@@ -369,10 +400,11 @@ where
                 s.user = parts.next().unwrap_or("").to_string();
                 s.passwd = parts.next().unwrap_or("").to_string();
                 s.method = "APOP";
+                s.salt = apop_salt.clone();
                 s.replay.extend_from_slice(line.as_bytes());
                 s.replay.extend_from_slice(b"\r\n");
                 if let Some(o) = authorise(writer, &s, server, peer, Protocol::Pop3).await? {
-                    return proxy(o, reader, writer, &s.replay, server).await;
+                    return proxy(o, reader, writer, &s.replay, server, Protocol::Pop3).await;
                 }
             }
             "AUTH" => {
@@ -393,7 +425,7 @@ where
                         if let Some(o) =
                             authorise(writer, &s, server, peer, Protocol::Pop3).await?
                         {
-                            return proxy(o, reader, writer, &s.replay, server).await;
+                            return proxy(o, reader, writer, &s.replay, server, Protocol::Pop3).await;
                         }
                     }
                     None => continue,
@@ -407,15 +439,27 @@ where
     }
 }
 
+/// `<pid.seq@host>`, the shape nginx uses for its APOP banner.
+fn make_salt() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".to_string());
+    format!(
+        "<{}.{}@{}>",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed),
+        host
+    )
+}
+
 /// Mechanisms advertised by a bare POP3 `AUTH`, in nginx's order.
 fn pop3_mechanisms(server: &MailServer) -> Vec<&'static str> {
     let mut out = Vec::new();
     if server.auth_plain {
         out.push("PLAIN");
     }
-    if server.auth_login {
-        out.push("LOGIN");
-    }
+    // LOGIN is always available; `pop3_auth` cannot disable it.
+    out.push("LOGIN");
     if server.auth_cram_md5 {
         out.push("CRAM-MD5");
     }
@@ -555,9 +599,24 @@ where
                 writer.flush().await?;
                 return Ok(None);
             }
+            // Without an initial response the client is prompted, exactly as
+            // nginx does, and the base64 line is forwarded to the backend.
+            let mut replay = String::from("AUTH EXTERNAL");
+            match arg {
+                Some(a) if !a.is_empty() => {
+                    replay.push(' ');
+                    replay.push_str(&a);
+                }
+                _ => {
+                    writer.write_all(b"+ \r\n").await?;
+                    writer.flush().await?;
+                    let r = read_line(reader).await?;
+                    replay.push(' ');
+                    replay.push_str(&r);
+                }
+            }
             s.method = "EXTERNAL";
-            s.replay
-                .extend_from_slice(format!("AUTH EXTERNAL {}\r\n", arg.unwrap_or_default()).as_bytes());
+            s.replay.extend_from_slice(format!("{replay}\r\n").as_bytes());
             Ok(Some(()))
         }
         _ => {
@@ -620,14 +679,24 @@ where
             }
             "LOGIN" => {
                 let mut parts = rest.splitn(2, ' ');
-                s.user = imap_arg(parts.next().unwrap_or(""));
-                s.passwd = imap_arg(parts.next().unwrap_or(""));
+                let u = parts.next().unwrap_or("");
+                let p = parts.next();
+                if u.is_empty() || p.is_none() {
+                    // nginx answers a malformed LOGIN with BAD, not NO.
+                    writer
+                        .write_all(format!("{tag} BAD invalid arguments\r\n").as_bytes())
+                        .await?;
+                    writer.flush().await?;
+                    continue;
+                }
+                s.user = imap_arg(u);
+                s.passwd = imap_arg(p.unwrap_or(""));
                 s.method = "LOGIN";
                 s.tag = tag.clone();
                 s.replay
                     .extend_from_slice(format!("{line}\r\n").as_bytes());
                 if let Some(o) = authorise(writer, &s, server, peer, Protocol::Imap).await? {
-                    return proxy(o, reader, writer, &s.replay, server).await;
+                    return proxy(o, reader, writer, &s.replay, server, Protocol::Imap).await;
                 }
             }
             "AUTHENTICATE" => {
@@ -702,7 +771,7 @@ where
                     _ => {}
                 }
                 if let Some(o) = authorise(writer, &s, server, peer, Protocol::Imap).await? {
-                    return proxy(o, reader, writer, &s.replay, server).await;
+                    return proxy(o, reader, writer, &s.replay, server, Protocol::Imap).await;
                 }
             }
             _ => {
@@ -720,9 +789,7 @@ fn imap_mechanisms(server: &MailServer) -> Vec<&'static str> {
     if server.auth_plain {
         out.push("PLAIN");
     }
-    if server.auth_login {
-        out.push("LOGIN");
-    }
+    out.push("LOGIN");
     if server.auth_cram_md5 {
         out.push("CRAM-MD5");
     }
@@ -822,7 +889,7 @@ where
                         if let Some(o) =
                             authorise(writer, &s, server, peer, Protocol::Smtp).await?
                         {
-                            return proxy(o, reader, writer, &s.replay, server).await;
+                            return proxy(o, reader, writer, &s.replay, server, Protocol::Smtp).await;
                         }
                     }
                     "LOGIN" => {
@@ -846,7 +913,7 @@ where
                         if let Some(o) =
                             authorise(writer, &s, server, peer, Protocol::Smtp).await?
                         {
-                            return proxy(o, reader, writer, &s.replay, server).await;
+                            return proxy(o, reader, writer, &s.replay, server, Protocol::Smtp).await;
                         }
                     }
                     _ => {
@@ -858,6 +925,18 @@ where
                 }
             }
             _ => {
+                if server.auth_none {
+                    // `smtp_auth none`: nginx still asks auth_http where the
+                    // mailbox is, but with no credentials and method `none`.
+                    s.method = "none";
+                    s.replay.extend_from_slice(format!("{line}\r\n").as_bytes());
+                    if let Some(o) =
+                        authorise(writer, &s, server, peer, Protocol::Smtp).await?
+                    {
+                        return proxy(o, reader, writer, &s.replay, server, Protocol::Smtp).await;
+                    }
+                    continue;
+                }
                 writer.write_all(b"500 unknown command\r\n").await?;
                 writer.flush().await?;
             }
@@ -952,7 +1031,7 @@ where
 fn render_error(protocol: Protocol, tag: &str, text: &str) -> String {
     match protocol {
         Protocol::Pop3 => format!("-ERR {text}\r\n"),
-        Protocol::Imap => format!("{tag}NO {text}\r\n"),
+        Protocol::Imap => format!("{tag} NO {text}\r\n"),
         Protocol::Smtp => format!("535 5.7.8 {text}\r\n"),
     }
 }
@@ -960,18 +1039,23 @@ fn render_error(protocol: Protocol, tag: &str, text: &str) -> String {
 fn render_failure(protocol: Protocol, tag: &str) -> String {
     match protocol {
         Protocol::Pop3 => "-ERR authorization failed\r\n".to_string(),
-        Protocol::Imap => format!("{tag}NO authorization failed\r\n"),
+        Protocol::Imap => format!("{tag} NO authorization failed\r\n"),
         Protocol::Smtp => "535 5.7.8 authorization failed\r\n".to_string(),
     }
 }
 
 /// Splice the client onto its backend and relay until either side closes.
+///
+/// nginx consumes the client's credentials during the auth phase, so they are
+/// replayed to the backend first — the mailbox server re-authenticates the same
+/// session against its own user database.
 async fn proxy<R, W>(
     up: Upstream,
     reader: &mut BufReader<R>,
     writer: &mut BufWriter<W>,
     _replay: &[u8],
     server: &MailServer,
+    protocol: Protocol,
 ) -> io::Result<()>
 where
     R: AsyncReadExt + Unpin,
@@ -990,10 +1074,54 @@ where
     let _ = backend.set_nodelay(true);
     let (mut brd, mut bwr) = backend.into_split();
 
-    tokio::select! {
-        r = tokio::io::copy(&mut *reader, &mut bwr) => { let _ = r; }
-        r = tokio::io::copy(&mut brd, writer) => { let _ = r; }
+    // nginx re-runs the SMTP dialogue with the backend: the client already got
+    // its greeting from us, so the upstream one is dropped along with the reply
+    // to our own HELO. Forwarding either would put a `220`/`250` in front of
+    // the `235` the client is waiting for.
+    if protocol == Protocol::Smtp {
+        let _greeting = read_line_plain(&mut brd).await.unwrap_or_default();
+        bwr.write_all(b"HELO ngxrs\r\n").await?;
+        bwr.flush().await?;
+        let _helo = read_line_plain(&mut brd).await.unwrap_or_default();
     }
-    let _ = server.proxy_timeout;
+
+    if !up.replay.is_empty() {
+        bwr.write_all(&up.replay).await?;
+        bwr.flush().await?;
+    }
+
+    // Relay by hand rather than with `copy`: the client side is a `BufWriter`,
+    // so every write must be flushed or the client sees nothing until the
+    // buffer fills (which never happens for a one-line greeting).
+    let timeout = server.proxy_timeout;
+    let mut cbuf = vec![0u8; 8192];
+    let mut bbuf = vec![0u8; 8192];
+    loop {
+        tokio::select! {
+            r = tokio::time::timeout(timeout, reader.read(&mut cbuf)) => {
+                match r {
+                    Err(_) => break,
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => {
+                        bwr.write_all(&cbuf[..n]).await?;
+                        bwr.flush().await?;
+                    }
+                    Ok(Err(_)) => break,
+                }
+            }
+            r = tokio::time::timeout(timeout, brd.read(&mut bbuf)) => {
+                match r {
+                    Err(_) => break,
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => {
+                        writer.write_all(&bbuf[..n]).await?;
+                        writer.flush().await?;
+                    }
+                    Ok(Err(_)) => break,
+                }
+            }
+        }
+    }
     Ok(())
 }
+

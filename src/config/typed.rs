@@ -85,6 +85,8 @@ pub struct LocCfg {
     pub ifs: Vec<IfBlock>,
     /// `set $var value;`
     pub sets: Vec<(String, String)>,
+    /// `set`/`if` in source order; indices into `sets` / `ifs`.
+    pub steps: Vec<Step>,
     pub proxy_pass: Option<ProxyPass>,
     /// `grpc_pass <target>`: kept raw; nginx strips the scheme and looks the
     /// remainder up in the upstream table, then resolves at request time.
@@ -167,6 +169,7 @@ impl LocCfg {
     fn new(root: PathBuf) -> Self {
         LocCfg {
             root,
+            steps: Vec::new(),
             alias: None,
             alias_prefix_len: 0,
             index: vec!["index.html".to_string()],
@@ -259,6 +262,18 @@ pub struct IfBlock {
     pub rewrites: Vec<Rewrite>,
     pub ret: Option<(u16, String)>,
     pub sets: Vec<(String, String)>,
+}
+
+/// One entry of the rewrite-phase script, in source order.
+///
+/// nginx evaluates `set` and `if` **interleaved** as written; keeping them in
+/// separate lists (all sets, then all ifs) gives the wrong answer whenever a
+/// config re-assigns a variable between two `if`s — which is the standard
+/// idiom for `auth_http` handlers.
+#[derive(Debug, Clone, Copy)]
+pub enum Step {
+    Set(usize),
+    If(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -485,6 +500,10 @@ pub struct MailServer {
     pub proxy_timeout: std::time::Duration,
     /// Mechanisms enabled by `pop3_auth` / `imap_auth` / `smtp_auth`.
     pub auth_plain: bool,
+    /// APOP (POP3 only). nginx has a flag for this; LOGIN never does.
+    pub auth_apop: bool,
+    /// `smtp_auth none`: no authentication, proxy the session straight away.
+    pub auth_none: bool,
     pub auth_login: bool,
     pub auth_cram_md5: bool,
     pub auth_external: bool,
@@ -501,6 +520,8 @@ impl Default for MailServer {
             proxy_timeout: std::time::Duration::from_secs(24 * 3600),
             // nginx enables every mechanism by default.
             auth_plain: true,
+            auth_apop: true,
+            auth_none: false,
             auth_login: true,
             auth_cram_md5: true,
             auth_external: false,
@@ -575,6 +596,8 @@ pub struct Server {
     /// Server-level `if` blocks, evaluated before location matching.
     pub ifs: Vec<IfBlock>,
     pub sets: Vec<(String, String)>,
+    /// `set`/`if` in source order; indices into `sets` / `ifs`.
+    pub steps: Vec<Step>,
     pub regex_names: Vec<regex::Regex>,
     /// Regex server names paired with their source text (for diagnostics and
     /// for named-capture handling).
@@ -1213,13 +1236,19 @@ impl Builder {
                         })?;
                     }
                     "pop3_auth" | "imap_auth" | "smtp_auth" => {
+                        // nginx's bitmask only covers plain/apop/cram-md5/
+                        // external; LOGIN is unconditional and always
+                        // advertised (`NGX_MAIL_POP3_AUTH_LOGIN` has no flag).
                         srv.auth_plain = false;
-                        srv.auth_login = false;
+                        srv.auth_apop = false;
+                        srv.auth_none = false;
                         srv.auth_cram_md5 = false;
                         srv.auth_external = false;
                         for a in &child.args {
                             match a.as_str() {
                                 "plain" => srv.auth_plain = true,
+                                "apop" => srv.auth_apop = true,
+                                "none" => srv.auth_none = true,
                                 "login" => srv.auth_login = true,
                                 "cram-md5" => srv.auth_cram_md5 = true,
                                 "external" => srv.auth_external = true,
@@ -1367,6 +1396,7 @@ impl Builder {
                 if d.args.len() < 2 {
                     return Err(sem(&d.file, d.line, "set requires a variable and a value"));
                 }
+                cfg.steps.push(Step::Set(cfg.sets.len()));
                 cfg.sets.push((d.args[0].clone(), d.args[1..].join(" ")));
             }
             "if" => {
@@ -1436,6 +1466,7 @@ impl Builder {
                 ifb.cond = cond;
                 cond = IfCond::Truthy(String::new());
                 let _ = cond;
+                cfg.steps.push(Step::If(cfg.ifs.len()));
                 cfg.ifs.push(ifb);
             }
             "break" => {}
@@ -2089,6 +2120,7 @@ impl Builder {
         let mut access_log_off = false;
         let mut server_ifs: Vec<IfBlock> = Vec::new();
         let mut server_sets: Vec<(String, String)> = Vec::new();
+        let mut server_steps: Vec<Step> = Vec::new();
         let mut ssl = false;
         let mut http2 = http_http2;
         let mut header_field_limit = http_header_field_limit;
@@ -2257,10 +2289,20 @@ impl Builder {
                 "if" | "set" => {
                     // Server-level `if`/`set` run before location selection.
                     self.apply_loc(child, &mut default_loc)?;
+                    // `set` and `if` are hoisted out of the server block but
+                    // must keep their relative order, so re-index the steps.
                     let moved = std::mem::take(&mut default_loc.ifs);
+                    let if_base = server_ifs.len();
                     server_ifs.extend(moved);
                     let moved_sets = std::mem::take(&mut default_loc.sets);
+                    let set_base = server_sets.len();
                     server_sets.extend(moved_sets);
+                    for st in std::mem::take(&mut default_loc.steps) {
+                        server_steps.push(match st {
+                            Step::Set(i) => Step::Set(set_base + i),
+                            Step::If(i) => Step::If(if_base + i),
+                        });
+                    }
                 }
                 _ => {
                     if !self.apply_loc(child, &mut default_loc)? {
@@ -2303,6 +2345,7 @@ impl Builder {
                 access_log_off,
                 ifs: server_ifs,
                 sets: server_sets,
+                steps: server_steps,
                 regex_names,
                 regex_names_src,
                 ssl,
@@ -2910,11 +2953,13 @@ pub fn build(
         http.groups.push(g);
     }
 
-    if http.groups.is_empty() {
+    // A config may legitimately have no `http {}` at all (mail-only or
+    // stream-only), so only reject when every module is empty.
+    let stream = build_stream(&stream_dirs, &mut b)?;
+    let mail_servers_probe = b.parse_mail(&mail_dirs)?;
+    if http.groups.is_empty() && stream.servers.is_empty() && mail_servers_probe.is_empty() {
         return Err(sem(&conf_path, 0, "no server listen sockets configured"));
     }
-
-    let stream = build_stream(&stream_dirs, &mut b)?;
 
     // nginx defaults to `<prefix>/logs/nginx.pid` and `<prefix>/logs/error.log`.
     let pid = Some(pid.unwrap_or_else(|| prefix.join("logs/nginx.pid")));
@@ -2932,7 +2977,7 @@ pub fn build(
         error_log,
         http,
         stream,
-        mail_servers: b.parse_mail(&mail_dirs)?,
+        mail_servers: mail_servers_probe,
         warnings: b.warnings,
     })
 }

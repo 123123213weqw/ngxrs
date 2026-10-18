@@ -708,6 +708,7 @@ fn apply_rewrites(
         query,
         &loc.sets,
         &loc.ifs,
+        &loc.steps,
         &loc.rewrites,
         server,
         default_type,
@@ -723,11 +724,12 @@ fn apply_rewrites_parts(
     query: &str,
     sets: &[(String, String)],
     ifs: &[crate::config::IfBlock],
+    steps: &[crate::config::Step],
     rewrites: &[crate::config::Rewrite],
     server: &Server,
     default_type: &str,
 ) -> RewriteOutcome {
-    apply_rewrites_full(req, path, query, sets, ifs, rewrites, server, default_type).0
+    apply_rewrites_full(req, path, query, sets, ifs, steps, rewrites, server, default_type).0
 }
 
 /// Same, but also returns the variables `set` produced.
@@ -738,6 +740,7 @@ fn apply_rewrites_full(
     query: &str,
     sets: &[(String, String)],
     ifs: &[crate::config::IfBlock],
+    steps: &[crate::config::Step],
     rewrites: &[crate::config::Rewrite],
     server: &Server,
     default_type: &str,
@@ -746,65 +749,47 @@ fn apply_rewrites_full(
     let mut args = query.to_string();
     let _ = req;
 
-    // `set` runs first; the values feed `if` conditions and rewrites.
+    // nginx runs `set` and `if` interleaved, in source order; a config that
+    // re-assigns a variable between two `if`s depends on that order.
     let mut vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for (name, value) in sets {
-        let ctx = RwVars {
-            req,
-            path: &uri,
-            query: &args,
-            vars: &vars,
-        };
-        let expanded = expand_vars(value, &ctx);
-        vars.insert(name.trim_start_matches('$').to_string(), expanded);
-    }
+    let default_order: Vec<crate::config::Step>;
+    let order: &[crate::config::Step] = if steps.is_empty() {
+        default_order = sets
+            .iter()
+            .enumerate()
+            .map(|(i, _)| crate::config::Step::Set(i))
+            .chain(ifs.iter().enumerate().map(|(i, _)| crate::config::Step::If(i)))
+            .collect();
+        &default_order
+    } else {
+        steps
+    };
 
-    // `if` blocks
-    for ifb in ifs {
-        let ctx = RwVars {
-            req,
-            path: &uri,
-            query: &args,
-            vars: &vars,
-        };
-        if !eval_cond(&ifb.cond, &ctx) {
-            continue;
-        }
-        for (name, value) in &ifb.sets {
-            let ctx = RwVars {
-                req,
-                path: &uri,
-                query: &args,
-                vars: &vars,
-            };
-            let expanded = expand_vars(value, &ctx);
-            vars.insert(name.trim_start_matches('$').to_string(), expanded);
-        }
-        if let Some((code, body)) = &ifb.ret {
-            let status = *code;
-            let mut resp = if matches!(status, 301 | 302 | 303 | 307 | 308) {
-                Response::empty(status).header("Location", body.clone())
-            } else if body.is_empty() {
-                Response::empty(status)
-            } else {
-                // nginx picks the type from the URI extension, else default_type
-                let ext = match path.rfind('.') {
-                    Some(i) if i + 1 < path.len() => path[i + 1..].to_ascii_lowercase(),
-                    _ => String::new(),
+    for step in order {
+        match *step {
+            crate::config::Step::Set(idx) => {
+                let Some((name, value)) = sets.get(idx) else {
+                    continue;
                 };
-                let ctype = default_type_for(ext.as_str(), default_type);
-                Response::bytes(status, &ctype, body.clone().into_bytes())
-            };
-            resp.no_error_page = true;
-            return (RewriteOutcome::Respond(resp), vars);
-        }
-        for rw in &ifb.rewrites {
-            if let Some(out) = apply_one(rw, &mut uri, &mut args) {
-                return (out, vars);
+                let ctx = RwVars {
+                    req,
+                    path: &uri,
+                    query: &args,
+                    vars: &vars,
+                };
+                let expanded = expand_vars(value, &ctx);
+                vars.insert(name.trim_start_matches('$').to_string(), expanded);
+            }
+            crate::config::Step::If(idx) => {
+                let Some(ifb) = ifs.get(idx) else {
+                    continue;
+                };
+                if let Some(out) = run_if(ifb, req, &mut uri, &mut args, &mut vars, rewrites, default_type) {
+                    return (out, vars);
+                }
             }
         }
     }
-
     for rw in rewrites {
         if let Some(out) = apply_one(rw, &mut uri, &mut args) {
             return (out, vars);
@@ -812,6 +797,68 @@ fn apply_rewrites_full(
     }
     let _ = server;
     (RewriteOutcome::Continue(uri, args), vars)
+}
+
+/// Evaluate one `if` block: its `set`s, an optional `return`, then rewrites.
+///
+/// `None` means "carry on with the next step"; `Some` is a terminal outcome.
+#[allow(clippy::too_many_arguments)]
+fn run_if(
+    ifb: &crate::config::IfBlock,
+    req: &Request,
+    uri: &mut String,
+    args: &mut String,
+    vars: &mut std::collections::HashMap<String, String>,
+    _rewrites: &[crate::config::Rewrite],
+    default_type: &str,
+) -> Option<RewriteOutcome> {
+    let cond = {
+        let ctx = RwVars {
+            req,
+            path: uri,
+            query: args,
+            vars,
+        };
+        eval_cond(&ifb.cond, &ctx)
+    };
+    if !cond {
+        return None;
+    }
+    for (name, value) in &ifb.sets {
+        let ctx = RwVars {
+            req,
+            path: uri,
+            query: args,
+            vars,
+        };
+        let expanded = expand_vars(value, &ctx);
+        vars.insert(name.trim_start_matches('$').to_string(), expanded);
+    }
+    if let Some((code, body)) = &ifb.ret {
+        let status = *code;
+        let mut resp = if matches!(status, 301 | 302 | 303 | 307 | 308) {
+            Response::empty(status).header("Location", body.clone())
+        } else if body.is_empty() {
+            Response::empty(status)
+        } else {
+            // nginx picks the type from the URI extension, else default_type.
+            let ext = match uri.rfind('.') {
+                Some(i) if i + 1 < uri.len() => uri[i + 1..].to_ascii_lowercase(),
+                _ => String::new(),
+            };
+            let ctype = default_type_for(ext.as_str(), default_type);
+            Response::bytes(status, &ctype, body.clone().into_bytes())
+        };
+        // A `return` produced by `if` is not subject to `error_page`.
+        resp.no_error_page = true;
+        return Some(RewriteOutcome::Respond(resp));
+    }
+    for rw in &ifb.rewrites {
+        if let Some(out) = apply_one(rw, uri, args) {
+            return Some(out);
+        }
+    }
+    None
 }
 
 /// Apply one rewrite rule; `None` means "keep scanning".
@@ -1697,6 +1744,7 @@ pub fn resolve_target<'a>(
             &cur_query,
             &server.sets,
             &server.ifs,
+            &server.steps,
             &[],
             server,
             &http.default_type,
@@ -1722,6 +1770,7 @@ pub fn resolve_target<'a>(
             &cur_query,
             &cur_loc.sets,
             &cur_loc.ifs,
+            &cur_loc.steps,
             &cur_loc.rewrites,
             server,
             &http.default_type,

@@ -78,12 +78,16 @@
 | 请求体转发（Content-Length / chunked 解块） | ✅ | |
 | 响应体流式转发（定长 / chunked / 无长度） | ✅ | chunked 原样透传 |
 | `proxy_connect_timeout` / `read_timeout` / `send_timeout` | ✅ | |
+| `proxy_intercept_errors` | ✅ | 状态交给 `error_page`；401 的 `WWW-Authenticate` 跨内部重定向保留 |
+| `proxy_limit_rate`（含变量） | ✅ | 限速在**写入前**休眠，客户端看到的是真实速率 |
+| `proxy_bind`（源地址绑定） | ✅ | `off` / 地址 / `addr:port` / 变量 |
 | `proxy_buffering` | 🟡 | 已解析；当前总是流式转发 |
 | 上游失败重试（stale pooled socket） | 🟡 | 仅幂等方法重试同一后端 |
 | `proxy_cache` / `proxy_cache_path`（levels/keys_zone/max_size/inactive） | ✅ | 磁盘缓存（原子替换写入），`X-Cache-Status` 走 `add_header $upstream_cache_status` |
 | `proxy_cache_valid` / `proxy_cache_key` / `proxy_cache_bypass` | ✅ | 只缓存 `proxy_cache_valid` 列出的状态码 |
 | 缓存淘汰（max_size / inactive） | 🟡 | max_size 按 mtime 淘汰；`inactive` 只解析未执行定时清理 |
 | `proxy_no_cache` | 🟡 | 已解析，未按变量求值 |
+| 缓存错误状态（nginx `c->error`，ticket #827） | ✅ | 被拦截的上游错误以「无 body 的错误条目」入缓存，后续请求重放该错误；`bypass` 不写 |
 | `fastcgi_pass` / `fastcgi_param` / `fastcgi_index` / `fastcgi_split_path_info` | ✅ | FastCGI 1.0 记录协议；`$fastcgi_script_name`、`$fastcgi_path_info` 等变量 |
 | FastCGI 无 Content-Length 时用 chunked | ✅ | 与 nginx 帧格式逐字节一致 |
 | `fastcgi_connect_timeout` / `fastcgi_read_timeout` | ✅ | |
@@ -193,9 +197,12 @@ HTTP/1.1 keepalive 响应会一直阻塞到 8s 超时并返回 `undef`。**真 n
 http/proxy/upstream/range/fastcgi/scgi/uwsgi/stream/limit 各类用例，
 只报告「nginx 过而 ngxrs 不过」的真缺陷。
 
-最近一次全扫（35 个可运行文件）：**27 个与 nginx 断言数完全一致**，
-8 个更差；剩余差距 **21 条断言**（第九轮 33 条 / 第八轮 20 条，覆盖面扩大了
-35% 后仍下降）。
+最近一次全扫（27 个参评文件 / 18 个双方都跳过）：**24 个与 nginx 断言数完全一致**，
+2 个**优于** nginx（`http_headers_multi` 49 vs 48、`http_host` 58 vs 62），
+1 个更差（`http_keepalive_shutdown`，1 条断言）。
+
+> 该轮扫描时 `http_keepalive_shutdown` 的修复（`limit_req` 延迟后重新判定 keepalive）
+> 还没部署；单独重跑后它是 3/3 与 nginx 一致，所以最新的落后断言数是 **0**（在这 27 个文件范围内）。
 
 完全一致的用例（断言数与 nginx 相同）：`http_location` 16/16、`http_uri` 21/21、
 `http_server_name` 22/22、`http_method` 4/6、`http_try_files` 12/12、

@@ -31,6 +31,8 @@ outcomes() {
 }
 
 worse_total=0; same=0; better=0; skipped=0; compared=0
+better_total=0
+worse_files=0
 : > "$OUT/summary.txt"
 
 for t in $files; do
@@ -61,11 +63,12 @@ for t in $files; do
 
   if [ "$worse" -gt 0 ]; then
     worse_total=$((worse_total + worse))
+    worse_files=$((worse_files + 1))
     printf 'WORSE  %-28s nginx %3s/%-3s  ngxrs %3s/%-3s  (-%s)\n' \
       "$t" "$r_ok" "$((r_ok + r_bad))" "$o_ok" "$((o_ok + o_bad))" "$worse" \
       | tee -a "$OUT/summary.txt"
   elif [ "$better" -gt 0 ]; then
-    better=$((better + 1))
+    better_total=$((better_total + 1))
     printf 'BETTER %-28s nginx %3s/%-3s  ngxrs %3s/%-3s\n' \
       "$t" "$r_ok" "$((r_ok + r_bad))" "$o_ok" "$((o_ok + o_bad))" | tee -a "$OUT/summary.txt"
   else
@@ -75,6 +78,6 @@ for t in $files; do
 done
 
 echo
-printf 'files compared=%d same=%d better=%d  (skipped=%d)\n' \
-  "$compared" "$same" "$better" "$skipped"
+printf 'files compared=%d same=%d better=%d worse=%d  (skipped=%d)\n' \
+  "$compared" "$same" "$better_total" "$worse_files" "$skipped"
 printf 'total assertions where ngxrs loses: %d\n' "$worse_total"

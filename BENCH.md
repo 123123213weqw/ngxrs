@@ -369,3 +369,70 @@ nginx 用前缀树，条数无关。我们的 `match_list` 对每个请求做**�
 HTTP 层那 4.4 µs。已知它不在：tokio、文件 I/O、日志（`access_log off` 时
 `log_access` 首行就返回）、`ServerVars`（纯引用结构体）、系统调用数量（6 vs 8）。
 下一步候选：请求头解析、`finalize_response` 的过滤器链、响应头渲染。
+
+## 四段归因：找到了 16 KB 的 memset，并推翻上一轮的结论
+
+上一轮用"最小 tokio 地板"减出"HTTP 层多 4.4 µs"，但没定位到代码。这轮加了
+`bench/skipcmp.py`：在解析完请求头之后立刻应答（`NGXRS_SKIP_AFTER_PARSE=1`，
+返回与 `/ret` 同样的 200 + 5 字节体），于是四点可比：
+
+```
+floor     裸 tokio：读头 + 写固定响应
+skip      ngxrs 解析完就应答 = 我们的解析器 + 连接循环
+full      ngxrs 真正跑 location /ret
+nginx     参照
+skip - floor   = 解析器 + 连接循环
+full - skip    = 路由 + 过滤器 + 渲染
+```
+
+1 worker、`-t4 -c128 -d3s`、交错取中位数：
+
+| 点位 | 修复前 | 修复后 |
+|---|---|---|
+| nginx | 14.32 µs | 14.36 µs |
+| floor | 11.01 µs | 10.99 µs |
+| skip | 18.21 µs | **13.69 µs** |
+| full | 18.74 µs | 17.90 µs |
+
+### 缺陷：每次 read 都零初始化 16 KB 栈缓冲
+
+```rust
+async fn fill(&mut self) -> io::Result<usize> {
+    let mut tmp = [0u8; 16 * 1024];      // 每次 read 都 memset 16 KB
+    let n = self.stream.read(&mut tmp).await?;
+```
+
+注释写的是"避免把 16 KB 零填充进 self.buf"，但它在**栈上**照样零填充了 16 KB，
+而且是在 keepalive 连接的**每个请求**上做一次，外加弄脏 256 条 cache line
+（16 KB 已经超过 L1）。改成每连接一次的 staging 缓冲后：
+
+- 解析器 + 连接循环：+7.21 µs → **+2.70 µs**
+- 完整路径：18.74 µs → **17.90 µs**（−4.5% CPU）
+- 1 worker c=64 的 `/1k.txt`：37,454 → **38,421 rps**，比值 0.881 → **0.901**
+
+### 必须撤回的上一轮结论
+
+上一轮我写"路由 + 过滤器 + 渲染只花 −0.27 µs，基本免费"。**那是测量假象。**
+16 KB memset 被算进了 skip 变体，把 skip 抬到和 full 一样高，于是 full−skip 被压成 0。
+memset 修掉之后真实数字是 **+4.21 µs**，它现在是最大的一项。
+
+教训和之前几次同类：一个未归因的固定开销会**同时**扭曲基准差值和它的分解。
+只有把被测量的路径本身拆到足够细，差值才可信。
+
+### 顺带确认
+
+`NGXRS_NO_IDLE_TIMER` 开关显示每请求的 keepalive 定时器重置是 **+0.00 µs**
+（之前怀疑过它），可以排除。
+
+## 当前分解（1 worker，修复后）
+
+| 项 | 我们 | nginx |
+|---|---|---|
+| 解析器 + 连接循环（− floor） | +2.70 µs | — |
+| 路由 + 过滤器 + 渲染 | +4.21 µs | — |
+| **合计 − floor** | **+6.91 µs** | **+3.37 µs** |
+
+解析器这一段我们已经**优于 nginx**（2.70 vs nginx 整个栈的 3.37）。赤字全部
+转移到了路由/过滤器/渲染这一段，下一步从那里下手：`finalize_response` 每请求都做
+`path.to_string()` + `query.to_string()` + `cur_loc.root.to_string_lossy().to_string()`
+三次分配，并**重新做一次 location 匹配**（调用方 `handle_conn_inner` 已经算过 `loc`）。

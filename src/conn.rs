@@ -162,6 +162,14 @@ pub struct Conn {
     buf: Vec<u8>,
     start: usize,
     end: usize,
+    /// Staging buffer for `read`, allocated once per connection.
+    ///
+    /// `fill` used to declare `let mut tmp = [0u8; 16 * 1024]` on the stack,
+    /// which zero-fills 16 KB and dirties 256 cache lines for *every* read --
+    /// on a keepalive connection, that is once per request. Reading through a
+    /// per-connection buffer turns that into no initialisation at all plus one
+    /// copy of the bytes actually received.
+    staging: Vec<u8>,
     /// Reused response staging buffer: saves one allocation per request.
     pub out: Vec<u8>,
     /// `stub_status` state for this connection: whether it is currently
@@ -233,6 +241,7 @@ impl Conn {
             // 16 KB reservation per connection costs more in cache misses than
             // it saves in reallocations (nginx's header buffer is 1 KB).
             buf: Vec::with_capacity(512),
+            staging: Vec::new(),
             start: 0,
             end: 0,
             out: Vec::with_capacity(512),
@@ -359,12 +368,16 @@ impl Conn {
     /// read would zero-fill 16 KB for every request (measured: ~6x more CPU).
     async fn fill(&mut self) -> io::Result<usize> {
         self.compact();
-        // Read into the tail of the buffer directly, growing it only as far as
-        // the socket actually delivers.
-        let mut tmp = [0u8; 16 * 1024];
-        let n = self.stream.read(&mut tmp).await?;
+        // Staging buffer for `read`, allocated once per connection rather than
+        // zero-filled per call (see the field comment).
+        const CHUNK: usize = 16 * 1024;
+        if self.staging.len() < CHUNK {
+            self.staging.resize(CHUNK, 0);
+        }
+        // Disjoint field borrows: `stream` and `staging` are separate fields.
+        let n = self.stream.read(&mut self.staging[..]).await?;
         if n > 0 {
-            self.buf.extend_from_slice(&tmp[..n]);
+            self.buf.extend_from_slice(&self.staging[..n]);
             self.end += n;
         }
         Ok(n)

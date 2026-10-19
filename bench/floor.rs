@@ -19,12 +19,18 @@ use tokio::net::{TcpListener, TcpStream};
 
 fn response(body_len: usize) -> Vec<u8> {
     let mut v = Vec::with_capacity(240 + body_len);
+    // Content-Length must match the body or the client will hang; the header
+    // block is otherwise the 240-byte block nginx sends for /1k.txt.
     v.extend_from_slice(
         b"HTTP/1.1 200 OK\r\n\
           Server: nginx/1.28.0\r\n\
           Date: Mon, 19 Oct 2026 03:57:24 GMT\r\n\
           Content-Type: text/plain\r\n\
-          Content-Length: 1024\r\n\
+          Content-Length: ",
+    );
+    v.extend_from_slice(body_len.to_string().as_bytes());
+    v.extend_from_slice(
+        b"\r\n\
           Last-Modified: Sat, 17 Oct 2026 16:37:58 GMT\r\n\
           ETag: \"6ad3a466-400\"\r\n\
           Accept-Ranges: bytes\r\n\

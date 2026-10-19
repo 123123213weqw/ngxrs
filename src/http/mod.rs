@@ -144,6 +144,9 @@ pub static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 /// Wakes connection tasks that are blocked waiting for the next request on a
 /// keepalive connection, so a graceful shutdown does not have to wait for
 /// `keepalive_timeout` on every idle client.
+/// Set `NGXRS_SKIP_AFTER_PARSE=1` to answer right after parsing (measurement).
+static SKIP_AFTER_PARSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 static SHUTDOWN_NOTIFY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
 
 pub fn shutdown_notify() -> &'static tokio::sync::Notify {
@@ -360,6 +363,18 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
             }
         };
         served += 1;
+
+        // Measurement only: `NGXRS_SKIP_AFTER_PARSE=1` answers immediately after
+        // the request head has been parsed, with the same status and body length
+        // as `location /ret { return 200 "hello"; }`. The difference against a
+        // real `/ret` is therefore the cost of routing, filtering and rendering,
+        // and the difference against a bare tokio server is our parser and
+        // connection loop.
+        if *SKIP_AFTER_PARSE.get_or_init(|| std::env::var_os("NGXRS_SKIP_AFTER_PARSE").is_some()) {
+            let resp = Response::bytes(200, "text/plain", b"hello".to_vec());
+            let _ = write_response_ka(&mut conn, resp, true, true, false, None).await;
+            continue;
+        }
 
         // nginx checks `ssl_verify_client` here, against the server conf the
         // request resolved to (`ngx_http_process_request_headers`), and answers

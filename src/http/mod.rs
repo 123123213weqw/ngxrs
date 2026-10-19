@@ -4957,7 +4957,13 @@ fn log_access(
     }
 }
 
+/// nginx's built-in `combined` format, used whenever `access_log` names no
+/// format. Without it the literal word `combined` was written to the log.
+pub const COMBINED: &str = "$remote_addr - $remote_user [$time_local] \"$request\" \
+$status $body_bytes_sent \"$http_referer\" \"$http_user_agent\"";
+
 pub(crate) fn expand_log(fmt: &str, vars: &[(&str, &str)], now: i64) -> String {
+    let fmt = if fmt == "combined" { COMBINED } else { fmt };
     let mut out = String::with_capacity(fmt.len() + 64);
     let bytes = fmt.as_bytes();
     let mut i = 0;

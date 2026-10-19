@@ -753,3 +753,38 @@ UNRUN 是同一类问题。现在断言行数少于参考运行的一律进 `TRU
 
 ### 基准（同机 ABBA）
 1k 0.940、64k 0.972、1m 0.962；64KB p99 28.18ms vs **2.63ms**。
+
+## 本轮（proxy_cache_use_stale 收尾、后端条件请求、combined 格式）
+
+`proxy_cache_use_stale.t` **29/36 → 36/36**，与 nginx 完全一致。
+
+### 三处语义修正
+
+1. **`proxy_cache_use_stale updating` 也覆盖「没人刷新」的过期条目**。之前只在
+   `background_update && within_swr` 时返回陈旧副本，于是 `use_stale updating`
+   对「过期且无刷新在途」的键仍然走前台回源，返回 500。nginx 是直接发陈旧副本
+   并由这次请求自己发起更新。
+2. **后台刷新必须带条件头**。`proxy_cache_revalidate on` 时刷新是条件请求，
+   上游答 304 就保留已存 body、只刷新有效期；我原来发的是无条件请求，于是把
+   304 变成 200 并把 body 换掉。
+3. **socket-free 路径（h2/h3/SSI/auth 子请求）也要发陈旧副本**。之前只有流式路径
+   支持，`h2_proxy_cache` 与 SSI 的用例因此失败。注意这里**不能 await** 刷新：
+   nginx 克隆子请求做更新，不阻塞客户端响应 —— 这正是
+   "stale response not blocked by background update" 检查的行为。
+
+### 另外两个真缺陷
+
+- **`access_log` 的 `combined` 是字面量**。内置 `combined` 格式从未被展开，日志里
+  写的是字符串 `combined`（之前所有依赖日志内容的断言都在看它）。补上 nginx 的
+  标准格式后 `proxy_cache_revalidate.t` 的 `not modified` 通过。
+- **`Last-Modified` 只有 200/206 能存**。nginx 存缓存前会剥掉其它状态码的
+  `Last-Modified`，所以只有这两种状态能条件回源；我原来对 201 也发了
+  `If-Modified-Since`，`other status no revalidation` 失败。
+- **缓存命中要过 `not_modified`**。条件请求命中缓存时应当 304，nginx 在头部过滤器
+  里做，所以命中与回源表现一致；`h2_proxy_cache.t` 的 conditional 就是这条。
+
+### 结果
+`proxy_cache_use_stale` 36/36、`proxy_cache_revalidate` 25/25、
+`h2_proxy_cache` 11/11、`proxy.t` 30/30、`proxy_cache_vary` 53/54、
+`proxy_cache` 17/17 —— 均与 nginx 断言数一致。23 个文件的回归：
+22 个完全一致、1 个更好（`ssi_if` 41 vs 32）、0 个更差。

@@ -822,7 +822,14 @@ pub async fn handle(
                 } else if in_flight {
                     loc.proxy_cache_use_stale_updating || within_swr
                 } else {
-                    loc.proxy_cache_background_update && within_swr
+                    // `proxy_cache_use_stale updating` also covers an expired
+                    // entry nobody is refreshing yet: nginx answers with the
+                    // stale copy and starts the update itself, rather than
+                    // refetching in the foreground (this is what makes
+                    // `use_stale updating` a way to keep a 5xx out of the
+                    // client's face, see ticket with 1.19.3 behaviour).
+                    (loc.proxy_cache_background_update && within_swr)
+                        || loc.proxy_cache_use_stale_updating
                 };
                 if !fresh && !serve_stale {
                     stale_entry = Some(entry.clone());
@@ -835,6 +842,26 @@ pub async fn handle(
                         status: entry.error.unwrap_or(entry.status),
                         headers: Vec::new(),
                     }));
+                }
+                // A conditional request on a HIT gets 304, exactly like an
+                // upstream 200 would (nginx's `not_modified` header filter).
+                if fresh {
+                    if let Some(nm) = cached_not_modified(&entry, req) {
+                        let n = crate::http::write_response(
+                            conn,
+                            nm,
+                            true,
+                            tokens,
+                            req.method.as_str() == "HEAD",
+                        )
+                        .await?;
+                        return Ok(Some(written(Outcome {
+                            status: 304,
+                            bytes: n,
+                            close: false,
+                            sent: Vec::new(),
+                        })));
+                    }
                 }
                 if fresh || serve_stale {
                     let hit_status = if fresh {
@@ -852,6 +879,7 @@ pub async fn handle(
                             key.clone(),
                             &conn.peer.ip().to_string(),
                             &target_uri,
+                            &entry,
                         )
                     } else {
                         None
@@ -1499,7 +1527,10 @@ fn build_upstream_head(
     // `$upstream_cache_last_modified` / `$upstream_cache_etag`, which are only
     // defined for an EXPIRED entry with revalidation on. A user
     // `proxy_set_header` for either name wins.
-    if let Some(entry) = reval {
+    // nginx strips `Last-Modified` from anything but a 200/206 before storing
+    // it, which is what makes conditional requests possible only for those two
+    // statuses (`proxy_cache_revalidate.t`: "other status no revalidation").
+    if let Some(entry) = reval.filter(|e| e.status == 200 || e.status == 206) {
         for (want, name) in [
             ("last-modified", "If-Modified-Since"),
             ("etag", "If-None-Match"),
@@ -2580,12 +2611,41 @@ pub async fn fetch(
             match crate::cache::lookup(z, key, get) {
                 Some((entry, _)) if entry.is_fresh(crate::cache::now()) => {
                     if entry.error.is_none() {
+                        if let Some(nm) = cached_not_modified(&entry, req) {
+                            return Some(nm);
+                        }
                         return Some(cached_response(entry, loc, "HIT"));
                     }
                     cache_status = "HIT";
                     stale_entry = Some(entry);
                 }
                 Some((entry, _)) => {
+                    // A stale copy is serviceable under the same two rules as
+                    // the streaming path. The refresh is fire-and-forget here:
+                    // nginx clones a subrequest for it and does *not* hold the
+                    // client's response, which is what
+                    // "stale response not blocked by background update" checks
+                    // for a slow SSI include.
+                    let now = crate::cache::now();
+                    let stale_ok = (loc.proxy_cache_background_update
+                        && entry.may_serve_stale(now))
+                        || (loc.proxy_cache_use_stale_updating && updating_test(key));
+                    if stale_ok {
+                        if let Some(h) = spawn_background_update(
+                            loc,
+                            http,
+                            req,
+                            key.to_string(),
+                            peer_ip,
+                            &target_uri,
+                            &entry,
+                        ) {
+                            drop(h);
+                        }
+                        if entry.error.is_none() {
+                            return Some(cached_response(entry, loc, "STALE"));
+                        }
+                    }
                     cache_status = "EXPIRED";
                     stale_entry = Some(entry);
                 }
@@ -2830,6 +2890,46 @@ fn dechunk(input: &[u8]) -> Option<Vec<u8>> {
 ///
 /// Used by the background refresh, which has no connection context.
 /// Turn a stored entry into a response, for the socket-free path.
+/// nginx's `not_modified` filter applied to a cached response: a conditional
+/// request that matches the stored validators gets 304, whatever protocol
+/// served it. nginx does this in a header filter, so a cache hit and a fresh
+/// upstream response behave the same.
+fn cached_not_modified(entry: &crate::cache::Cached, req: &Request) -> Option<Response> {
+    if entry.status != 200 {
+        return None;
+    }
+    let hdr = |name: &str| {
+        entry
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    };
+    let mut matched = false;
+    if let Some(inm) = req.headers.get("if-none-match") {
+        if let Some(etag) = hdr("etag") {
+            matched = crate::http::static_file::etag_list_matches(inm, etag);
+        }
+    } else if let Some(ims) = req.headers.get("if-modified-since") {
+        if let (Some(lm), Some(t)) = (hdr("last-modified"), crate::util::parse_http_date(ims)) {
+            if let Some(mtime) = crate::util::parse_http_date(lm) {
+                matched = mtime <= t;
+            }
+        }
+    }
+    if !matched {
+        return None;
+    }
+    let mut resp = Response::empty(304);
+    if let Some(etag) = hdr("etag") {
+        resp = resp.header("ETag", etag);
+    }
+    if let Some(lm) = hdr("last-modified") {
+        resp = resp.header("Last-Modified", lm);
+    }
+    Some(resp)
+}
+
 fn cached_response(entry: crate::cache::Cached, loc: &LocCfg, status: &str) -> Response {
     let mut raw = Vec::with_capacity(entry.body.len() + 256);
     for (k, v) in &entry.headers {
@@ -2896,6 +2996,7 @@ pub fn spawn_background_update(
     key: String,
     peer_ip: &str,
     target_uri: &str,
+    cached: &crate::cache::Cached,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let Some(zone) = loc
         .proxy_cache
@@ -2933,6 +3034,16 @@ pub fn spawn_background_update(
     // `location ~ /(reg)(?P<name>exp)` style `proxy_pass .../$1$name` keeps its
     // captures instead of being rebuilt from the raw URI.
     // The background refresh re-fetches the whole entity for the cache.
+    // `proxy_cache_revalidate`: the refresh is conditional, exactly like the
+    // foreground path, so an unchanged upstream answers 304 and the stored body
+    // is kept instead of being replaced by a bodyless 200.
+    let reval = if loc.proxy_cache_revalidate {
+        Some(cached)
+    } else {
+        None
+    };
+    // The task outlives this call, so it needs its own copy.
+    let cached_owned = cached.clone();
     let head = build_upstream_head(
         req,
         target_uri,
@@ -2942,7 +3053,7 @@ pub fn spawn_background_update(
         peer_ip,
         false,
         true,
-        None,
+        reval,
         true,
     );
 
@@ -2970,6 +3081,17 @@ pub fn spawn_background_update(
         else {
             return;
         };
+        // A revalidating subrequest keeps the stored response and only refreshes
+        // its validity (`ngx_http_upstream_304`): the body is unchanged, so
+        // replacing it would lose the payload the client will ask for next.
+        if status == 304 && loc_owned.proxy_cache_revalidate {
+            let refreshed = crate::cache::Cached {
+                stored_at: crate::cache::now(),
+                ..cached_owned
+            };
+            let _ = crate::cache::store(&zone, &key, &refreshed);
+            return;
+        }
         if let Some(valid) =
             crate::cache::ttl(&loc_owned, status, &headers, loc_owned.proxy_cache_ignore)
         {

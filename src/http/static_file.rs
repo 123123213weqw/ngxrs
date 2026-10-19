@@ -347,7 +347,7 @@ fn extension(name: &str) -> &str {
     }
 }
 
-fn etag_list_matches(header: &str, etag: &str) -> bool {
+pub(crate) fn etag_list_matches(header: &str, etag: &str) -> bool {
     for part in header.split(',') {
         let p = part.trim();
         if p == "*" {

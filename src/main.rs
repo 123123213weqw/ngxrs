@@ -23,6 +23,7 @@ mod log;
 mod mail;
 mod mapping;
 mod net;
+mod prof;
 mod proxy;
 mod referer;
 mod resolver;

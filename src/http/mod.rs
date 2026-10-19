@@ -222,6 +222,11 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
     // One timer per connection, reset after each request: registering a fresh
     // timer per request costs more than the request itself at 400k rps.
     let mut idle = Box::pin(tokio::time::sleep(keepalive_timeout));
+    // Likewise one shutdown registration per *connection*. tokio's `Notify`
+    // keeps its waiter list behind a mutex, so building a `Notified` inside the
+    // request loop made every request contend on it across all workers: measured
+    // at 2.20x nginx's CPU per request with 64 workers against 1.14x with one.
+    let mut shutdown_wait = Box::pin(shutdown_notify().notified());
     // Peer and local addresses never change over a connection; rendering them
     // per request cost two allocations each time.
     let client_ip_owned = conn.peer_ip_str();
@@ -245,11 +250,12 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
         // any client idles, which stalls `stop()` in the official test harness
         // and made a restart look like a cache miss.
         let idle_shutdown = is_shutting_down() && conn.buffered().is_empty();
+        let prof_parse = crate::prof::start();
         let read = if idle_shutdown {
             Err(())
         } else if NO_IDLE_TIMER.with(|v| *v) {
             tokio::select! {
-                _ = shutdown_notify().notified(), if conn.buffered().is_empty() => Err(()),
+                _ = &mut shutdown_wait, if conn.buffered().is_empty() => Err(()),
                 r = conn.read_request(MAX_REQUEST_LINE, MAX_HEADER_BYTES) => Ok(r),
             }
         } else {
@@ -257,11 +263,12 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
                 .reset(tokio::time::Instant::now() + read_timeout);
             tokio::select! {
                 _ = idle.as_mut() => Err(()),
-                _ = shutdown_notify().notified(), if conn.buffered().is_empty() => Err(()),
+                _ = &mut shutdown_wait, if conn.buffered().is_empty() => Err(()),
                 r = conn.read_request(MAX_REQUEST_LINE, MAX_HEADER_BYTES) => Ok(r),
             }
         };
 
+        crate::prof::record(0, prof_parse);
         #[allow(unused_mut)]
         let mut req = match read {
             Err(_elapsed) => {
@@ -509,6 +516,7 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
         // Local address of this connection (nginx uses it when the Host header
         // is missing or unusable).
         let local_ip = &local_ip_owned;
+        let prof_dispatch = crate::prof::start();
         let outcome = dispatch(
             &mut conn,
             &req,
@@ -526,6 +534,10 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
             &mut guards_sink,
         )
         .await;
+        crate::prof::record(1, prof_dispatch);
+        if crate::prof::enabled() {
+            crate::prof::REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let elapsed = started.elapsed().unwrap_or_default();
 
         #[cfg(feature = "alloc-count")]
@@ -1070,10 +1082,13 @@ async fn route(
         None
     };
     let index_ref = expanded_index.as_deref();
-    match static_file::respond_indexed(req, path, loc, http, index_ref) {
+    let prof_content = crate::prof::start();
+    let out = match static_file::respond_indexed(req, path, loc, http, index_ref) {
         Ok(r) => r,
         Err(_) => error_response(404, server.server_tokens),
-    }
+    };
+    crate::prof::record(2, prof_content);
+    out
 }
 
 pub fn error_response(status: u16, tokens: bool) -> Response {
@@ -3422,6 +3437,26 @@ async fn dispatch(
     client_ip: &str,
     guards: &mut Vec<crate::limit::ConnGuard>,
 ) -> io::Result<Outcome> {
+    // Measurement endpoint for `NGXRS_PROF=1`: per-request thread-CPU time by
+    // phase, so the cost of a path can be attributed instead of guessed.
+    if crate::prof::enabled() && (path == "/_prof" || path == "/_prof_reset") {
+        let body = crate::prof::dump(path == "/_prof_reset").into_bytes();
+        let mut resp = Response::bytes(200, "text/plain", body);
+        let sent = if sent_headers_needed(server) {
+            split_head(&resp.raw)
+        } else {
+            Vec::new()
+        };
+        let written = write_response(conn, resp, true, server.server_tokens, false).await?;
+        // The dump itself must not be charged to any phase.
+        return Ok(Outcome {
+            status: 200,
+            bytes: written,
+            close: false,
+            sent,
+        });
+    }
+
     // Measurement endpoint for `--features alloc-count`: reports the global
     // allocation counters so a request's heap cost can be read, not guessed.
     #[cfg(feature = "alloc-count")]
@@ -4354,6 +4389,20 @@ pub async fn write_response(
 }
 
 pub async fn write_response_ka(
+    conn: &mut Conn,
+    resp: Response,
+    keepalive: bool,
+    tokens: bool,
+    head_only: bool,
+    keepalive_header: Option<u32>,
+) -> io::Result<u64> {
+    let prof_write = crate::prof::start();
+    let r = write_response_inner(conn, resp, keepalive, tokens, head_only, keepalive_header).await;
+    crate::prof::record(3, prof_write);
+    r
+}
+
+async fn write_response_inner(
     conn: &mut Conn,
     resp: Response,
     keepalive: bool,

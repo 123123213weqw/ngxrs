@@ -1117,6 +1117,14 @@ pub struct StreamServerCfg {
     pub proxy_ssl_name: Option<String>,
     /// `return <text>` in a stream server.
     pub return_text: Option<String>,
+    /// `ssl_verify_client`: 0 off, 1 on, 2 optional, 3 optional_no_ca.
+    pub ssl_verify_client: u8,
+    /// `ssl_client_certificate`: trust anchors for the client chain.
+    pub ssl_client_certificate: Option<PathBuf>,
+    /// `ssl_trusted_certificate`: extra chain-building certificates.
+    pub ssl_trusted_certificate: Option<PathBuf>,
+    /// `access_log` of this stream server; empty means none.
+    pub access_logs: Vec<AccessLog>,
 }
 
 impl Http {
@@ -3186,6 +3194,17 @@ impl Builder {
 }
 
 /// Parse the `stream {}` block: upstreams first, then listeners.
+/// `ssl_verify_client off|on|optional|optional_no_ca` in stream context.
+fn verify_client_mode(d: &Directive) -> Result<u8, ConfigError> {
+    match d.args.first().map(|s| s.as_str()) {
+        Some("off") => Ok(0),
+        Some("on") => Ok(1),
+        Some("optional") => Ok(2),
+        Some("optional_no_ca") => Ok(3),
+        _ => Err(sem(&d.file, d.line, "invalid ssl_verify_client value")),
+    }
+}
+
 fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, ConfigError> {
     let mut section = StreamSection::default();
     let mut server_dirs: Vec<&Directive> = Vec::new();
@@ -3193,6 +3212,12 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
     let mut stream_cert: Option<PathBuf> = None;
     let mut stream_key: Option<PathBuf> = None;
     let mut stream_password: Option<PathBuf> = None;
+    let mut stream_verify_client: u8 = 0;
+    let mut stream_client_ca: Option<PathBuf> = None;
+    let mut stream_trusted: Option<PathBuf> = None;
+    // `log_format` in stream context, and the stream-level `access_log`.
+    let mut stream_log_formats: HashMap<String, String> = HashMap::new();
+    let mut stream_access_logs: Vec<AccessLog> = Vec::new();
     let mut stream_proxy_ssl = false;
     let mut stream_session_reuse = true;
     let mut stream_connect_timeout = std::time::Duration::from_secs(60);
@@ -3233,10 +3258,7 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                 section.upstreams.push(StreamUpstream { name, backends });
             }
             "server" => server_dirs.push(d),
-            "log_format"
-            | "access_log"
-            | "error_log"
-            | "resolver"
+            "resolver"
             | "map"
             | "geo"
             | "split_clients"
@@ -3268,6 +3290,46 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             "ssl_password_file" => {
                 if let Some(p) = d.args.first() {
                     stream_password = Some(b.prefix.join(p));
+                }
+            }
+            "log_format" => {
+                if d.args.len() >= 2 {
+                    let start = if d.args.get(1).is_some_and(|a| a.starts_with("escape=")) {
+                        2
+                    } else {
+                        1
+                    };
+                    stream_log_formats.insert(d.args[0].clone(), d.args[start..].concat());
+                }
+            }
+            "access_log" => {
+                if d.args.first().map(|s| s.as_str()) == Some("off") {
+                    stream_access_logs.clear();
+                } else if let Some(path) = d.args.first() {
+                    let fmt = match d.args.get(1).map(|s| s.as_str()).unwrap_or("combined") {
+                        "combined" => "combined".to_string(),
+                        name => stream_log_formats
+                            .get(name)
+                            .cloned()
+                            .unwrap_or_else(|| "combined".to_string()),
+                    };
+                    stream_access_logs.push(AccessLog {
+                        path: b.prefix.join(path),
+                        format: fmt,
+                    });
+                }
+            }
+            "ssl_verify_client" => {
+                stream_verify_client = verify_client_mode(d)?;
+            }
+            "ssl_client_certificate" => {
+                if let Some(p) = d.args.first() {
+                    stream_client_ca = Some(b.prefix.join(p));
+                }
+            }
+            "ssl_trusted_certificate" => {
+                if let Some(p) = d.args.first() {
+                    stream_trusted = Some(b.prefix.join(p));
                 }
             }
             "proxy_ssl" => {
@@ -3321,6 +3383,10 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             return_text: None,
             proxy_timeout: stream_proxy_timeout,
             proxy_connect_timeout: Duration::from_secs(60),
+            ssl_verify_client: stream_verify_client,
+            ssl_client_certificate: stream_client_ca.clone(),
+            ssl_trusted_certificate: stream_trusted.clone(),
+            access_logs: stream_access_logs.clone(),
         };
         let mut have_listen = false;
         for child in sd.block.as_ref().map(|x| x.as_slice()).unwrap_or(&[]) {
@@ -3383,6 +3449,37 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                 "ssl_password_file" => {
                     if let Some(p) = child.args.first() {
                         cfg.ssl_password_file = Some(b.prefix.join(p));
+                    }
+                }
+                "access_log" => {
+                    if child.args.first().map(|s| s.as_str()) == Some("off") {
+                        cfg.access_logs.clear();
+                    } else if let Some(path) = child.args.first() {
+                        let fmt = match child.args.get(1).map(|s| s.as_str()).unwrap_or("combined")
+                        {
+                            "combined" => "combined".to_string(),
+                            name => stream_log_formats
+                                .get(name)
+                                .cloned()
+                                .unwrap_or_else(|| "combined".to_string()),
+                        };
+                        cfg.access_logs.push(AccessLog {
+                            path: b.prefix.join(path),
+                            format: fmt,
+                        });
+                    }
+                }
+                "ssl_verify_client" => {
+                    cfg.ssl_verify_client = verify_client_mode(child)?;
+                }
+                "ssl_client_certificate" => {
+                    if let Some(p) = child.args.first() {
+                        cfg.ssl_client_certificate = Some(b.prefix.join(p));
+                    }
+                }
+                "ssl_trusted_certificate" => {
+                    if let Some(p) = child.args.first() {
+                        cfg.ssl_trusted_certificate = Some(b.prefix.join(p));
                     }
                 }
                 "proxy_ssl" => {

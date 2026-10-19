@@ -16,7 +16,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
 
 /// One `listen` in stream context, already resolved to its backend list.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StreamServer {
     pub listen: SocketAddr,
     pub udp: bool,
@@ -37,6 +37,16 @@ pub struct StreamServer {
     pub proxy_ssl_session_reuse: bool,
     /// `proxy_ssl_name`: SNI for the upstream (defaults to `localhost`).
     pub proxy_ssl_name: Option<String>,
+    /// `ssl_verify_client`: 0 off, 1 on, 2 optional, 3 optional_no_ca.
+    pub client_verify: u8,
+    /// `ssl_client_certificate`: trust anchors for `$ssl_client_verify`.
+    pub client_ca: Option<std::path::PathBuf>,
+    /// `ssl_trusted_certificate`: extra chain-building certificates.
+    pub trusted_ca: Option<std::path::PathBuf>,
+    /// `access_log` of this stream server.
+    pub access_logs: Vec<crate::config::AccessLog>,
+    /// Shared writer for `access_log`.
+    pub logger: std::sync::Arc<crate::log::Logger>,
 }
 
 pub struct StreamConfig {
@@ -152,10 +162,25 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                 let proxy_ssl = server.proxy_ssl;
                 let reuse = server.proxy_ssl_session_reuse;
                 let sni = server.proxy_ssl_name.clone();
+                let verify_mode = server.client_verify;
+                let client_ca = server.client_ca.clone();
+                let trusted_ca = server.trusted_ca.clone();
+                // One log line per connection, written when the task ends.
+                let mut alog = StreamAccessLog::new(&server, peer, "stream");
                 tokio::spawn(async move {
                     // `return <text>` answers without touching an upstream.
                     if let Some(text) = return_text {
-                        answer_stream_return(client, tls, &text).await;
+                        answer_stream_return(
+                            client,
+                            tls,
+                            &text,
+                            verify_mode,
+                            &client_ca,
+                            &trusted_ca,
+                            alog.as_mut(),
+                        )
+                        .await;
+                        drop(alog);
                         return;
                     }
                     let Some(upstream) = pick_backend(&backends, &counter) else {
@@ -203,7 +228,11 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                             let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
                             match acceptor.accept(client).await {
                                 Ok(t) => proxy_io(t, upstream, timeout, peer).await,
-                                Err(_) => {}
+                                Err(_) => {
+                                    if let Some(l) = alog.as_mut() {
+                                        l.status = 500;
+                                    }
+                                }
                             }
                         }
                         None => proxy_tcp(client, upstream, timeout, peer).await,
@@ -333,10 +362,79 @@ where
 
 /// Serve `return <text>` on a stream listener, expanding the few variables a
 /// stream server can see (`$ssl_session_reused`).
+/// Writes one `access_log` line when a stream connection ends.
+///
+/// nginx logs `$status` 200 for a session that ended normally and 500 when the
+/// session ended in an error (`ngx_stream_log_handler` on
+/// `c->error`), which is what a failed TLS handshake produces. `Drop` is used
+/// because the connection paths have many early returns.
+pub struct StreamAccessLog {
+    logs: Vec<crate::config::AccessLog>,
+    logger: std::sync::Arc<crate::log::Logger>,
+    peer: SocketAddr,
+    listen: SocketAddr,
+    protocol: &'static str,
+    started: std::time::Instant,
+    pub status: u16,
+}
+
+impl StreamAccessLog {
+    pub fn new(
+        server: &StreamServer,
+        peer: SocketAddr,
+        protocol: &'static str,
+    ) -> Option<StreamAccessLog> {
+        if server.access_logs.is_empty() {
+            return None;
+        }
+        Some(StreamAccessLog {
+            logs: server.access_logs.clone(),
+            logger: server.logger.clone(),
+            peer,
+            listen: server.listen,
+            protocol,
+            started: std::time::Instant::now(),
+            status: 200,
+        })
+    }
+}
+
+impl Drop for StreamAccessLog {
+    fn drop(&mut self) {
+        let now = crate::cache::now();
+        let peer_ip = self.peer.ip().to_string();
+        let peer_port = self.peer.port().to_string();
+        let server_ip = self.listen.ip().to_string();
+        let server_port = self.listen.port().to_string();
+        let status = self.status.to_string();
+        let session = format!("{:.3}", self.started.elapsed().as_secs_f64());
+        let vars: Vec<(&str, &str)> = vec![
+            ("status", &status),
+            ("remote_addr", &peer_ip),
+            ("remote_port", &peer_port),
+            ("server_addr", &server_ip),
+            ("server_port", &server_port),
+            ("protocol", self.protocol),
+            ("session_time", &session),
+            ("bytes_sent", "-"),
+            ("bytes_received", "-"),
+            ("time_local", ""),
+        ];
+        for log in &self.logs {
+            let line = crate::http::expand_log(&log.format, &vars, now);
+            self.logger.access(&log.path, line);
+        }
+    }
+}
+
 async fn answer_stream_return(
     mut client: TcpStream,
     tls: Option<std::sync::Arc<rustls::ServerConfig>>,
     text: &str,
+    verify_mode: u8,
+    client_ca: &Option<std::path::PathBuf>,
+    trusted_ca: &Option<std::path::PathBuf>,
+    log: Option<&mut StreamAccessLog>,
 ) {
     let reused = match tls {
         Some(sc) => {
@@ -348,17 +446,29 @@ async fn answer_stream_return(
                         t.get_ref().1.handshake_kind(),
                         Some(rustls::HandshakeKind::Resumed)
                     );
-                    let body = expand(text, r);
+                    let (verify, cert) =
+                        client_cert_vars(t.get_ref().1, verify_mode, client_ca, trusted_ca);
+                    let body = expand(text, r, &verify, &cert);
                     let _ = t.write_all(body.as_bytes()).await;
                     let _ = t.flush().await;
                     let _ = t.shutdown().await;
                     return;
                 }
-                Err(_) => return,
+                Err(mut e) => {
+                    // A failed handshake makes nginx log `$status` 500.
+                    if let Some(l) = log {
+                        l.status = 500;
+                        let _ = &mut e;
+                    }
+                    return;
+                }
             }
         }
         None => {
-            let body = expand(text, false);
+            // A `return` in a non-ssl stream server sees no TLS facts at all,
+            // which is why `$ssl_client_verify:$ssl_client_cert` renders as
+            // `:` there.
+            let body = expand(text, false, "", "");
             let _ = client.write_all(body.as_bytes()).await;
             let _ = client.shutdown().await;
             return;
@@ -366,8 +476,49 @@ async fn answer_stream_return(
     };
 }
 
-fn expand(text: &str, reused: bool) -> String {
+fn expand(text: &str, reused: bool, verify: &str, cert: &str) -> String {
     text.replace("$ssl_session_reused", if reused { "r" } else { "." })
+        .replace("$ssl_client_verify", verify)
+        .replace("$ssl_client_cert", cert)
+}
+
+/// `$ssl_client_verify` and `$ssl_client_cert` for a stream connection.
+///
+/// In `optional_no_ca` mode nginx records why verification would have failed
+/// while still letting the connection through, so the chain is evaluated here
+/// rather than in the handshake.
+fn client_cert_vars(
+    conn: &rustls::ServerConnection,
+    verify_mode: u8,
+    client_ca: &Option<std::path::PathBuf>,
+    trusted_ca: &Option<std::path::PathBuf>,
+) -> (String, String) {
+    let chain: Vec<_> = conn
+        .peer_certificates()
+        .map(|c| c.iter().map(|d| d.to_owned()).collect())
+        .unwrap_or_default();
+    if chain.is_empty() {
+        // `off` and `on` never reach here with a missing certificate (`on`
+        // fails the handshake), but `optional` does.
+        return ("NONE".to_string(), String::new());
+    }
+    let pem = crate::tls::der_to_pem(chain[0].as_ref());
+    let verify = if verify_mode == 0 {
+        "NONE".to_string()
+    } else {
+        // nginx loads both bundles into the verify store; `ssl_trusted_certificate`
+        // simply does not contribute names to the CertificateRequest.
+        let paths: Vec<&std::path::Path> = [client_ca, trusted_ca]
+            .into_iter()
+            .flatten()
+            .map(|p| p.as_path())
+            .collect();
+        match crate::tls::verify_client_chain_multi(paths, &chain) {
+            Ok(()) => "SUCCESS".to_string(),
+            Err(reason) => format!("FAILED:{reason}"),
+        }
+    };
+    (verify, pem)
 }
 
 async fn proxy_tcp(

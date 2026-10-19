@@ -4957,7 +4957,7 @@ fn log_access(
     }
 }
 
-fn expand_log(fmt: &str, vars: &[(&str, &str)], now: i64) -> String {
+pub(crate) fn expand_log(fmt: &str, vars: &[(&str, &str)], now: i64) -> String {
     let mut out = String::with_capacity(fmt.len() + 64);
     let bytes = fmt.as_bytes();
     let mut i = 0;

@@ -284,6 +284,11 @@ pub fn serve(cfg: Config) -> io::Result<()> {
             proxy_ssl: sc.proxy_ssl,
             proxy_ssl_session_reuse: sc.proxy_ssl_session_reuse,
             proxy_ssl_name: sc.proxy_ssl_name.clone(),
+            client_verify: sc.ssl_verify_client,
+            client_ca: sc.ssl_client_certificate.clone(),
+            trusted_ca: sc.ssl_trusted_certificate.clone(),
+            access_logs: sc.access_logs.clone(),
+            logger: ctx.logger.clone(),
         });
     }
     let stream_cfg = Arc::new(stream_cfg);
@@ -443,7 +448,14 @@ fn stream_tls(sc: &crate::config::typed::StreamServerCfg) -> Option<Arc<rustls::
         Some(p) => crate::tls::read_passwords(p).unwrap_or_default(),
         None => Vec::new(),
     };
-    match crate::tls::build_mail_config_with(cert, key, &pw) {
+    match crate::tls::build_stream_config(
+        cert,
+        key,
+        &pw,
+        sc.ssl_verify_client,
+        sc.ssl_client_certificate.as_deref(),
+        sc.ssl_trusted_certificate.as_deref(),
+    ) {
         Ok(c) => Some(c),
         Err(e) => {
             eprintln!("ngxrs: [error] stream TLS for {}: {e}", sc.listen);

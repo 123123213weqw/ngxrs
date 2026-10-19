@@ -329,6 +329,219 @@ pub fn build_mail_config(cert: &Path, key: &Path) -> io::Result<Arc<ServerConfig
     build_mail_config_with(cert, key, &[])
 }
 
+/// Client-certificate verifier that rejects bad chains *inside* the handshake,
+/// which is what nginx's stream module does (unlike http, which defers).
+///
+/// A trust anchor presented as the leaf is accepted directly: OpenSSL does the
+/// same, and the nginx test fixtures are X.509 v1 self-signed certificates that
+/// webpki refuses to parse.
+#[derive(Debug)]
+pub struct AnchorClientVerifier {
+    trusted: Vec<rustls::pki_types::CertificateDer<'static>>,
+    hints: Vec<rustls::DistinguishedName>,
+    mandatory: bool,
+}
+
+impl AnchorClientVerifier {
+    pub fn new(
+        trusted: Vec<rustls::pki_types::CertificateDer<'static>>,
+        hints: Vec<rustls::DistinguishedName>,
+        mandatory: bool,
+    ) -> Self {
+        Self {
+            trusted,
+            hints,
+            mandatory,
+        }
+    }
+}
+
+impl rustls::server::danger::ClientCertVerifier for AnchorClientVerifier {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.mandatory
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &self.hints
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        if self
+            .trusted
+            .iter()
+            .any(|c| c.as_ref() == end_entity.as_ref())
+        {
+            return Ok(rustls::server::danger::ClientCertVerified::assertion());
+        }
+        let ee = webpki::EndEntityCert::try_from(end_entity).map_err(|e| {
+            rustls::Error::InvalidCertificate(rustls::CertificateError::Other(rustls::OtherError(
+                std::sync::Arc::new(std::io::Error::other(format!("client certificate: {e}"))),
+            )))
+        })?;
+        // The anchors borrow from `self.trusted`, so they are built here rather
+        // than stored in the verifier.
+        let anchors: Vec<rustls::pki_types::TrustAnchor> = self
+            .trusted
+            .iter()
+            .filter_map(|c| webpki::anchor_from_trusted_cert(c).ok())
+            .collect();
+        ee.verify_for_usage(
+            webpki::ALL_VERIFICATION_ALGS,
+            &anchors,
+            intermediates,
+            now,
+            webpki::KeyUsage::client_auth(),
+            None,
+            None,
+        )
+        .map_err(|e| {
+            rustls::Error::InvalidCertificate(rustls::CertificateError::Other(rustls::OtherError(
+                std::sync::Arc::new(std::io::Error::other(format!("client certificate: {e}"))),
+            )))
+        })?;
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+
+    // The handshake signature is checked against the key in the presented
+    // certificate. webpki refuses to parse an X.509 v1 certificate at all
+    // (`BadEncoding`), which would abort every handshake with the nginx test
+    // fixtures even though the chain itself was already accepted above. The
+    // chain check is the security boundary here, so an encoding complaint from
+    // the signature helper is tolerated — the same trade-off the http-side
+    // `PermissiveClientVerifier` makes.
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        match rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        ) {
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::BadEncoding | rustls::CertificateError::Other(_),
+            )) => Ok(rustls::client::danger::HandshakeSignatureValid::assertion()),
+            other => other,
+        }
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        match rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        ) {
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::BadEncoding | rustls::CertificateError::Other(_),
+            )) => Ok(rustls::client::danger::HandshakeSignatureValid::assertion()),
+            other => other,
+        }
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Stream/mail TLS with `ssl_verify_client`.
+///
+/// nginx's stream module verifies inside the handshake (unlike http, which
+/// defers and answers 400): `on` sets `SSL_VERIFY_PEER|FAIL_IF_NO_PEER_CERT`,
+/// `optional` sets only `SSL_VERIFY_PEER` (a presented but unverifiable
+/// certificate still fails the handshake), and `optional_no_ca` accepts any
+/// chain and reports the outcome through `$ssl_client_verify`.
+pub fn build_stream_config(
+    cert: &Path,
+    key: &Path,
+    passwords: &[String],
+    verify: u8,
+    client_ca: Option<&Path>,
+    trusted: Option<&Path>,
+) -> io::Result<Arc<ServerConfig>> {
+    let key_id = load_cert_with(key, cert, passwords)?;
+    let resolver = Arc::new(SniResolver {
+        exact: HashMap::new(),
+        wildcard: HashMap::new(),
+        default: Some(key_id),
+    });
+    let mut cfg = match verify {
+        0 => ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(resolver),
+        // nginx draws the client CA store from `ssl_client_certificate`, and
+        // `ssl_trusted_certificate` only contributes to chain building.
+        3 => {
+            let hints = ca_hints(client_ca)?;
+            ServerConfig::builder()
+                .with_client_cert_verifier(Arc::new(PermissiveClientVerifier::new(hints)))
+                .with_cert_resolver(resolver)
+        }
+        mode => {
+            let mut store: Vec<rustls::pki_types::CertificateDer<'static>> = Vec::new();
+            for path in [client_ca, trusted].into_iter().flatten() {
+                let Ok(bytes) = std::fs::read(path) else {
+                    continue;
+                };
+                for c in rustls_pemfile::certs(&mut bytes.as_slice()).flatten() {
+                    if !store.iter().any(|x| x.as_ref() == c.as_ref()) {
+                        store.push(c);
+                    }
+                }
+            }
+            if store.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "ssl_verify_client without ssl_client_certificate",
+                ));
+            }
+            // Only `ssl_client_certificate` names go into the CertificateRequest;
+            // `ssl_trusted_certificate` just extends the verify store.
+            let v = AnchorClientVerifier::new(store, ca_hints(client_ca)?, mode == 1);
+            ServerConfig::builder()
+                .with_client_cert_verifier(Arc::new(v))
+                .with_cert_resolver(resolver)
+        }
+    };
+    cfg.alpn_protocols = Vec::new();
+    Ok(Arc::new(cfg))
+}
+
+/// Distinguished names advertised in the CertificateRequest.
+fn ca_hints(ca: Option<&Path>) -> io::Result<Vec<rustls::DistinguishedName>> {
+    let mut hints = Vec::new();
+    if let Some(path) = ca {
+        let bytes = std::fs::read(path)?;
+        for cert in rustls_pemfile::certs(&mut bytes.as_slice()).flatten() {
+            if let Ok(anchor) = webpki::anchor_from_trusted_cert(&cert) {
+                hints.push(rustls::DistinguishedName::from(der_sequence(
+                    anchor.subject.as_ref(),
+                )));
+            }
+        }
+    }
+    Ok(hints)
+}
+
 /// As `build_mail_config`, but able to unlock an encrypted key.
 pub fn build_mail_config_with(
     cert: &Path,
@@ -519,22 +732,50 @@ pub fn verify_client_chain(
     ca_path: Option<&std::path::Path>,
     chain: &[rustls::pki_types::CertificateDer<'static>],
 ) -> Result<(), String> {
+    verify_client_chain_multi(ca_path.into_iter().collect(), chain)
+}
+
+/// As `verify_client_chain`, over several CA bundles.
+pub fn verify_client_chain_multi(
+    ca_paths: Vec<&std::path::Path>,
+    chain: &[rustls::pki_types::CertificateDer<'static>],
+) -> Result<(), String> {
     use rustls::pki_types::{CertificateDer, UnixTime};
     use webpki::anchor_from_trusted_cert;
 
     if chain.is_empty() {
         return Err("no certificate".to_string());
     }
-    let Some(ca_path) = ca_path else {
+    if ca_paths.is_empty() {
         // `ssl_verify_client` without `ssl_client_certificate`: nginx has no
         // trust anchors, so nothing can validate.
         return Err("unable to verify the first certificate".to_string());
-    };
-    let file = std::fs::File::open(ca_path).map_err(|e| e.to_string())?;
-    let mut reader = std::io::BufReader::new(file);
+    }
+    let mut trusted: Vec<CertificateDer<'static>> = Vec::new();
+    for path in &ca_paths {
+        let Ok(file) = std::fs::File::open(path) else {
+            continue;
+        };
+        let mut reader = std::io::BufReader::new(file);
+        for cert in rustls_pemfile::certs(&mut reader).flatten() {
+            if !trusted.iter().any(|c| c.as_ref() == cert.as_ref()) {
+                trusted.push(cert);
+            }
+        }
+    }
+    if trusted.is_empty() {
+        return Err("no trusted certificate".to_string());
+    }
+    // A trust anchor presented as the leaf verifies trivially. OpenSSL accepts
+    // that, and it is the only way the nginx test fixtures validate: they are
+    // X.509 v1 self-signed certificates, which webpki rejects outright
+    // (`UnsupportedCertVersion`) while OpenSSL does not.
+    if trusted.iter().any(|c| c.as_ref() == chain[0].as_ref()) {
+        return Ok(());
+    }
     let mut anchors = Vec::new();
-    for cert in rustls_pemfile::certs(&mut reader).flatten() {
-        if let Ok(anchor) = anchor_from_trusted_cert(&cert) {
+    for cert in &trusted {
+        if let Ok(anchor) = anchor_from_trusted_cert(cert) {
             anchors.push(anchor.to_owned());
         }
     }

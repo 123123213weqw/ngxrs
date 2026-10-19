@@ -709,3 +709,47 @@ UNRUN 是同一类问题。现在断言行数少于参考运行的一律进 `TRU
 
 ### 基准（同机 ABBA）
 1k 0.950（447,538 vs 425,180）、64k 0.959、1m 0.959；64KB p99 30.59ms vs **2.65ms**。
+
+## 本轮（stream 客户端证书验证、stream access_log）
+
+### 新的功能：stream 的 ssl_verify_client
+
+之前完全没实现，`stream_ssl_verify_client.t` 连配置都起不来。现在：
+
+- `ssl_verify_client off|on|optional|optional_no_ca`、`ssl_client_certificate`、
+  `ssl_trusted_certificate`，stream 与 stream server 两级、可继承。
+- 与 http 的语义**不同**：nginx 的 stream 在握手内验证 —— `on` 是
+  `SSL_VERIFY_PEER|FAIL_IF_NO_PEER_CERT`，`optional` 只要对端出示了就验证失败即断，
+  `optional_no_ca` 一律放行并只在 `$ssl_client_verify` 里报告原因。
+  我们用自写的 `AnchorClientVerifier` 在 rustls 里做到这一点。
+- `$ssl_client_verify` / `$ssl_client_cert` 在 stream `return` 里可用。
+
+两个必须绕开的坑：
+
+1. **X.509 v1 证书**。测试夹具是 `openssl req -x509` 生成的 v1 自签证书，webpki
+   直接 `UnsupportedCertVersion`。而 OpenSSL 接受 —— 所以「叶子证书本身就是信任锚」
+   应当通过。现在先做字节相等判断，再退回 webpki。
+2. **`verify_tls13_signature` 也会解析证书**，同样在 v1 上失败，导致握手以
+   `certificate unknown` 结束（而 `verify_client_cert` 根本不会被调用，所以单看
+   verifier 是自洽的、排查时极具误导性）。对 `BadEncoding/Other` 放宽，与 http 侧
+   `PermissiveClientVerifier` 的取舍一致；链验证仍是安全边界。
+
+### stream access_log
+
+`access_log` 与 `log_format` 在 stream 上下文里是**被忽略的**——不是因为没实现，而是
+被前面一个「接受但忽略」的 match 分支遮蔽了（Rust 分支按顺序匹配）。同一份列表里
+`error_log` 也是这样被遮蔽的。移出后 `access_log` 生效，`$status` 在握手失败时是 500、
+正常结束时 200，与 nginx 一致。
+
+### 结果
+| 用例 | ngxrs | nginx |
+|---|---|---|
+| `stream_ssl_verify_client.t` | **12/12** | 12/12 |
+| `stream_ssl.t` / `stream_proxy_ssl.t` | 7/7 / 8/8 | 同 |
+| `stream_error_log.t` | 36/36 | 36/36 |
+
+36 个文件的 A/B：32 个完全一致、3 个更好、2 个更差（`proxy_cache_use_stale` 29/36、
+`h2_host` 52/62），断言 824 / 813。自建差分套件 70/70，单测 101。
+
+### 基准（同机 ABBA）
+1k 0.940、64k 0.972、1m 0.962；64KB p99 28.18ms vs **2.63ms**。

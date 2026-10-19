@@ -346,6 +346,10 @@ fn hexval(c: u8) -> Option<u8> {
 
 /// Percent-decode a URI component. Rejects `%00` and bad escapes.
 pub fn percent_decode(s: &str) -> Result<String, ()> {
+    // No escapes is the common case; skip the copy entirely.
+    if !s.as_bytes().contains(&b'%') {
+        return Ok(s.to_string());
+    }
     let b = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -378,6 +382,16 @@ pub fn percent_decode(s: &str) -> Result<String, ()> {
 pub fn normalize_path(path: &str, merge_slashes: bool) -> Result<String, ()> {
     if !path.starts_with('/') {
         return Err(());
+    }
+    // Fast path: nothing to merge and no `.`/`..` segments, so the result is the
+    // input. Avoids the segment Vec and the join for the overwhelmingly common
+    // case (any path with no `//` and no `/./` or `/../`).
+    if !path.contains("..")
+        && (!merge_slashes || !path.contains("//"))
+        && !path.contains("/./")
+        && !path.ends_with("/.")
+    {
+        return Ok(path.to_string());
     }
     let trailing = path.ends_with('/') || path.ends_with("/.") || path.ends_with("/..");
     let mut stack: Vec<&str> = Vec::new();
@@ -441,8 +455,14 @@ pub fn parse_target(raw: &str) -> Result<(String, String), ()> {
 /// Turn `http://host[/path][?query]` into an origin-form target, or `None` when
 /// the input is already origin-form.
 fn absolute_form_to_origin(raw: &str) -> Option<String> {
-    let lower = raw.get(..8).unwrap_or("").to_ascii_lowercase();
-    if !lower.starts_with("http://") && !lower.starts_with("https://") {
+    // Case-insensitive prefix test without allocating: this ran for every
+    // request and built an 8-byte lowercase String only to discard it (see
+    // BENCH.md, "parse_target" cost).
+    let head = raw.as_bytes();
+    let matches = |want: &[u8]| {
+        head.len() >= want.len() && head[..want.len()].iter().zip(want).all(|(a, b)| a.eq_ignore_ascii_case(b))
+    };
+    if !matches(b"http://") && !matches(b"https://") {
         return None;
     }
     let after = &raw[raw.find("://")? + 3..];

@@ -147,6 +147,20 @@ pub static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 /// Set `NGXRS_SKIP_AFTER_PARSE=1` to answer right after parsing (measurement).
 static SKIP_AFTER_PARSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
+/// Graduated measurement stops: each value answers as soon as that stage has
+/// completed, so the cost of one stage is the difference between neighbours.
+/// 1 = after parsing, 2 = after URL normalisation, 3 = after location match.
+static STOP_STAGE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+
+fn stop_stage() -> u8 {
+    *STOP_STAGE.get_or_init(|| {
+        std::env::var("NGXRS_STOP_STAGE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 static SHUTDOWN_NOTIFY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
 
 pub fn shutdown_notify() -> &'static tokio::sync::Notify {
@@ -370,7 +384,9 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
         // real `/ret` is therefore the cost of routing, filtering and rendering,
         // and the difference against a bare tokio server is our parser and
         // connection loop.
-        if *SKIP_AFTER_PARSE.get_or_init(|| std::env::var_os("NGXRS_SKIP_AFTER_PARSE").is_some()) {
+        if stop_stage() == 1
+            || *SKIP_AFTER_PARSE.get_or_init(|| std::env::var_os("NGXRS_SKIP_AFTER_PARSE").is_some())
+        {
             let resp = Response::bytes(200, "text/plain", b"hello".to_vec());
             let _ = write_response_ka(&mut conn, resp, true, true, false, None).await;
             continue;
@@ -474,6 +490,12 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
             group.default_server,
             req.host.as_deref(),
         );
+        if stop_stage() == 2 {
+            let resp = Response::bytes(200, "text/plain", b"hello".to_vec());
+            let _ = write_response_ka(&mut conn, resp, true, true, false, None).await;
+            continue;
+        }
+
         let (loc, loc_caps) = server.locate_with_captures(&path);
         // Location regex captures are ordinary variables (`$1`, `$name`), and
         // they take precedence over `server_name` captures when both exist.

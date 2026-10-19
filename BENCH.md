@@ -436,3 +436,58 @@ memset 修掉之后真实数字是 **+4.21 µs**，它现在是最大的一项�
 转移到了路由/过滤器/渲染这一段，下一步从那里下手：`finalize_response` 每请求都做
 `path.to_string()` + `query.to_string()` + `cur_loc.root.to_string_lossy().to_string()`
 三次分配，并**重新做一次 location 匹配**（调用方 `handle_conn_inner` 已经算过 `loc`）。
+
+## 分阶段归因：把"路由/渲染"再拆开
+
+上一轮把赤字定位到"路由+过滤器+渲染 +4.21 µs"，但那一整段太粗。这轮把它拆成
+可测量的阶段停点（`NGXRS_STOP_STAGE=N`，N=1 解析后、N=2 URL 规范化后），
+配合 `bench/skipcmp.py`：
+
+| 阶段（1 worker，−floor） | 时间 |
+|---|---|
+| 解析器 + 连接循环 | +2.63 µs |
+| `parse_target`（URL 规范化） | +0.86 µs |
+| location 匹配之后的一切 | +3.57 µs |
+| **合计** | **+7.06 µs**（nginx 全栈 +3.37） |
+
+## 本轮修掉的：`parse_target` 里的无谓分配
+
+三处，都是每请求一次：
+
+1. `absolute_form_to_origin` 对每个请求 `raw[..8].to_ascii_lowercase()` 造一个
+   8 字节 String，然后对 origin-form（99.9% 的请求）立刻丢弃。改成按字节不区分
+   大小写比较。
+2. `percent_decode` 无论如何都 `Vec::with_capacity` + 转 String；没有 `%` 时直接返回输入。
+3. `normalize_path` 无论路径多简单都建 `Vec<&str>` 再 join；无 `..`/`//`/`/./` 时直接返回输入。
+
+`parse_target` 段：**1.00 µs → 0.86 µs**。
+
+### 这里踩了一个真坑
+
+第 1 项第一版写成 `head.len() == want.len()`，而 `http://` 是 7 字节、`https://` 是
+8 字节，我却拿 8 字节的头去比 7 字节的前缀，于是**所有 absolute-form 请求都失效**。
+单元测试 `absolute_form_with_query` / `targets` 立刻抓到了。改成
+`head.len() >= want.len() && head[..want.len()]` 后通过。
+
+## 一次失败的重构（已回退，未造成损害）
+
+本轮先试图把 `finalize_response` 里每请求的
+`path.to_string()` + `query.to_string()` + `root.to_string_lossy().to_string()`
+和**第二次 location 匹配**去掉。改法是让 `cur_path`/`cur_query` 变成 `&str`
+借用、把重定向后的值存进 `Option<(String,String)>`、`cur_loc` 变成
+`Option<&LocCfg>` 回落到调用方已算出的 `loc`。
+
+结果：`finalize_response` 主体改完了，但 12 个调用点、`render_resolved_state`
+的签名也被我用一个批量替换改到了，出现 35 个编译错误，其中 12 个是"把参数加到了
+错误的函数上"。**已 `git checkout` 全部回退**，回到干净可编译状态。
+
+这次和之前一次批量脚本事故是同一类错误：**不要用文本批量替换去改跨函数的签名**。
+而且事后看，这三个分配总共约 150 ns，根本解释不了 4.21 µs——即使改对也不会有效果。
+正确的做法是本轮采用的办法：先用阶段停点测出钱花在哪，再动手。
+
+## 顺带发现一个此前从未测量过的缺口
+
+跑 URL 相关用例时第一次带上 `autoindex.t`：**12/18（nginx 18/18）**。
+失败的 6 条是符号链接目录、超长名字、以及 HTML 转义/UTF-8 长名的三组转义。
+我用 `git stash` 回到改动前的二进制重跑，**同样是 12/18**，所以是既有缺口，
+不是本轮引入的。记入待办。

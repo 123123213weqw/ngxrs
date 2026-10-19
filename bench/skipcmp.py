@@ -36,6 +36,9 @@ PORTS = {
     # skip-right-after-parse with the per-request keepalive timer disabled, to
     # separate the timer-wheel registration from the parser itself.
     "notimer": 18955,
+    # Graduated stops: 1 = after parse, 2 = after URL normalisation.
+    "stage1": 18956,
+    "stage2": 18957,
 }
 
 CONF = """worker_processes %(wp)s;
@@ -119,6 +122,12 @@ def start(workers):
         elif name == "skip":
             cmd = [NGXRS_BIN, "-c", path, "-p", ROOT]
             envv = dict(**__import__("os").environ, NGXRS_SKIP_AFTER_PARSE="1")
+        elif name == "stage1":
+            cmd = [NGXRS_BIN, "-c", path, "-p", ROOT]
+            envv = dict(**__import__("os").environ, NGXRS_STOP_STAGE="1")
+        elif name == "stage2":
+            cmd = [NGXRS_BIN, "-c", path, "-p", ROOT]
+            envv = dict(**__import__("os").environ, NGXRS_STOP_STAGE="2")
         elif name == "notimer":
             cmd = [NGXRS_BIN, "-c", path, "-p", ROOT]
             envv = dict(
@@ -172,21 +181,23 @@ def main():
     print("workers=%s c=%d d=%ds repeats=%d  (/ret, 200 + 5-byte body)" % (workers, conns, dur, repeats))
     res = {k: {"cpu": [], "rps": []} for k in PORTS}
     for _ in range(repeats):
-        for name in ("nginx", "floor", "skip", "notimer", "full"):
+        for name in ("nginx", "floor", "stage1", "stage2", "full"):
             rps, cpu = measure(name, conns, dur)
             res[name]["cpu"].append(cpu)
             res[name]["rps"].append(rps)
     med = {}
-    for name in PORTS:
+    wanted = ("nginx", "floor", "stage1", "stage2", "full")
+    for name in wanted:
+        if not res[name]["cpu"]:
+            raise RuntimeError("%s produced no samples" % name)
         med[name] = (statistics.median(res[name]["cpu"]), statistics.median(res[name]["rps"]))
-    for name in ("nginx", "floor", "skip", "notimer", "full"):
+    for name in ("nginx", "floor", "stage1", "stage2", "full"):
         c, r = med[name]
         print("  %-6s cpu=%6.2fus rps=%8.0f  vs_ngxrs_full=%.2f" % (name, c, r, c / med["full"][0]))
     print()
-    print("  our parser+loop over bare tokio : %+.2fus" % (med["skip"][0] - med["floor"][0]))
-    print("    of which keepalive timer reset: %+.2fus" % (med["skip"][0] - med["notimer"][0]))
-    print("    of which parser/loop proper   : %+.2fus" % (med["notimer"][0] - med["floor"][0]))
-    print("  routing+filters+render          : %+.2fus" % (med["full"][0] - med["skip"][0]))
+    print("  parser + connection loop        : %+.2fus" % (med["stage1"][0] - med["floor"][0]))
+    print("  URL normalisation (parse_target): %+.2fus" % (med["stage2"][0] - med["stage1"][0]))
+    print("  everything after location match : %+.2fus" % (med["full"][0] - med["stage2"][0]))
     print("  total ngxrs over floor          : %+.2fus" % (med["full"][0] - med["floor"][0]))
     print("  total nginx over floor          : %+.2fus" % (med["nginx"][0] - med["floor"][0]))
     for name, port in PORTS.items():

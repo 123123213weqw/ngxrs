@@ -788,3 +788,50 @@ UNRUN 是同一类问题。现在断言行数少于参考运行的一律进 `TRU
 `h2_proxy_cache` 11/11、`proxy.t` 30/30、`proxy_cache_vary` 53/54、
 `proxy_cache` 17/17 —— 均与 nginx 断言数一致。23 个文件的回归：
 22 个完全一致、1 个更好（`ssi_if` 41 vs 32）、0 个更差。
+
+## sub_filter / stub_status / split_clients / referer batch
+
+Added in one round, each verified A/B against nginx 1.28 on the same host:
+
+| suite | ngxrs | nginx |
+|---|---|---|
+| `empty_gif.t` | 6/6 | 6/6 |
+| `stub_status.t` | 36/36 | 36/36 |
+| `split_clients.t` | 3/3 | 3/3 |
+| `referer.t` | 56/56 | 56/56 |
+| `sub_filter.t` | 31/32 | 32/32 |
+| `sub_filter_multi.t` | 42/44 | 44/44 |
+
+Real bugs found on the way, all of them outside the new modules:
+
+- **The h2c preface peek blocked every connection.** `TcpStream::peek` waits
+  until the whole buffer can be filled, so a client that had not yet sent 24
+  bytes was parked *before* `handle_conn` ran. Consequences: `$connections_*`
+  were wrong, and an 18-byte `GET / HTTP/1.0\r\n\r\n` hung. Now a
+  non-blocking `recv(MSG_PEEK|MSG_DONTWAIT)`, with a 100 ms grace only when the
+  bytes seen so far are a prefix of the preface.
+- **`limit_rate` was never applied.** Only the `$limit_rate` variable existed.
+  Measured nginx: a 155-byte header for an empty file takes **20 s** at
+  `limit_rate 15`, because the write filter throttles the whole chain, headers
+  included. Implemented on the write path (and on `sendfile`, which falls back
+  to a buffered copy when throttled), with a readability watch during the pacing
+  sleep so a client disconnect finalises the request immediately like nginx.
+- **`$connection` did not exist**, so `split_clients $connection` bucketed
+  everything into the first entry.
+- **`index` was not a complex value**: `index index${variant}.html` never
+  expanded, so `split_clients.t` returned 403 for every request.
+- **`sub_filter` matching is caseless** (nginx compares `ngx_tolower` of each
+  byte) and its operands are complex values.
+- **`sub_filter` merge order is own-rules-first, then inherited.** Rules chain,
+  each seeing the previous one's output; with the order reversed a location's
+  own rule ran on an already-rewritten body.
+- `handled` in `stub_status` counts **connections**, not requests.
+
+### Known deviations
+
+- `sub_filter` on a `proxy_pass` response is not applied: the proxy path streams
+  and the filter needs the whole body. Costs 2-3 assertions in `sub_filter.t`.
+- `sub_filter` with *overlapping* patterns differs: nginx chains per-rule
+  streaming state machines, this implementation applies each rule over the whole
+  body in order. `sub_filter_multi.t` `partial match` and `utf8 match` fail for
+  this reason.

@@ -196,6 +196,29 @@ pub fn maps() -> std::sync::Arc<Vec<crate::mapping::MapDef>> {
         .unwrap_or_else(|e| e.into_inner().clone())
 }
 
+/// `split_clients` blocks of the active configuration (same rationale as
+/// `MAPS`).
+static SPLITS: std::sync::OnceLock<
+    std::sync::RwLock<std::sync::Arc<Vec<crate::split::SplitClients>>>,
+> = std::sync::OnceLock::new();
+
+fn splits_cell() -> &'static std::sync::RwLock<std::sync::Arc<Vec<crate::split::SplitClients>>> {
+    SPLITS.get_or_init(|| std::sync::RwLock::new(std::sync::Arc::new(Vec::new())))
+}
+
+pub fn set_splits(v: Vec<crate::split::SplitClients>) {
+    if let Ok(mut w) = splits_cell().write() {
+        *w = std::sync::Arc::new(v);
+    }
+}
+
+pub fn splits() -> std::sync::Arc<Vec<crate::split::SplitClients>> {
+    splits_cell()
+        .read()
+        .map(|r| r.clone())
+        .unwrap_or_else(|e| e.into_inner().clone())
+}
+
 /// `geo {}` blocks of the active configuration.
 static GEOS: std::sync::OnceLock<std::sync::RwLock<std::sync::Arc<Vec<crate::geo::GeoDef>>>> =
     std::sync::OnceLock::new();

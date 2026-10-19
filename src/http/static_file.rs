@@ -17,8 +17,53 @@ pub fn respond(
     loc: &LocCfg,
     http: &Http,
 ) -> io::Result<Response> {
+    respond_indexed(req, uri, loc, http, None)
+}
+
+/// `respond` with the location's `index` names already expanded. `index` is a
+/// complex value in nginx, so `index index${{variant}}.html` picks a file from a
+/// `split_clients` result; the caller that has the variables expands them.
+pub fn respond_indexed(
+    req: &Request,
+    uri: &str,
+    loc: &LocCfg,
+    http: &Http,
+    expanded_index: Option<&[String]>,
+) -> io::Result<Response> {
+    // `empty_gif` and `stub_status` are content handlers that take precedence
+    // over the static handler: nginx registers one content handler per
+    // location, and the location's own wins over the default file handler.
+    if let Some(r) = small_content(req, loc) {
+        return Ok(r);
+    }
     let fs_path = map_path(uri, loc);
-    respond_fs(req, &fs_path, uri, loc, http)
+    respond_fs_indexed(req, &fs_path, uri, loc, http, expanded_index)
+}
+
+/// Content handlers that produce a response without touching the file system.
+fn small_content(req: &Request, loc: &LocCfg) -> Option<Response> {
+    if loc.empty_gif {
+        // `ngx_http_empty_gif_handler` refuses anything but GET/HEAD with 405.
+        if !matches!(req.method.as_str(), "GET" | "HEAD") {
+            return Some(Response::empty(405).header("Allow", "GET, HEAD"));
+        }
+        return Some(Response::bytes(
+            200,
+            "image/gif",
+            super::small::EMPTY_GIF.to_vec(),
+        ));
+    }
+    if loc.stub_status {
+        if !matches!(req.method.as_str(), "GET" | "HEAD") {
+            return Some(Response::empty(405).header("Allow", "GET, HEAD"));
+        }
+        return Some(Response::bytes(
+            200,
+            "text/plain",
+            crate::stats::stub_status_body().into_bytes(),
+        ));
+    }
+    None
 }
 
 pub fn map_path(uri: &str, loc: &LocCfg) -> PathBuf {
@@ -47,6 +92,17 @@ pub fn respond_fs(
     uri: &str,
     loc: &LocCfg,
     http: &Http,
+) -> io::Result<Response> {
+    respond_fs_indexed(req, fs_path, uri, loc, http, None)
+}
+
+pub fn respond_fs_indexed(
+    req: &Request,
+    fs_path: &Path,
+    uri: &str,
+    loc: &LocCfg,
+    http: &Http,
+    expanded_index: Option<&[String]>,
 ) -> io::Result<Response> {
     // nginx splits the method check in two. Anything outside GET/HEAD/POST is
     // rejected *before* the path is resolved, so TRACE or DELETE to a missing
@@ -97,7 +153,39 @@ pub fn respond_fs(
                 .header("Content-Length", "0"));
         }
 
-        for index in &loc.index {
+        // `random_index` picks one directory entry at random instead of trying
+        // the configured names in order (`ngx_http_random_index_handler`).
+        // A directory with no eligible file still answers 403, like nginx.
+        if loc.random_index {
+            if let Some(name) = crate::http::small::random_index_pick(fs_path) {
+                if let Ok(idx_file) = File::open(fs_path.join(&name)) {
+                    if let Ok(meta) = idx_file.metadata() {
+                        if meta.is_file() {
+                            return serve_entry(
+                                req,
+                                idx_file,
+                                &name,
+                                meta.len(),
+                                meta_mtime(&meta),
+                                loc,
+                                http,
+                            );
+                        }
+                    }
+                }
+            }
+            return Ok(Response::empty(403));
+        }
+
+        for (i, index_spec) in loc.index.iter().enumerate() {
+            // `index` is a complex value: `index index${variant}.html` is the
+            // documented way to pick a file from a `split_clients`/`map`
+            // result, so the name is expanded per request.
+            let index_owned = match expanded_index {
+                Some(list) => list.get(i).cloned().unwrap_or_else(|| index_spec.clone()),
+                None => index_spec.clone(),
+            };
+            let index: &str = &index_owned;
             if index.starts_with('/') {
                 continue;
             }

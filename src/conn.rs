@@ -164,6 +164,16 @@ pub struct Conn {
     end: usize,
     /// Reused response staging buffer: saves one allocation per request.
     pub out: Vec<u8>,
+    /// `stub_status` state for this connection: whether it is currently
+    /// counted as reading / writing.
+    reading: bool,
+    writing: bool,
+    /// `limit_rate` for the response in flight, in bytes per second (0 = off),
+    /// and how many leading bytes escape throttling (`limit_rate_after`).
+    pub limit_rate: u64,
+    pub limit_rate_after: u64,
+    rate_bytes: u64,
+    rate_start: Option<std::time::Instant>,
 }
 
 impl Conn {
@@ -226,6 +236,12 @@ impl Conn {
             start: 0,
             end: 0,
             out: Vec::with_capacity(512),
+            reading: false,
+            writing: false,
+            limit_rate: 0,
+            limit_rate_after: 0,
+            rate_bytes: 0,
+            rate_start: None,
         }
     }
 
@@ -367,6 +383,28 @@ impl Conn {
     }
 
     /// Read one parsed request head. Returns `None` on a clean EOF.
+    /// Update the `reading` counter for this connection only.
+    fn set_reading(&mut self, on: bool) {
+        if self.reading != on {
+            self.reading = on;
+            crate::stats::reading_delta(on);
+        }
+    }
+
+    /// Update the `writing` counter for this connection only.
+    pub fn set_writing(&mut self, on: bool) {
+        if self.writing != on {
+            self.writing = on;
+            crate::stats::writing_delta(on);
+        }
+    }
+
+    /// Clear both counters, for use on the way out of a connection.
+    pub fn clear_stats(&mut self) {
+        self.set_reading(false);
+        self.set_writing(false);
+    }
+
     pub async fn read_request(
         &mut self,
         max_line: usize,
@@ -376,6 +414,8 @@ impl Conn {
             if let Some(pos) = find_header_end(self.buffered()) {
                 let head = &self.buffered()[..pos];
                 let parsed = Request::parse(head, max_line, max_total);
+                self.set_reading(false);
+                crate::stats::request_started();
                 match parsed {
                     Ok(req) => {
                         self.consume(pos);
@@ -390,6 +430,10 @@ impl Conn {
             if self.buffered().len() > max_total {
                 return Err(RecvError::Bad(HttpError::new(400, true)));
             }
+            // Data is pending: nginx counts the connection as reading from the
+            // moment `recv` returns bytes until the header is complete. With
+            // nothing buffered it is idle, i.e. "waiting".
+            self.set_reading(!self.buffered().is_empty());
             let n = self.fill().await?;
             if n == 0 {
                 if self.buffered().is_empty() {
@@ -529,10 +573,130 @@ impl Conn {
     }
 
     pub async fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
-        self.stream.write_all(data).await
+        // `limit_rate` throttles the whole response, headers included — nginx's
+        // write filter applies the limit to whatever the chain produced, so a
+        // 155-byte header with an empty body still takes 155/rate seconds
+        // (measured: 20 s at `limit_rate 15`). The fast path must stay free, so
+        // the check is a single field comparison.
+        if self.limit_rate == 0 {
+            self.rate_bytes += data.len() as u64;
+            return self.stream.write_all(data).await;
+        }
+        let rate = self.limit_rate;
+        let mut sent = 0usize;
+        while sent < data.len() {
+            // Anything below `limit_rate_after` is not throttled.
+            let head_free = self.rate_bytes < self.limit_rate_after;
+            let chunk = if head_free {
+                (self.limit_rate_after - self.rate_bytes).max(1) as usize
+            } else {
+                // Aim for ~10 writes per second at the configured rate, but keep
+                // chunks small enough that a large body does not stall the loop.
+                (rate / 10).clamp(1, 16 * 1024) as usize
+            };
+            let end = (sent + chunk).min(data.len());
+            // Pace against the schedule: sleep only if we are ahead of it.
+            if !head_free {
+                let target =
+                    std::time::Duration::from_secs_f64(self.rate_bytes as f64 / rate as f64);
+                if let Some(elapsed) = self.rate_start.map(|t| t.elapsed()) {
+                    if elapsed < target {
+                        // A throttled response can sit here for seconds. nginx
+                        // keeps the read event armed, so a client disconnect
+                        // finalises the request immediately rather than after
+                        // the body has been paced out; watch for readability
+                        // during the wait to get the same behaviour.
+                        let wait = tokio::time::sleep(target - elapsed);
+                        tokio::pin!(wait);
+                        tokio::select! {
+                            _ = &mut wait => {}
+                            _ = async {
+                                match &self.stream {
+                                    Stream::Plain(t) => { let _ = t.readable().await; }
+                                    Stream::Unix(t) => { let _ = t.readable().await; }
+                                    Stream::Tls(_) => std::future::pending::<()>().await,
+                                }
+                            } => {
+                                if self.peer_gone() {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::BrokenPipe,
+                                        "peer closed",
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                if self.peer_gone() {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "peer closed"));
+                }
+            }
+            self.stream.write_all(&data[sent..end]).await?;
+            self.rate_bytes += (end - sent) as u64;
+            sent = end;
+            // A partial write means the client is keeping up (or the buffer
+            // drained); the wait above paces the rest.
+            if self.rate_start.is_none() {
+                self.rate_start = Some(std::time::Instant::now());
+            }
+        }
+        Ok(())
+    }
+
+    /// One-shot "has the peer gone?" probe.
+    ///
+    /// `recv(MSG_PEEK | MSG_DONTWAIT)` returning 0 is an orderly shutdown;
+    /// `EAGAIN` means the connection is still open.
+    fn peer_gone(&self) -> bool {
+        use std::os::unix::io::AsRawFd;
+        let fd = match &self.stream {
+            Stream::Plain(s) => s.as_raw_fd(),
+            Stream::Unix(s) => s.as_raw_fd(),
+            // TLS keeps its own framing state; fall back to write errors.
+            Stream::Tls(_) => return false,
+        };
+        let mut b = [0u8; 1];
+        let n = unsafe {
+            libc::recv(
+                fd,
+                b.as_mut_ptr() as *mut libc::c_void,
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        // 0 is an orderly shutdown; any error other than "would block" is a
+        // reset (a close with unread data yields ECONNRESET), which also means
+        // the peer is gone.
+        n == 0
+            || (n < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock)
+    }
+
+    /// Start a new response: reset the `limit_rate` accounting.
+    pub fn begin_response(&mut self, rate: u64, after: u64) {
+        self.limit_rate = rate;
+        self.limit_rate_after = after;
+        self.rate_bytes = 0;
+        self.rate_start = None;
     }
 
     pub async fn send_file(&mut self, file: &File, offset: u64, len: u64) -> io::Result<u64> {
+        // A rate-limited response cannot use sendfile: the bytes have to pass
+        // through the throttling writer.
+        if self.limit_rate != 0 && self.rate_bytes >= self.limit_rate_after {
+            use std::os::unix::fs::FileExt;
+            let mut buf = vec![0u8; 16 * 1024];
+            let mut done = 0u64;
+            while done < len {
+                let want = ((len - done) as usize).min(buf.len());
+                let n = file.read_at(&mut buf[..want], offset + done)?;
+                if n == 0 {
+                    break;
+                }
+                self.write_all(&buf[..n]).await?;
+                done += n as u64;
+            }
+            return Ok(done);
+        }
         match &mut self.stream {
             Stream::Plain(tcp) => send_file_impl(tcp, file, offset, len).await,
             // TLS cannot use sendfile, and neither can a unix socket (which

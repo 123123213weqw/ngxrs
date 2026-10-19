@@ -723,6 +723,27 @@ async fn unix_accept_loop(
     }
 }
 
+/// `recv(MSG_PEEK | MSG_DONTWAIT)`: how many bytes are already available.
+///
+/// Returns 0 when nothing has arrived yet, so a caller can decide without
+/// blocking. `TcpStream::peek` cannot express this — it waits for a full buffer.
+fn peek_available(stream: &tokio::net::TcpStream, buf: &mut [u8]) -> usize {
+    let fd = std::os::fd::AsRawFd::as_raw_fd(stream);
+    let n = unsafe {
+        libc::recv(
+            fd,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if n > 0 {
+        n as usize
+    } else {
+        0
+    }
+}
+
 async fn accept_loop(
     listener: Arc<TcpListener>,
     group_idx: usize,
@@ -752,12 +773,45 @@ async fn accept_loop(
                                     // with the HTTP/2 connection preface. Only
                                     // take that path when the group actually has
                                     // `http2 on`, mirroring nginx.
+                                    //
+                                    // The peek must not block: `TcpStream::peek`
+                                    // waits until the whole buffer can be filled,
+                                    // which for a silent (or short-request) client
+                                    // never happens — that stalled the connection
+                                    // before `handle_conn` was even entered, so
+                                    // `accepts`/`active` were wrong and an 18-byte
+                                    // `GET / HTTP/1.0` hung.
+                                    let h2_capable = cfg.http.groups[group_idx]
+                                        .servers
+                                        .iter()
+                                        .any(|s| cfg.http.server(*s).http2);
                                     let mut head = [0u8; 24];
-                                    let is_h2c = matches!(
-                                        stream.peek(&mut head).await,
-                                        Ok(n) if n == 24
-                                            && &head[..] == b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
-                                    ) && cfg.http.groups[group_idx]
+                                    let avail = if h2_capable {
+                                        peek_available(&stream, &mut head)
+                                    } else {
+                                        0
+                                    };
+                                    let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+                                    let n = if avail > 0 && avail < 24 && preface.starts_with(&head[..avail])
+                                    {
+                                        // A split preface: give the rest a moment
+                                        // rather than misreading it as HTTP/1.
+                                        match tokio::time::timeout(
+                                            Duration::from_millis(100),
+                                            stream.peek(&mut head),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(n)) => n,
+                                            _ => avail,
+                                        }
+                                    } else {
+                                        avail
+                                    };
+                                    let is_h2c = h2_capable
+                                        && (n == 24
+                                            && &head[..] == b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+                                        && cfg.http.groups[group_idx]
                                         .servers
                                         .iter()
                                         .any(|s| cfg.http.server(*s).http2);

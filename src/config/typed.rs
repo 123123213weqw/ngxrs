@@ -44,6 +44,37 @@ pub struct LocCfg {
     pub autoindex: bool,
     /// `ssi on`: process Server Side Include directives in the response body.
     pub ssi: bool,
+    /// `empty_gif`: a content handler with a fixed 43-byte GIF.
+    pub empty_gif: bool,
+    /// `stub_status`: the connection counters.
+    pub stub_status: bool,
+    /// `random_index`: `index` picks a random directory entry instead of
+    /// trying the configured names in order.
+    pub random_index: bool,
+    /// `valid_referers` arguments as written. They are resolved into rules once
+    /// the server's `server_name` list is final, because `server_names` refers
+    /// to it and nginx allows `server_name` after the location.
+    pub valid_referers_args: Option<Vec<String>>,
+    /// Resolved `valid_referers`. `None` means the module is not configured and
+    /// `$invalid_referer` is always empty.
+    pub valid_referers: Option<crate::referer::ValidReferers>,
+    /// `limit_rate` as written (a complex value: `$limit_rate` is settable).
+    pub limit_rate: Option<String>,
+    /// `limit_rate_after`: leading bytes that escape the limit.
+    pub limit_rate_after: u64,
+    /// `sub_filter` replacements declared **in this scope**. nginx appends the
+    /// inherited entries *after* these (`ngx_http_sub_filter_merge_conf`), and
+    /// the order matters because each rule sees the previous one's output.
+    pub sub_filters: Vec<(String, String)>,
+    /// `sub_filter` entries inherited from the enclosing scope.
+    pub sub_filter_inherited: Vec<(String, String)>,
+    /// `sub_filter_once on` (nginx's default): replace only the first match.
+    pub sub_filter_once: bool,
+    /// `sub_filter_types`: MIME types eligible for substitution.
+    pub sub_filter_types: Vec<String>,
+    /// `sub_filter_last_modified` (nginx default: off, which drops the header
+    /// because the body no longer matches the file).
+    pub sub_filter_last_modified: bool,
     pub gzip: bool,
     pub client_max_body_size: u64,
     pub headers: Vec<(String, String)>,
@@ -205,6 +236,18 @@ impl LocCfg {
             index: vec!["index.html".to_string()],
             autoindex: false,
             ssi: false,
+            empty_gif: false,
+            stub_status: false,
+            random_index: false,
+            valid_referers_args: None,
+            valid_referers: None,
+            limit_rate: None,
+            limit_rate_after: 0,
+            sub_filters: Vec::new(),
+            sub_filter_inherited: Vec::new(),
+            sub_filter_once: true,
+            sub_filter_types: vec!["text/html".to_string()],
+            sub_filter_last_modified: false,
             gzip: false,
             client_max_body_size: DEFAULT_CLIENT_MAX_BODY,
             headers: Vec::new(),
@@ -1011,6 +1054,8 @@ pub struct Http {
     pub upstreams: Vec<Upstream>,
     pub cache_zones: Vec<CacheZone>,
     pub maps: Vec<crate::mapping::MapDef>,
+    /// `split_clients` buckets, resolved as variables.
+    pub split_clients: Vec<crate::split::SplitClients>,
     pub geos: Vec<crate::geo::GeoDef>,
     pub limit_req_zones: Vec<LimitReqZone>,
     pub limit_conn_zones: Vec<LimitConnZone>,
@@ -1503,6 +1548,12 @@ fn translate_pcre(src: &str) -> String {
     out
 }
 
+/// `translate_pcre` for other modules (the referer matcher needs the same
+/// `\Q...\E` handling).
+pub fn translate_pcre_public(src: &str) -> String {
+    translate_pcre(src)
+}
+
 fn build_regex(src: &str, ci: bool) -> Option<regex::Regex> {
     let translated = translate_pcre(src);
     let pattern = if ci {
@@ -1938,6 +1989,77 @@ impl Builder {
                     .ok_or_else(|| sem(&d.file, d.line, "ssi requires on|off"))?;
                 cfg.ssi = parse_on_off(v)
                     .ok_or_else(|| sem(&d.file, d.line, format!("invalid ssi value \"{v}\"")))?;
+            }
+            "limit_rate" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "limit_rate requires a value"))?;
+                cfg.limit_rate = Some(v.clone());
+            }
+            "limit_rate_after" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "limit_rate_after requires a size"))?;
+                cfg.limit_rate_after = if v == "0" {
+                    0
+                } else {
+                    parse_size(v)
+                        .ok_or_else(|| sem(&d.file, d.line, format!("invalid size \"{v}\"")))?
+                };
+            }
+            "empty_gif" => cfg.empty_gif = true,
+            "stub_status" => cfg.stub_status = true,
+            "random_index" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "random_index requires on|off"))?;
+                cfg.random_index = parse_on_off(v).ok_or_else(|| {
+                    sem(
+                        &d.file,
+                        d.line,
+                        format!("invalid random_index value \"{v}\""),
+                    )
+                })?;
+            }
+            "valid_referers" => {
+                cfg.valid_referers_args = Some(d.args.clone());
+            }
+            "sub_filter" => {
+                if d.args.len() < 2 {
+                    return Err(sem(&d.file, d.line, "sub_filter requires two arguments"));
+                }
+                cfg.sub_filters.push((d.args[0].clone(), d.args[1].clone()));
+            }
+            "sub_filter_once" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "sub_filter_once requires on|off"))?;
+                cfg.sub_filter_once = parse_on_off(v).ok_or_else(|| {
+                    sem(
+                        &d.file,
+                        d.line,
+                        format!("invalid sub_filter_once value \"{v}\""),
+                    )
+                })?;
+            }
+            "sub_filter_types" => {
+                cfg.sub_filter_types = d.args.clone();
+            }
+            "sub_filter_last_modified" => {
+                let v = d.args.first().ok_or_else(|| {
+                    sem(&d.file, d.line, "sub_filter_last_modified requires on|off")
+                })?;
+                cfg.sub_filter_last_modified = parse_on_off(v).ok_or_else(|| {
+                    sem(
+                        &d.file,
+                        d.line,
+                        format!("invalid sub_filter_last_modified value \"{v}\""),
+                    )
+                })?;
             }
             "gzip" => {
                 let v = d
@@ -2863,6 +2985,17 @@ impl Builder {
         };
 
         let mut cfg = parent.clone();
+        // `sub_filter` entries accumulate, with this scope's own rules first and
+        // the inherited ones after (nginx's merge order). Each rule sees the
+        // previous rule's output, so getting this backwards makes a location's
+        // own `sub_filter` run on an already-rewritten body.
+        cfg.sub_filter_inherited = parent
+            .sub_filters
+            .iter()
+            .chain(parent.sub_filter_inherited.iter())
+            .cloned()
+            .collect();
+        cfg.sub_filters = Vec::new();
         // Cookie rewrites are replaced, not inherited-into.
         cfg.cookie_domains_set = false;
         cfg.cookie_paths_set = false;
@@ -2906,6 +3039,15 @@ impl Builder {
             .ok_or_else(|| sem(&d.file, d.line, "server requires a block"))?;
 
         let mut default_loc = http_default.clone();
+        // The server scope has its own `sub_filter` list too; `http`-level
+        // rules are inherited after it.
+        default_loc.sub_filter_inherited = http_default
+            .sub_filters
+            .iter()
+            .chain(http_default.sub_filter_inherited.iter())
+            .cloned()
+            .collect();
+        default_loc.sub_filters = Vec::new();
         let mut names: Vec<String> = Vec::new();
         let mut locations: Vec<Location> = Vec::new();
         let mut access_logs: Vec<AccessLog> = Vec::new();
@@ -3161,6 +3303,36 @@ impl Builder {
                 false,
             ));
         }
+
+        // `valid_referers ... server_names` refers to this server's names, which
+        // are only final now: nginx resolves it at merge time for the same
+        // reason (a `server_name` may follow the location).
+        let plain_names: Vec<String> = names
+            .iter()
+            .filter(|n| !n.starts_with('~'))
+            .cloned()
+            .collect();
+        let regex_srcs: Vec<String> = names
+            .iter()
+            .filter_map(|n| n.strip_prefix('~').map(|s| s.to_string()))
+            .collect();
+        let resolve = |cfg: &mut LocCfg| {
+            if let Some(args) = cfg.valid_referers_args.clone() {
+                cfg.valid_referers = Some(crate::referer::ValidReferers::parse(
+                    &args,
+                    &plain_names,
+                    &regex_srcs,
+                ));
+            }
+        };
+        resolve(&mut default_loc);
+        fn walk_locations(locs: &mut [Location], f: &dyn Fn(&mut LocCfg)) {
+            for l in locs.iter_mut() {
+                f(&mut l.cfg);
+                walk_locations(&mut l.nested, f);
+            }
+        }
+        walk_locations(&mut locations, &resolve);
 
         Ok((
             Server {
@@ -3676,6 +3848,7 @@ pub fn build(
         upstreams: Vec::new(),
         cache_zones: Vec::new(),
         maps: Vec::new(),
+        split_clients: Vec::new(),
         geos: Vec::new(),
         limit_req_zones: Vec::new(),
         limit_conn_zones: Vec::new(),
@@ -3762,6 +3935,31 @@ pub fn build(
                     }
                 }
                 http.maps.push(def);
+            }
+            "split_clients" => {
+                // split_clients $source $result { 51.2% .one; * .other; }
+                if d.args.len() < 2 {
+                    return Err(sem(
+                        &d.file,
+                        d.line,
+                        "split_clients needs $source and $result",
+                    ));
+                }
+                let mut entries: Vec<(String, String)> = Vec::new();
+                for c in d.block.as_deref().unwrap_or(&[]) {
+                    // The percentage is the *directive name* (`51.2%` is lexed
+                    // as a bare token) and the value is its single argument.
+                    if let Some(v) = c.args.first() {
+                        entries.push((c.name.clone(), v.clone()));
+                    }
+                }
+                let sc = crate::split::SplitClients::parse(
+                    &d.args[0],
+                    d.args[1].trim_start_matches('$'),
+                    &entries,
+                )
+                .map_err(|e| sem(&d.file, d.line, e))?;
+                http.split_clients.push(sc);
             }
             "limit_req_zone" | "limit_conn_zone" => {
                 // limit_req_zone KEY zone=NAME:SIZE rate=Nr/s
@@ -4181,6 +4379,7 @@ pub fn build(
     let error_log = Some(error_log.unwrap_or_else(|| prefix.join("logs/error.log")));
 
     crate::config::set_maps(http.maps.clone());
+    crate::config::set_splits(http.split_clients.clone());
     crate::config::set_geos(http.geos.clone());
 
     Ok(Config {

@@ -1,6 +1,7 @@
 //! HTTP/1.1 request handling: routing, responses, access logging.
 
 pub mod request;
+pub mod small;
 pub mod static_file;
 
 use std::fs::File;
@@ -197,6 +198,16 @@ pub async fn handle_conn(conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx: &C
 
 async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx: &Ctx) {
     let _active = ActiveGuard::enter();
+    let conn_serial = crate::stats::accepted();
+    // `writing` must fall back to "waiting" when the connection goes idle or
+    // closes, so the guard clears it on every exit path.
+    struct StatGuard;
+    impl Drop for StatGuard {
+        fn drop(&mut self) {
+            crate::stats::closed();
+        }
+    }
+    let _stats = StatGuard;
     let http = &cfg.http;
     let group = &http.groups[group_idx];
     let first_server = http.server(group.default_server);
@@ -406,6 +417,8 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
             }
         }
 
+        // The header is parsed; the connection is producing a response now.
+        conn.set_writing(true);
         // A keepalive connection serves many requests from the same task.
         crate::timing::reset();
         let (path, query) = match util::parse_target(&req.raw_target) {
@@ -550,12 +563,17 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
             m
         };
 
+        // The response is out; the connection returns to `waiting`.
+        conn.set_writing(false);
         if close || !req.keepalive || util::force_close(status) || served >= http.keepalive_requests
         {
             break;
         }
     }
 
+    // Every break path lands here, so this is the single place the counters are
+    // cleared before the connection is closed.
+    conn.clear_stats();
     conn.shutdown().await;
 }
 
@@ -936,6 +954,18 @@ async fn access_then_route(
     // The assignments are collected first and applied after the borrow of the
     // map by `ServerVars` ends.
     let mut sets: Vec<(String, String)> = Vec::new();
+    // `$invalid_referer` is a per-location value that nginx evaluates lazily.
+    // Carrying it in the variable map keeps `ServerVars` (and its nineteen
+    // construction sites) unchanged while still letting `if` and `return` see
+    // the location's own `valid_referers`.
+    if let Some(rules) = &loc.valid_referers {
+        let val = if rules.invalid(req.headers.get("referer")) {
+            "1"
+        } else {
+            ""
+        };
+        custom.insert("invalid_referer".to_string(), val.to_string());
+    }
     let check = access_phase(req, loc, server, http, &view!(custom), &mut sets).await;
     if let Some(denied) = check {
         return denied;
@@ -1032,7 +1062,15 @@ async fn route(
         };
     }
 
-    match static_file::respond(req, path, query, loc, http) {
+    // `index` is a complex value: expand it here, where the request variables
+    // (`$variant` from `split_clients`, `$arg_*`, ...) are available.
+    let expanded_index: Option<Vec<String>> = if loc.index.iter().any(|i| i.contains('$')) {
+        Some(loc.index.iter().map(|i| vars.expand(i)).collect())
+    } else {
+        None
+    };
+    let index_ref = expanded_index.as_deref();
+    match static_file::respond_indexed(req, path, loc, http, index_ref) {
         Ok(r) => r,
         Err(_) => error_response(404, server.server_tokens),
     }
@@ -2085,6 +2123,18 @@ thread_local! {
 impl<'a> ServerVars<'a> {
     /// Resolve a `map`-defined variable, if `name` is one.
     fn map_var(&self, name: &str) -> Option<String> {
+        // `split_clients` results are ordinary variables, resolved the same way
+        // as `map`: expand the source, hash it, pick the bucket, then expand the
+        // bucket's value.
+        if let Some(sc) = crate::config::splits()
+            .iter()
+            .find(|s| s.var == name)
+            .cloned()
+        {
+            let source = self.expand(&sc.source);
+            let value = sc.pick(&source)?.to_string();
+            return Some(self.expand(&value));
+        }
         let maps = crate::config::maps();
         let def = maps.iter().find(|m| m.var == name)?;
         if MAP_DEPTH.with(|d| d.get()) > 16 {
@@ -2233,6 +2283,26 @@ impl<'a> ServerVars<'a> {
                 .unwrap_or_default(),
             "connection_requests" => self.connection_requests.to_string(),
             "connection_time" => self.connection_time.to_string(),
+            // `$connection` is the connection's serial number (`c->number`),
+            // which `split_clients $connection ...` buckets on.
+            "connection" => crate::stats::conn_serial().to_string(),
+            // `stub_status` counters, exposed as variables the same way nginx
+            // does (`ngx_stat_active` etc.).
+            "connections_active" => crate::stats::ACTIVE
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+            "connections_reading" => crate::stats::READING
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+            "connections_writing" => crate::stats::WRITING
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+            "connections_waiting" => {
+                let a = crate::stats::ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+                let r = crate::stats::READING.load(std::sync::atomic::Ordering::Relaxed);
+                let w = crate::stats::WRITING.load(std::sync::atomic::Ordering::Relaxed);
+                a.saturating_sub(r + w).to_string()
+            }
             // Second with millisecond precision, as nginx formats it
             // (`%T.%03M` from the request start).
             "request_time" => {
@@ -3412,6 +3482,36 @@ async fn dispatch(
         resolved_loc,
     );
 
+    // `limit_rate` is a per-response write rate. `$limit_rate` is also settable
+    // (`set $limit_rate 5k`), so the variable wins when it has a value.
+    {
+        let root_str = loc.root.to_string_lossy().to_string();
+        let vars = ServerVars {
+            req,
+            path,
+            query,
+            server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
+            server_port: listen_port,
+            peer_ip: &conn.peer_ip_str(),
+            peer_port,
+            scheme: if req.tls.is_some() { "https" } else { "http" },
+            document_root: &root_str,
+            upstream_cache_status: "",
+            custom: &set_vars,
+            connection_requests: state.requests,
+            connection_time: state.elapsed_secs(),
+            sent: &[],
+        };
+        let rate = match loc.limit_rate.as_deref() {
+            Some(spec) => parse_rate(&vars.expand(spec)),
+            None => match set_vars.get("limit_rate") {
+                Some(v) => parse_rate(v),
+                None => 0,
+            },
+        };
+        conn.begin_response(rate, loc.limit_rate_after);
+    }
+
     // A response produced by `return`/`rewrite` still goes through error_page.
     if let Some(mut r) = pre {
         let mut custom: std::collections::HashMap<String, String> = set_vars.clone();
@@ -3839,8 +3939,24 @@ async fn dispatch(
     let resp = crate::gzip::maybe_compress(req, resp, loc, http);
     // `ssi on` rewrites the body before it is written. HEAD has no body to
     // process, and nginx skips the filter for non-200 replies.
+    let root = loc.root.to_string_lossy().to_string();
+    let vars = ServerVars {
+        req,
+        path,
+        query,
+        server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
+        server_port: listen_port,
+        peer_ip: &peer_ip,
+        peer_port,
+        scheme: if req.tls.is_some() { "https" } else { "http" },
+        document_root: &root,
+        upstream_cache_status: "",
+        custom: &set_vars,
+        connection_requests: state.requests,
+        connection_time: state.elapsed_secs(),
+        sent: &[],
+    };
     let resp = if loc.ssi && resp.status == 200 && req.method != Method::Head {
-        let root = loc.root.to_string_lossy().to_string();
         let vars = ServerVars {
             req,
             path,
@@ -3858,6 +3974,16 @@ async fn dispatch(
             sent: &[],
         };
         apply_ssi(req, resp, server, http, &vars).await
+    } else {
+        resp
+    };
+    // `sub_filter` is a body filter like SSI, so it sees what SSI produced.
+    // nginx skips it for non-200 replies and for HEAD (no body to rewrite).
+    let resp = if (!loc.sub_filters.is_empty() || !loc.sub_filter_inherited.is_empty())
+        && resp.status == 200
+        && req.method != Method::Head
+    {
+        apply_sub_filter(resp, loc, &vars)
     } else {
         resp
     };
@@ -4473,6 +4599,78 @@ fn apply_ssi<'a>(
     Box::pin(apply_ssi_inner(req, resp, server, http, vars))
 }
 
+/// Apply `sub_filter` to a buffered response.
+///
+/// The filter needs the whole body, so a streamed body is collected first; that
+/// is also what nginx's buffering does by default (`sub_filter_buffering on`).
+fn apply_sub_filter(mut resp: Response, loc: &LocCfg, vars: &ServerVars<'_>) -> Response {
+    let ctype = resp
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| {
+            // Static responses carry their headers pre-rendered in `raw`.
+            split_head(&resp.raw)
+                .into_iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                .map(|(_, v)| v)
+                .unwrap_or_default()
+        });
+    // Both operands are complex values: `sub_filter X$arg_a _replaced`.
+    let filters = crate::http::small::SubFilters {
+        once: loc.sub_filter_once,
+        types: loc.sub_filter_types.clone(),
+        // Own rules first, inherited ones after — nginx's merge order.
+        pairs: loc
+            .sub_filters
+            .iter()
+            .chain(loc.sub_filter_inherited.iter())
+            .map(|(a, b)| (vars.expand(a), vars.expand(b)))
+            .collect(),
+    };
+    if filters.pairs.is_empty() {
+        return resp;
+    }
+    // A file-backed body has to be read in: the filter needs the whole entity.
+    let body = match std::mem::replace(&mut resp.body, Body::Empty) {
+        Body::Bytes(b) => b,
+        Body::Empty => Vec::new(),
+        Body::File { file, offset, len } => {
+            use std::os::unix::fs::FileExt;
+            let mut buf = vec![0u8; len as usize];
+            let mut read = 0usize;
+            while read < buf.len() {
+                match file.read_at(&mut buf[read..], offset + read as u64) {
+                    Ok(0) => break,
+                    Ok(n) => read += n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            buf.truncate(read);
+            buf
+        }
+    };
+    let Some(new_body) = filters.apply(&body, &ctype) else {
+        resp.body = Body::Bytes(body);
+        return resp;
+    };
+    // The body no longer matches the file: nginx drops `Last-Modified` (unless
+    // `sub_filter_last_modified on`) and the strong ETag.
+    if loc.sub_filter_last_modified {
+        // nginx keeps the validators but weakens the ETag: the entity is no
+        // longer byte-identical to the file, so a strong validator would lie.
+        weaken_etag(&mut resp);
+    } else {
+        strip_header(&mut resp, "ETag");
+        strip_header(&mut resp, "Last-Modified");
+    }
+    resp.explicit_len = false;
+    resp.body = Body::Bytes(new_body);
+    resp
+}
+
 async fn apply_ssi_inner(
     req: &Request,
     mut resp: Response,
@@ -4593,6 +4791,34 @@ async fn apply_ssi_inner(
 }
 
 /// Remove a pre-rendered header line (case-insensitive) from the raw block.
+/// `ETag: "x"` -> `ETag: W/"x"`, in whichever representation holds it.
+fn weaken_etag(resp: &mut Response) {
+    for (k, v) in resp.headers.iter_mut() {
+        if k.eq_ignore_ascii_case("etag") && !v.starts_with("W/") {
+            *v = format!("W/{v}");
+        }
+    }
+    let raw = std::mem::take(&mut resp.raw);
+    let mut out = Vec::with_capacity(raw.len() + 4);
+    let mut start = 0usize;
+    while start < raw.len() {
+        let end = match memchr::memchr(b'\n', &raw[start..]) {
+            Some(p) => start + p + 1,
+            None => raw.len(),
+        };
+        let line = &raw[start..end];
+        let is_etag = line.len() > 5 && line[..5].eq_ignore_ascii_case(b"ETag:") && line[5] == b' ';
+        if is_etag && !line[6..].starts_with(b"W/") {
+            out.extend_from_slice(b"ETag: W/");
+            out.extend_from_slice(&line[6..]);
+        } else {
+            out.extend_from_slice(line);
+        }
+        start = end;
+    }
+    resp.raw = out;
+}
+
 fn strip_header(resp: &mut Response, name: &str) {
     let raw = std::mem::take(&mut resp.raw);
     let mut out = Vec::with_capacity(raw.len());

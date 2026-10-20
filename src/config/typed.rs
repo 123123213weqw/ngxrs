@@ -42,6 +42,9 @@ pub struct LocCfg {
     pub alias_prefix_len: usize,
     pub index: Vec<String>,
     pub autoindex: bool,
+    /// `charset utf-8`, which makes autoindex count name lengths in characters
+    /// instead of bytes when it truncates a too-long entry.
+    pub charset_utf8: bool,
     /// `ssi on`: process Server Side Include directives in the response body.
     pub ssi: bool,
     /// `empty_gif`: a content handler with a fixed 43-byte GIF.
@@ -226,6 +229,7 @@ impl LocCfg {
     fn new(root: PathBuf) -> Self {
         LocCfg {
             access_logs: None,
+            charset_utf8: false,
             error_logs: Vec::new(),
             limit_req_log_level: crate::log::Level::Error,
             limit_conn_log_level: crate::log::Level::Error,
@@ -1905,6 +1909,15 @@ impl Builder {
             "index" => {
                 cfg.index = d.args.clone();
             }
+            "charset" => {
+                // Only utf-8 matters to autoindex, which counts name widths in
+                // characters rather than bytes when the charset is utf-8.
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "charset requires a value"))?;
+                cfg.charset_utf8 = v.eq_ignore_ascii_case("utf-8") || v.eq_ignore_ascii_case("utf8");
+            }
             "autoindex" => {
                 let v = d
                     .args
@@ -2938,7 +2951,7 @@ impl Builder {
                 // Accepted, not yet honoured.
             }
             "limit_rate" | "limit_rate_after" | "sendfile" | "tcp_nopush" | "tcp_nodelay"
-            | "server_tokens" | "default_type" | "charset" | "merge_slashes" | "log_not_found"
+            | "server_tokens" | "default_type" | "merge_slashes" | "log_not_found"
             | "open_file_cache" | "etag" | "msie_padding" => {
                 // Accepted at this scope but not yet plumbed through: handled at
                 // http/server level where relevant, otherwise silently accepted.

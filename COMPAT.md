@@ -835,3 +835,22 @@ Real bugs found on the way, all of them outside the new modules:
   streaming state machines, this implementation applies each rule over the whole
   body in order. `sub_filter_multi.t` `partial match` and `utf8 match` fail for
   this reason.
+
+### autoindex
+
+Verified byte-for-byte identical to nginx 1.28 on a directory containing the
+awkward names `autoindex.t` uses (`bench/aiprobe.sh` diffs both pages):
+
+- **href** uses `NGX_ESCAPE_URI_COMPONENT`, so `:` is escaped as `%3A` and the
+  entry cannot be mistaken for a URI scheme. The full escaped set was read off a
+  real nginx listing by driving every printable ASCII character through it
+  (`bench/aiesc.sh`) rather than assumed: space and
+  `` !"#$%&'()*+,:;<=>?@[\]^`{|} `` are escaped; alphanumerics and `-._~` are not.
+- **label** uses `ngx_escape_html`, which escapes only `& < > "`. An apostrophe
+  is *not* escaped — the previous renderer emitted `&#39;` and was wrong.
+- **width** is counted in characters when `charset` is utf-8 and in bytes
+  otherwise (`entry->utf_len`); a name wider than `NGX_HTTP_AUTOINDEX_NAME_LEN`
+  (50) is cut to 47 and suffixed `..>`, which then HTML-escapes to `..&gt;`.
+- **directories sort first**, then names — not one flat name sort.
+- the date is **GMT**: `autoindex_localtime` defaults to off.
+- `charset` is now parsed instead of being accepted and ignored.

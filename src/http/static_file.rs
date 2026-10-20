@@ -644,6 +644,10 @@ pub fn parse_range(header: &str, size: u64) -> RangeSpec {
     RangeSpec::Single(start, end)
 }
 
+/// nginx's `NGX_HTTP_AUTOINDEX_NAME_LEN`. A name wider than this is truncated
+/// to `NAME_LEN - 3` columns and suffixed with `..>`.
+const AUTOINDEX_NAME_LEN: usize = 50;
+
 fn autoindex(dir: &Path, uri: &str, loc: &LocCfg, http: &Http) -> io::Result<Response> {
     let mut entries: Vec<(String, bool, u64, i64)> = Vec::new();
     for e in std::fs::read_dir(dir)? {
@@ -652,13 +656,18 @@ fn autoindex(dir: &Path, uri: &str, loc: &LocCfg, http: &Http) -> io::Result<Res
             Err(_) => continue,
         };
         let name = e.file_name().to_string_lossy().to_string();
-        let meta = match e.metadata() {
+        // `DirEntry::metadata` does not follow symlinks (it is lstat), so a
+        // symlink to a directory was rendered as a plain file with no trailing
+        // slash. nginx reports the target's type.
+        let meta = match std::fs::metadata(e.path()) {
             Ok(m) => m,
             Err(_) => continue,
         };
         entries.push((name, meta.is_dir(), meta.len(), meta_mtime(&meta)));
     }
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    // `ngx_http_autoindex_cmp_entries` puts every directory before every file,
+    // then compares names -- not one flat name sort.
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     let mut html = String::with_capacity(1024 + entries.len() * 96);
     html.push_str("<html>\r\n<head><title>Index of ");
@@ -667,21 +676,26 @@ fn autoindex(dir: &Path, uri: &str, loc: &LocCfg, http: &Http) -> io::Result<Res
     html.push_str(&escape_html(uri));
     html.push_str("</h1><hr><pre><a href=\"../\">../</a>\r\n");
     for (name, is_dir, size, mtime) in entries {
-        let mut href = url_encode(&name);
-        let mut label = name.clone();
-        if is_dir {
-            href.push('/');
-            label.push('/');
-        }
         html.push_str("<a href=\"");
-        html.push_str(&escape_html(&href));
+        html.push_str(&escape_href(&name));
+        if is_dir {
+            html.push('/');
+        }
         html.push_str("\">");
-        html.push_str(&escape_html(&label));
+        let (label, columns) = label_for(&name, is_dir, loc.charset_utf8);
+        html.push_str(&label);
         html.push_str("</a>");
-        html.push_str(&" ".repeat(4));
-        html.push_str(&http_date(mtime));
-        if !is_dir {
-            html.push_str(&format!(" {:>12}", size));
+        // Pad the name column, then one space, then the date.
+        for _ in columns..AUTOINDEX_NAME_LEN {
+            html.push(' ');
+        }
+        html.push(' ');
+        html.push_str(&autoindex_time(mtime));
+        html.push(' ');
+        if is_dir {
+            html.push_str(&format!("{:>19}", "-"));
+        } else {
+            html.push_str(&format!("{size:>19}"));
         }
         html.push_str("\r\n");
     }
@@ -692,6 +706,79 @@ fn autoindex(dir: &Path, uri: &str, loc: &LocCfg, http: &Http) -> io::Result<Res
     Ok(resp)
 }
 
+/// Render one directory entry's label, returning it together with the number of
+/// columns it occupies.
+///
+/// nginx measures the width in characters when the charset is utf-8 and in bytes
+/// otherwise (`entry->utf_len`), truncates anything longer than
+/// `AUTOINDEX_NAME_LEN` to `NAME_LEN - 3` and appends `..>`, then HTML-escapes
+/// the result — so the appended `>` becomes `&gt;` in the output.
+fn label_for(name: &str, is_dir: bool, utf8: bool) -> (String, usize) {
+    let width = if utf8 {
+        name.chars().count()
+    } else {
+        name.len()
+    };
+    let mut out = String::with_capacity(name.len() + 8);
+    if width > AUTOINDEX_NAME_LEN {
+        let keep = AUTOINDEX_NAME_LEN - 3;
+        if utf8 {
+            out.extend(name.chars().take(keep));
+        } else {
+            // Keep whole UTF-8 sequences so the output stays valid even when the
+            // width is counted in bytes.
+            let mut used = 0usize;
+            for ch in name.chars() {
+                if used + ch.len_utf8() > keep {
+                    break;
+                }
+                used += ch.len_utf8();
+                out.push(ch);
+            }
+        }
+        out.push_str("..>");
+    } else {
+        out.push_str(name);
+    }
+    if is_dir {
+        out.push('/');
+    }
+    let escaped = escape_html(&out);
+    // Column count is the pre-escaping width; truncation already fixed it at
+    // NAME_LEN columns including the `..>` suffix.
+    let columns = if width > AUTOINDEX_NAME_LEN {
+        AUTOINDEX_NAME_LEN + usize::from(is_dir)
+    } else {
+        width + usize::from(is_dir)
+    };
+    (escaped, columns)
+}
+
+/// nginx's autoindex date column: `dd-Mon-yyyy hh:mm`.
+fn autoindex_time(ts: i64) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let t = ts as libc::time_t;
+    unsafe {
+        // `autoindex_localtime` defaults to off, so nginx renders GMT.
+        libc::gmtime_r(&t, &mut tm);
+    }
+    format!(
+        "{:02}-{}-{} {:02}:{:02}",
+        tm.tm_mday,
+        MONTHS.get(tm.tm_mon as usize).copied().unwrap_or("Jan"),
+        tm.tm_year + 1900,
+        tm.tm_hour,
+        tm.tm_min
+    )
+}
+
+/// `ngx_escape_html`: only `& < > "` are escaped (an apostrophe is not).
+///
+/// Verified against nginx 1.28 by driving every printable character through a
+/// real autoindex listing (bench/aiesc.sh).
 fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -700,8 +787,26 @@ fn escape_html(s: &str) -> String {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
             c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `ngx_escape_uri(..., NGX_ESCAPE_URI_COMPONENT)`: everything except the RFC
+/// 3986 unreserved set plus `~` is percent-encoded, uppercase hex.
+///
+/// The exact set was read off a real nginx listing rather than assumed; note
+/// that `:` **is** escaped, which is what keeps `test-colon:blah` from looking
+/// like a URI scheme in the rendered `href`.
+fn escape_href(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
         }
     }
     out

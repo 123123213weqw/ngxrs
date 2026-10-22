@@ -2297,7 +2297,7 @@ async fn exchange(
                     raw.extend_from_slice(v.as_bytes());
                     raw.extend_from_slice(b"\r\n");
                 }
-                crate::http::apply_expires(&mut raw, loc);
+                crate::http::apply_expires(&mut raw, loc, entry.status);
                 crate::http::apply_add_headers_upstream(
                     &mut raw,
                     &loc.headers,
@@ -2586,7 +2586,7 @@ async fn exchange(
 
         let mut out_raw = raw;
         apply_cookie_rules(&mut out_raw, loc, vars);
-        crate::http::apply_expires(&mut out_raw, loc);
+        crate::http::apply_expires(&mut out_raw, loc, head.status);
         crate::http::apply_add_headers_upstream(
             &mut out_raw,
             &loc.headers,
@@ -2669,7 +2669,7 @@ async fn exchange(
     }
 
     let mut raw = raw;
-    crate::http::apply_expires(&mut raw, loc);
+    crate::http::apply_expires(&mut raw, loc, head.status);
     let upstream_headers = crate::http::split_head(&raw);
     crate::http::apply_add_headers_ctx(
         &mut raw,
@@ -3248,7 +3248,7 @@ pub async fn fetch(
             Chosen::Direct(_, a) => a.to_string(),
             Chosen::Upstream { addr, .. } => addr.to_string(),
         };
-        crate::http::apply_expires(&mut raw, loc);
+        crate::http::apply_expires(&mut raw, loc, head.status);
         crate::http::apply_add_headers_full(
             &mut raw,
             &loc.headers,

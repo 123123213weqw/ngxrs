@@ -1698,8 +1698,16 @@ fn local_utc_offset(t: i64) -> i64 {
     }
 }
 
-pub fn apply_expires(raw: &mut Vec<u8>, loc: &LocCfg) {
+pub fn apply_expires(raw: &mut Vec<u8>, loc: &LocCfg, status: u16) {
     let Some(spec) = &loc.expires else { return };
+    // `expires` is installed by the same filter as `add_header`
+    // (`ngx_http_headers_filter_module`), so it is subject to the same status
+    // gate. nginx does not put Expires/Cache-Control on a 404; verified with
+    // bench/expires_diff.sh, which is the only check for this directive because
+    // nginx-tests has no expires test.
+    if !add_header_applies(status, false) {
+        return;
+    }
     let spec = spec.trim();
     let (expires_value, cache_control): (String, Option<CacheControl>) = match spec {
         "off" => (String::new(), None),
@@ -3692,7 +3700,7 @@ async fn finalize_response(
         http,
     );
 
-    apply_expires(&mut out.raw, cur_loc);
+    apply_expires(&mut out.raw, cur_loc, out.status);
 
     if !cur_loc.headers.is_empty() || !cur_loc.trailers.is_empty() {
         // `$sent_http_*` sees the headers produced so far (nginx evaluates

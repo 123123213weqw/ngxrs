@@ -3,3 +3,5 @@ bench/run/
 bench/www/
 logs/
 *.pid
+htpasswd
+/html/

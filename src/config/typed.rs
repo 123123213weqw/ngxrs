@@ -31,6 +31,28 @@ pub struct Location {
     pub nested: Vec<Location>,
 }
 
+/// `proxy_next_upstream` flags, nginx's `NGX_HTTP_UPSTREAM_FT_*` bits. The
+/// directive *replaces* the default, so `proxy_next_upstream http_500` no
+/// longer retries on connect errors.
+pub mod next_upstream {
+    pub const OFF: u32 = 1 << 0;
+    pub const ERROR: u32 = 1 << 1;
+    pub const TIMEOUT: u32 = 1 << 2;
+    pub const INVALID_HEADER: u32 = 1 << 3;
+    pub const HTTP_500: u32 = 1 << 4;
+    pub const HTTP_502: u32 = 1 << 5;
+    pub const HTTP_503: u32 = 1 << 6;
+    pub const HTTP_504: u32 = 1 << 7;
+    pub const HTTP_403: u32 = 1 << 8;
+    pub const HTTP_404: u32 = 1 << 9;
+    pub const HTTP_429: u32 = 1 << 10;
+    pub const NON_IDEMPOTENT: u32 = 1 << 11;
+    pub const ANY_HTTP: u32 =
+        HTTP_500 | HTTP_502 | HTTP_503 | HTTP_504 | HTTP_403 | HTTP_404 | HTTP_429;
+    /// nginx's default: `error timeout`.
+    pub const DEFAULT: u32 = ERROR | TIMEOUT;
+}
+
 #[derive(Debug, Clone)]
 pub struct LocCfg {
     /// `access_log` inside this location; `None` inherits the server's.
@@ -156,6 +178,13 @@ pub struct LocCfg {
     pub proxy_connect_timeout: Duration,
     pub proxy_read_timeout: Duration,
     pub proxy_send_timeout: Duration,
+    /// `proxy_next_upstream` flags (`next_upstream::*`); nginx default is
+    /// `error timeout`.
+    pub proxy_next_upstream: u32,
+    /// `proxy_next_upstream_tries N`; 0 = unlimited.
+    pub proxy_next_upstream_tries: u32,
+    /// `proxy_next_upstream_timeout T`; zero = unlimited.
+    pub proxy_next_upstream_timeout: Duration,
     pub proxy_buffering: bool,
     pub proxy_hide_headers: Vec<String>,
     // ---- fastcgi ----
@@ -295,6 +324,9 @@ impl LocCfg {
             proxy_connect_timeout: Duration::from_secs(60),
             proxy_read_timeout: Duration::from_secs(60),
             proxy_send_timeout: Duration::from_secs(60),
+            proxy_next_upstream: next_upstream::DEFAULT,
+            proxy_next_upstream_tries: 0,
+            proxy_next_upstream_timeout: Duration::ZERO,
             proxy_buffering: true,
             proxy_hide_headers: Vec::new(),
             fastcgi_pass: None,
@@ -860,13 +892,21 @@ pub struct UpstreamServer {
     pub backup: bool,
     pub down: bool,
     pub name: String,
+    /// `max_fails=N` (nginx default 1; 0 = never mark down).
+    pub max_fails: u32,
+    /// `fail_timeout=T` (nginx default 10s): how long a peer with
+    /// `fails >= max_fails` stays out of rotation.
+    pub fail_timeout: Duration,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LbMethod {
     RoundRobin,
     LeastConn,
     IpHash,
+    /// `hash <key> [consistent]` — the key is a complex value expanded per
+    /// request.
+    Hash { key: String, consistent: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -875,6 +915,10 @@ pub struct Upstream {
     pub servers: Vec<UpstreamServer>,
     pub method: LbMethod,
     pub keepalive: usize,
+    /// `hash ... consistent` ring, built once at config time:
+    /// `(crc32 point hash, server index)`, sorted by hash with duplicates
+    /// removed — nginx's `ngx_http_upstream_update_chash`.
+    pub chash_points: Vec<(u32, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -1366,6 +1410,7 @@ fn parse_upstream(d: &Directive) -> Result<Upstream, ConfigError> {
         servers: Vec::new(),
         method: LbMethod::RoundRobin,
         keepalive: 0,
+        chash_points: Vec::new(),
     };
 
     for child in d.block.as_ref().map(|b| b.as_slice()).unwrap_or(&[]) {
@@ -1393,6 +1438,8 @@ fn parse_upstream(d: &Directive) -> Result<Upstream, ConfigError> {
                     backup: false,
                     down: false,
                     name: addr_arg.clone(),
+                    max_fails: 1,
+                    fail_timeout: Duration::from_secs(10),
                 };
                 for p in &child.args[1..] {
                     if p == "backup" {
@@ -1401,6 +1448,12 @@ fn parse_upstream(d: &Directive) -> Result<Upstream, ConfigError> {
                         srv.down = true;
                     } else if let Some(w) = p.strip_prefix("weight=") {
                         srv.weight = w.parse().unwrap_or(1).max(1);
+                    } else if let Some(mf) = p.strip_prefix("max_fails=") {
+                        srv.max_fails = mf.parse().unwrap_or(1);
+                    } else if let Some(ft) = p.strip_prefix("fail_timeout=") {
+                        if let Some(t) = parse_time(ft) {
+                            srv.fail_timeout = t;
+                        }
                     }
                 }
                 up.servers.push(srv);
@@ -1414,7 +1467,13 @@ fn parse_upstream(d: &Directive) -> Result<Upstream, ConfigError> {
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(0);
             }
-            "keepalive_requests" | "keepalive_timeout" | "zone" | "hash" | "queue" | "resolver" => {
+            "hash" => {
+                // `hash <complex value> [consistent]`.
+                let key = child.args.first().cloned().unwrap_or_default();
+                let consistent = child.args.get(1).map(|a| a == "consistent").unwrap_or(false);
+                up.method = LbMethod::Hash { key, consistent };
+            }
+            "keepalive_requests" | "keepalive_timeout" | "zone" | "queue" | "resolver" => {
             }
             other => {
                 return Err(sem(
@@ -1429,7 +1488,108 @@ fn parse_upstream(d: &Directive) -> Result<Upstream, ConfigError> {
     if up.servers.is_empty() {
         return Err(sem(&d.file, d.line, "upstream has no servers"));
     }
+    // `hash ... consistent`: build the ketama ring once, nginx-style.
+    if let LbMethod::Hash { consistent: true, .. } = up.method {
+        up.chash_points = build_chash_points(&up.servers);
+    }
     Ok(up)
+}
+
+/// nginx's CRC-32 (the standard IEEE table, `ngx_crc32_table_init`): needed
+/// byte-for-byte because the hash balancer's peer mapping depends on it.
+pub fn crc32_update(crc: u32, data: &[u8]) -> u32 {
+    fn table_entry(i: u32) -> u32 {
+        let mut c = i;
+        for _ in 0..8 {
+            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+        }
+        c
+    }
+    let mut c = !crc;
+    for &b in data {
+        c = table_entry((c ^ u32::from(b)) & 0xff) ^ (c >> 8);
+    }
+    !c
+}
+
+/// Split a `server` string as `ngx_http_upstream_update_chash` does: scan from
+/// the end over digits; a `:` ends the port; anything non-digit first means the
+/// whole string is the host. `unix:` keeps everything after the prefix.
+fn chash_host_port(server: &str) -> (&str, &str) {
+    if server.len() >= 5 && server[..5].eq_ignore_ascii_case("unix:") {
+        return (&server[5..], "");
+    }
+    let bytes = server.as_bytes();
+    for j in 0..bytes.len() {
+        let c = bytes[server.len() - j - 1];
+        if c == b':' {
+            return (&server[..server.len() - j - 1], &server[server.len() - j..]);
+        }
+        if !c.is_ascii_digit() {
+            break;
+        }
+    }
+    (server, "")
+}
+
+/// Cache::Memcached::Fast-compatible points: per peer `weight * 160` entries,
+/// each `crc32(host \0 port prev_hash_le32)` chained through the previous
+/// point's hash, sorted and deduplicated by hash.
+fn build_chash_points(servers: &[UpstreamServer]) -> Vec<(u32, usize)> {
+    let mut points: Vec<(u32, usize)> = Vec::new();
+    for (i, s) in servers.iter().enumerate() {
+        let (host, port) = chash_host_port(&s.name);
+        let mut base = 0u32;
+        base = crc32_update(base, host.as_bytes());
+        base = crc32_update(base, b"\x00");
+        base = crc32_update(base, port.as_bytes());
+        let mut prev: u32 = 0;
+        for _ in 0..(s.weight as usize * 160) {
+            let hash = crc32_update(base, &prev.to_le_bytes());
+            points.push((hash, i));
+            prev = hash;
+        }
+    }
+    points.sort_by_key(|&(h, _)| h);
+    points.dedup_by(|a, b| a.0 == b.0);
+    points
+}
+
+#[cfg(test)]
+mod chash_tests {
+    use super::*;
+
+    /// The weighted ring must reproduce nginx's mapping (probed against
+    /// nginx 1.28: keys 1..=10 over `{8081 w1, 8082 w1, 8083 w10}`).
+    #[test]
+    fn weighted_ring_matches_nginx() {
+        let servers: Vec<UpstreamServer> = [
+            ("127.0.0.1:28001", 1u32),
+            ("127.0.0.1:28002", 1),
+            ("127.0.0.1:28003", 10),
+        ]
+        .iter()
+        .map(|(n, w)| UpstreamServer {
+            addr: "127.0.0.1:28001".parse().unwrap(),
+            weight: *w,
+            backup: false,
+            down: false,
+            name: n.to_string(),
+            max_fails: 1,
+            fail_timeout: Duration::from_secs(10),
+        })
+        .collect();
+        let ring = build_chash_points(&servers);
+        assert_eq!(ring.len(), 1920);
+        let expected = [2, 2, 2, 1, 2, 2, 2, 2, 2, 2];
+        for (a, want) in expected.iter().enumerate() {
+            let key = (a + 1).to_string();
+            let kh = crc32_update(0, key.as_bytes());
+            let i = ring.partition_point(|&(h, _)| h < kh);
+            let got = ring[i % ring.len()].1;
+            assert_eq!(got, *want, "key {} mapped to {} want {}", key, got, want);
+        }
+    }
 }
 
 /// Patch every location's `proxy_pass http://<name>` to the upstream index.
@@ -2931,9 +3091,38 @@ impl Builder {
             }
             "proxy_no_cache" => cfg.proxy_no_cache = d.args.clone(),
             "proxy_cache_bypass" => cfg.proxy_cache_bypass = d.args.clone(),
-            "proxy_next_upstream"
-            | "proxy_next_upstream_tries"
-            | "proxy_buffers"
+            "proxy_next_upstream" => {
+                // The argument list *replaces* the default; `off` clears it.
+                let mut flags = 0u32;
+                for a in &d.args {
+                    flags |= match a.as_str() {
+                        "off" => next_upstream::OFF,
+                        "error" => next_upstream::ERROR,
+                        "timeout" => next_upstream::TIMEOUT,
+                        "invalid_header" => next_upstream::INVALID_HEADER,
+                        "http_500" => next_upstream::HTTP_500,
+                        "http_502" => next_upstream::HTTP_502,
+                        "http_503" => next_upstream::HTTP_503,
+                        "http_504" => next_upstream::HTTP_504,
+                        "http_403" => next_upstream::HTTP_403,
+                        "http_404" => next_upstream::HTTP_404,
+                        "http_429" => next_upstream::HTTP_429,
+                        "non_idempotent" => next_upstream::NON_IDEMPOTENT,
+                        _ => 0,
+                    };
+                }
+                cfg.proxy_next_upstream = flags;
+            }
+            "proxy_next_upstream_tries" => {
+                cfg.proxy_next_upstream_tries =
+                    d.args.first().and_then(|v| v.parse().ok()).unwrap_or(0);
+            }
+            "proxy_next_upstream_timeout" => {
+                if let Some(t) = d.args.first().and_then(|v| parse_time(v)) {
+                    cfg.proxy_next_upstream_timeout = t;
+                }
+            }
+            "proxy_buffers"
             | "proxy_buffer_size"
             | "proxy_busy_buffers_size"
             | "proxy_max_temp_file_size"

@@ -1,5 +1,9 @@
-target/
-bench/run/
-bench/www/
-logs/
+/target
+/logs
+/bench/run
+/bench/results
+/bench/floor/floor
+__pycache__/
+*.log
 *.pid
+nohup.out

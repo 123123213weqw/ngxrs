@@ -15,11 +15,17 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct Attempt {
     pub connect: Option<f64>,
     pub header: Option<f64>,
     pub response: Option<f64>,
+    /// `$upstream_addr` entry (`127.0.0.1:8081`, `unix:/path`) for this
+    /// attempt, recorded when it starts.
+    pub addr: Option<String>,
+    /// Upstream status once the response head is parsed; `None` for attempts
+    /// that never got that far.
+    pub status: Option<u16>,
 }
 
 tokio::task_local! {
@@ -86,6 +92,22 @@ pub fn set_response(idx: usize, d: Duration) {
     });
 }
 
+pub fn set_addr(idx: usize, addr: &str) {
+    with(|list| {
+        if let Some(a) = list.get_mut(idx) {
+            a.addr = Some(addr.to_string());
+        }
+    });
+}
+
+pub fn set_status(idx: usize, status: u16) {
+    with(|list| {
+        if let Some(a) = list.get_mut(idx) {
+            a.status = Some(status);
+        }
+    });
+}
+
 /// nginx prints seconds with millisecond resolution, and `-` for a value that
 /// was never set.
 fn render(v: Option<f64>) -> String {
@@ -97,10 +119,22 @@ fn render(v: Option<f64>) -> String {
 
 /// `$upstream_connect_time` / `$upstream_header_time` / `$upstream_response_time`
 /// for every attempt so far, comma-separated. Empty when nothing was attempted.
+/// `$upstream_addr` / `$upstream_status` join the same list (nginx prints one
+/// entry per attempt, `addr, addr`).
 pub fn variable(name: &str) -> Option<String> {
     let list = with(|l| l.clone())?;
     if list.is_empty() {
         return None;
+    }
+    if name == "upstream_addr" || name == "upstream_status" {
+        let parts: Vec<String> = list
+            .iter()
+            .filter_map(|a| match name {
+                "upstream_addr" => a.addr.clone(),
+                _ => a.status.map(|s| s.to_string()),
+            })
+            .collect();
+        return Some(parts.join(", "));
     }
     let pick = |a: &Attempt| match name {
         "upstream_connect_time" => a.connect,
@@ -116,8 +150,8 @@ pub fn variable(name: &str) -> Option<String> {
     )
 }
 
-/// Replace every `$upstream_*_time` in `spec`. Unknown variables are left for
-/// the caller's other expanders.
+/// Replace every known `$upstream_*` variable in `spec`. Unknown variables are
+/// left for the caller's other expanders.
 pub fn expand(spec: &str) -> String {
     if !spec.contains("$upstream_") {
         return spec.to_string();
@@ -127,6 +161,8 @@ pub fn expand(spec: &str) -> String {
         "upstream_connect_time",
         "upstream_header_time",
         "upstream_response_time",
+        "upstream_addr",
+        "upstream_status",
     ] {
         let needle = format!("${name}");
         if out.contains(&needle) {

@@ -8,8 +8,8 @@ pub use parser::{ConfigError, Directive};
 pub use typed::{
     access_denied, access_denied_for, parse_time, AccessLog, AccessRule, CacheZone, Config,
     FastcgiParam, FastcgiPass, Http, IfBlock, IfCond, KeepaliveDisable, LbMethod, ListenGroup,
-    LocCfg, Match, ProxyPass, ProxyTarget, Rewrite, RewriteFlag, ScgiPass, Server, Step, Upstream,
-    UpstreamServer, UwsgiPass,
+    LocCfg, Match, next_upstream, ProxyPass, ProxyTarget, Rewrite, RewriteFlag, ScgiPass, Server,
+    Step, Upstream, UpstreamServer, UwsgiPass,
 };
 
 use std::path::{Path, PathBuf};

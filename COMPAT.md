@@ -545,16 +545,13 @@ CONTENT，所以 ACCESS 必须先求值。
 - `auth_request` 子请求缓存、`max_errors`、`stream`/`mail` 客户端证书校验
 - 高并发（c≥1024）吞吐约为 nginx 的 0.94–0.95×；64KB 尾延迟优于 nginx 一个数量级
 
-## 本轮已知回归（未修复）
+## 本轮已知回归（均已修复，见下节）
 
-- `proxy_cache_vary.t`：手工跑 48/54，nginx 53/54；经 A/B 脚本跑时更会被判定为
-  UNRUN（脚本以 `prove -v > file` 运行，本次运行会卡住直到 150s 超时，TAP 输出丢失）。
-  已排除的原因：`serve_cached` 里的 gzip（关掉它之后 vary 仍然失败，只是
-  `proxy_cache.t` 从 17/17 掉到 15/17，已恢复）。根因尚未定位，失败集中在
-  需要重启服务器的用例（`cold first/second`）与 Vary 归一化用例
-  （`normalize first`、`vary asterisk second`）。
-- `proxy_cache_use_stale.t`：25/36（上一轮 26/36），差集主要是 `updating` /
-  `revalidated` 事件，两者都还没有实现。
+- ~~`proxy_cache_vary.t`：手工跑 48/54~~ 已修复：53/54，与 nginx 一致（唯一失败项是
+  用例自带的 TODO `normalize order`，nginx 同样失败）。当时"经 A/B 脚本判定 UNRUN"
+  的挂起现象在本轮复测中未再出现（11 项 proxy 簇用例全部正常完成）。
+- ~~`proxy_cache_use_stale.t`：25/36，缺 `updating`/`revalidated` 事件~~ 已实现，
+  现在 36/36 与 nginx 一致。
 
 ## 本轮修复（proxy_cache_vary 回归）
 
@@ -854,3 +851,150 @@ awkward names `autoindex.t` uses (`bench/aiprobe.sh` diffs both pages):
 - **directories sort first**, then names — not one flat name sort.
 - the date is **GMT**: `autoindex_localtime` defaults to off.
 - `charset` is now parsed instead of being accepted and ignored.
+
+## 本轮（proxy_next_upstream 完整实现 + max_fails/fail_timeout + $upstream_addr 累加）
+
+`proxy_next_upstream` 之前只解析不生效（在"accepted, not yet honoured"清单里），
+`proxy_next_upstream.t` 6/10：看似"第二个请求成功"其实只是轮询轮到了好后端。
+本轮完整实现后 **10/10，与 nginx 一致**。proxy 簇 + 自建差分套件全量复测无回归
+（`bench/all.sh` 70/70）。
+
+### 实现
+
+- **指令解析**：`off|error|timeout|invalid_header|http_500|http_502|http_503|http_504|
+  http_403|http_404|http_429|non_idempotent` 位标志；参数列表**替换**默认值
+  `error timeout`（只写 `http_500` 就不再对连接错误重试）。`_tries`/`_timeout`
+  同步解析并生效。
+- **状态码触发**：决策点在 `exchange` 解析完响应头之后、任何字节到达客户端或
+  缓存之前（对应 nginx 的 `ngx_http_upstream_test_next`）。仅当"后面还有候选
+  且 tries/timeout 预算允许且方法可重放"时才放弃本次响应换下一个 peer；最后一
+  个候选的响应总是照常送达（`proxy_next_upstream.t` 的 `all tried with down`
+  依赖这一点）。
+- **非幂等方法**：POST/LOCK/PATCH 只在带 `non_idempotent` 时才对"已发送后"的
+  失败重试；连接建立失败发生在任何字节发出之前，任何方法都可重试（实测 nginx
+  行为）。
+- **`max_fails`/`fail_timeout`**：`server` 参数补全解析（默认 1 / 10s）。
+  运行时按 (upstream, server) 记 `fails`/`checked`；`fails >= max_fails` 且距
+  上次尝试不足 `fail_timeout` 的 peer 被选出局。
+- **`$upstream_addr` / `$upstream_status` 累加**：`timing` 的 per-request 尝试
+  列表增加 addr/status 字段，与 `*_time` 一样逗号拼接，且能活过 `error_page`
+  内部跳转（`proxy_intercept_errors` + `return "$upstream_addr"` 的组合因此
+  从空串变成 `addr1, addr2`）。`add_header` 与 access_log 里的引用同步改为
+  累加值。
+
+### 用真 nginx 探明的语义(`bench/next_upstream_probe.conf` 八项，ngxrs 全部对齐）
+
+| 探针 | nginx 行为 |
+|---|---|
+| 500 触发的重试计失败 | 是 |
+| 503 触发的重试计失败 | 是 |
+| **403 触发的重试计失败** | **否** |
+| **429 触发的重试计失败** | **是** |
+| 成功请求清零 fails | **否**（只有 fail_timeout 到期才恢复） |
+| fail_timeout 到期 | peer 回到轮转 |
+| `proxy_next_upstream off` + 连接错误 | 直接 502，不转移 |
+| POST + 连接被拒（默认 flags） | 重试（尚未发送任何字节） |
+
+403 不计 / 429 计与凭记忆的直觉相反，成功不清零亦然——这组结论全部来自对
+nginx 1.28 的实测，不是猜的。
+
+### 顺带修掉的两个真缺陷
+
+1. **backup 的候选顺序**：backup peer 从未进入候选列表（`select_order` 旧逻辑
+   只在主服务器全空时才用 backup 池），状态码触发的重试到不了 backup。现在
+   候选 = 轮转/排序后的可用 primaries **再拼** 可用 backups：正常流量永远先打
+   primary，重试能落到 backup。第一次修复时把 backup 拼进了轮转池，RR 计数器
+   会让 backup 每隔一个请求顶到首位——轮转必须只作用于 primaries。
+2. **`least_conn` 平局不轮转**：稳定排序 + 固定输入顺序 = 空闲时全部流量钉死
+   在第一台（`upstream_least_conn.t` `balanced` 4/4 之前不过）。现在平局按 RR
+   计数器轮转，`upstream_least_conn.t` 4/4。
+
+### 遗留（未实现，与上一致）
+
+- `upstream_hash.t` 7/17：`hash` 指令（含 ketama `consistent`）整体未实现。
+- `upstream_ip_hash.t` 被 harness 跳过：ngxrs 未向 Test::Nginx 声明 realip 模块。
+- `proxy.t` 曾记录的 `$upstream_header_time` 慢响应头差异未再复现（本轮 30/30）。
+
+## 本轮（hash 负载均衡完整实现 + return 444 + rewrite 阶段 $server_port）
+
+`upstream_hash.t` 7/17 → **17/17，与 nginx 一致**。proxy 簇 + 自建差分套件
+（70/70）+ 单元测试（122/122，含新增环构建回归测试）全量复测无回归。
+
+### 实现（算法按 nginx 1.28 源码 `ngx_http_upstream_hash_module.c` 逐行核对）
+
+- **指令**：`hash <复杂值> [consistent]`（`LbMethod::Hash`，不再是"接受但忽略"）。
+  key 在请求时经 `ServerVars` 展开（`$arg_*` 等）。
+- **CRC-32**：内置 nginx 同款 IEEE 表实现（`typed::crc32_update`），哈希映射需要
+  逐字节一致，不引入新依赖。
+- **plain hash**（`get_hash_peer`）：`((crc32([REHASH] KEY) >> 16) & 0x7fff) + PREV_HASH`
+  的 Cache::Memcached 兼容表达式——REHASH 是重试计数的**十进制字符串**前缀，
+  PREV_HASH 跨重试**累加**；peer 按 `hash % total_weight` 在**全量**（含 down）主
+  服务器列表上按权重游走选定；被 tried/down/max_fails 拒绝则 rehash。
+- **consistent**（ketama）：配置期建环——每 peer `weight*160` 个点，
+  `crc32(host \0 port prev_hash_le32)` 链式生成，按哈希排序去重；请求时
+  `crc32(key)` 二分找 `第一个 >= key哈希` 的点，失败/不可用则 `hash++` 顺延。
+  host/port 拆分按 nginx 从尾部扫数字遇 `:` 切分（`unix:` 前缀特判）。
+- **退化**：空 key、单主服务器、超过上限 → 轮询（`get_rr_peer`）。
+- **实测映射对齐**：`bench/hashprobe` 场景（plain/consistent/带权重 共 5 组 ×
+  10 key）与 nginx 1.28 **逐 key 完全一致**（含 weight=10 的环）。
+
+### 过程中修掉的三个真缺陷
+
+1. **候选生成的自设上限**：把 nginx"逐次 get"改成预生成完整候选列表时保留了
+   每 get 20 步的上限——环上起点附近长期没有低权重点时（weight=10 的组里
+   恰好第 3 个 key）生成被截断、荒谬地退到 RR 轮转。nginx 的 20 上限计的是
+   *peer 尝试数*而非步数；生成上限放宽到覆盖全部主服务器（plain 100 次
+   rehash / chash 走满一圈环）。
+2. **`return 444`**：nginx 语义是**不发任何响应直接断连**；此前会真的发出
+   444 状态行（upstream_hash.t 的 444 后端全靠它）。现在 `write_response`
+   对 444 直接以断连错误返回。
+3. **rewrite 阶段的 `$server_port`**：`get_var` 没有该分支、恒为空串，导致
+   `if ($server_port = N)` 永假（upstream_hash.t 后端按端口返回 502 的用例
+   因此全空转）。`RwVars` 增加 `server_port`，从连接的监听端口一路穿进
+   `resolve_target` / `apply_rewrites_*` / `run_if`。
+
+### 其他
+
+- `$upstream_addr` 在"无可用 peer"（选不出候选 / 错误重试耗尽）时追加
+  **upstream 组名**作为最后一项（nginx "no live upstreams" 的表现形式），
+  且 502 响应现在也会应用该 location 的 `add_header`（`always` 场景）。
+- 后台缓存刷新（background update）没有变量上下文，hash 上游退化为轮询
+  （任何 peer 都能服务该刷新）。
+
+### 新纳入追踪的已知缺口（非本轮回归）
+
+- `rewrite.t` 15/25（nginx 25/25）：首次纳入 A/B 清单。失败集中在 rewrite 的
+  参数追加/转义与 `error_page ... return` 组合，与 $server_port 无关（该文件
+  不含此变量）。后续专项处理。
+- `upstream_ip_hash.t`：仍因未向 Test::Nginx 声明 realip 模块被跳过。
+
+## 本轮（rewrite.t 打平：rewrite 参数语义 + error_page return 状态规则）
+
+`rewrite.t` 15/25 → **25/25，与 nginx 一致**。19 文件 A/B 全量复测：18 SAME +
+1 BETTER（http_host.t 58/62 对 nginx 54/62），**零 WORSE**（ngxrs 399 断言对
+nginx 395）；`bench/all.sh` 70/70、单元测试 122/122。
+
+四类修复（行为均先经 `bench/rewrite_probe.conf` 双端实测对齐，现输出与 nginx
+逐字节一致）：
+
+1. **rewrite 替换串的参数规则**（`apply_one` 重写）：按模板首个 `?` 拆成 URI 与
+   args 两部分——尾部 `?` 丢弃原参数、普通新参数以 `&` 追加原参数、无 `?` 保留
+   原参数；外链 redirect 的 Location 也带参数（此前 `?c=d` 整个被丢弃）。
+   落入 args 部分的捕获值按 `NGX_ESCAPE_ARGS` 转义（`%`→`%25`），URI 部分保持
+   未转义形式——`/capturedup/%25?a=b` 因此得到 `args:c=/capturedup/%25&a=b`。
+2. **error_page → return 的状态码规则**（1.15.4+ 语义）：错误处理器的应答若为
+   ≥300，其状态**替换**原错误码（`error_page 404 /return405` → 405）；若为 2xx，
+   保留原错误码、只取其 body（`error_page 405 /return204` → 405 + 空 body，
+   不再画蛇添足地补内建错误页——补页只发生在没有跑过 error_page 时）。
+   ≥300 且空 body 的处理器应答在补内建页时保留其原有头（`return 302 "text"`
+   目标的 Location 不再丢失）。
+3. **原 302 的 Location 存活**：`return 302 "text"` + `error_page 302 /...` 时，
+   错误处理器（如 `return 200 "text"`）不自带 Location，则沿用原 302 的
+   Location——最终 302 + `Location: text` + body `text`，与 nginx 一致。
+4. **location 内 URI 被改写时忽略 proxy_pass 的 URI 部分**：`rewrite ... ;
+   break; proxy_pass http://u/return204;` 按改写后的 URI（/return200）直连上游。
+   `Target::Loc` 增加 `uri_rewritten` 标志（Relocate 换 location 后重新计算），
+   穿透到 `upstream_target`。
+
+顺带：`return 302 "text"` 的直连响应此前 Location 会被 `write_redirect` 丢弃
+的问题同样暴露并修复。

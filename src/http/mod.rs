@@ -1149,6 +1149,7 @@ struct RwVars<'a> {
     path: &'a str,
     query: &'a str,
     vars: &'a std::collections::HashMap<String, String>,
+    server_port: u16,
 }
 
 fn get_var(name: &str, v: &RwVars<'_>) -> String {
@@ -1161,6 +1162,9 @@ fn get_var(name: &str, v: &RwVars<'_>) -> String {
         "request_uri" => v.req.raw_target.clone(),
         "args" | "query_string" => v.query.to_string(),
         "request_method" => v.req.method.as_str().to_string(),
+        // nginx's rewrite phase evaluates these from the request's server
+        // context; without them `if ($server_port = ...)` can never match.
+        "server_port" => v.server_port.to_string(),
         "host" | "http_host" => v
             .req
             .host
@@ -1260,6 +1264,7 @@ fn apply_rewrites(
     loc: &LocCfg,
     server: &Server,
     default_type: &str,
+    server_port: u16,
 ) -> RewriteOutcome {
     apply_rewrites_parts(
         req,
@@ -1271,6 +1276,7 @@ fn apply_rewrites(
         &loc.rewrites,
         server,
         default_type,
+        server_port,
     )
 }
 
@@ -1287,6 +1293,7 @@ fn apply_rewrites_parts(
     rewrites: &[crate::config::Rewrite],
     server: &Server,
     default_type: &str,
+    server_port: u16,
 ) -> RewriteOutcome {
     apply_rewrites_full(
         req,
@@ -1298,6 +1305,7 @@ fn apply_rewrites_parts(
         rewrites,
         server,
         default_type,
+        server_port,
     )
     .0
 }
@@ -1314,6 +1322,7 @@ fn apply_rewrites_full(
     rewrites: &[crate::config::Rewrite],
     server: &Server,
     default_type: &str,
+    server_port: u16,
 ) -> (RewriteOutcome, std::collections::HashMap<String, String>) {
     let mut uri = path.to_string();
     let mut args = query.to_string();
@@ -1350,6 +1359,7 @@ fn apply_rewrites_full(
                     path: &uri,
                     query: &args,
                     vars: &vars,
+                    server_port,
                 };
                 let expanded = expand_vars(value, &ctx);
                 vars.insert(name.trim_start_matches('$').to_string(), expanded);
@@ -1366,6 +1376,7 @@ fn apply_rewrites_full(
                     &mut vars,
                     rewrites,
                     default_type,
+                    server_port,
                 ) {
                     return (out, vars);
                 }
@@ -1393,6 +1404,7 @@ fn run_if(
     vars: &mut std::collections::HashMap<String, String>,
     _rewrites: &[crate::config::Rewrite],
     default_type: &str,
+    server_port: u16,
 ) -> Option<RewriteOutcome> {
     let cond = {
         let ctx = RwVars {
@@ -1400,6 +1412,7 @@ fn run_if(
             path: uri,
             query: args,
             vars,
+            server_port,
         };
         eval_cond(&ifb.cond, &ctx)
     };
@@ -1412,6 +1425,7 @@ fn run_if(
             path: uri,
             query: args,
             vars,
+            server_port,
         };
         let expanded = expand_vars(value, &ctx);
         vars.insert(name.trim_start_matches('$').to_string(), expanded);
@@ -1453,18 +1467,57 @@ fn apply_one(
         return None;
     }
     let caps = rw.re.captures(uri)?;
-    let mut target = expand_captures(&rw.replacement, &caps);
-    if let Some(q) = target.find('?') {
-        *args = target[q + 1..].to_string();
-        target.truncate(q);
-    }
+    // nginx splits the replacement at the first `?` of the *template*: the
+    // part before is the new URI, the part after is the new args. A trailing
+    // `?` drops the request's original args, plain new args are appended to
+    // them with `&`, and no `?` at all keeps them verbatim.
+    let (uri_tmpl, arg_tmpl) = match rw.replacement.find('?') {
+        Some(q) => (
+            &rw.replacement[..q],
+            Some(&rw.replacement[q + 1..]),
+        ),
+        None => (rw.replacement.as_str(), None),
+    };
+    let drop_args = arg_tmpl.is_some_and(|a| a.ends_with('?'));
+    let arg_tmpl = arg_tmpl.map(|a| a.trim_end_matches('?'));
+    // Capture values that land in the args part are escaped there
+    // (`$1` containing `%` becomes `%25`, nginx's NGX_ESCAPE_ARGS); values in
+    // the URI part keep their unescaped form.
+    let target = expand_captures(uri_tmpl, &caps);
+    let new_args = match arg_tmpl {
+        Some(t) if !t.is_empty() => {
+            let a = expand_captures_args(t, &caps);
+            if drop_args || args.is_empty() {
+                a
+            } else {
+                format!("{a}&{}", args)
+            }
+        }
+        Some(_) => {
+            // A bare `?` keeps the original args, `??` drops them.
+            if drop_args {
+                String::new()
+            } else {
+                args.clone()
+            }
+        }
+        None => args.clone(),
+    };
+    *args = new_args.clone();
+    let location_with_args = |loc: String| {
+        if new_args.is_empty() {
+            loc
+        } else {
+            format!("{loc}?{new_args}")
+        }
+    };
     if target.starts_with("http://") || target.starts_with("https://") {
         let code = match rw.flag {
             RewriteFlag::Permanent => 301,
             _ => 302,
         };
         return Some(RewriteOutcome::Respond(
-            Response::empty(code).header("Location", target),
+            Response::empty(code).header("Location", location_with_args(target)),
         ));
     }
     match rw.flag {
@@ -1474,22 +1527,63 @@ fn apply_one(
             } else {
                 302
             };
-            let mut location = target;
-            if !args.is_empty() {
-                location.push('?');
-                location.push_str(args);
-            }
             Some(RewriteOutcome::Respond(
-                Response::empty(code).header("Location", location),
+                Response::empty(code).header("Location", location_with_args(target)),
             ))
         }
-        RewriteFlag::Last => Some(RewriteOutcome::Relocate(target, args.clone())),
-        RewriteFlag::Break => Some(RewriteOutcome::Break(target, args.clone())),
+        RewriteFlag::Last => Some(RewriteOutcome::Relocate(target, new_args)),
+        RewriteFlag::Break => Some(RewriteOutcome::Break(target, new_args)),
         RewriteFlag::None => {
             *uri = target;
             None
         }
     }
+}
+
+/// Escape a value substituted into the args part of a rewrite replacement
+/// (nginx `NGX_ESCAPE_ARGS`): `%`, space and the characters that would
+/// otherwise be parsed as delimiters or markup in a query string.
+fn escape_arg_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '%' => out.push_str("%25"),
+            ' ' => out.push_str("%20"),
+            '"' | '#' | '<' | '>' | '\'' => {
+                out.push('%');
+                out.push_str(&format!("{:02X}", c as u32));
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// `expand_captures`, but every capture value is escaped for the args part
+/// of a rewrite replacement.
+fn expand_captures_args(replacement: &str, caps: &regex::Captures<'_>) -> String {
+    let plain = expand_captures(replacement, caps);
+    if plain == replacement {
+        // No captures in the template: the literal text stays as written.
+        return plain;
+    }
+    // Re-expand value by value so only the substituted parts get escaped.
+    let mut out = String::with_capacity(replacement.len());
+    let b = replacement.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'$' && i + 1 < b.len() && b[i + 1].is_ascii_digit() {
+            let n = b[i + 1] - b'0';
+            if let Some(m) = caps.get(n as usize) {
+                out.push_str(&escape_arg_value(m.as_str()));
+            }
+            i += 2;
+            continue;
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
 }
 
 /// Expand `$var` references against the rewrite-phase variable set.
@@ -1946,9 +2040,14 @@ pub fn apply_add_headers_ctx(
             Some((_, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => p.to_string(),
             _ => "80".to_string(),
         };
+        // `$upstream_addr` in `add_header` shows every attempt, not just the
+        // one that answered; fall back to the single address when the
+        // task-local list is empty (h2 spawned paths).
+        let addr_list = crate::timing::variable("upstream_addr")
+            .unwrap_or_else(|| upstream_addr.to_string());
         let mut expanded = expand_upstream_vars(value, upstream_headers)
             .replace("$upstream_cache_status", upstream_cache_status)
-            .replace("$upstream_addr", upstream_addr)
+            .replace("$upstream_addr", &addr_list)
             .replace("$proxy_host", proxy_host)
             .replace("$proxy_port", &proxy_port)
             .replace("$status", &status.to_string());
@@ -2322,6 +2421,11 @@ impl<'a> ServerVars<'a> {
             "document_root" => self.document_root.to_string(),
             "request_filename" => format!("{}{}", self.document_root, self.path),
             "upstream_cache_status" => self.upstream_cache_status.to_string(),
+            // One entry per upstream attempt, ", "-joined (nginx's
+            // `u->state` list); empty when this request never proxied.
+            "upstream_addr" | "upstream_status" => {
+                crate::timing::variable(name).unwrap_or_default()
+            }
             "content_length" => self
                 .req
                 .headers
@@ -2468,11 +2572,13 @@ pub async fn resolve_response(
 /// response produced without consulting any content handler.
 pub enum Target<'a> {
     /// Path, query, location, whether `rewrite ... break` skipped `return`,
-    /// and the variables produced by `set`.
+    /// whether a rewrite inside the *current* location changed the URI
+    /// (nginx then ignores a `proxy_pass` URI part), and the `set` variables.
     Loc(
         String,
         String,
         &'a LocCfg,
+        bool,
         bool,
         std::collections::HashMap<String, String>,
     ),
@@ -2487,6 +2593,7 @@ pub fn resolve_target<'a>(
     server: &'a Server,
     loc: &'a LocCfg,
     http: &Http,
+    server_port: u16,
 ) -> Target<'a> {
     let mut cur_path = path.to_string();
     let mut cur_query = query.to_string();
@@ -2506,6 +2613,7 @@ pub fn resolve_target<'a>(
             &[],
             server,
             &http.default_type,
+            server_port,
         ) {
             RewriteOutcome::Respond(r) => return Target::Done(r),
             RewriteOutcome::Continue(p, q) | RewriteOutcome::Relocate(p, q) => {
@@ -2521,7 +2629,11 @@ pub fn resolve_target<'a>(
     }
 
     let mut vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // Whether a rewrite inside the location currently being processed changed
+    // the URI (a relocation starts fresh rules for the new location).
+    let mut uri_rewritten = false;
     loop {
+        let loc_path_in = cur_path.clone();
         let (outcome, phase_vars) = apply_rewrites_full(
             req,
             &cur_path,
@@ -2532,6 +2644,7 @@ pub fn resolve_target<'a>(
             &cur_loc.rewrites,
             server,
             &http.default_type,
+            server_port,
         );
         vars.extend(phase_vars);
         match outcome {
@@ -2539,18 +2652,21 @@ pub fn resolve_target<'a>(
             RewriteOutcome::Continue(p, q) => {
                 cur_path = p;
                 cur_query = q;
+                uri_rewritten = cur_path != loc_path_in;
                 break;
             }
             RewriteOutcome::Break(p, q) => {
                 cur_path = p;
                 cur_query = q;
                 skip_return = true;
+                uri_rewritten = true;
                 break;
             }
             RewriteOutcome::Relocate(p, q) => {
                 cur_path = p;
                 cur_query = q;
                 cur_loc = server.locate(&cur_path);
+                uri_rewritten = false;
                 relocations += 1;
                 if relocations > 10 {
                     return Target::Done(error_response(500, server.server_tokens));
@@ -2578,7 +2694,7 @@ pub fn resolve_target<'a>(
         }
     }
 
-    Target::Loc(cur_path, cur_query, cur_loc, skip_return, vars)
+    Target::Loc(cur_path, cur_query, cur_loc, skip_return, uri_rewritten, vars)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2747,9 +2863,9 @@ pub async fn resolve_response_local(
         }
     }
 
-    let mut resp = match resolve_target(req, path, query, server, loc, http) {
+    let mut resp = match resolve_target(req, path, query, server, loc, http, server_port) {
         Target::Done(r) => r,
-        Target::Loc(p, q, l, skip, set_vars) => {
+        Target::Loc(p, q, l, skip, _rw, set_vars) => {
             return render_resolved_state(
                 req,
                 &p,
@@ -2837,9 +2953,9 @@ pub async fn resolve_response_state(
         }
     }
 
-    let mut resp = match resolve_target(req, path, query, server, loc, http) {
+    let mut resp = match resolve_target(req, path, query, server, loc, http, server_port) {
         Target::Done(r) => r,
-        Target::Loc(p, q, l, skip, set_vars) => {
+        Target::Loc(p, q, l, skip, _rw, set_vars) => {
             return render_resolved_state(
                 req,
                 &p,
@@ -3173,6 +3289,19 @@ async fn check_limits(
 /// Apply `error_page`, `add_header` and `gzip` to a response the content phase
 /// produced (including ones from `return` / `rewrite`).
 #[allow(clippy::too_many_arguments)]
+/// A header value from a `Response`'s dynamic or pre-rendered header set.
+fn response_header(r: &Response, name: &str) -> Option<String> {
+    for (k, v) in &r.headers {
+        if k.eq_ignore_ascii_case(name) {
+            return Some(v.clone());
+        }
+    }
+    split_head(&r.raw)
+        .into_iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v)
+}
+
 async fn finalize_response(
     req: &Request,
     resp: &mut Response,
@@ -3193,11 +3322,16 @@ async fn finalize_response(
     let mut cur_loc = server.locate(&cur_path);
     let mut depth = 0usize;
     let root_str = cur_loc.root.to_string_lossy().to_string();
+    // Whether an `error_page` target actually ran: the builtin body fill at
+    // the end must not kick in for it (a 204/200 target deliberately answers
+    // with an empty body, nginx keeps that instead of the error page).
+    let mut ran_error_page = false;
 
     while depth < 10 && util::is_special_status(resp.status) && resp.status >= 300 {
         let Some(target) = cur_loc.error_pages.get(&resp.status).cloned() else {
             break;
         };
+        ran_error_page = true;
         // `error_page 404 /a.html` keeps the original status;
         // `error_page 404 =200 /a.html` forces 200; a bare `=`
         // (`error_page 404 = /a.html`, `... = @named`) adopts whatever status
@@ -3315,6 +3449,29 @@ async fn finalize_response(
                 custom,
             )
             .await;
+            let mut redirected = redirected;
+            if redirected.status >= 300 && redirected.body.is_empty() {
+                // Fill the builtin page, keeping the target's own headers
+                // (a `return 302 "text"` target carries its Location here).
+                let mut filled = error_response(redirected.status, server.server_tokens);
+                filled.headers.extend(redirected.headers.iter().cloned());
+                for (k, v) in split_head(&redirected.raw) {
+                    if !k.eq_ignore_ascii_case("content-type")
+                        && !k.eq_ignore_ascii_case("content-length")
+                    {
+                        filled.headers.push((k, v));
+                    }
+                }
+                redirected = filled;
+            }
+            if !use_target_status
+                && (300..400).contains(&original_status)
+                && response_header(&redirected, "location").is_none()
+            {
+                if let Some(loc) = response_header(resp, "location") {
+                    redirected.headers.push(("Location".to_string(), loc));
+                }
+            }
             let redirected_status = redirected.status;
             *resp = redirected;
             resp.status = if use_target_status {
@@ -3322,7 +3479,7 @@ async fn finalize_response(
             } else {
                 match new_status {
                     Some(code) => code,
-                    None if (300..400).contains(&redirected_status) => redirected_status,
+                    None if redirected_status >= 300 => redirected_status,
                     None => original_status,
                 }
             };
@@ -3332,9 +3489,9 @@ async fn finalize_response(
 
         // The error page target runs the full rewrite phase too, so a
         // `rewrite ^ http://...` inside it produces the redirect.
-        let redirected = match resolve_target(req, &cur_path, &cur_query, server, cur_loc, http) {
+        let redirected = match resolve_target(req, &cur_path, &cur_query, server, cur_loc, http, server_port) {
             Target::Done(r) => r,
-            Target::Loc(p, q, l, _skip, _set_vars) => {
+            Target::Loc(p, q, l, _skip, _rw, _set_vars) => {
                 cur_path = p;
                 cur_query = q;
                 let vars = ServerVars {
@@ -3375,6 +3532,27 @@ async fn finalize_response(
         // otherwise the original error status is preserved. A bare `=` adopts
         // the target's status outright. An empty body here is normal — `return
         // 403;` has none and gets the error page generated after the loop.
+        let mut redirected = redirected;
+        if redirected.status >= 300 && redirected.body.is_empty() {
+            let mut filled = error_response(redirected.status, server.server_tokens);
+            filled.headers.extend(redirected.headers.iter().cloned());
+            for (k, v) in split_head(&redirected.raw) {
+                if !k.eq_ignore_ascii_case("content-type")
+                    && !k.eq_ignore_ascii_case("content-length")
+                {
+                    filled.headers.push((k, v));
+                }
+            }
+            redirected = filled;
+        }
+        if !use_target_status
+            && (300..400).contains(&original_status)
+            && !response_header(&redirected, "location").is_some()
+        {
+            if let Some(loc) = response_header(resp, "location") {
+                redirected.headers.push(("Location".to_string(), loc));
+            }
+        }
         let redirected_status = redirected.status;
         *resp = redirected;
         resp.status = if use_target_status {
@@ -3382,13 +3560,13 @@ async fn finalize_response(
         } else {
             match new_status {
                 Some(code) => code,
-                None if (300..400).contains(&redirected_status) => redirected_status,
+                None if redirected_status >= 300 => redirected_status,
                 None => original_status,
             }
         };
     }
 
-    if resp.status >= 400 && resp.body.is_empty() {
+    if !ran_error_page && resp.status >= 400 && resp.body.is_empty() {
         *resp = error_response(resp.status, server.server_tokens);
     }
 
@@ -3536,17 +3714,20 @@ async fn dispatch(
 
     // Rewrite/try_files may point at a different location; resolve it before
     // choosing a content handler so `/x -> /fallback` can reach a proxy.
-    let (resolved_path, resolved_query, resolved_loc, skip_return, pre, set_vars) =
-        match resolve_target(req, path, query, server, loc, http) {
+    let (resolved_path, resolved_query, resolved_loc, skip_return, uri_rewritten, pre, set_vars) =
+        match resolve_target(req, path, query, server, loc, http, listen_port) {
             Target::Done(r) => (
                 path.to_string(),
                 query.to_string(),
                 loc,
                 false,
+                false,
                 Some(r),
                 Default::default(),
             ),
-            Target::Loc(p, q, l, skip, set_vars) => (p, q, l, skip, None, set_vars),
+            Target::Loc(p, q, l, skip, rewritten, set_vars) => {
+                (p, q, l, skip, rewritten, None, set_vars)
+            }
         };
     let (path, query, loc) = (
         resolved_path.as_str(),
@@ -3915,6 +4096,7 @@ async fn dispatch(
             http,
             server.server_tokens,
             &proxy_vars,
+            uri_rewritten,
         )
         .await?
         {
@@ -4457,6 +4639,16 @@ async fn write_response_inner(
         expect_trailers,
         body,
     } = resp;
+
+    // nginx's `return 444`: close the connection without sending anything.
+    // Surfaced as an error so the connection loop drops the socket, exactly
+    // like `ngx_http_special_response_handler(NGX_HTTP_REQUEST_TIMEOUT/444)`.
+    if status == 444 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "444 close",
+        ));
+    }
 
     let body_len = match &body {
         Body::Empty => 0,
@@ -5234,6 +5426,8 @@ fn log_access(
     let t_connect = crate::timing::variable("upstream_connect_time").unwrap_or_default();
     let t_header = crate::timing::variable("upstream_header_time").unwrap_or_default();
     let t_response = crate::timing::variable("upstream_response_time").unwrap_or_default();
+    let t_addr = crate::timing::variable("upstream_addr").unwrap_or_default();
+    let t_upstatus = crate::timing::variable("upstream_status").unwrap_or_default();
     let scheme = if req.tls.is_some() { "https" } else { "http" };
 
     let mut vars: Vec<(&str, &str)> = vec![
@@ -5258,6 +5452,8 @@ fn log_access(
         ("upstream_connect_time", &t_connect),
         ("upstream_header_time", &t_header),
         ("upstream_response_time", &t_response),
+        ("upstream_addr", &t_addr),
+        ("upstream_status", &t_upstatus),
     ];
     vars.extend(sent_refs);
 

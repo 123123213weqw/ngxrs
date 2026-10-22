@@ -149,6 +149,101 @@ fn updating_test(key: &str) -> bool {
         .unwrap_or(false)
 }
 
+// ---- peer failure accounting (server ... max_fails fail_timeout) ----------
+
+/// Which retry triggers count as an "unsuccessful attempt" against
+/// `max_fails`. Probed against nginx 1.28: retries triggered by 5xx and 429
+/// count, 403 and 404 do not; I/O errors and timeouts count; a *successful*
+/// attempt never resets the counter — only the `fail_timeout` window expiring
+/// brings a peer back.
+struct PeerFail {
+    fails: u32,
+    checked: std::time::Instant,
+}
+
+fn peer_fail_cell() -> &'static std::sync::Mutex<std::collections::HashMap<(usize, usize), PeerFail>>
+{
+    static CELLS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(usize, usize), PeerFail>>,
+    > = std::sync::OnceLock::new();
+    CELLS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// nginx `ngx_http_upstream_get_rr_peer`: a peer is unavailable while
+/// `fails >= max_fails` and the last attempt is inside `fail_timeout`.
+fn peer_available(up: usize, sidx: usize, max_fails: u32, fail_timeout: Duration) -> bool {
+    if max_fails == 0 {
+        return true;
+    }
+    let guard = peer_fail_cell().lock().unwrap_or_else(|e| e.into_inner());
+    match guard.get(&(up, sidx)) {
+        Some(p) => !(p.fails >= max_fails && p.checked.elapsed() < fail_timeout),
+        None => true,
+    }
+}
+
+/// Every completed attempt refreshes `checked`; an unsuccessful one also
+/// bumps `fails`.
+fn peer_mark(up: usize, sidx: usize, failed: bool) {
+    let mut guard = peer_fail_cell().lock().unwrap_or_else(|e| e.into_inner());
+    let p = guard
+        .entry((up, sidx))
+        .or_insert(PeerFail { fails: 0, checked: std::time::Instant::now() });
+    p.checked = std::time::Instant::now();
+    if failed {
+        p.fails = p.fails.saturating_add(1);
+    }
+}
+
+/// `exchange` returns this when the upstream status matches a
+/// `proxy_next_upstream http_XXX` flag and another peer may still be tried:
+/// nothing has reached the client at that point, so the attempt is discarded.
+#[derive(Debug)]
+struct RetryNextUpstream(u16);
+impl std::fmt::Display for RetryNextUpstream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "proxy_next_upstream retry (status {})", self.0)
+    }
+}
+impl std::error::Error for RetryNextUpstream {}
+
+fn as_retry(e: &io::Error) -> Option<u16> {
+    e.get_ref()
+        .and_then(|x| x.downcast_ref::<RetryNextUpstream>())
+        .map(|r| r.0)
+}
+
+/// The `proxy_next_upstream` flag covering this upstream status (0: none).
+fn status_flag(status: u16) -> u32 {
+    use crate::config::next_upstream as nu;
+    match status {
+        500 => nu::HTTP_500,
+        502 => nu::HTTP_502,
+        503 => nu::HTTP_503,
+        504 => nu::HTTP_504,
+        403 => nu::HTTP_403,
+        404 => nu::HTTP_404,
+        429 => nu::HTTP_429,
+        _ => 0,
+    }
+}
+
+/// May a failure while *establishing* the connection move to the next peer?
+/// Nothing has been sent at that point, so nginx applies no method
+/// restriction, only the `error` / `timeout` flags.
+fn connect_retry(e: &io::Error, nu_flags: u32) -> bool {
+    use crate::config::next_upstream as nu;
+    if nu_flags & nu::OFF != 0 {
+        return false;
+    }
+    let want = if e.kind() == io::ErrorKind::TimedOut {
+        nu::TIMEOUT
+    } else {
+        nu::ERROR
+    };
+    nu_flags & want != 0
+}
+
 fn pool_key_of(c: &Chosen) -> (usize, u32) {
     match c {
         Chosen::Direct(_, a) => (usize::MAX, a.port() as u32),
@@ -232,14 +327,23 @@ async fn dynamic_addr(
     Some(std::net::SocketAddr::new(ip, port))
 }
 
-fn choose(http: &Http, loc: &LocCfg, client_ip: &std::net::IpAddr) -> Option<Vec<Chosen>> {
+fn choose(
+    http: &Http,
+    loc: &LocCfg,
+    client_ip: &std::net::IpAddr,
+    hash_vars: Option<&crate::http::ServerVars<'_>>,
+) -> Option<Vec<Chosen>> {
     let pp = loc.proxy_pass.as_ref()?;
     match &pp.target {
         ProxyTarget::Addr(addr) => Some(vec![Chosen::Direct(0, *addr)]),
         ProxyTarget::Unix(path) => Some(vec![Chosen::Unix(path.clone())]),
         ProxyTarget::Upstream(idx) => {
             let up = http.upstreams.get(*idx)?;
-            let order = select_order(up, *idx, client_ip)?;
+            let hash_key = match (&up.method, hash_vars) {
+                (LbMethod::Hash { key, .. }, Some(v)) => Some(v.expand(key)),
+                _ => None,
+            };
+            let order = select_order(up, *idx, client_ip, hash_key.as_deref())?;
             Some(
                 order
                     .into_iter()
@@ -258,61 +362,224 @@ fn choose(http: &Http, loc: &LocCfg, client_ip: &std::net::IpAddr) -> Option<Vec
     }
 }
 
-fn select_order(up: &Upstream, idx: usize, client_ip: &std::net::IpAddr) -> Option<Vec<usize>> {
-    let live: Vec<usize> = up
+fn select_order(
+    up: &Upstream,
+    idx: usize,
+    client_ip: &std::net::IpAddr,
+    hash_key: Option<&str>,
+) -> Option<Vec<usize>> {
+    // `max_fails`/`fail_timeout`: a peer whose recent attempts all failed is
+    // held out of rotation until its `fail_timeout` expires. Backups are
+    // appended after the primaries: a normal request never reaches them, but
+    // a `proxy_next_upstream` retry does (nginx's two peer pools). When no
+    // primary is available at all, backups serve directly.
+    let mut primaries: Vec<usize> = up
         .servers
         .iter()
         .enumerate()
-        .filter(|(_, s)| !s.down && !s.backup)
+        .filter(|(i, s)| {
+            !s.down && !s.backup && peer_available(idx, *i, s.max_fails, s.fail_timeout)
+        })
         .map(|(i, _)| i)
         .collect();
-    let mut pool = if live.is_empty() {
-        up.servers
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| !s.down)
-            .map(|(i, _)| i)
-            .collect::<Vec<_>>()
-    } else {
-        live
-    };
-    if pool.is_empty() {
-        return None;
+    let backups: Vec<usize> = up
+        .servers
+        .iter()
+        .enumerate()
+        .filter(|(i, s)| {
+            !s.down && s.backup && peer_available(idx, *i, s.max_fails, s.fail_timeout)
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    // `hash` selects by key; nginx only ever hashes the primary pool.
+    if let (LbMethod::Hash { consistent, .. }, Some(key)) = (&up.method, hash_key) {
+        let hashed = if *consistent {
+            chash_order(up, idx, key, &primaries)
+        } else {
+            plain_hash_order(up, idx, key, &primaries)
+        };
+        if let Some(mut order) = hashed {
+            order.extend(backups);
+            return Some(order);
+        }
+        // Empty key, a single peer, or every rehash rejected: fall through to
+        // plain round-robin (`get_rr_peer` in nginx).
     }
 
-    match up.method {
-        LbMethod::RoundRobin => {
-            let start = rr(idx) % pool.len();
-            pool.rotate_left(start);
+    if !primaries.is_empty() {
+        // The rotation (or sort) only ever orders the primaries: backups stay
+        // behind them, reachable by a retry but never by rotation.
+        match &up.method {
+            LbMethod::RoundRobin | LbMethod::Hash { .. } => {
+                let start = rr(idx) % primaries.len();
+                primaries.rotate_left(start);
+            }
+            LbMethod::LeastConn => {
+                // Ties rotate: nginx round-robins between peers with the same
+                // (active) count, so a stable sort over an unrotated list
+                // would pin every idle request on the first peer.
+                let start = rr(idx) % primaries.len();
+                primaries.rotate_left(start);
+                let act = ACTIVE.get();
+                primaries.sort_by_key(|&i| {
+                    act.and_then(|v| v.get(idx))
+                        .and_then(|l| l.get(i))
+                        .map(|a| a.load(Ordering::Relaxed))
+                        .unwrap_or(0)
+                });
+            }
+            LbMethod::IpHash => {
+                // nginx hashes the first three octets of IPv4.
+                let h = match client_ip {
+                    std::net::IpAddr::V4(v4) => {
+                        let o = v4.octets();
+                        (o[0] as u64) << 16 | (o[1] as u64) << 8 | o[2] as u64
+                    }
+                    std::net::IpAddr::V6(v6) => {
+                        let o = v6.octets();
+                        (0..16).fold(0u64, |acc, i| {
+                            acc.wrapping_mul(31).wrapping_add(o[i] as u64)
+                        })
+                    }
+                };
+                let start = (h as usize) % primaries.len();
+                primaries.rotate_left(start);
+            }
         }
-        LbMethod::LeastConn => {
-            let act = ACTIVE.get();
-            pool.sort_by_key(|&i| {
-                act.and_then(|v| v.get(idx))
-                    .and_then(|l| l.get(i))
-                    .map(|a| a.load(Ordering::Relaxed))
-                    .unwrap_or(0)
-            });
+        primaries.extend(backups);
+        Some(primaries)
+    } else if !backups.is_empty() {
+        Some(backups)
+    } else {
+        None
+    }
+}
+
+/// `ngx_http_upstream_get_hash_peer`: the Cache::Memcached-compatible
+/// expression `((crc32([REHASH] KEY) >> 16) & 0x7fff) + PREV_HASH`, where
+/// REHASH is the *decimal string* of the retry counter (omitted on the first
+/// iteration) and PREV_HASH accumulates. The peer is picked by walking the
+/// whole list (down peers included) by `hash % total_weight`; a peer that is
+/// already tried, down, or failed makes the loop rehash — after 20 tries
+/// nginx falls back to round-robin, which is `None` here.
+fn plain_hash_order(up: &Upstream, idx: usize, key: &str, primaries: &[usize]) -> Option<Vec<usize>> {
+    // nginx: `number < 2 || key.len == 0` selects by round-robin instead.
+    // `number` is the configured primary count, down peers included.
+    let configured = up.servers.iter().filter(|s| !s.backup).count();
+    if configured < 2 || key.is_empty() || primaries.is_empty() {
+        return None;
+    }
+    // Static total over every primary server, down ones included.
+    let total_weight: u64 = up
+        .servers
+        .iter()
+        .filter(|s| !s.backup)
+        .map(|s| u64::from(s.weight))
+        .sum();
+    if total_weight == 0 {
+        return None;
+    }
+    let mut hash: u32 = 0;
+    let mut rehash: u32 = 0;
+    let mut tries: u32 = 0;
+    let mut order: Vec<usize> = Vec::new();
+    loop {
+        if !order.is_empty() && order.len() >= primaries.len() {
+            break;
         }
-        LbMethod::IpHash => {
-            // nginx hashes the first three octets of IPv4.
-            let h = match client_ip {
-                std::net::IpAddr::V4(v4) => {
-                    let o = v4.octets();
-                    (o[0] as u64) << 16 | (o[1] as u64) << 8 | o[2] as u64
-                }
-                std::net::IpAddr::V6(v6) => {
-                    let o = v6.octets();
-                    (0..16).fold(0u64, |acc, i| {
-                        acc.wrapping_mul(31).wrapping_add(o[i] as u64)
-                    })
-                }
-            };
-            let start = (h as usize) % pool.len();
-            pool.rotate_left(start);
+        // nginx rehashes without bound *within* one get; its per-request cap
+        // of 20 counts full peer attempts, not these steps. The list is
+        // consumed lazily by the request loop, so generate it with a cap
+        // generous enough to cover every primary.
+        if tries > 100 {
+            return None;
+        }
+        let mut crc = 0u32;
+        if rehash > 0 {
+            crc = crate::config::typed::crc32_update(crc, rehash.to_string().as_bytes());
+        }
+        crc = crate::config::typed::crc32_update(crc, key.as_bytes());
+        let folded = (crc >> 16) & 0x7fff;
+        hash = hash.wrapping_add(folded);
+        rehash += 1;
+        tries += 1;
+
+        // Walk every primary server in config order — down ones included, as
+        // nginx only rejects a peer *after* the walk selected it.
+        let primaries_all: Vec<usize> = up
+            .servers
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.backup)
+            .map(|(i, _)| i)
+            .collect();
+        let mut w = u64::from(hash % (total_weight as u32));
+        let mut picked = primaries_all[0];
+        for &i in &primaries_all {
+            let wt = u64::from(up.servers[i].weight);
+            if w < wt {
+                picked = i;
+                break;
+            }
+            w -= wt;
+        }
+        if !order.contains(&picked) && primaries.contains(&picked) {
+            order.push(picked);
         }
     }
-    Some(pool)
+    if order.is_empty() {
+        None
+    } else {
+        Some(order)
+    }
+}
+
+/// `ngx_http_upstream_get_chash_peer`: look the key's crc32 up in the ring
+/// (`find_chash_point`: first point with `hash >= key hash`), and on every
+/// further attempt continue from the *next* point (`hash++`), skipping points
+/// whose server is down, failed, or already tried. `None` falls back to
+/// round-robin (empty key / empty ring / more than 20 tries).
+fn chash_order(up: &Upstream, idx: usize, key: &str, primaries: &[usize]) -> Option<Vec<usize>> {
+    if key.is_empty() || up.chash_points.is_empty() || primaries.is_empty() {
+        return None;
+    }
+    let key_hash = crate::config::typed::crc32_update(0, key.as_bytes());
+    // First index with point.hash >= key_hash (binary search over sorted ring).
+    let start = up
+        .chash_points
+        .partition_point(|&(h, _)| h < key_hash);
+    let mut hidx = start;
+    let mut steps: u32 = 0;
+    let mut order: Vec<usize> = Vec::new();
+    loop {
+        if order.len() >= primaries.len() {
+            break;
+        }
+        // One full circle over the ring is enough to reach every server's
+        // points; nginx only caps *peer attempts* per request, not the
+        // in-get walk.
+        let n = up.chash_points.len();
+        if steps as usize >= n {
+            return None;
+        }
+        steps += 1;
+        let sidx = up.chash_points[hidx % up.chash_points.len()].1;
+        let s = &up.servers[sidx];
+        if !order.contains(&sidx)
+            && !s.down
+            && !s.backup
+            && peer_available(idx, sidx, s.max_fails, s.fail_timeout)
+        {
+            order.push(sidx);
+        }
+        hidx += 1;
+    }
+    if order.is_empty() {
+        None
+    } else {
+        Some(order)
+    }
 }
 
 // ---- request building ----------------------------------------------------
@@ -426,8 +693,15 @@ fn upstream_target(
     loc: &LocCfg,
     pp: &crate::config::ProxyPass,
     vars: &crate::http::ServerVars<'_>,
+    uri_rewritten: bool,
 ) -> String {
-    let mut target = match &pp.uri {
+    let mut target = if uri_rewritten {
+        // `rewrite ... break` changed the request URI inside this location:
+        // nginx then ignores the URI part of `proxy_pass` entirely and sends
+        // the rewritten URI as-is.
+        path.to_string()
+    } else {
+        match &pp.uri {
         // `proxy_pass http://u/$1$name.html`: the URI part is a complex value,
         // expanded per request with the location's regex captures.
         Some(prefix) if prefix.contains('$') => vars.expand(prefix),
@@ -441,6 +715,7 @@ fn upstream_target(
             }
         }
         None => path.to_string(),
+    }
     };
     if !query.is_empty() {
         target.push('?');
@@ -614,6 +889,7 @@ pub async fn handle(
     http: &Http,
     tokens: bool,
     vars: &crate::http::ServerVars<'_>,
+    uri_rewritten: bool,
 ) -> io::Result<Option<Proxied>> {
     let pp = match &loc.proxy_pass {
         Some(p) => p.clone(),
@@ -663,10 +939,13 @@ pub async fn handle(
     };
     let Some(candidates) = dyn_target
         .map(|a| vec![Chosen::Direct(0, a)])
-        .or_else(|| choose(http, loc, &peer_ip))
+        .or_else(|| choose(http, loc, &peer_ip, Some(vars)))
     else {
+        // Peer selection found nothing live: nginx records the upstream group
+        // name as the only `$upstream_addr` entry.
+        note_group_name(http, &pp);
         return Ok(Some(written(
-            respond_error(conn, 502, tokens, req.keepalive).await?,
+            respond_error_upstream(conn, 502, tokens, req.keepalive, loc, &pp).await?,
         )));
     };
 
@@ -703,7 +982,8 @@ pub async fn handle(
         Vec::new()
     };
 
-    let target_uri = dyn_uri.unwrap_or_else(|| upstream_target(path, query, loc, &pp, vars));
+    let target_uri =
+        dyn_uri.unwrap_or_else(|| upstream_target(path, query, loc, &pp, vars, uri_rewritten));
     let is_upgrade = req
         .headers
         .get("upgrade")
@@ -1036,22 +1316,67 @@ pub async fn handle(
 
     let mut used_pooled = false;
     let mut last_err = None;
+    // Set when a failed attempt would have moved to another peer: exhausting
+    // the candidate list that way is nginx's "no live upstreams", which
+    // appends the group name to `$upstream_addr`.
+    let mut wanted_more = false;
 
-    'candidates: for cand in candidates {
-        // One entry in `$upstream_*_time` per backend tried.
+    // `proxy_next_upstream` gating. The directive *replaces* the default
+    // `error timeout`, so a config that only lists `http_500` does not retry
+    // on connect errors. `_tries` / `_timeout` bound the whole sequence.
+    use crate::config::next_upstream as nu;
+    let nu_flags = loc.proxy_next_upstream;
+    let nu_off = nu_flags & nu::OFF != 0;
+    let nu_start = std::time::Instant::now();
+    let nu_tries = loc.proxy_next_upstream_tries;
+    let nu_timeout = loc.proxy_next_upstream_timeout;
+    // nginx passes non-idempotent methods (POST/LOCK/PATCH) to the next server
+    // only with the `non_idempotent` flag — and only once the request has
+    // already been sent; a connect error happens before that and always may
+    // retry.
+    let method_retryable = match &req.method {
+        Method::Post => false,
+        Method::Other(s) => {
+            let m = s.as_str();
+            !m.eq_ignore_ascii_case("LOCK") && !m.eq_ignore_ascii_case("PATCH")
+        }
+        _ => true,
+    } || nu_flags & nu::NON_IDEMPOTENT != 0;
+    let mut attempts = 0u32;
+
+    'candidates: for (cand_idx, cand) in candidates.iter().enumerate() {
+        // Respect `proxy_next_upstream_tries` / `_timeout` before every new
+        // attempt (nginx checks both in `ngx_http_upstream_next`).
+        attempts += 1;
+        if nu_tries > 0 && attempts > nu_tries {
+            break;
+        }
+        if !nu_timeout.is_zero() && nu_start.elapsed() >= nu_timeout {
+            break;
+        }
+        // One entry in `$upstream_*` per backend tried.
         let tidx = crate::timing::begin();
         let t_up = std::time::Instant::now();
-        let key = pool_key_of(&cand);
-        let upstream_addr = match &cand {
+        let key = pool_key_of(cand);
+        let upstream_addr = match cand {
             Chosen::Direct(_, a) => a.to_string(),
             Chosen::Unix(p) => format!("unix:{}", p.display()),
             Chosen::Upstream { addr, .. } => addr.to_string(),
         };
+        crate::timing::set_addr(tidx, &upstream_addr);
+        // A status-triggered retry must be decided before anything reaches the
+        // client, and is only offered when another peer could still take the
+        // request and the method may be replayed.
+        let status_retry = (!nu_off
+            && cand_idx + 1 < candidates.len()
+            && method_retryable
+            && nu_flags & nu::ANY_HTTP != 0)
+        .then_some(nu_flags);
         // First attempt may reuse a pooled socket; if that socket turns out to
         // be dead, retry the same backend once on a fresh connection.
         for attempt in 0..2 {
             let want_pool = attempt == 0;
-            let (stream, from_pool, up_idx, sidx) = match &cand {
+            let (stream, from_pool, up_idx, sidx) = match cand {
                 Chosen::Direct(_, addr) => {
                     let pooled = if want_pool { checkout(key) } else { None };
                     match pooled {
@@ -1059,7 +1384,11 @@ pub async fn handle(
                         None => match connect_bound(*addr, bind, loc.proxy_connect_timeout).await {
                             Ok(s) => (UpStream::Tcp(s), false, usize::MAX, 0),
                             Err(e) => {
+                                let retry = connect_retry(&e, nu_flags);
                                 last_err = Some(e);
+                                if !retry {
+                                    break 'candidates;
+                                }
                                 continue 'candidates;
                             }
                         },
@@ -1068,7 +1397,11 @@ pub async fn handle(
                 Chosen::Unix(path) => match connect_unix(path, loc.proxy_connect_timeout).await {
                     Ok(s) => (s, false, usize::MAX, 0),
                     Err(e) => {
+                        let retry = connect_retry(&e, nu_flags);
                         last_err = Some(e);
+                        if !retry {
+                            break 'candidates;
+                        }
                         continue 'candidates;
                     }
                 },
@@ -1083,7 +1416,12 @@ pub async fn handle(
                         None => match connect_bound(*addr, bind, loc.proxy_connect_timeout).await {
                             Ok(s) => (UpStream::Tcp(s), false, *up, *sidx),
                             Err(e) => {
+                                peer_mark(*up, *sidx, true);
+                                let retry = connect_retry(&e, nu_flags);
                                 last_err = Some(e);
+                                if !retry {
+                                    break 'candidates;
+                                }
                                 continue 'candidates;
                             }
                         },
@@ -1131,6 +1469,7 @@ pub async fn handle(
                 convert_head,
                 http,
                 tidx,
+                status_retry,
             )
             .await;
 
@@ -1140,8 +1479,28 @@ pub async fn handle(
             crate::timing::set_response(tidx, t_up.elapsed());
 
             match result {
-                Ok(o) => return Ok(Some(o)),
+                Ok(o) => {
+                    if let Chosen::Upstream { up, sidx, .. } = cand {
+                        // A completed exchange is a successful attempt: it
+                        // refreshes `checked` but does not reset `fails`
+                        // (probed against nginx 1.28).
+                        peer_mark(*up, *sidx, false);
+                    }
+                    return Ok(Some(o));
+                }
                 Err(e) => {
+                    // The status matched a `proxy_next_upstream http_XXX`
+                    // flag: nothing reached the client, discard the attempt.
+                    if let Some(code) = as_retry(&e) {
+                        if !matches!(code, 403 | 404) {
+                            if let Chosen::Upstream { up, sidx, .. } = cand {
+                                peer_mark(*up, *sidx, true);
+                            }
+                        }
+                        wanted_more = true;
+                        continue 'candidates;
+                    }
+                    let retry_conn = connect_retry(&e, nu_flags) && method_retryable;
                     last_err = Some(e);
                     if from_pool {
                         // Stale pooled socket: a request may have partially
@@ -1150,7 +1509,20 @@ pub async fn handle(
                         if req.method.is_read() {
                             continue;
                         }
+                    } else {
+                        // The request already reached this peer, so nginx
+                        // only moves on for idempotent methods.
+                        if let Chosen::Upstream { up, sidx, .. } = cand {
+                            peer_mark(*up, *sidx, true);
+                        }
+                        if !retry_conn {
+                            break 'candidates;
+                        }
                     }
+                    // Falling through to the next candidate means this
+                    // request still wants a peer; exhausting the list that
+                    // way is nginx's "no live upstreams".
+                    wanted_more = true;
                     continue 'candidates;
                 }
             }
@@ -1162,6 +1534,12 @@ pub async fn handle(
             "ngxrs: [error] upstream failure for {}: {e}",
             req.raw_target
         );
+    }
+    if wanted_more && last_err.is_some() {
+        note_group_name(http, &pp);
+        return Ok(Some(written(
+            respond_error_upstream(conn, 502, tokens, req.keepalive, loc, &pp).await?,
+        )));
     }
     Ok(Some(written(
         respond_error(conn, 502, tokens, req.keepalive).await?,
@@ -1338,6 +1716,58 @@ async fn respond_error(
         close: false,
         sent: Vec::new(),
     })
+}
+
+/// The proxy's own error response (502 "no live upstreams" style): unlike
+/// `respond_error` it still runs the location's `add_header` set, so
+/// `add_header X-IP $upstream_addr always` shows the attempted peers and the
+/// upstream group name — nginx records the group name as a final
+/// `$upstream_addr` entry when peer selection reports "no live upstreams".
+#[allow(clippy::too_many_arguments)]
+async fn respond_error_upstream(
+    conn: &mut crate::conn::Conn,
+    status: u16,
+    tokens: bool,
+    keepalive: bool,
+    loc: &LocCfg,
+    pp: &crate::config::ProxyPass,
+) -> io::Result<Outcome> {
+    let body = crate::http::error_body(status, tokens);
+    let addr = crate::timing::variable("upstream_addr").unwrap_or_default();
+    let mut raw = b"Content-Type: text/html\r\n".to_vec();
+    crate::http::apply_add_headers_proxy(
+        &mut raw,
+        &loc.headers,
+        status,
+        "",
+        &addr,
+        &[],
+        &pp.host_header,
+        None,
+    );
+    raw.extend_from_slice(b"Content-Length: ");
+    raw.extend_from_slice(body.len().to_string().as_bytes());
+    raw.extend_from_slice(b"\r\n");
+    let resp = Response::raw(status, raw, crate::http::Body::Bytes(body));
+    let bytes = crate::http::write_response(conn, resp, keepalive, tokens, false).await?;
+    Ok(Outcome {
+        status,
+        bytes,
+        close: false,
+        sent: Vec::new(),
+    })
+}
+
+/// nginx appends the upstream group name to `$upstream_addr` when a peer
+/// selection found nothing live: the attempt list gains one entry that has an
+/// address (the name) but no timings, which is exactly how it renders.
+fn note_group_name(http: &Http, pp: &crate::config::ProxyPass) {
+    if let crate::config::ProxyTarget::Upstream(i) = &pp.target {
+        if let Some(up) = http.upstreams.get(*i) {
+            let tidx = crate::timing::begin();
+            crate::timing::set_addr(tidx, &up.name);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1697,6 +2127,10 @@ async fn exchange(
     convert_head: bool,
     http: &crate::config::Http,
     tidx: usize,
+    // `Some(proxy_next_upstream flags)` when a status-triggered retry is
+    // allowed for this attempt (another peer can still take the request);
+    // the caller only offers it before anything reaches the client.
+    status_retry: Option<u32>,
 ) -> io::Result<Proxied> {
     let t_up = Instant::now();
     // ---- request head ----
@@ -1816,6 +2250,23 @@ async fn exchange(
     if let Some(entry) = cache.stale {
         if loc.proxy_cache_use_stale_codes.contains(&head.status) {
             return serve_cached(conn, req, loc, http, tokens, entry, "STALE").await;
+        }
+    }
+
+    // ---- `proxy_next_upstream http_XXX`: try the next peer instead ----
+    //
+    // nginx decides in `ngx_http_upstream_test_next`, i.e. right after the
+    // head is parsed and before anything is relayed or cached. The caller
+    // only sets `status_retry` when another peer remains, so the last
+    // candidate is always served.
+    crate::timing::set_status(tidx, head.status);
+    if let Some(nu_flags) = status_retry {
+        let flag = status_flag(head.status);
+        if flag != 0 && nu_flags & flag != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                RetryNextUpstream(head.status),
+            ));
         }
     }
 
@@ -2549,7 +3000,6 @@ pub async fn fetch(
     custom: &std::collections::HashMap<String, String>,
 ) -> Option<Response> {
     let pp = loc.proxy_pass.clone()?;
-    let candidates = choose(http, loc, &peer_ip.parse().ok()?)?;
     let fetch_vars = crate::http::ServerVars {
         req,
         path,
@@ -2566,7 +3016,8 @@ pub async fn fetch(
         connection_time: 0,
         sent: &[],
     };
-    let target_uri = upstream_target(path, query, loc, &pp, &fetch_vars);
+    let candidates = choose(http, loc, &peer_ip.parse().ok()?, Some(&fetch_vars))?;
+    let target_uri = upstream_target(path, query, loc, &pp, &fetch_vars, false);
 
     // The socket-free path serves HTTP/2, HTTP/3, SSI includes and auth
     // subrequests, and it must honour `proxy_cache` exactly like the streaming
@@ -3016,6 +3467,9 @@ pub fn spawn_background_update(
             Ok(ip) => ip,
             Err(_) => return None,
         },
+        // No variable scope here: a `hash` upstream falls back to round-robin
+        // for the background refresh (any peer can serve it).
+        None,
     ) else {
         return None;
     };

@@ -2509,6 +2509,17 @@ impl<'a> ServerVars<'a> {
             }
             "remote_addr" => self.peer_ip.to_string(),
             "remote_port" => self.peer_port.to_string(),
+            // nginx: without a rewrite these alias the connection values.
+            "realip_remote_addr" => self
+                .custom
+                .get("realip_remote_addr")
+                .cloned()
+                .unwrap_or_else(|| self.peer_ip.to_string()),
+            "realip_remote_port" => self
+                .custom
+                .get("realip_remote_port")
+                .cloned()
+                .unwrap_or_else(|| self.peer_port.to_string()),
             // nginx: current time with millisecond resolution, `sec.msec`.
             "msec" => {
                 let now = std::time::SystemTime::now()
@@ -3740,6 +3751,141 @@ pub async fn body_bytes(body: Body) -> io::Result<Vec<u8>> {
 
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
+// ---- realip (ngx_http_realip_module) --------------------------------------
+
+fn cidr_contains(net: std::net::IpAddr, bits: u8, ip: std::net::IpAddr) -> bool {
+    match (net, ip) {
+        (std::net::IpAddr::V4(n), std::net::IpAddr::V4(i)) => {
+            let b = u32::from(bits);
+            if b == 0 {
+                return true;
+            }
+            let mask = u32::MAX << (32 - b);
+            (u32::from(n) & mask) == (u32::from(i) & mask)
+        }
+        (std::net::IpAddr::V6(n), std::net::IpAddr::V6(i)) => {
+            let b = u32::from(bits);
+            if b == 0 {
+                return true;
+            }
+            let mask = u128::MAX << (128 - b);
+            (u128::from(n) & mask) == (u128::from(i) & mask)
+        }
+        _ => false,
+    }
+}
+
+/// `1.2.3.4[:56]` / `[::1]:56` / `::1` — the address forms nginx's
+/// `ngx_parse_addr_port` accepts in proxy headers.
+fn parse_addr_port(s: &str) -> Option<(std::net::IpAddr, u16)> {
+    if let Some(rest) = s.strip_prefix('[') {
+        let (host, port) = rest.split_once(']')?;
+        let port = port.strip_prefix(':')?;
+        return Some((host.parse().ok()?, port.parse().ok()?));
+    }
+    match s.rsplit_once(':') {
+        Some((host, port)) if host.parse::<std::net::IpAddr>().is_ok() => {
+            Some((host.parse().ok()?, port.parse().ok()?))
+        }
+        _ => Some((s.parse().ok()?, 0)),
+    }
+}
+
+/// `ngx_http_get_forwarded_addr`'s per-header step: walk the value from the
+/// right while the current address is trusted; `recursive` gates the walk
+/// inside one header (nginx: `while (recursive && p > xff)`).
+enum FwdStep {
+    Ok,
+    Done,
+    Declined,
+}
+
+fn forwarded_step(
+    value: &str,
+    addr: &mut (std::net::IpAddr, u16),
+    loc: &LocCfg,
+    recursive: bool,
+) -> FwdStep {
+    let trusted =
+        |ip| loc.realip_from.iter().any(|(n, b)| cidr_contains(*n, *b, ip));
+    let mut rest = value;
+    let mut found = false;
+    loop {
+        if !trusted(addr.0) {
+            return if found { FwdStep::Done } else { FwdStep::Declined };
+        }
+        let trimmed = rest.trim_end_matches([' ', ',']);
+        let token = match trimmed.rsplit([' ', ',']).next() {
+            Some(t) if !t.is_empty() => t,
+            _ => return if found { FwdStep::Done } else { FwdStep::Declined },
+        };
+        let Some(parsed) = parse_addr_port(token) else {
+            return if found { FwdStep::Done } else { FwdStep::Declined };
+        };
+        *addr = parsed;
+        found = true;
+        if !recursive {
+            break;
+        }
+        let consumed = trimmed.len() - token.len();
+        if consumed == 0 {
+            break;
+        }
+        rest = &rest[..consumed];
+    }
+    FwdStep::Ok
+}
+
+/// The address `real_ip_*` rewrites `$remote_addr` to, if any
+/// (`ngx_http_realip_handler` + `ngx_http_get_forwarded_addr`).
+fn realip_effective(
+    loc: &LocCfg,
+    req: &Request,
+    peer: std::net::IpAddr,
+) -> Option<(std::net::IpAddr, u16)> {
+    if loc.realip_from.is_empty() {
+        return None;
+    }
+    let mut addr = (peer, 0u16);
+    if loc.real_ip_header.eq_ignore_ascii_case("X-Forwarded-For") {
+        let values: Vec<&str> = req.headers.get_all("x-forwarded-for").collect();
+        // nginx reverts the header list and walks it last-received first.
+        let mut found = false;
+        for v in values.iter().rev() {
+            match forwarded_step(v, &mut addr, loc, loc.real_ip_recursive) {
+                FwdStep::Ok => {
+                    found = true;
+                    if !loc.real_ip_recursive {
+                        break;
+                    }
+                }
+                FwdStep::Done => {
+                    found = true;
+                    break;
+                }
+                FwdStep::Declined => {
+                    if !loc.real_ip_recursive {
+                        break;
+                    }
+                    if found {
+                        break;
+                    }
+                }
+            }
+        }
+        if !found {
+            return None;
+        }
+        Some(addr)
+    } else {
+        // Header names are stored lowercased; the directive keeps its case.
+        let name = loc.real_ip_header.to_ascii_lowercase();
+        let value = req.headers.get(name.as_str())?;
+        let parsed = parse_addr_port(value)?;
+        Some(parsed)
+    }
+}
+
 async fn dispatch(
     conn: &mut Conn,
     req: &Request,
@@ -3818,7 +3964,7 @@ async fn dispatch(
 
     // Rewrite/try_files may point at a different location; resolve it before
     // choosing a content handler so `/x -> /fallback` can reach a proxy.
-    let (resolved_path, resolved_query, resolved_loc, skip_return, uri_rewritten, pre, set_vars) =
+    let (resolved_path, resolved_query, resolved_loc, skip_return, uri_rewritten, pre, mut set_vars) =
         match resolve_target(req, path, query, server, loc, http, listen_port) {
             Target::Done(r) => (
                 path.to_string(),
@@ -3838,6 +3984,22 @@ async fn dispatch(
         resolved_query.as_str(),
         resolved_loc,
     );
+
+    // `real_ip_*`: a trusted proxy's header rewrites $remote_addr. The
+    // rewritten and original values are per-request variables, so every
+    // later ServerVars sees them through the custom map.
+    if let Ok(peer) = conn.peer_ip_str().parse::<std::net::IpAddr>() {
+        if let Some((ip, port)) = realip_effective(loc, req, peer) {
+            set_vars.insert("remote_addr".to_string(), ip.to_string());
+            set_vars.insert("remote_port".to_string(), port.to_string());
+            set_vars.insert(
+                "realip_remote_addr".to_string(),
+                conn.peer_ip_str().to_string(),
+            );
+            set_vars.insert("realip_remote_port".to_string(), peer_port.to_string());
+        }
+        let _ = &set_vars;
+    }
 
     // `limit_rate` is a per-response write rate. `$limit_rate` is also settable
     // (`set $limit_rate 5k`), so the variable wins when it has a value.

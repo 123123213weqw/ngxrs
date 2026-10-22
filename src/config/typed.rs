@@ -139,6 +139,14 @@ pub struct LocCfg {
     pub satisfy_any: bool,
     /// `proxy_bind ADDR[:PORT]` / `off`; empty means "not configured".
     pub proxy_bind: Option<String>,
+    /// `set_real_ip_from` networks (address, prefix bits). A scope-local list
+    /// replaces the inherited one.
+    pub realip_from: Vec<(std::net::IpAddr, u8)>,
+    pub realip_from_set: bool,
+    /// `real_ip_header` (nginx default `X-Real-IP`).
+    pub real_ip_header: String,
+    /// `real_ip_recursive` (default off).
+    pub real_ip_recursive: bool,
     pub limit_reqs: Vec<LimitReq>,
     pub limit_conns: Vec<LimitConn>,
     /// `error_log` directives that apply to this location, in order.
@@ -304,6 +312,10 @@ impl LocCfg {
             auth_request_set: Vec::new(),
             satisfy_any: false,
             proxy_bind: None,
+            realip_from: Vec::new(),
+            realip_from_set: false,
+            real_ip_header: "X-Real-IP".to_string(),
+            real_ip_recursive: false,
             limit_reqs: Vec::new(),
             limit_conns: Vec::new(),
             limit_req_status: 503,
@@ -1280,6 +1292,18 @@ fn mail_protocol(v: &str) -> Option<crate::mail::Protocol> {
         "imap" => Some(crate::mail::Protocol::Imap),
         "smtp" => Some(crate::mail::Protocol::Smtp),
         _ => None,
+    }
+}
+
+/// `a.b.c.d[/nn]` (bare address = /32 or /128).
+pub fn parse_realip_cidr(s: &str) -> Option<(std::net::IpAddr, u8)> {
+    match s.split_once('/') {
+        Some((ip, bits)) => Some((ip.parse().ok()?, bits.parse().ok()?)),
+        None => {
+            let ip: std::net::IpAddr = s.parse().ok()?;
+            let bits = if ip.is_ipv4() { 32 } else { 128 };
+            Some((ip, bits))
+        }
     }
 }
 
@@ -2434,6 +2458,26 @@ impl Builder {
                 cfg.try_files = d.args.clone();
             }
             "internal" => cfg.internal = true,
+            "set_real_ip_from" => {
+                // First directive in this scope replaces the inherited list.
+                if !cfg.realip_from_set {
+                    cfg.realip_from.clear();
+                    cfg.realip_from_set = true;
+                }
+                if let Some(v) = d.args.first() {
+                    if let Some(cidr) = parse_realip_cidr(v) {
+                        cfg.realip_from.push(cidr);
+                    }
+                }
+            }
+            "real_ip_header" => {
+                if let Some(v) = d.args.first() {
+                    cfg.real_ip_header = v.clone();
+                }
+            }
+            "real_ip_recursive" => {
+                cfg.real_ip_recursive = d.args.first().map(|v| v == "on").unwrap_or(false);
+            }
             "expires" => {
                 // `expires` is TAKE12: only `modified <time>` uses two args.
                 let spec = if d.args.len() >= 2 && d.args[0] == "modified" {

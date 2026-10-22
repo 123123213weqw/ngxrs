@@ -1036,3 +1036,33 @@ nginx 395）；`bench/all.sh` 70/70、单元测试 122/122。
 
 A/B 清单现存 **19 个文件全部持平**（含本轮新增 expires 探针与
 proxy_cache_valid），无任何 WORSE/BETTER/UNRUN。
+
+## 本轮（realip 模块完整实现）
+
+`ngx_http_realip_module` 从零实现，四个官方用例一次打平：`realip.t` 10/10、
+`realip_remote_addr.t` 6/6、`realip_remote_port.t` 6/6、`upstream_ip_hash.t` 5/5
+（此前被 harness 跳过——`-V` 现在声明 `--with-http_realip_module`）。
+A/B 23 文件 382/382 全部一致，`bench/all.sh` 70/70，单测 122/122。
+
+### 语义（按 nginx 1.28 源码 `ngx_http_get_forwarded_addr` 逐行核对）
+
+- `set_real_ip_from <cidr>`（本域声明替换继承表）、`real_ip_header`（默认
+  `X-Real-IP`，存小写再查——头表是精确匹配）、`real_ip_recursive`。
+- X-Forwarded-For：**按接收顺序的倒序**逐个头处理；头内从右往左走，**递归标志
+  同时门控头内步进与跨头迭代**（`while (recursive && p > xff)`）；当前地址不受信
+  任即停，已产出则保留（DONE/DECLINED 的 found 语义）。
+- 值支持 `ip\[:port\]` / `[v6]:port`（`ngx_parse_addr_port`）。
+- 挂在 dispatch 的 location 解析之后（等价 nginx 的 post_read+preaccess 组合，
+  per-location `real_ip_header` 因此生效），重写结果经 per-request 变量表注入，
+  `add_header`/`return`/日志全链路可见。
+- $remote_addr 重写后，**ip_hash 与上游选择用重写值**（proxy::handle 的 peer_ip
+  改从变量取）。
+- $realip_remote_addr / $realip_remote_port **无重写时回落到连接值**（nginx 同），
+  有重写时保留原始连接地址/端口。
+
+### 已知偏差（记录在案）
+
+- allow/deny 与 limit_req/limit_conn 的 zone 键仍取连接地址（nginx 在 realip
+  之后评估 ACCESS 阶段）；官方用例未覆盖，后续把 access_guard 的 peer_ip 一并
+  切到变量。
+- `set_real_ip_from <hostname>`（realip_hostname.t）需要运行时解析，未实现。

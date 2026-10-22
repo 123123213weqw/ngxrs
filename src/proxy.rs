@@ -897,7 +897,12 @@ pub async fn handle(
     };
     let _ = http;
 
-    let peer_ip = conn.peer.ip();
+    //  may have been rewritten by realip; ip_hash and the
+    // upstream selection must hash the rewritten address like nginx.
+    let peer_ip: std::net::IpAddr = vars
+        .get("remote_addr")
+        .parse()
+        .unwrap_or_else(|_| conn.peer.ip());
     let peer_ip_owned = peer_ip.to_string();
     let peer_port = conn.peer.port();
     // A `proxy_pass` whose authority contains variables is resolved per

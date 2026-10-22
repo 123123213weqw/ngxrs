@@ -121,7 +121,7 @@ fn real_main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                          --with-http_grpc_module --with-http_ssi_module \
                          --with-http_auth_request_module --with-http_auth_basic_module \
                          --with-http_sub_module --with-http_split_clients_module \
-                         --with-http_referer_module --with-http_stub_status_module \
+                         --with-http_referer_module --with-http_stub_status_module --with-http_realip_module \
                          --with-http_empty_gif_module --with-http_random_index_module                          --without-http_dav_module --without-http_slice_module \
                          --with-mail --with-mail_ssl_module --with-ipv6 --without-http_memcached_module \
                          --without-http_flv_module --without-http_mp4_module \

@@ -1295,6 +1295,7 @@ fn apply_rewrites_parts(
     default_type: &str,
     server_port: u16,
 ) -> RewriteOutcome {
+    let mut ignored_override = None;
     apply_rewrites_full(
         req,
         path,
@@ -1306,6 +1307,7 @@ fn apply_rewrites_parts(
         server,
         default_type,
         server_port,
+        &mut ignored_override,
     )
     .0
 }
@@ -1323,6 +1325,9 @@ fn apply_rewrites_full(
     server: &Server,
     default_type: &str,
     server_port: u16,
+    // Set when a matching `if` carried its own `proxy_pass`, which nginx lets
+    // override the location's target while the condition holds.
+    proxy_override: &mut Option<(crate::config::ProxyPass, Option<String>)>,
 ) -> (RewriteOutcome, std::collections::HashMap<String, String>) {
     let mut uri = path.to_string();
     let mut args = query.to_string();
@@ -1368,6 +1373,12 @@ fn apply_rewrites_full(
                 let Some(ifb) = ifs.get(idx) else {
                     continue;
                 };
+                // Remember a `proxy_pass` carried by this `if`; it only takes
+                // effect if the condition matches (checked just below).
+                let if_proxy = ifb
+                    .proxy_pass
+                    .clone()
+                    .map(|pp| (pp, ifb.proxy_upstream_name.clone()));
                 if let Some(out) = run_if(
                     ifb,
                     req,
@@ -1379,6 +1390,11 @@ fn apply_rewrites_full(
                     server_port,
                 ) {
                     return (out, vars);
+                }
+                // The condition held and produced no terminal outcome, so an
+                // `if`-scoped `proxy_pass` now owns the target.
+                if if_proxy.is_some() {
+                    *proxy_override = if_proxy;
                 }
             }
         }
@@ -2700,7 +2716,7 @@ pub enum Target<'a> {
     Loc(
         String,
         String,
-        &'a LocCfg,
+        std::borrow::Cow<'a, LocCfg>,
         bool,
         bool,
         std::collections::HashMap<String, String>,
@@ -2755,6 +2771,20 @@ pub fn resolve_target<'a>(
     // Whether a rewrite inside the location currently being processed changed
     // the URI (a relocation starts fresh rules for the new location).
     let mut uri_rewritten = false;
+    // `proxy_pass` supplied by a matching `if` or `limit_except`, which replaces
+    // the location's target for this request.
+    let mut proxy_override: Option<(crate::config::ProxyPass, Option<String>)> = None;
+    // `limit_except GET { proxy_pass ...; }` applies to every method *not*
+    // listed, so it is decided once from the request method.
+    for le in &cur_loc.limit_except {
+        if !le.methods.iter().any(|m| m == req.method.as_str()) {
+            if le.proxy_pass.is_some() {
+                proxy_override =
+                    le.proxy_pass.clone().map(|pp| (pp, le.proxy_upstream_name.clone()));
+            }
+            break;
+        }
+    }
     loop {
         let loc_path_in = cur_path.clone();
         let (outcome, phase_vars) = apply_rewrites_full(
@@ -2768,6 +2798,7 @@ pub fn resolve_target<'a>(
             server,
             &http.default_type,
             server_port,
+            &mut proxy_override,
         );
         vars.extend(phase_vars);
         match outcome {
@@ -2817,8 +2848,34 @@ pub fn resolve_target<'a>(
         }
     }
 
-    Target::Loc(cur_path, cur_query, cur_loc, skip_return, uri_rewritten, vars)
+    // An `if` or `limit_except` `proxy_pass` replaces the location's target.
+    // Cloning the config is only done when an override actually applies.
+    if let Some((pp, name)) = proxy_override.take() {
+        let mut overridden = cur_loc.clone();
+        if name.is_some() {
+            overridden.proxy_upstream_name = name;
+        }
+        overridden.proxy_pass = Some(pp);
+        return Target::Loc(
+            cur_path,
+            cur_query,
+            std::borrow::Cow::Owned(overridden),
+            skip_return,
+            uri_rewritten,
+            vars,
+        );
+    }
+
+    Target::Loc(
+        cur_path,
+        cur_query,
+        std::borrow::Cow::Borrowed(cur_loc),
+        skip_return,
+        uri_rewritten,
+        vars,
+    )
 }
+
 
 #[allow(clippy::too_many_arguments)]
 pub async fn resolve_response_caps(
@@ -2993,7 +3050,7 @@ pub async fn resolve_response_local(
                 req,
                 &p,
                 &q,
-                l,
+                &l,
                 skip,
                 server,
                 http,
@@ -3083,7 +3140,7 @@ pub async fn resolve_response_state(
                 req,
                 &p,
                 &q,
-                l,
+                &l,
                 skip,
                 server,
                 http,
@@ -3637,7 +3694,7 @@ async fn finalize_response(
                     req,
                     &cur_path,
                     &cur_query,
-                    l,
+                    &l,
                     server,
                     http,
                     true,
@@ -3972,25 +4029,39 @@ async fn dispatch(
 
     // Rewrite/try_files may point at a different location; resolve it before
     // choosing a content handler so `/x -> /fallback` can reach a proxy.
-    let (resolved_path, resolved_query, resolved_loc, skip_return, uri_rewritten, pre, mut set_vars) =
-        match resolve_target(req, path, query, server, loc, http, listen_port) {
-            Target::Done(r) => (
-                path.to_string(),
-                query.to_string(),
-                loc,
-                false,
-                false,
-                Some(r),
-                Default::default(),
-            ),
-            Target::Loc(p, q, l, skip, rewritten, set_vars) => {
-                (p, q, l, skip, rewritten, None, set_vars)
-            }
-        };
+    // `resolve_target` may hand back a location that carries an `if`/`limit_except`
+    // `proxy_pass` override, so `loc` is a Cow rather than a plain reference.
+    let resolved_path;
+    let resolved_query;
+    let resolved_loc: std::borrow::Cow<'_, LocCfg>;
+    let skip_return;
+    let uri_rewritten;
+    let pre;
+    let mut set_vars;
+    match resolve_target(req, path, query, server, loc, http, listen_port) {
+        Target::Done(r) => {
+            resolved_path = path.to_string();
+            resolved_query = query.to_string();
+            resolved_loc = std::borrow::Cow::Borrowed(loc);
+            skip_return = false;
+            uri_rewritten = false;
+            pre = Some(r);
+            set_vars = Default::default();
+        }
+        Target::Loc(p, q, l, skip, rewritten, sv) => {
+            resolved_path = p;
+            resolved_query = q;
+            resolved_loc = l;
+            skip_return = skip;
+            uri_rewritten = rewritten;
+            pre = None;
+            set_vars = sv;
+        }
+    }
     let (path, query, loc) = (
         resolved_path.as_str(),
         resolved_query.as_str(),
-        resolved_loc,
+        &*resolved_loc,
     );
 
     // `real_ip_*`: a trusted proxy's header rewrites $remote_addr. The

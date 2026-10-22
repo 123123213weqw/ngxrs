@@ -389,6 +389,11 @@ pub struct IfBlock {
     pub rewrites: Vec<Rewrite>,
     pub ret: Option<(u16, String)>,
     pub sets: Vec<(String, String)>,
+    /// `proxy_pass` inside `if` — nginx allows it and it replaces the
+    /// location's target while the condition holds.
+    pub proxy_pass: Option<ProxyPass>,
+    /// Upstream name, as `LocCfg::proxy_upstream_name` records it.
+    pub proxy_upstream_name: Option<String>,
 }
 
 /// One entry of the rewrite-phase script, in source order.
@@ -419,6 +424,10 @@ pub enum IfCond {
 pub struct LimitExcept {
     pub methods: Vec<String>,
     pub rules: Vec<AccessRule>,
+    /// `limit_except GET { proxy_pass ...; }` replaces the location's target
+    /// for every method *not* listed.
+    pub proxy_pass: Option<ProxyPass>,
+    pub proxy_upstream_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -919,6 +928,10 @@ pub enum LbMethod {
     /// `hash <key> [consistent]` — the key is a complex value expanded per
     /// request.
     Hash { key: String, consistent: bool },
+    /// `random [two [least_conn]]`. `two` picks two peers and takes the better
+    /// of them; `least_conn` makes that comparison least-connections instead of
+    /// the default (fewest requests in flight, then random).
+    Random { two: bool, least_conn: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -927,6 +940,14 @@ pub struct Upstream {
     pub servers: Vec<UpstreamServer>,
     pub method: LbMethod,
     pub keepalive: usize,
+    /// `keepalive_requests N`: nginx closes an idle pooled connection after it
+    /// has carried N requests (default 1000).
+    pub keepalive_requests: u64,
+    /// `keepalive_time T`: maximum age of a pooled connection (default 1h).
+    pub keepalive_time: Duration,
+    /// `keepalive_timeout T`: how long an idle pooled connection is kept
+    /// (nginx upstream default 60s).
+    pub keepalive_timeout: Duration,
     /// `hash ... consistent` ring, built once at config time:
     /// `(crc32 point hash, server index)`, sorted by hash with duplicates
     /// removed — nginx's `ngx_http_upstream_update_chash`.
@@ -1446,6 +1467,9 @@ fn parse_upstream(d: &Directive) -> Result<Upstream, ConfigError> {
         servers: Vec::new(),
         method: LbMethod::RoundRobin,
         keepalive: 0,
+        keepalive_requests: 1000,
+        keepalive_time: Duration::from_secs(3600),
+        keepalive_timeout: Duration::from_secs(60),
         chash_points: Vec::new(),
     };
 
@@ -1496,6 +1520,26 @@ fn parse_upstream(d: &Directive) -> Result<Upstream, ConfigError> {
             }
             "least_conn" => up.method = LbMethod::LeastConn,
             "ip_hash" => up.method = LbMethod::IpHash,
+            "random" => {
+                let two = child.args.first().map(|a| a == "two").unwrap_or(false);
+                let least_conn = child.args.iter().any(|a| a == "least_conn");
+                up.method = LbMethod::Random { two, least_conn };
+            }
+            "keepalive_time" => {
+                if let Some(t) = child.args.first().and_then(|v| parse_time(v)) {
+                    up.keepalive_time = t;
+                }
+            }
+            "keepalive_requests" => {
+                if let Some(n) = child.args.first().and_then(|v| v.parse::<u64>().ok()) {
+                    up.keepalive_requests = n;
+                }
+            }
+            "keepalive_timeout" => {
+                if let Some(t) = child.args.first().and_then(|v| parse_time(v)) {
+                    up.keepalive_timeout = t;
+                }
+            }
             "keepalive" => {
                 up.keepalive = child
                     .args
@@ -2377,6 +2421,8 @@ impl Builder {
                 let mut cond = parse_if_cond(&d.args)
                     .ok_or_else(|| sem(&d.file, d.line, "unsupported if condition"))?;
                 let mut ifb = IfBlock {
+                    proxy_pass: None,
+                    proxy_upstream_name: None,
                     cond: IfCond::Truthy(String::new()),
                     rewrites: Vec::new(),
                     ret: None,
@@ -2421,6 +2467,17 @@ impl Builder {
                             }
                         }
                         "break" => {}
+                        // nginx allows `proxy_pass` inside `if`; it takes over
+                        // from the location while the condition holds.
+                        "proxy_pass" => {
+                            let v = child.args.first().ok_or_else(|| {
+                                sem(&child.file, child.line, "proxy_pass requires a URL")
+                            })?;
+                            ifb.proxy_pass = Some(parse_proxy_pass(v).ok_or_else(|| {
+                                sem(&child.file, child.line, format!("invalid proxy_pass URL \"{v}\""))
+                            })?);
+                            ifb.proxy_upstream_name = proxy_upstream_name(v);
+                        }
                         other => {
                             return Err(sem(
                                 &child.file,
@@ -2438,14 +2495,23 @@ impl Builder {
             }
             "break" => {}
             "return" => {
-                if d.args.len() < 1 {
+                if d.args.is_empty() {
                     return Err(sem(&d.file, d.line, "return requires a status code"));
                 }
-                let code: u16 = d.args[0]
-                    .parse()
-                    .map_err(|_| sem(&d.file, d.line, "return requires a numeric status"))?;
-                let body = d.args.get(1).cloned().unwrap_or_default();
-                cfg.ret = Some((code, body));
+                // `return <non-numeric>` is nginx's shorthand for a 302 whose
+                // Location is the argument (which may be a variable or an
+                // expression like `http://127.0.0.1:8081$uri`). Only a leading
+                // decimal number is a status code.
+                match d.args[0].parse::<u16>() {
+                    Ok(code) => {
+                        let body = d.args.get(1).cloned().unwrap_or_default();
+                        cfg.ret = Some((code, body));
+                    }
+                    Err(_) => {
+                        let target = d.args[0].clone();
+                        cfg.ret = Some((302, target));
+                    }
+                }
             }
             "try_files" => {
                 if d.args.len() < 2 {
@@ -2601,6 +2667,8 @@ impl Builder {
                 let mut le = LimitExcept {
                     methods: d.args.iter().map(|m| m.to_uppercase()).collect(),
                     rules: Vec::new(),
+                    proxy_pass: None,
+                    proxy_upstream_name: None,
                 };
                 for child in block {
                     if child.name == "allow" || child.name == "deny" {
@@ -2623,6 +2691,14 @@ impl Builder {
                             net,
                             unix: false,
                         });
+                    } else if child.name == "proxy_pass" {
+                        let v = child.args.first().ok_or_else(|| {
+                            sem(&child.file, child.line, "proxy_pass requires a URL")
+                        })?;
+                        le.proxy_pass = Some(parse_proxy_pass(v).ok_or_else(|| {
+                            sem(&child.file, child.line, format!("invalid proxy_pass URL \"{v}\""))
+                        })?);
+                        le.proxy_upstream_name = proxy_upstream_name(v);
                     }
                 }
                 cfg.limit_except.push(le);

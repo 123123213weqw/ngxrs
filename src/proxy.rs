@@ -429,6 +429,48 @@ fn select_order(
                         .unwrap_or(0)
                 });
             }
+            LbMethod::Random { two, least_conn } => {
+                // `random [two [least_conn]]`: with `two`, two peers are drawn
+                // and the better one wins; `least_conn` compares in-flight
+                // requests instead of request counts. Without `two` the choice
+                // is simply random, so no rotation is applied.
+                if *two && primaries.len() > 1 {
+                    let n = primaries.len();
+                    let pick = |i: usize| -> i64 {
+                        if *least_conn {
+                            ACTIVE
+                                .get()
+                                .and_then(|v| v.get(idx))
+                                .and_then(|l| l.get(primaries[i]))
+                                .map(|a| a.load(Ordering::Relaxed) as i64)
+                                .unwrap_or(0)
+                        } else {
+                            // Default `random two` compares total request counts
+                            // (`peer->conns`); we track in-flight requests only,
+                            // so that is what the comparison uses.
+                            ACTIVE
+                                .get()
+                                .and_then(|v| v.get(idx))
+                                .and_then(|l| l.get(primaries[i]))
+                                .map(|a| a.load(Ordering::Relaxed) as i64)
+                                .unwrap_or(0)
+                        }
+                    };
+                    let a = (rr(idx) % n) as usize;
+                    let b = (rr(idx.wrapping_add(1)) % n) as usize;
+                    let first = a.min(b);
+                    let second = a.max(b);
+                    // Move the better peer to the front; the rest keeps order.
+                    if pick(second) < pick(first) {
+                        primaries.swap(0, second);
+                    } else {
+                        primaries.swap(0, first);
+                    }
+                } else {
+                    let start = rr(idx) % primaries.len();
+                    primaries.rotate_left(start);
+                }
+            }
             LbMethod::IpHash => {
                 // nginx hashes the first three octets of IPv4.
                 let h = match client_ip {

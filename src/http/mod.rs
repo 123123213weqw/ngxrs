@@ -1669,6 +1669,35 @@ pub fn split_head(raw: &[u8]) -> Vec<(String, String)> {
 }
 
 /// Apply the `expires` directive to a rendered header block.
+/// The `Last-Modified` epoch of a rendered header block, if present.
+fn last_modified_of(raw: &[u8]) -> Option<i64> {
+    let text = String::from_utf8_lossy(raw);
+    for line in text.split("\r\n") {
+        if let Some(v) = line
+            .to_ascii_lowercase()
+            .starts_with("last-modified:")
+            .then(|| line[15..].trim())
+        {
+            if let Some(t) = crate::util::parse_http_date(v) {
+                return Some(t);
+            }
+        }
+    }
+    None
+}
+
+/// The server's local UTC offset at `t` (seconds east), via libc's localtime.
+fn local_utc_offset(t: i64) -> i64 {
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        let tt = t as libc::time_t;
+        if libc::localtime_r(&tt, &mut tm).is_null() {
+            return 0;
+        }
+        tm.tm_gmtoff as i64
+    }
+}
+
 pub fn apply_expires(raw: &mut Vec<u8>, loc: &LocCfg) {
     let Some(spec) = &loc.expires else { return };
     let spec = spec.trim();
@@ -1683,43 +1712,118 @@ pub fn apply_expires(raw: &mut Vec<u8>, loc: &LocCfg) {
             Some(CacheControl::Fixed("max-age=315360000")),
         ),
         other => {
-            let (neg, body) = match other.strip_prefix('-') {
-                Some(rest) => (true, rest),
+            // `modified <time>` anchors on Last-Modified (falling back to
+            // now); `@Hh[Mm[Ss]]` is a daily time — the next occurrence of
+            // that time of day.
+            let (modified, rest) = match other.strip_prefix("modified ") {
+                Some(r) => (true, r.trim()),
                 None => (false, other),
             };
-            match crate::config::parse_time(body) {
-                Some(d) => {
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64;
-                    let secs = d.as_secs() as i64;
-                    let at = if neg { now - secs } else { now + secs };
-                    let max_age = if neg { 0 } else { secs };
-                    (util::http_date(at), Some(CacheControl::MaxAge(max_age)))
+            if let Some(daily) = rest.strip_prefix('@') {
+                // nginx reads the daily time in the server's *local* zone
+                // (`ngx_time_next_expiration` works on broken-down time).
+                let of_day = crate::config::parse_time(daily)
+                    .map(|d| (d.as_secs() % 86_400) as i64)
+                    .unwrap_or(0);
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                let local = now + local_utc_offset(now);
+                let today_start = local - local % 86_400;
+                let mut local_at = today_start + of_day;
+                if local_at <= local {
+                    local_at += 86_400;
                 }
-                None => (String::new(), None),
+                let at = local_at - local_utc_offset(local_at);
+                let max_age = at - now;
+                (util::http_date(at), Some(CacheControl::MaxAge(max_age)))
+            } else {
+                let (neg, body) = match rest.strip_prefix('-') {
+                    Some(rest) => (true, rest),
+                    None => (false, rest.strip_prefix('+').unwrap_or(rest)),
+                };
+                let d = crate::config::parse_time(body)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                let base = if modified {
+                    last_modified_of(raw).unwrap_or(now)
+                } else {
+                    now
+                };
+                let at = if neg { base - d } else { base + d };
+                // nginx: a moment at or before "now" turns the Cache-Control
+                // into `no-cache` (negative times land here too).
+                let cc = if at <= now {
+                    CacheControl::Fixed("no-cache")
+                } else {
+                    CacheControl::MaxAge(at - now)
+                };
+                (util::http_date(at), Some(cc))
             }
         }
     };
-    // nginx's expires *replaces* any Cache-Control the upstream produced.
+    // nginx's expires *replaces* any Cache-Control the upstream produced —
+    // in place: a proxied `Cache-Control` keeps its slot and the new value,
+    // while a response without one gets both headers appended (Expires first,
+    // then Cache-Control, as `ngx_http_headers_filter` orders them).
     if cache_control.is_some() || !expires_value.is_empty() {
         let text = String::from_utf8_lossy(raw).to_string();
-        let kept: Vec<&str> = text
-            .split("\r\n")
-            .filter(|line| {
-                !line.is_empty()
-                    && !line.to_ascii_lowercase().starts_with("cache-control:")
-                    && !(cache_control.is_some()
-                        && line.to_ascii_lowercase().starts_with("expires:"))
-            })
-            .collect();
         let mut rebuilt = Vec::with_capacity(raw.len());
-        for line in kept {
+        let mut cc_placed = false;
+        for line in text.split("\r\n") {
+            let lower = line.to_ascii_lowercase();
+            if lower.starts_with("cache-control:") {
+                if let (Some(cc), false) = (&cache_control, cc_placed) {
+                    rebuilt.extend_from_slice(b"Cache-Control: ");
+                    let v = match cc {
+                        CacheControl::Fixed(v) => v.to_string(),
+                        CacheControl::MaxAge(n) => format!("max-age={n}"),
+                    };
+                    rebuilt.extend_from_slice(v.as_bytes());
+                    rebuilt.extend_from_slice(b"\r\n");
+                    cc_placed = true;
+                }
+                continue;
+            }
+            if cache_control.is_some() && lower.starts_with("expires:") {
+                continue;
+            }
+            if line.is_empty() {
+                continue;
+            }
             rebuilt.extend_from_slice(line.as_bytes());
             rebuilt.extend_from_slice(b"\r\n");
         }
         *raw = rebuilt;
+        if let Some(cc) = &cache_control {
+            // A response that had no Cache-Control gets both appended, the
+            // Expires header first (ngx_http_headers_filter's order); one
+            // that had it keeps the slot (handled above).
+            if !cc_placed && !expires_value.is_empty() {
+                raw.extend_from_slice(b"Expires: ");
+                raw.extend_from_slice(expires_value.as_bytes());
+                raw.extend_from_slice(b"\r\n");
+            }
+            if !cc_placed {
+                raw.extend_from_slice(b"Cache-Control: ");
+                let v = match cc {
+                    CacheControl::Fixed(v) => v.to_string(),
+                    CacheControl::MaxAge(n) => format!("max-age={n}"),
+                };
+                raw.extend_from_slice(v.as_bytes());
+                raw.extend_from_slice(b"\r\n");
+            } else if !expires_value.is_empty() {
+                raw.extend_from_slice(b"Expires: ");
+                raw.extend_from_slice(expires_value.as_bytes());
+                raw.extend_from_slice(b"\r\n");
+            }
+            return;
+        }
     }
 
     if !expires_value.is_empty() {

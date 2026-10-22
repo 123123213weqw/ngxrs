@@ -1284,30 +1284,42 @@ fn mail_protocol(v: &str) -> Option<crate::mail::Protocol> {
 }
 
 pub fn parse_time(s: &str) -> Option<Duration> {
-    if let Some(num) = s.strip_suffix("ms") {
-        // Bare "ms" has no numeric part.
-        if num.is_empty() {
+    // nginx's time grammar sums unit tokens in any order: `1h30m`, `1d 12h`,
+    // `500` (bare seconds). A bare number must end the value.
+    let mut total_ms: u64 = 0;
+    let mut rest = s;
+    while !rest.is_empty() {
+        let digits = rest.bytes().take_while(|c| c.is_ascii_digit()).count();
+        if digits == 0 {
             return None;
         }
-        return num.parse::<u64>().ok().map(Duration::from_millis);
+        let (n, tail) = rest.split_at(digits);
+        let n: u64 = n.parse().ok()?;
+        if tail.is_empty() {
+            total_ms = total_ms.saturating_add(n.saturating_mul(1000));
+            break;
+        }
+        let (mult, consumed) = if let Some(t) = tail.strip_prefix("ms") {
+            (1u64, t)
+        } else {
+            let mut ch = tail.chars();
+            let c = ch.next()?;
+            let m = match c {
+                's' => 1000,
+                'm' => 60 * 1000,
+                'h' => 3600 * 1000,
+                'd' => 86400 * 1000,
+                'w' => 7 * 86400 * 1000,
+                'M' => 30 * 86400 * 1000,
+                'y' => 365 * 86400 * 1000,
+                _ => return None,
+            };
+            (m, ch.as_str())
+        };
+        total_ms = total_ms.saturating_add(n.saturating_mul(mult));
+        rest = consumed;
     }
-    let b = s.as_bytes();
-    let (num, mult) = match b.last()? {
-        b's' => (&s[..s.len() - 1], 1000u64),
-        b'm' => (&s[..s.len() - 1], 60 * 1000),
-        b'h' => (&s[..s.len() - 1], 3600 * 1000),
-        b'd' => (&s[..s.len() - 1], 86400 * 1000),
-        b'w' => (&s[..s.len() - 1], 7 * 86400 * 1000),
-        b'M' => (&s[..s.len() - 1], 30 * 86400 * 1000),
-        b'y' => (&s[..s.len() - 1], 365 * 86400 * 1000),
-        _ => (s, 1000),
-    };
-    if num.is_empty() {
-        return None;
-    }
-    num.parse::<u64>()
-        .ok()
-        .map(|v| Duration::from_millis(v.saturating_mul(mult)))
+    Some(Duration::from_millis(total_ms))
 }
 
 fn resolve_path(prefix: &Path, p: &str) -> PathBuf {
@@ -2423,7 +2435,24 @@ impl Builder {
             }
             "internal" => cfg.internal = true,
             "expires" => {
-                cfg.expires = Some(d.args.first().cloned().unwrap_or_else(|| "off".into()));
+                // `expires` is TAKE12: only `modified <time>` uses two args.
+                let spec = if d.args.len() >= 2 && d.args[0] == "modified" {
+                    d.args[..2].join(" ")
+                } else {
+                    d.args.first().cloned().unwrap_or_else(|| "off".into())
+                };
+                // nginx: "expires modified @..." does not parse ("daily time
+                // cannot be used with modified parameter").
+                if let Some(rest) = spec.strip_prefix("modified ") {
+                    if rest.trim_start().starts_with('@') {
+                        return Err(sem(
+                            &d.file,
+                            d.line,
+                            "daily time cannot be used with \"modified\" parameter".to_string(),
+                        ));
+                    }
+                }
+                cfg.expires = Some(spec);
             }
             "error_log" => {
                 if let Some(spec) = parse_log_spec(&self.prefix, &d.args) {

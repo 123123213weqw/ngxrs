@@ -998,3 +998,41 @@ nginx 395）；`bench/all.sh` 70/70、单元测试 122/122。
 
 顺带：`return 302 "text"` 的直连响应此前 Location 会被 `write_redirect` 丢弃
 的问题同样暴露并修复。
+
+## 本轮（expires 全语义 + 错误条目缓存的 Cache-Control 交互）
+
+`expires` 从"已解析未生效"补齐为全语义实现，`bench/expires_probe.conf`
+十种形式（off/epoch/max/相对时间/`@15h`/`@15h30m`/`modified +1h`/负时间/
+代理替换）双端输出与 nginx **逐字节一致**。顺带修掉新纳入追踪的
+`proxy_cache_valid.t`（12/14 → **14/14**）。A/B 18 文件 334/334 全部一致，
+`bench/all.sh` 70/70，单测 122/122。
+
+### expires
+
+- `@time`（每日定时）：**服务器本地时区**的下一个该时刻（libm `tm_gmtoff`），
+  `max-age` 为距此刻的秒数——按 UTC 算会差出时区（实测 V100 UTC+8）。
+- `modified <time>`：锚定 Last-Modified（缺失回落到 now）；`+1h` 的加号前缀
+  要剥掉。过期时刻 **≤ now 一律 `Cache-Control: no-cache`**（负时间因此天然
+  是 no-cache，不是 max-age=0）。
+- `expires modified @...`：配置期拒绝（与 nginx 同样的报错文案）。
+- 上游 `Cache-Control` 是**原位替换**（代理响应里保持原位置，Expires 追加在
+  末尾）；自身没有的响应按 Expires 在前、Cache-Control 在后的顺序追加。
+- `expires` 是 TAKE12：`modified +1h` 以两个参数到达，需要拼接（此前只存了
+  "modified"）。
+
+### parse_time 复合时间
+
+只认单单位（`1h`）改为 nginx 语法：单位标记按任意顺序累加（`1h30m`、
+`1d 12h`），裸数字为秒。`@15h30m` 依赖此修复。
+
+### proxy_cache_valid（存量缺陷，基线 9294b16 即失败，经二进制对照确认）
+
+- 拦截错误（`proxy_intercept_errors` + `error_page`）写缓存时把**空的响应头**
+  传给了 ttl：上游错误响应携带的 `Cache-Control: max-age=N` 被无视（nginx
+  ticket #1382：错误条目的有效期应取自 max-age），`no-cache` 也没有阻止
+  缓存。现在传入真实头，14/14。
+
+### 追踪清单状态
+
+A/B 清单现存 **19 个文件全部持平**（含本轮新增 expires 探针与
+proxy_cache_valid），无任何 WORSE/BETTER/UNRUN。

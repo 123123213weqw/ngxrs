@@ -2386,8 +2386,12 @@ async fn exchange(
             // `proxy_cache_bypass` means "do not use the cache at all", so such
             // a request must not seed an error entry either.
             if cache.status != "BYPASS" {
+                // The upstream headers decide cacheability here too: a
+                //  on the error stores it for N
+                // seconds (nginx ticket #1382),  stores nothing.
+                let cc_headers = crate::http::split_head(&head.raw);
                 if let Some(valid) =
-                    crate::cache::ttl(loc, head.status, &[], loc.proxy_cache_ignore)
+                    crate::cache::ttl(loc, head.status, &cc_headers, loc.proxy_cache_ignore)
                 {
                     let entry = crate::cache::Cached {
                         status: head.status,

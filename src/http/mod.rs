@@ -3758,6 +3758,11 @@ async fn finalize_response(
     );
 
     apply_expires(&mut out.raw, cur_loc, out.status);
+    // nginx's header filter turns *any* `Location` that starts with `/` into an
+    // absolute URL when `absolute_redirect` is on -- including one an upstream
+    // sent and `proxy_redirect` rewrote. Verified with `proxy_redirect.t`, whose
+    // expectations are absolute.
+    absolutize_location(&mut out.raw, req, cur_loc, server_port, local_addr);
 
     if !cur_loc.headers.is_empty() || !cur_loc.trailers.is_empty() {
         // `$sent_http_*` sees the headers produced so far (nginx evaluates
@@ -5876,3 +5881,51 @@ mod tests {
         assert_eq!(expand_log("[$status] $request_uri", &vars, 0), "[200] /x");
     }
 }
+
+/// Absolutise a relative `Location` in a rendered header block, matching
+/// nginx's `ngx_http_header_filter`. `Refresh` is left alone: nginx only
+/// rewrites the `Location` header this way.
+fn absolutize_location(
+    raw: &mut Vec<u8>,
+    req: &Request,
+    loc: &LocCfg,
+    listen_port: u16,
+    local_addr: &str,
+) {
+    if !loc.absolute_redirect {
+        return;
+    }
+    let head_end = match raw.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(i) => i + 2,
+        None => return,
+    };
+    let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
+    if !head.to_ascii_lowercase().contains("\r\nlocation:") {
+        return;
+    }
+    let mut out = String::with_capacity(head.len() + 64);
+    for line in head.split_inclusive("\r\n") {
+        let trimmed = line.trim_end_matches("\r\n");
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("location:") {
+            let value = trimmed[9..].trim();
+            if let Some(rest) = value.strip_prefix('/') {
+                let abs = redirect_location(
+                    req,
+                    loc,
+                    &format!("/{rest}"),
+                    listen_port,
+                    local_addr,
+                );
+                out.push_str("Location: ");
+                out.push_str(&abs);
+                out.push_str("\r\n");
+                continue;
+            }
+        }
+        out.push_str(line);
+    }
+    out.push_str(&String::from_utf8_lossy(&raw[head_end..]));
+    *raw = out.into_bytes();
+}
+

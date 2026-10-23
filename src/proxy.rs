@@ -2340,6 +2340,7 @@ async fn exchange(
                     raw.extend_from_slice(b"\r\n");
                 }
                 crate::http::apply_expires(&mut raw, loc, entry.status);
+                apply_proxy_redirect(&mut raw, loc, vars);
                 crate::http::apply_add_headers_upstream(
                     &mut raw,
                     &loc.headers,
@@ -2628,6 +2629,7 @@ async fn exchange(
 
         let mut out_raw = raw;
         apply_cookie_rules(&mut out_raw, loc, vars);
+        apply_proxy_redirect(&mut out_raw, loc, vars);
         crate::http::apply_expires(&mut out_raw, loc, head.status);
         crate::http::apply_add_headers_upstream(
             &mut out_raw,
@@ -2711,6 +2713,7 @@ async fn exchange(
     }
 
     let mut raw = raw;
+    apply_proxy_redirect(&mut raw, loc, vars);
     crate::http::apply_expires(&mut raw, loc, head.status);
     let upstream_headers = crate::http::split_head(&raw);
     crate::http::apply_add_headers_ctx(
@@ -3290,6 +3293,7 @@ pub async fn fetch(
             Chosen::Direct(_, a) => a.to_string(),
             Chosen::Upstream { addr, .. } => addr.to_string(),
         };
+        apply_proxy_redirect(&mut raw, loc, &fetch_vars);
         crate::http::apply_expires(&mut raw, loc, head.status);
         crate::http::apply_add_headers_full(
             &mut raw,
@@ -3872,4 +3876,158 @@ fn span_hash(req: &Request, size: u64) -> u64 {
     req.raw_target.hash(&mut h);
     size.hash(&mut h);
     h.finish()
+}
+
+/// `proxy_redirect`: rewrite the `Location` and `Refresh` headers of a proxied
+/// response.
+///
+/// nginx passes a `prefix` to the rewrite so `Refresh: 7; url=<u>` can have its
+/// `<u>` replaced while `7; url=` survives. For `Refresh` the prefix is
+/// everything up to and including the **last** `=` in the value.
+///
+/// Prefix rules replace the matched prefix and keep the remainder. Regex rules
+/// replace the **whole** URL with the expanded replacement -- the test suite
+/// pins this (`regexp w/captures` expects the trailing `/test.html` to be
+/// dropped, not appended), and it is why a `$1/$2/x.html` replacement produces
+/// nginx's exact output.
+fn apply_proxy_redirect(raw: &mut Vec<u8>, loc: &LocCfg, vars: &crate::http::ServerVars<'_>) {
+    let rules = &loc.proxy_redirects;
+    if rules.is_empty() || matches!(rules.first(), Some(crate::config::RedirectRule::Off)) {
+        return;
+    }
+    // Some call sites pass the header lines only (no terminating blank line),
+    // others pass the whole block; handle both.
+    let head_end = match raw.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(i) => i + 2,
+        None => raw.len(),
+    };
+    let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
+
+    let mut out = String::with_capacity(head.len() + 64);
+    for line in head.split_inclusive("\r\n") {
+        let trimmed = line.trim_end_matches("\r\n");
+        let lower = trimmed.to_ascii_lowercase();
+        let (name, prefix_len) = if lower.starts_with("location:") {
+            // Skip the spaces after the colon: the value starts at the first
+            // non-space, and `before` keeps them verbatim.
+            let mut i = 9;
+            let b = trimmed.as_bytes();
+            while i < b.len() && b[i] == b' ' {
+                i += 1;
+            }
+            ("location", i)
+        } else if lower.starts_with("refresh:") {
+            match trimmed.rfind('=') {
+                Some(i) => ("refresh", i + 1),
+                None => {
+                    out.push_str(line);
+                    continue;
+                }
+            }
+        } else {
+            out.push_str(line);
+            continue;
+        };
+        let _ = name;
+        if prefix_len >= trimmed.len() {
+            out.push_str(line);
+            continue;
+        }
+        let before = &trimmed[..prefix_len];
+        let url = &trimmed[prefix_len..];
+        let mut rewritten = rewrite_one(url, rules, vars).unwrap_or_else(|| url.to_string());
+        if lower.starts_with("location:") {
+            // The proxy path writes straight to the socket and never reaches
+            // `finalize_response`, so the absolutisation nginx's header filter
+            // performs has to happen here. `Refresh` is deliberately excluded:
+            // nginx leaves it relative.
+            rewritten = absolute_location(&rewritten, loc, vars);
+        }
+        out.push_str(before);
+        out.push_str(&rewritten);
+        out.push_str("\r\n");
+    }
+    out.push_str(&String::from_utf8_lossy(&raw[head_end..]));
+    *raw = out.into_bytes();
+}
+
+fn rewrite_one(
+    url: &str,
+    rules: &[crate::config::RedirectRule],
+    vars: &crate::http::ServerVars<'_>,
+) -> Option<String> {
+    for rule in rules {
+        match rule {
+            crate::config::RedirectRule::Off => {}
+            crate::config::RedirectRule::Prefix { from, to } => {
+                let from = vars.expand(from);
+                if from.is_empty() || !url.starts_with(&from) {
+                    continue;
+                }
+                return Some(format!("{}{}", vars.expand(to), &url[from.len()..]));
+            }
+            crate::config::RedirectRule::Regex { re, to } => {
+                let Some(caps) = re.captures(url) else { continue };
+                // Positional captures become `$1..$n` for the replacement.
+                let mut expanded = String::new();
+                let bytes = to.as_bytes();
+                let mut i = 0;
+                while i < bytes.len() {
+                    if bytes[i] == b'$' && i + 1 < bytes.len() {
+                        if bytes[i + 1].is_ascii_digit() {
+                            let n = (bytes[i + 1] - b'0') as usize;
+                            if let Some(m) = caps.get(n) {
+                                expanded.push_str(m.as_str());
+                            }
+                            i += 2;
+                            continue;
+                        }
+                        if bytes[i + 1] == b'{' {
+                            if let Some(close) = to[i + 2..].find('}') {
+                                let name = &to[i + 2..i + 2 + close];
+                                if let Some(m) = caps.name(name) {
+                                    expanded.push_str(m.as_str());
+                                }
+                                i += 2 + close + 1;
+                                continue;
+                            }
+                        }
+                    }
+                    expanded.push(bytes[i] as char);
+                    i += 1;
+                }
+                return Some(vars.expand(&expanded));
+            }
+        }
+    }
+    None
+}
+
+/// Absolutise a `Location` value the way `ngx_http_header_filter` does when
+/// `absolute_redirect` is on. Mirrors `http::redirect_location`, without the
+/// listening-socket fallback for a missing Host (that address is not available
+/// on the proxy path; nginx only uses it when the request carried no usable
+/// Host, in which case the value is left relative here).
+fn absolute_location(
+    value: &str,
+    loc: &LocCfg,
+    vars: &crate::http::ServerVars<'_>,
+) -> String {
+    if !loc.absolute_redirect || !value.starts_with('/') {
+        return value.to_string();
+    }
+    let host = if loc.server_name_in_redirect && !loc.server_name.is_empty() {
+        loc.server_name.clone()
+    } else {
+        let h = vars.req.host.as_ref().map(|h| h.as_str()).unwrap_or("");
+        if h.is_empty() || !crate::http::request::host_is_usable(h) {
+            return value.to_string();
+        }
+        h.to_string()
+    };
+    if loc.port_in_redirect && vars.server_port != 80 {
+        format!("http://{}:{}{}", host, vars.server_port, value)
+    } else {
+        format!("http://{}{}", host, value)
+    }
 }

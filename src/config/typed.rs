@@ -211,6 +211,11 @@ pub struct LocCfg {
     pub proxy_cache: Option<String>,
     pub proxy_cache_valid: Vec<(Vec<u16>, Duration)>,
     /// `proxy_cache_lock on|off`, `proxy_cache_lock_timeout`, `_age`.
+    /// `proxy_redirect` rules as written; resolved in `parse_location` once the
+    /// location prefix is known (`default` needs it).
+    pub proxy_redirect_src: Option<Vec<Vec<String>>>,
+    /// Resolved rules. Empty means "do not touch Location/Refresh".
+    pub proxy_redirects: Vec<RedirectRule>,
     /// `proxy_cookie_domain` entries. `Some(vec![])` means `off`.
     pub proxy_cookie_domains: Option<Vec<crate::cookie::CookieRewrite>>,
     pub proxy_cookie_paths: Option<Vec<crate::cookie::CookieRewrite>>,
@@ -353,6 +358,8 @@ impl LocCfg {
             scgi_params: Vec::new(),
             proxy_cache: None,
             proxy_cache_valid: Vec::new(),
+            proxy_redirect_src: None,
+            proxy_redirects: Vec::new(),
             proxy_cookie_domains: None,
             proxy_cookie_paths: None,
             cookie_domains_set: false,
@@ -918,6 +925,23 @@ pub struct UpstreamServer {
     /// `fail_timeout=T` (nginx default 10s): how long a peer with
     /// `fails >= max_fails` stays out of rotation.
     pub fail_timeout: Duration,
+}
+
+/// One resolved `proxy_redirect` rule.
+///
+/// `from`/`to` stay as complex values until request time because nginx expands
+/// variables in both arguments (`proxy_redirect http://$host/ /$some_var/`).
+#[derive(Debug, Clone)]
+pub enum RedirectRule {
+    /// `proxy_redirect off`: leave `Location`/`Refresh` untouched.
+    Off,
+    /// Literal prefix: the matched prefix is replaced and the remainder kept.
+    Prefix { from: String, to: String },
+    /// `~`/`~*`: the **whole** URL after the header prefix is replaced by the
+    /// expansion of `to`, with `$1..$n` taken from the match. Verified against
+    /// nginx by `proxy_redirect.t`: `regexp w/captures` expects the suffix
+    /// `/test.html` to be dropped, not appended.
+    Regex { re: regex::Regex, to: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2804,6 +2828,15 @@ impl Builder {
                 // variables are allowed.
                 cfg.grpc_pass = Some(v.clone());
             }
+            "proxy_redirect" => {
+                let entry: Vec<String> = d.args.clone();
+                if entry.is_empty() {
+                    return Err(sem(&d.file, d.line, "proxy_redirect requires a value"));
+                }
+                // Replace, never append: nginx inherits the whole list from the
+                // enclosing level only when this level declares none.
+                cfg.proxy_redirect_src.get_or_insert_with(Vec::new).push(entry);
+            }
             "proxy_pass" => {
                 let v = d
                     .args
@@ -3347,6 +3380,10 @@ impl Builder {
             .cloned()
             .collect();
         cfg.sub_filters = Vec::new();
+        // `proxy_redirect` declared in this block replaces the inherited list,
+        // so the raw list must start empty here. Leaving the parent's entries in
+        // place made a parent's `off` outrank a child's own rule.
+        cfg.proxy_redirect_src = None;
         // Cookie rewrites are replaced, not inherited-into.
         cfg.cookie_domains_set = false;
         cfg.cookie_paths_set = false;
@@ -3355,14 +3392,26 @@ impl Builder {
             Match::Exact(s) | Match::Prefix(s) | Match::PrefixNoRegex(s) => s.len(),
             _ => 0,
         };
+        // `proxy_redirect` needs this location's own prefix, so it can only be
+        // resolved here -- and only *after* the directives below are applied,
+        // because `default` reads the `proxy_pass` written in this block.
+        let loc_prefix = match &matcher {
+            Match::Exact(s) | Match::Prefix(s) | Match::PrefixNoRegex(s) => s.clone(),
+            _ => String::new(),
+        };
 
-        let mut nested = Vec::new();
-        for child in block {
-            if child.name == "location" {
-                nested.push(self.parse_location(child, &cfg)?);
-            } else if !self.apply_loc(child, &mut cfg)? {
+        // Two passes: this block's own directives first, so `proxy_redirect`
+        // can be resolved (it reads `proxy_pass`), then the nested locations,
+        // which inherit the *resolved* list.
+        for child in block.iter().filter(|c| c.name != "location") {
+            if !self.apply_loc(child, &mut cfg)? {
                 self.unknown(child, "location");
             }
+        }
+        resolve_proxy_redirects(&mut cfg, &loc_prefix);
+        let mut nested = Vec::new();
+        for child in block.iter().filter(|c| c.name == "location") {
+            nested.push(self.parse_location(child, &cfg)?);
         }
 
         Ok(Location {
@@ -5003,3 +5052,86 @@ mod tests {
         assert_eq!(s.locate("/other").ret.as_ref().unwrap().1, "root");
     }
 }
+
+/// Turn the raw `proxy_redirect` arguments into rules.
+///
+/// `default` is nginx's mapping from the proxy_pass URL back to the location
+/// prefix: `http://<host_header><proxy_pass uri>` -> `<location prefix>`. It is
+/// also what applies when the directive is absent entirely.
+fn resolve_proxy_redirects(cfg: &mut LocCfg, prefix: &str) {
+    let Some(src) = cfg.proxy_redirect_src.clone() else {
+        // Not declared here: inherit whatever the parent resolved, except that
+        // a location with none anywhere still gets nginx's implicit `default`.
+        if cfg.proxy_redirects.is_empty() {
+            cfg.proxy_redirects = implicit_default(cfg, prefix);
+        }
+        return;
+    };
+    let mut out: Vec<RedirectRule> = Vec::new();
+    for entry in src {
+        let first = entry.first().map(|s| s.as_str()).unwrap_or("");
+        if first == "off" {
+            out.clear();
+            out.push(RedirectRule::Off);
+            break;
+        }
+        if first == "default" {
+            if let Some(pp) = &cfg.proxy_pass {
+                let from = match &pp.uri {
+                    Some(u) => format!("{}{}", scheme_of(pp), u),
+                    None => format!("{}/", scheme_of(pp)),
+                };
+                out.push(RedirectRule::Prefix {
+                    from,
+                    to: prefix.to_string(),
+                });
+            }
+            continue;
+        }
+        let second = entry.get(1).cloned().unwrap_or_default();
+        if let Some(body) = first.strip_prefix("~*") {
+            if let Some(re) = build_regex(body, true) {
+                out.push(RedirectRule::Regex { re, to: second });
+            }
+        } else if let Some(body) = first.strip_prefix('~') {
+            if let Some(re) = build_regex(body, false) {
+                out.push(RedirectRule::Regex { re, to: second });
+            }
+        } else {
+            out.push(RedirectRule::Prefix {
+                from: first.to_string(),
+                to: second,
+            });
+        }
+    }
+    if out.is_empty() {
+        out = implicit_default(cfg, prefix);
+    }
+    cfg.proxy_redirects = out;
+}
+
+/// `http://` or `https://` followed by the authority, which is how nginx writes
+/// the `from` side of a `proxy_redirect` rule.
+fn scheme_of(pp: &ProxyPass) -> String {
+    format!(
+        "{}://{}",
+        if pp.https { "https" } else { "http" },
+        pp.host_header
+    )
+}
+
+/// nginx's implicit `proxy_redirect default`. It only applies when `proxy_pass`
+/// carries a URI part; `proxy_redirect default` is explicitly invalid otherwise.
+fn implicit_default(cfg: &LocCfg, prefix: &str) -> Vec<RedirectRule> {
+    match (&cfg.proxy_pass, prefix.is_empty()) {
+        (Some(pp), false) => match &pp.uri {
+            Some(u) if !u.contains('$') => vec![RedirectRule::Prefix {
+                from: format!("{}{}", scheme_of(pp), u),
+                to: prefix.to_string(),
+            }],
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+

@@ -47,14 +47,31 @@ pub fn accepted() -> u64 {
     ACCEPTS.fetch_add(1, Ordering::Relaxed);
     HANDLED.fetch_add(1, Ordering::Relaxed);
     ACTIVE.fetch_add(1, Ordering::Relaxed);
-    let n = CONNECTION.fetch_add(1, Ordering::Relaxed) + 1;
-    CONN_SERIAL.with(|v| v.set(n));
-    n
+    CONNECTION.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+tokio::task_local! {
+    /// `$connection` for the connection being served by this task.
+    ///
+    /// A task-local rather than a thread-local: several connections are served
+    /// concurrently on one runtime thread, and a single slot is clobbered by
+    /// whichever task runs last. That is invisible until a server proxies to
+    /// itself in the same process, where the upstream's `$connection` then
+    /// reports the *client* connection's number.
+    static CONN_SERIAL: std::cell::Cell<u64>;
+}
+
+/// Run one connection's future with its serial bound.
+pub fn scope_conn_serial<F>(n: u64, f: F) -> impl std::future::Future<Output = F::Output>
+where
+    F: std::future::Future,
+{
+    CONN_SERIAL.scope(std::cell::Cell::new(n), f)
 }
 
 /// `$connection` for the current connection (0 outside one).
 pub fn conn_serial() -> u64 {
-    CONN_SERIAL.with(|v| v.get())
+    CONN_SERIAL.try_with(|v| v.get()).unwrap_or(0)
 }
 
 pub fn closed() {
@@ -97,11 +114,6 @@ pub fn writing_delta(on: bool) {
             Some(v.saturating_sub(1))
         });
     }
-}
-
-thread_local! {
-    /// This connection's `$connection` number, set on accept.
-    static CONN_SERIAL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Body of a `stub_status` response.

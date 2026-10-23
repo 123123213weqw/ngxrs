@@ -115,6 +115,10 @@ pub struct TlsInfo {
     pub client_verify: String,
     /// PEM of the presented client certificate.
     pub client_cert: String,
+    /// True when the session was resumed — `$ssl_session_reused` reports `r`
+    /// then and `.` otherwise, for both TLS 1.2 and 1.3 (rustls reports a
+    /// resumed handshake for either).
+    pub session_reused: bool,
     /// `/CN=...` subject and issuer of the client certificate.
     pub client_s_dn: String,
     pub client_i_dn: String,
@@ -209,6 +213,10 @@ impl Conn {
             version: version.to_string(),
             cipher,
             server_name: conn.server_name().map(|s| s.to_string()),
+            session_reused: conn
+                .handshake_kind()
+                .map(|k| k == rustls::HandshakeKind::Resumed)
+                .unwrap_or(false),
             ..TlsInfo::default()
         };
         match conn.peer_certificates() {

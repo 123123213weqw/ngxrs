@@ -29,6 +29,8 @@ static POOL: OnceLock<Mutex<HashMap<(usize, u32), Vec<PooledConn>>>> = OnceLock:
 pub enum UpStream {
     Tcp(TcpStream),
     Unix(tokio::net::UnixStream),
+    /// `proxy_pass https://`: the connection is a TLS session over TCP.
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
 }
 
 impl tokio::io::AsyncRead for UpStream {
@@ -40,6 +42,7 @@ impl tokio::io::AsyncRead for UpStream {
         match self.get_mut() {
             UpStream::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
             UpStream::Unix(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            UpStream::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -53,6 +56,7 @@ impl tokio::io::AsyncWrite for UpStream {
         match self.get_mut() {
             UpStream::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
             UpStream::Unix(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            UpStream::Tls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -63,6 +67,7 @@ impl tokio::io::AsyncWrite for UpStream {
         match self.get_mut() {
             UpStream::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
             UpStream::Unix(s) => std::pin::Pin::new(s).poll_flush(cx),
+            UpStream::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -73,13 +78,30 @@ impl tokio::io::AsyncWrite for UpStream {
         match self.get_mut() {
             UpStream::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
             UpStream::Unix(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            UpStream::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
         }
     }
 }
 
 pub struct PooledConn {
     stream: UpStream,
+    /// When the TCP connection was established -- nginx's `keepalive_time`
+    /// bounds the *total* age of a pooled connection, not its idle period.
+    created: Instant,
     last_used: Instant,
+    /// Requests already served over this connection.
+    requests: u64,
+}
+
+/// Per-upstream keepalive limits, filled from the config once.
+static UPSTREAM_KA: OnceLock<Vec<(u64, Duration, Duration)>> = OnceLock::new();
+
+fn ka_limits(idx: usize) -> (u64, Duration, Duration) {
+    UPSTREAM_KA
+        .get()
+        .and_then(|v| v.get(idx).copied())
+        // nginx defaults: 1000 requests, 1h maximum age, 60s idle.
+        .unwrap_or((1000, Duration::from_secs(3600), Duration::from_secs(60)))
 }
 
 /// Called once after the config is built.
@@ -244,41 +266,83 @@ fn connect_retry(e: &io::Error, nu_flags: u32) -> bool {
     nu_flags & want != 0
 }
 
-fn pool_key_of(c: &Chosen) -> (usize, u32) {
-    match c {
+fn pool_key_of(c: &Chosen) -> PoolKey {
+    let (up, sidx) = match c {
         Chosen::Direct(_, a) => (usize::MAX, a.port() as u32),
         Chosen::Unix(_) => (usize::MAX, 0),
         Chosen::Upstream { up, sidx, .. } => (*up, *sidx as u32),
+    };
+    // A fresh connection; `checkout` replaces these when reusing a pooled one.
+    PoolKey {
+        up,
+        sidx,
+        created: Instant::now(),
+        requests: 0,
     }
 }
 
-fn checkout(key: (usize, u32)) -> Option<UpStream> {
+/// `ka_limits` for a direct (non-`upstream`) target: no pooling at all.
+const _: fn(usize) -> (u64, Duration, Duration) = ka_limits;
+
+/// Take a pooled connection, dropping any that outlived their limits.
+///
+/// `keepalive_timeout` is checked here because it is an *idle* limit; a
+/// connection that sat unused for longer is closed and a fresh one opened, which
+/// is what `upstream_keepalive.t` observes as a new `$connection`.
+fn checkout(key: PoolKey) -> Option<(UpStream, Instant, u64)> {
+    // Only the **idle** limit is enforced here. `keepalive_requests` and
+    // `keepalive_time` decide whether a connection is put back into the pool
+    // (`checkin`), not whether it may be taken out: nginx happily serves one
+    // more request on a connection that has reached `keepalive_time` and only
+    // then closes it -- which is what `upstream_keepalive.t` asserts with
+    // "keepalive time last" followed by "keepalive time new".
+    let (_, _, idle_timeout) = ka_limits(key.up);
     let pool = POOL.get()?;
     let mut guard = pool.lock().ok()?;
-    let list = guard.get_mut(&key)?;
+    let list = guard.get_mut(&(key.up, key.sidx))?;
     while let Some(c) = list.pop() {
-        if c.last_used.elapsed() < Duration::from_secs(50) {
-            return Some(c.stream);
+        if c.last_used.elapsed() >= idle_timeout {
+            continue;
         }
+        return Some((c.stream, c.created, c.requests));
     }
     None
 }
 
-fn checkin(key: (usize, u32), stream: UpStream, cap: usize) {
+fn checkin(key: PoolKey, stream: UpStream, cap: usize) {
     if cap == 0 {
+        return;
+    }
+    let (max_req, max_age, _) = ka_limits(key.up);
+    let requests = key.requests + 1;
+    // nginx stops keeping a connection once it has carried `keepalive_requests`
+    // or reached `keepalive_time`; the socket is simply closed, which the
+    // upstream sees as EOF.
+    if requests >= max_req || key.created.elapsed() >= max_age {
         return;
     }
     if let Some(pool) = POOL.get() {
         if let Ok(mut guard) = pool.lock() {
-            let list = guard.entry(key).or_default();
+            let list = guard.entry((key.up, key.sidx)).or_default();
             if list.len() < cap {
                 list.push(PooledConn {
                     stream,
+                    created: key.created,
                     last_used: Instant::now(),
+                    requests,
                 });
             }
         }
     }
+}
+
+/// Identifies a pooled connection and carries its lifetime counters.
+#[derive(Clone, Copy)]
+struct PoolKey {
+    up: usize,
+    sidx: u32,
+    created: Instant,
+    requests: u64,
 }
 
 // ---- selection -----------------------------------------------------------
@@ -1404,7 +1468,7 @@ pub async fn handle(
         // One entry in `$upstream_*` per backend tried.
         let tidx = crate::timing::begin();
         let t_up = std::time::Instant::now();
-        let key = pool_key_of(cand);
+        let mut key = pool_key_of(cand);
         let upstream_addr = match cand {
             Chosen::Direct(_, a) => a.to_string(),
             Chosen::Unix(p) => format!("unix:{}", p.display()),
@@ -1426,10 +1490,35 @@ pub async fn handle(
             let (stream, from_pool, up_idx, sidx) = match cand {
                 Chosen::Direct(_, addr) => {
                     let pooled = if want_pool { checkout(key) } else { None };
+                    let pooled = pooled.map(|(s, created, requests)| {
+                        key.created = created;
+                        key.requests = requests;
+                        s
+                    });
                     match pooled {
                         Some(s) => (s, true, usize::MAX, 0),
                         None => match connect_bound(*addr, bind, loc.proxy_connect_timeout).await {
-                            Ok(s) => (UpStream::Tcp(s), false, usize::MAX, 0),
+                            Ok(s) => {
+                                let up = if pp.https {
+                                    match tls_wrap(
+                                        s,
+                                        loc.proxy_ssl_name.as_deref().unwrap_or(&pp.host_header),
+                                        loc.proxy_ssl_session_reuse,
+                                        loc.proxy_connect_timeout,
+                                    )
+                                    .await
+                                    {
+                                        Ok(t) => t,
+                                        Err(e) => {
+                                            last_err = Some(e);
+                                            continue 'candidates;
+                                        }
+                                    }
+                                } else {
+                                    UpStream::Tcp(s)
+                                };
+                                (up, false, usize::MAX, 0)
+                            }
                             Err(e) => {
                                 let retry = connect_retry(&e, nu_flags);
                                 last_err = Some(e);
@@ -1454,14 +1543,39 @@ pub async fn handle(
                 },
                 Chosen::Upstream { up, sidx, addr, .. } => {
                     let pooled = if want_pool && http.upstreams[*up].keepalive > 0 {
-                        checkout(key)
+                        checkout(key).map(|(st, created, requests)| {
+                            key.created = created;
+                            key.requests = requests;
+                            st
+                        })
                     } else {
                         None
                     };
                     match pooled {
                         Some(s) => (s, true, *up, *sidx),
                         None => match connect_bound(*addr, bind, loc.proxy_connect_timeout).await {
-                            Ok(s) => (UpStream::Tcp(s), false, *up, *sidx),
+                            Ok(s) => {
+                                let stream = if pp.https {
+                                    match tls_wrap(
+                                        s,
+                                        loc.proxy_ssl_name.as_deref().unwrap_or(&pp.host_header),
+                                        loc.proxy_ssl_session_reuse,
+                                        loc.proxy_connect_timeout,
+                                    )
+                                        .await
+                                    {
+                                        Ok(t) => t,
+                                        Err(e) => {
+                                            peer_mark(*up, *sidx, true);
+                                            last_err = Some(e);
+                                            continue 'candidates;
+                                        }
+                                    }
+                                } else {
+                                    UpStream::Tcp(s)
+                                };
+                                (stream, false, *up, *sidx)
+                            }
                             Err(e) => {
                                 peer_mark(*up, *sidx, true);
                                 let retry = connect_retry(&e, nu_flags);
@@ -1582,19 +1696,75 @@ pub async fn handle(
             req.raw_target
         );
     }
+    // nginx answers 504 for a timeout (connect, handshake or read) and 502 for
+    // any other upstream failure.
+    let status = match &last_err {
+        Some(e) if e.kind() == io::ErrorKind::TimedOut => 504,
+        _ => 502,
+    };
     if wanted_more && last_err.is_some() {
         note_group_name(http, &pp);
         return Ok(Some(written(
-            respond_error_upstream(conn, 502, tokens, req.keepalive, loc, &pp).await?,
+            respond_error_upstream(conn, status, tokens, req.keepalive, loc, &pp).await?,
         )));
     }
     Ok(Some(written(
-        respond_error(conn, 502, tokens, req.keepalive).await?,
+        respond_error(conn, status, tokens, req.keepalive).await?,
     )))
 }
 
 async fn connect_timeout(addr: SocketAddr, dur: Duration) -> io::Result<UpStream> {
     Ok(UpStream::Tcp(connect_bound(addr, None, dur).await?))
+}
+
+/// Wrap an established TCP connection in TLS for `proxy_pass https://`.
+///
+/// The SNI name is `proxy_ssl_name` when configured, else the authority of the
+/// `proxy_pass` URL -- nginx's `u->conf->ssl_name` falls back to `u->host`.
+async fn tls_wrap(
+    tcp: TcpStream,
+    sni: &str,
+    reuse: bool,
+    dur: Duration,
+) -> io::Result<UpStream> {
+    let connector = tls_connector(reuse)?;
+    // `proxy_ssl_name` / `u->host` never carries the port, but the authority we
+    // keep as `host_header` does (`127.0.0.1:8082`), so strip it here. A bare IP
+    // is a valid `ServerName` but an `IP:port` string is not.
+    let host = authority_host(sni);
+    let name = match rustls::pki_types::ServerName::try_from(host.clone()) {
+        Ok(n) => n,
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid TLS server name",
+            ))
+        }
+    };
+    let tls = tokio::time::timeout(dur, connector.connect(name, tcp))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tls handshake timed out"))??;
+    Ok(UpStream::Tls(Box::new(tls)))
+}
+
+/// A cached TLS client per resumption setting.
+///
+/// `proxy_ssl_session_reuse on` is the nginx default, and it only works if the
+/// same `ClientConfig` (with its session store) outlives the connection:
+/// building one per connection starts from an empty store every time, so the
+/// upstream can never answer `$ssl_session_reused` with `r`.
+fn tls_connector(reuse: bool) -> io::Result<tokio_rustls::TlsConnector> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<bool, tokio_rustls::TlsConnector>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Some(c) = cache.lock().unwrap().get(&reuse) {
+        return Ok(c.clone());
+    }
+    let connector = crate::grpc::proxy_tls_connector_with_reuse(reuse)
+        .ok_or_else(|| io::Error::other("no TLS client config"))?;
+    cache.lock().unwrap().insert(reuse, connector.clone());
+    Ok(connector)
 }
 
 /// `proxy_pass http://unix:/path:`. A missing socket file is reported like any
@@ -2057,15 +2227,21 @@ fn build_upstream_head(
     } else if is_upgrade && loc.proxy_http_version == 1 {
         // headers already emitted from proxy_set_header
     } else if loc.proxy_http_version == 1 {
-        out.extend_from_slice(b"Connection: ");
-        if loc
-            .proxy_set_headers
-            .iter()
-            .any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.is_empty())
-        {
-            out.extend_from_slice(b"\r\n");
-        } else {
-            out.extend_from_slice(b"close\r\n");
+        // The value must be **expanded** before deciding: `proxy_set_header
+        // Connection $args` with empty `$args` means "send no Connection header"
+        // (keepalive), which is how `upstream_keepalive.t` enables pooling.
+        match set.get("connection") {
+            Some(v) => {
+                let v = expand(v, &vars);
+                if !v.is_empty() {
+                    out.extend_from_slice(b"Connection: ");
+                    out.extend_from_slice(v.as_bytes());
+                    out.extend_from_slice(b"\r\n");
+                }
+            }
+            // Nothing configured: nginx's own proxy config sets `Connection:
+            // close` so a bare `proxy_pass` never pools.
+            None => out.extend_from_slice(b"Connection: close\r\n"),
         }
     } else {
         out.extend_from_slice(b"Connection: close\r\n");
@@ -2167,7 +2343,7 @@ async fn exchange(
     tokens: bool,
     is_upgrade: bool,
     peer_ip: &str,
-    pool_key: (usize, u32),
+    pool_key: PoolKey,
     cache: CacheCtx<'_>,
     upstream_addr: &str,
     vars: &crate::http::ServerVars<'_>,
@@ -2473,7 +2649,10 @@ async fn exchange(
             UpStream::Tcp(tcp) => conn.pipe_with(tcp).await?,
             // `proxy_pass http://unix:` cannot be upgraded; answer like an
             // unusable upstream so the client is not left hanging.
-            UpStream::Unix(_) => {
+            // A TLS session cannot be spliced either: `pipe_with` needs the raw
+            // socket, and an upgrade over TLS would have to re-encrypt both
+            // directions.
+            UpStream::Unix(_) | UpStream::Tls(_) => {
                 return Ok(written(Outcome {
                     status: 502,
                     bytes: 0,
@@ -2889,6 +3068,12 @@ static UPSTREAM_KEEPALIVE: OnceLock<Vec<usize>> = OnceLock::new();
 
 pub fn init_keepalive(http: &Http) {
     let _ = UPSTREAM_KEEPALIVE.set(http.upstreams.iter().map(|u| u.keepalive).collect());
+    let _ = UPSTREAM_KA.set(
+        http.upstreams
+            .iter()
+            .map(|u| (u.keepalive_requests, u.keepalive_time, u.keepalive_timeout))
+            .collect(),
+    );
 }
 
 /// Paces the upstream→client copy for `proxy_limit_rate`.
@@ -4029,5 +4214,20 @@ fn absolute_location(
         format!("http://{}:{}{}", host, vars.server_port, value)
     } else {
         format!("http://{}{}", host, value)
+    }
+}
+
+/// Host part of an `authority`, without the port. Handles `[v6]:port` too.
+fn authority_host(authority: &str) -> String {
+    if let Some(rest) = authority.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return rest[..end].to_string();
+        }
+    }
+    match authority.rsplit_once(':') {
+        // Only strip when the tail really is a port, so a bare IPv6 address
+        // (which contains colons) is left intact.
+        Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => h.to_string(),
+        _ => authority.to_string(),
     }
 }

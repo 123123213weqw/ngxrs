@@ -211,6 +211,11 @@ pub struct LocCfg {
     pub proxy_cache: Option<String>,
     pub proxy_cache_valid: Vec<(Vec<u16>, Duration)>,
     /// `proxy_cache_lock on|off`, `proxy_cache_lock_timeout`, `_age`.
+    /// `proxy_ssl_session_reuse` (nginx default on).
+    pub proxy_ssl_session_reuse: bool,
+    /// `proxy_ssl_name`: the SNI name sent to an `https://` upstream. `None`
+    /// means "use the proxy_pass authority".
+    pub proxy_ssl_name: Option<String>,
     /// `proxy_redirect` rules as written; resolved in `parse_location` once the
     /// location prefix is known (`default` needs it).
     pub proxy_redirect_src: Option<Vec<Vec<String>>>,
@@ -358,6 +363,8 @@ impl LocCfg {
             scgi_params: Vec::new(),
             proxy_cache: None,
             proxy_cache_valid: Vec::new(),
+            proxy_ssl_session_reuse: true,
+            proxy_ssl_name: None,
             proxy_redirect_src: None,
             proxy_redirects: Vec::new(),
             proxy_cookie_domains: None,
@@ -2828,6 +2835,19 @@ impl Builder {
                 // variables are allowed.
                 cfg.grpc_pass = Some(v.clone());
             }
+            "proxy_ssl_session_reuse" => {
+                cfg.proxy_ssl_session_reuse = d.args.first().map(|v| v == "on").unwrap_or(true);
+            }
+            "proxy_ssl_name" => {
+                cfg.proxy_ssl_name = d.args.first().cloned();
+            }
+            "proxy_ssl_verify" | "proxy_ssl_verify_depth" | "proxy_ssl_server_name"
+            | "proxy_ssl_protocols" | "proxy_ssl_ciphers" | "proxy_ssl_trusted_certificate"
+            | "proxy_ssl_crl" | "proxy_ssl_conf_command" | "proxy_ssl_certificate"
+            | "proxy_ssl_certificate_key" | "proxy_ssl_password_file" => {
+                // Accepted; verified TLS towards an upstream is not implemented
+                // (nginx's default is `proxy_ssl_verify off`).
+            }
             "proxy_redirect" => {
                 let entry: Vec<String> = d.args.clone();
                 if entry.is_empty() {
@@ -3380,6 +3400,15 @@ impl Builder {
             .cloned()
             .collect();
         cfg.sub_filters = Vec::new();
+        // A nested location does **not** inherit `proxy_pass`. nginx only
+        // creates the proxy module's location config for a location that
+        // declares a directive of that module, and inheritance happens through
+        // that config -- so a nested location with no proxy directive has no
+        // proxy handler at all. Measured on nginx 1.28: with
+        // `location /p { proxy_pass .../replacement; location /p/plain { } }`,
+        // `/p/plain` is served statically (404), not proxied.
+        cfg.proxy_pass = None;
+        cfg.proxy_upstream_name = None;
         // `proxy_redirect` declared in this block replaces the inherited list,
         // so the raw list must start empty here. Leaving the parent's entries in
         // place made a parent's `off` outrank a child's own rule.

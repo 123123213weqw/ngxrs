@@ -206,16 +206,17 @@ pub async fn handle_conn(conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx: &C
     // Upstream attempt timings are collected per request inside this task; the
     // value is needed by `add_header` deep in the proxy code and by the access
     // logger afterwards, which have no plumbing between them.
+    let serial = crate::stats::accepted();
     crate::timing::scope(
         crate::timing::new_state(),
-        handle_conn_inner(conn, cfg, group_idx, ctx),
+        crate::stats::scope_conn_serial(serial, handle_conn_inner(conn, cfg, group_idx, ctx)),
     )
     .await
 }
 
 async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, ctx: &Ctx) {
     let _active = ActiveGuard::enter();
-    let conn_serial = crate::stats::accepted();
+    let conn_serial = crate::stats::conn_serial();
     // `writing` must fall back to "waiting" when the connection goes idle or
     // closes, so the guard clears it on every exit path.
     struct StatGuard;
@@ -1296,6 +1297,8 @@ fn apply_rewrites_parts(
     server_port: u16,
 ) -> RewriteOutcome {
     let mut ignored_override = None;
+    let mut ignored_seen = false;
+    let mut ignored_missing = false;
     apply_rewrites_full(
         req,
         path,
@@ -1308,6 +1311,8 @@ fn apply_rewrites_parts(
         default_type,
         server_port,
         &mut ignored_override,
+        &mut ignored_seen,
+        &mut ignored_missing,
     )
     .0
 }
@@ -1328,6 +1333,10 @@ fn apply_rewrites_full(
     // Set when a matching `if` carried its own `proxy_pass`, which nginx lets
     // override the location's target while the condition holds.
     proxy_override: &mut Option<(crate::config::ProxyPass, Option<String>)>,
+    // Whether any matching `if` declared `proxy_pass`.
+    if_proxy_seen: &mut bool,
+    // A matching `if` installed a proxy handler but left it without a target.
+    proxy_override_missing: &mut bool,
 ) -> (RewriteOutcome, std::collections::HashMap<String, String>) {
     let mut uri = path.to_string();
     let mut args = query.to_string();
@@ -1373,12 +1382,18 @@ fn apply_rewrites_full(
                 let Some(ifb) = ifs.get(idx) else {
                     continue;
                 };
-                // Remember a `proxy_pass` carried by this `if`; it only takes
-                // effect if the condition matches (checked just below).
+                // nginx gives each matching `if` an implicit location whose conf
+                // is a copy of the enclosing location with the `if`'s own
+                // directives applied, and the **last** matching `if` wins. So a
+                // matching `if` without `proxy_pass` clears the override that an
+                // earlier one installed -- that is why two `if`s both true, the
+                // first carrying `proxy_pass`, answer 500 (no target), while a
+                // single one answers with its own target.
                 let if_proxy = ifb
                     .proxy_pass
                     .clone()
                     .map(|pp| (pp, ifb.proxy_upstream_name.clone()));
+                let mut matched = false;
                 if let Some(out) = run_if(
                     ifb,
                     req,
@@ -1388,13 +1403,24 @@ fn apply_rewrites_full(
                     rewrites,
                     default_type,
                     server_port,
+                    &mut matched,
                 ) {
                     return (out, vars);
                 }
-                // The condition held and produced no terminal outcome, so an
-                // `if`-scoped `proxy_pass` now owns the target.
-                if if_proxy.is_some() {
+                if matched {
+                    if if_proxy.is_some() {
+                        *if_proxy_seen = true;
+                    }
+                    // Every matching `if` replaces the effective target: its own
+                    // `proxy_pass`, or none.
                     *proxy_override = if_proxy;
+                    if *if_proxy_seen && proxy_override.is_none() {
+                        // A proxy handler is active but has no target: nginx
+                        // answers 500 (proxy module with an empty conf).
+                        *proxy_override_missing = true;
+                    } else {
+                        *proxy_override_missing = false;
+                    }
                 }
             }
         }
@@ -1421,6 +1447,10 @@ fn run_if(
     _rewrites: &[crate::config::Rewrite],
     default_type: &str,
     server_port: u16,
+    // Set to whether the condition held. `None` alone cannot distinguish "the
+    // condition was false" from "the condition held but produced no terminal
+    // outcome", and `proxy_pass` inside `if` needs that difference.
+    matched: &mut bool,
 ) -> Option<RewriteOutcome> {
     let cond = {
         let ctx = RwVars {
@@ -1432,6 +1462,7 @@ fn run_if(
         };
         eval_cond(&ifb.cond, &ctx)
     };
+    *matched = cond;
     if !cond {
         return None;
     }
@@ -2499,6 +2530,10 @@ impl<'a> ServerVars<'a> {
             // `$ssl_*` come straight from the TLS session. On plaintext they are
             // empty, which is also nginx's behaviour.
             "ssl_protocol" => tls.map(|t| t.version.clone()).unwrap_or_default(),
+            "ssl_session_reused" => tls
+                .map(|t| if t.session_reused { "r" } else { "." })
+                .unwrap_or(".")
+                .to_string(),
             "ssl_cipher" => tls.map(|t| t.cipher.clone()).unwrap_or_default(),
             "ssl_server_name" => tls.and_then(|t| t.server_name.clone()).unwrap_or_default(),
             "ssl_client_verify" => tls.map(|t| t.client_verify.clone()).unwrap_or_default(),
@@ -2774,6 +2809,8 @@ pub fn resolve_target<'a>(
     // `proxy_pass` supplied by a matching `if` or `limit_except`, which replaces
     // the location's target for this request.
     let mut proxy_override: Option<(crate::config::ProxyPass, Option<String>)> = None;
+    let mut if_proxy_seen = false;
+    let mut proxy_override_missing = false;
     // `limit_except GET { proxy_pass ...; }` applies to every method *not*
     // listed, so it is decided once from the request method.
     for le in &cur_loc.limit_except {
@@ -2799,6 +2836,8 @@ pub fn resolve_target<'a>(
             &http.default_type,
             server_port,
             &mut proxy_override,
+            &mut if_proxy_seen,
+            &mut proxy_override_missing,
         );
         vars.extend(phase_vars);
         match outcome {
@@ -2846,6 +2885,12 @@ pub fn resolve_target<'a>(
             }
             None => {}
         }
+    }
+
+    // A matching `if` installed the proxy handler but left it without a target:
+    // nginx answers 500 (the proxy module runs with an empty conf).
+    if proxy_override_missing {
+        return Target::Done(error_response(500, server.server_tokens));
     }
 
     // An `if` or `limit_except` `proxy_pass` replaces the location's target.

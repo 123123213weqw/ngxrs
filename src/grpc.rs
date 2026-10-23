@@ -345,3 +345,29 @@ mod tests {
         assert_eq!(split_host_port("[::1]", true).unwrap(), ("::1".into(), 443));
     }
 }
+
+/// TLS client for `proxy_pass https://`. ALPN advertises `http/1.1`: the HTTP
+/// proxy speaks HTTP/1 to its upstream, unlike `grpcs://` which speaks HTTP/2.
+///
+/// Verification is off by default, matching `proxy_ssl_verify off` -- nginx's
+/// default for the HTTP proxy module (the *stream* module defaults to on).
+pub fn proxy_tls_connector() -> Option<tokio_rustls::TlsConnector> {
+    proxy_tls_connector_with_reuse(true)
+}
+
+/// Same, but `proxy_ssl_session_reuse off` disables the session store, which is
+/// how nginx makes the upstream report `$ssl_session_reused` as `.` again.
+pub fn proxy_tls_connector_with_reuse(reuse: bool) -> Option<tokio_rustls::TlsConnector> {
+    let provider = rustls::crypto::ring::default_provider();
+    let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(provider.clone()))
+        .with_safe_default_protocol_versions()
+        .ok()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify(Arc::new(provider))))
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    if !reuse {
+        cfg.resumption = rustls::client::Resumption::disabled();
+    }
+    Some(tokio_rustls::TlsConnector::from(Arc::new(cfg)))
+}

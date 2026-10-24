@@ -72,7 +72,7 @@ events { worker_connections 65535; }
 http {
   include $ROOT/conf/mime.types;
   default_type application/octet-stream;
-  sendfile on;
+  sendfile ${SENDFILE:-on};
   tcp_nopush on;
   tcp_nodelay on;
   keepalive_timeout 65;

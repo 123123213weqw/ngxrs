@@ -1,0 +1,111 @@
+# Declared conformance list.
+#
+# Scope: default-build nginx 1.28 http core + proxy/cache/gzip/TLS/HTTP2/
+# fastcgi/uwsgi/scgi/grpc/stream/mail.
+#
+# Selection rule, applied mechanically from a full 348-file scan:
+#   1. the suite is inside the scope above;
+#   2. BOTH servers emitted at least one assertion (a suite that skips on both
+#      sides proves nothing and is excluded -- see the SKIP bucket);
+#   3. no assertion passes on nginx and fails on ngxrs (WORSE = 0);
+#   4. the run is not truncated on our side (TRUNC = 0), i.e. both sides emitted
+#      the same number of assertion lines.
+# Files where BOTH servers fail some assertions are allowed and kept: the
+# criterion is "nginx passes and ngxrs does not", not absolute conformance.
+#
+# Counts are the last measured ngxrs result.
+
+# ---- http core ----
+http_absolute_redirect.t
+http_error_page.t
+http_headers_multi.t
+http_include.t
+http_keepalive.t
+http_keepalive_shutdown.t
+http_location.t
+http_location_auto.t
+http_server_name.t
+http_try_files.t
+http_uri.t
+http_variables.t
+
+# ---- reverse proxy ----
+proxy.t
+proxy_available.t
+proxy_bind.t
+proxy_cache.t
+proxy_cache_bypass.t
+proxy_cache_chunked.t
+proxy_cache_control.t
+proxy_cache_convert_head.t
+proxy_cache_error.t
+proxy_cache_lock.t
+proxy_cache_lock_age.t
+proxy_cache_max_range_offset.t
+proxy_cache_min_free.t
+proxy_cache_path.t
+proxy_cache_range.t
+proxy_cache_revalidate.t
+proxy_cache_use_stale.t
+proxy_cache_valid.t
+proxy_cache_variables.t
+proxy_cache_vary.t
+proxy_chunked_extra.t
+proxy_cookie.t
+proxy_cookie_flags.t
+proxy_duplicate_headers.t
+proxy_force_ranges.t
+proxy_if.t
+proxy_intercept_errors.t
+proxy_limit_rate.t
+proxy_max_temp_file_size.t
+proxy_next_upstream.t
+proxy_noclose.t
+proxy_redirect.t
+proxy_request_buffering_keepalive.t
+proxy_ssi_body.t
+proxy_ssl.t
+proxy_ssl_keepalive.t
+
+# ---- upstream ----
+upstream.t
+upstream_hash.t
+upstream_ip_hash.t
+upstream_keepalive.t
+upstream_least_conn.t
+upstream_random.t
+upstream_zone.t
+upstream_zone_ssl.t
+
+# ---- gzip ----
+gzip.t
+
+# ---- TLS / SNI / HTTP2 ----
+# `h2_host.t` is deliberately absent: its four remaining failures are requests
+# the `h2` crate rejects (RST_STREAM / GOAWAY) before routing, where nginx
+# answers 400. See COMPAT.md "已知偏差" #1 with the repro probe.
+ssl_certificate_chain.t
+ssl_sni.t
+ssl_sni_sessions.t
+h2_proxy_max_temp_file_size.t
+h2_ssl_proxy_cache.t
+
+# ---- fastcgi / grpc ----
+fastcgi_body.t
+grpc_pass.t
+
+# ---- stream ----
+stream_error_log.t
+stream_proxy.t
+stream_proxy_ssl.t
+stream_ssl.t
+stream_ssl_verify_client.t
+
+# ---- mail ----
+mail_capability.t
+mail_error_log.t
+mail_imap.t
+mail_pop3.t
+mail_smtp.t
+mail_smtp_greeting_delay.t
+mail_smtp_xclient.t

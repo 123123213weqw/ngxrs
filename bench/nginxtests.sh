@@ -20,6 +20,13 @@ if [[ ! -d "$TESTS_DIR" ]]; then
   exit 2
 fi
 REF_BIN="${REF_BIN:-$NGINX_BIN}"
+# `fastcgi.t` and friends `use FCGI`, which CPAN does not ship with perl.
+# cpanm installs into ~/perl5 by default, which is not on @INC for a
+# non-login shell, so add it when present. Without it those suites skip for
+# BOTH servers and report `0/0` -- a false "SAME" that hides real work.
+if [[ -d "$HOME/perl5/lib/perl5" ]]; then
+  export PERL5LIB="$HOME/perl5/lib/perl5${PERL5LIB:+:$PERL5LIB}"
+fi
 BIN="$ROOT/target/release/ngxrs"
 OUT_DIR="$ROOT/bench/run/nginxtests"
 mkdir -p "$OUT_DIR"
@@ -59,7 +66,7 @@ outcomes() { # $1=log -> sorted "id ok" / "id notok" lines
 }
 
 idx=0
-declare -a NAMES=() SAME=() WORSE=() BETTER=() UNRUN=() TRUNC=() REF_OK=() OUR_OK=()
+declare -a NAMES=() SAME=() WORSE=() BETTER=() UNRUN=() TRUNC=() SKIPPED=() REF_OK=() OUR_OK=()
 
 for t in $TESTS; do
   f="$TESTS_DIR/$t"
@@ -101,7 +108,15 @@ for t in $TESTS; do
   # fewer lines than the reference, so the per-id diff finds nothing "worse"
   # and the suite used to be reported as SAME. proxy.t showed `SAME 30/30 vs
   # 21/30` that way: the plan mismatch aborted the last nine assertions.
-  if [ "$o_total" -lt "$total" ]; then
+  # Neither side emitted an assertion: the suite skipped (missing module,
+  # missing Perl dependency, module not compiled in). That is not evidence of
+  # agreement -- `grep -c` on an empty file yields 0 and the diff is empty, so
+  # it used to be counted as SAME. Report it separately so the declared list can
+  # exclude it.
+  if [ "$total" -eq 0 ] && [ "$o_total" -eq 0 ]; then
+    SKIPPED+=("$t")
+    printf 'SKIP   %-26s (both sides emitted no assertions)\n' "$t"
+  elif [ "$o_total" -lt "$total" ]; then
     TRUNC+=("$t")
     printf 'TRUNC  %-26s nginx %2s/%-3s   ngxrs %2s/%-3s   (%s assertions never ran)\n' \
       "$t" "$r_ok" "$total" "$o_ok" "$total" "$((total - o_total))"
@@ -136,6 +151,13 @@ printf 'assertions      : nginx %d / ngxrs %d\n' "$total_ref" "$total_our"
 printf 'identical       : %d\n' "${#SAME[@]}"
 printf 'ngxrs worse     : %d  %s\n' "${#WORSE[@]}" "${WORSE[*]:-}"
 printf 'not comparable  : %d  %s\n' "${#UNRUN[@]}" "${UNRUN[*]:-}"
+printf 'skipped/both    : %d\n' "${#SKIPPED[@]}"
 printf 'truncated runs  : %d  %s\n' "${#TRUNC[@]}" "${TRUNC[*]:-}"
 printf 'ngxrs better    : %d  %s\n' "${#BETTER[@]}" "${BETTER[*]:-}"
+# A declared file that skips on both sides is not evidence of agreement; treat
+# it as a failure so the declared list cannot silently shrink its own meaning.
+if [ "${#SKIPPED[@]}" -gt 0 ]; then
+  echo "ERROR: ${#SKIPPED[@]} suite(s) emitted no assertions on either side: ${SKIPPED[*]}" >&2
+  exit 1
+fi
 [ "${#WORSE[@]}" -eq 0 ] && [ "${#TRUNC[@]}" -eq 0 ]

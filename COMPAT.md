@@ -2,7 +2,311 @@
 
 图例：`✅` 已实现并测过 · `🟡` 部分实现/有已知差异 · `⬜` 未实现
 
-对照基线：nginx 1.28.0（V100 `/usr/bin/nginx`）。
+对照基线：**nginx 1.28.0**（V100 上源码编译，`$HOME/nginx-baseline/sbin/nginx`）。
+所有数字都来自同一台机器上 ngxrs 与 nginx 的 **A/B 逐断言比对**，不是单边通过率。
+
+## 一、验收判据与当前状态
+
+判据只有一条：**「nginx 通过而 ngxrs 不通过」的断言数必须为 0**（在下方声明清单上）。
+绝对通过率没有意义——nginx-tests 里的套件会因为 Test::Nginx 版本、`-V` 特性门控、
+参考构建的编译选项而在两边一起失败，那种失败不构成我们的缺陷。
+
+| 项 | 命令 | 当前结果 |
+|---|---|---|
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 76 文件，WORSE=0 TRUNC=0（nginx 1003 / ngxrs 1007 断言） |
+| 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
+| 单元测试 | `cargo test --release` | **PASS** — 122 passed |
+| 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
+
+## 二、声明的测试清单
+
+清单在 `bench/declared.txt`，**76 个文件**，选取规则是机械的：
+
+1. 落在范围内（默认构建 nginx 1.28 的 http core + proxy/cache/gzip/TLS/HTTP2/
+   fastcgi/uwsgi/scgi/grpc/stream/mail）；
+2. **两边都真的产出了断言**——两边都跳过的套件什么也证明不了，已被排除；
+3. 没有任何断言在 nginx 通过而我们失败；
+4. 我方没有截断（两边断言行数相同）。
+
+两边都不通过某些断言的套件**允许**保留：判据是「nginx 过而我们不过」，
+不是绝对一致。例如 `http_keepalive.t` 两边都是 21/23，那 2 条对双方都不成立。
+
+## 三、已知偏差（全量扫描，逐项带复现）
+
+以下是对**全部 348 个在范围内文件**跑 A/B 的结果。共 **185 个文件 / 1733 条断言**
+未对齐。每行的「复现」列是一条可直接执行的命令。
+
+不在声明清单里的文件都在这里被列出——这份表就是「还差什么」的穷举。
+
+### 差异总账（全量 348 文件扫描）
+
+口径：`WORSE` = nginx 通过而 ngxrs 不通过；`TRUNC` = 我方断言行少于 nginx（跑不完）。
+二者合计 **185 个文件 / 1733 条断言** 尚未对齐。
+
+| 特性域 | 文件数 | 未对齐断言 | 主因 |
+|---|---|---|---|
+| stream（TCP/UDP） | 70 | 523 | 只实现了 `listen`/`proxy_pass`/`return`/TLS 终止与少量 upstream；nginx 的 179 条 stream 指令大部分缺失 |
+| HTTP/2 | 28 | 361 | 帧级/HPACK 由 `h2` crate 拥有；请求体缓冲与优先级更新未实现 |
+| 反向代理 | 36 | 251 | PROXY protocol、`proxy_request_buffering off`、证书缓存、`merge_headers`、`xar`/`cookie` 变量族未实现 |
+| gRPC | 4 | 210 | 上游帧细节与 `next_upstream` |
+| TLS | 24 | 136 | OCSP/stapling/CRL、`verify_depth`、renegotiation、证书缓存 |
+| http core | 7 | 123 | `disable_symlinks`、resolver 的 AAAA/CNAME、TTL 语义 |
+| upstream | 5 | 58 | `max_conns`、动态解析（`resolve`） |
+| mail | 8 | 50 | TLS 会话复用、`max_errors`、PROXY protocol、resolver |
+| uwsgi | 2 | 13 | SSL 证书变量 |
+| FastCGI | 1 | 8 | 上游 keepalive |
+| **合计** | **185** | **1733** | |
+
+#### stream（TCP/UDP）
+
+| 用例 | 结果 | 未对齐 | 复现 |
+|---|---|---|---|
+| `stream_upstream_service.t` | 0/23 | 23 | `TEST_LIST=stream_upstream_service.t bash bench/nginxtests.sh` |
+| `stream_proxy_ssl_certificate_cache.t` | 0/22 | 22 | `TEST_LIST=stream_proxy_ssl_certificate_cache.t bash bench/nginxtests.sh` |
+| `stream_ssl_ocsp.t` | 0/22 | 22 | `TEST_LIST=stream_ssl_ocsp.t bash bench/nginxtests.sh` |
+| `stream_server_name.t` | 0/21 | 21 | `TEST_LIST=stream_server_name.t bash bench/nginxtests.sh` |
+| `stream_access.t` | 0/20 | 20 | `TEST_LIST=stream_access.t bash bench/nginxtests.sh` |
+| `stream_geo.t` | 2/21 | 19 | `TEST_LIST=stream_geo.t bash bench/nginxtests.sh` |
+| `stream_ssl_certificate_cache.t` | 0/16 | 16 | `TEST_LIST=stream_ssl_certificate_cache.t bash bench/nginxtests.sh` |
+| `stream_proxy_protocol2_tlv.t` | 2/16 | 14 | `TEST_LIST=stream_proxy_protocol2_tlv.t bash bench/nginxtests.sh` |
+| `stream_upstream_max_conns.t` | 3/16 | 13 | `TEST_LIST=stream_upstream_max_conns.t bash bench/nginxtests.sh` |
+| `stream_upstream_resolve.t` | 0/13 | 13 | `TEST_LIST=stream_upstream_resolve.t bash bench/nginxtests.sh` |
+| `stream_access_log.t` | 0/12 | 12 | `TEST_LIST=stream_access_log.t bash bench/nginxtests.sh` |
+| `stream_ssl_stapling.t` | 0/12 | 12 | `TEST_LIST=stream_ssl_stapling.t bash bench/nginxtests.sh` |
+| `stream_limit_conn_dry_run.t` | 0/11 | 11 | `TEST_LIST=stream_limit_conn_dry_run.t bash bench/nginxtests.sh` |
+| `stream_limit_rate.t` | 0/11 | 11 | `TEST_LIST=stream_limit_rate.t bash bench/nginxtests.sh` |
+| `stream_limit_rate2.t` | 0/11 | 11 | `TEST_LIST=stream_limit_rate2.t bash bench/nginxtests.sh` |
+| `stream_udp_limit_conn.t` | 0/11 | 11 | `TEST_LIST=stream_udp_limit_conn.t bash bench/nginxtests.sh` |
+| `stream_upstream_resolve_reload.t` | 0/11 | 11 | `TEST_LIST=stream_upstream_resolve_reload.t bash bench/nginxtests.sh` |
+| `stream_limit_conn.t` | 0/10 | 10 | `TEST_LIST=stream_limit_conn.t bash bench/nginxtests.sh` |
+| `stream_realip.t` | 0/10 | 10 | `TEST_LIST=stream_realip.t bash bench/nginxtests.sh` |
+| `stream_resolver.t` | 0/10 | 10 | `TEST_LIST=stream_resolver.t bash bench/nginxtests.sh` |
+| `stream_udp_limit_rate.t` | 0/10 | 10 | `TEST_LIST=stream_udp_limit_rate.t bash bench/nginxtests.sh` |
+| `stream_ssl_certificate.t` | 0/9 | 9 | `TEST_LIST=stream_ssl_certificate.t bash bench/nginxtests.sh` |
+| `stream_ssl_reject_handshake.t` | 0/9 | 9 | `TEST_LIST=stream_ssl_reject_handshake.t bash bench/nginxtests.sh` |
+| `stream_ssl_session_reuse.t` | 0/9 | 9 | `TEST_LIST=stream_ssl_session_reuse.t bash bench/nginxtests.sh` |
+| `stream_ssl_alpn.t` | 0/8 | 8 | `TEST_LIST=stream_ssl_alpn.t bash bench/nginxtests.sh` |
+| `stream_ssl_realip.t` | 0/8 | 8 | `TEST_LIST=stream_ssl_realip.t bash bench/nginxtests.sh` |
+| `stream_status_variable.t` | 0/8 | 8 | `TEST_LIST=stream_status_variable.t bash bench/nginxtests.sh` |
+| `stream_upstream_resolver.t` | 0/8 | 8 | `TEST_LIST=stream_upstream_resolver.t bash bench/nginxtests.sh` |
+| `stream_upstream_service_reload.t` | 0/8 | 8 | `TEST_LIST=stream_upstream_service_reload.t bash bench/nginxtests.sh` |
+| `stream_variables.t` | 2/10 | 8 | `TEST_LIST=stream_variables.t bash bench/nginxtests.sh` |
+| `stream_proxy_complex.t` | 0/7 | 7 | `TEST_LIST=stream_proxy_complex.t bash bench/nginxtests.sh` |
+| `stream_proxy_next_upstream.t` | 0/7 | 7 | `TEST_LIST=stream_proxy_next_upstream.t bash bench/nginxtests.sh` |
+| `stream_proxy_ssl_certificate.t` | 0/7 | 7 | `TEST_LIST=stream_proxy_ssl_certificate.t bash bench/nginxtests.sh` |
+| `stream_proxy_ssl_certificate_vars.t` | 0/7 | 7 | `TEST_LIST=stream_proxy_ssl_certificate_vars.t bash bench/nginxtests.sh` |
+| `stream_geo_ipv6.t` | 2/8 | 6 | `TEST_LIST=stream_geo_ipv6.t bash bench/nginxtests.sh` |
+| `stream_geo_unix.t` | 0/6 | 6 | `TEST_LIST=stream_geo_unix.t bash bench/nginxtests.sh` |
+| `stream_limit_conn_complex.t` | 0/6 | 6 | `TEST_LIST=stream_limit_conn_complex.t bash bench/nginxtests.sh` |
+| `stream_realip_hostname.t` | 0/6 | 6 | `TEST_LIST=stream_realip_hostname.t bash bench/nginxtests.sh` |
+| `stream_ssl_sni_protocols.t` | 0/6 | 6 | `TEST_LIST=stream_ssl_sni_protocols.t bash bench/nginxtests.sh` |
+| `stream_ssl_variables.t` | 2/8 | 6 | `TEST_LIST=stream_ssl_variables.t bash bench/nginxtests.sh` |
+| `stream_udp_proxy_requests.t` | 22/28 | 6 | `TEST_LIST=stream_udp_proxy_requests.t bash bench/nginxtests.sh` |
+| `stream_map.t` | 2/7 | 5 | `TEST_LIST=stream_map.t bash bench/nginxtests.sh` |
+| `stream_ssl_conf_command.t` | 0/5 | 5 | `TEST_LIST=stream_ssl_conf_command.t bash bench/nginxtests.sh` |
+| `stream_upstream.t` | 3/8 | 5 | `TEST_LIST=stream_upstream.t bash bench/nginxtests.sh` |
+| `stream_proxy_half_close.t` | 0/4 | 4 | `TEST_LIST=stream_proxy_half_close.t bash bench/nginxtests.sh` |
+| `stream_proxy_ssl_name.t` | 3/7 | 4 | `TEST_LIST=stream_proxy_ssl_name.t bash bench/nginxtests.sh` |
+| `stream_tcp_nodelay.t` | 0/4 | 4 | `TEST_LIST=stream_tcp_nodelay.t bash bench/nginxtests.sh` |
+| `stream_udp_stream.t` | 6/10 | 4 | `TEST_LIST=stream_udp_stream.t bash bench/nginxtests.sh` |
+| `stream_unix.t` | 0/4 | 4 | `TEST_LIST=stream_unix.t bash bench/nginxtests.sh` |
+| `stream_upstream_zone_ssl.t` | 7/11 | 4 | `TEST_LIST=stream_upstream_zone_ssl.t bash bench/nginxtests.sh` |
+| `stream_proxy_bind.t` | 0/3 | 3 | `TEST_LIST=stream_proxy_bind.t bash bench/nginxtests.sh` |
+| `stream_proxy_ssl_conf_command.t` | 0/3 | 3 | `TEST_LIST=stream_proxy_ssl_conf_command.t bash bench/nginxtests.sh` |
+| `stream_proxy_ssl_verify.t` | 5/8 | 3 | `TEST_LIST=stream_proxy_ssl_verify.t bash bench/nginxtests.sh` |
+| `stream_udp_upstream.t` | 4/7 | 3 | `TEST_LIST=stream_udp_upstream.t bash bench/nginxtests.sh` |
+| `stream_upstream_random.t` | 11/14 | 3 | `TEST_LIST=stream_upstream_random.t bash bench/nginxtests.sh` |
+| `stream_access_log_escape.t` | 2/4 | 2 | `TEST_LIST=stream_access_log_escape.t bash bench/nginxtests.sh` |
+| `stream_geo_binary.t` | 2/4 | 2 | `TEST_LIST=stream_geo_binary.t bash bench/nginxtests.sh` |
+| `stream_proxy_ssl_name_complex.t` | 2/4 | 2 | `TEST_LIST=stream_proxy_ssl_name_complex.t bash bench/nginxtests.sh` |
+| `stream_set.t` | 2/4 | 2 | `TEST_LIST=stream_set.t bash bench/nginxtests.sh` |
+| `stream_udp_upstream_hash.t` | 2/4 | 2 | `TEST_LIST=stream_udp_upstream_hash.t bash bench/nginxtests.sh` |
+| `stream_upstream_hash.t` | 4/6 | 2 | `TEST_LIST=stream_upstream_hash.t bash bench/nginxtests.sh` |
+| `stream_upstream_zone.t` | 2/4 | 2 | `TEST_LIST=stream_upstream_zone.t bash bench/nginxtests.sh` |
+| `stream_access_log_none.t` | 2/3 | 1 | `TEST_LIST=stream_access_log_none.t bash bench/nginxtests.sh` |
+| `stream_proxy_protocol.t` | 3/4 | 1 | `TEST_LIST=stream_proxy_protocol.t bash bench/nginxtests.sh` |
+| `stream_proxy_protocol_ipv6.t` | 3/4 | 1 | `TEST_LIST=stream_proxy_protocol_ipv6.t bash bench/nginxtests.sh` |
+| `stream_proxy_protocol_ssl.t` | 3/4 | 1 | `TEST_LIST=stream_proxy_protocol_ssl.t bash bench/nginxtests.sh` |
+| `stream_split_clients.t` | 2/3 | 1 | `TEST_LIST=stream_split_clients.t bash bench/nginxtests.sh` |
+| `stream_udp_proxy.t` | 9/10 | 1 | `TEST_LIST=stream_udp_proxy.t bash bench/nginxtests.sh` |
+| `stream_udp_upstream_least_conn.t` | 3/4 | 1 | `TEST_LIST=stream_udp_upstream_least_conn.t bash bench/nginxtests.sh` |
+| `stream_upstream_least_conn.t` | 3/4 | 1 | `TEST_LIST=stream_upstream_least_conn.t bash bench/nginxtests.sh` |
+
+#### HTTP/2
+
+| 用例 | 结果 | 未对齐 | 复现 |
+|---|---|---|---|
+| `h2_priority_update.t` | 0/61 | 61 | `TEST_LIST=h2_priority_update.t bash bench/nginxtests.sh` |
+| `h2_proxy_request_buffering.t` | 2/51 | 49 | `TEST_LIST=h2_proxy_request_buffering.t bash bench/nginxtests.sh` |
+| `h2_fastcgi_request_buffering.t` | 2/50 | 48 | `TEST_LIST=h2_fastcgi_request_buffering.t bash bench/nginxtests.sh` |
+| `h2_proxy_request_buffering_ssl.t` | 2/42 | 40 | `TEST_LIST=h2_proxy_request_buffering_ssl.t bash bench/nginxtests.sh` |
+| `h2_headers.t` | 73/112 | 37 | `TEST_LIST=h2_headers.t bash bench/nginxtests.sh` |
+| `h2_request_body_extra.t` | 26/52 | 26 | `TEST_LIST=h2_request_body_extra.t bash bench/nginxtests.sh` |
+| `h2_absolute_redirect.t` | 7/25 | 18 | `TEST_LIST=h2_absolute_redirect.t bash bench/nginxtests.sh` |
+| `h2_trailers.t` | 10/24 | 14 | `TEST_LIST=h2_trailers.t bash bench/nginxtests.sh` |
+| `h2_priority.t` | 13/24 | 11 | `TEST_LIST=h2_priority.t bash bench/nginxtests.sh` |
+| `h2_request_body.t` | 40/51 | 11 | `TEST_LIST=h2_request_body.t bash bench/nginxtests.sh` |
+| `h2_keepalive.t` | 12/21 | 9 | `TEST_LIST=h2_keepalive.t bash bench/nginxtests.sh` |
+| `h2_ssl.t` | 0/6 | 6 | `TEST_LIST=h2_ssl.t bash bench/nginxtests.sh` |
+| `h2_http2.t` | 9/13 | 4 | `TEST_LIST=h2_http2.t bash bench/nginxtests.sh` |
+| `h2_request_body_preread.t` | 5/11 | 4 | `TEST_LIST=h2_request_body_preread.t bash bench/nginxtests.sh` |
+| `h2_ssl_variables.t` | 2/6 | 4 | `TEST_LIST=h2_ssl_variables.t bash bench/nginxtests.sh` |
+| `h2_variables.t` | 4/8 | 4 | `TEST_LIST=h2_variables.t bash bench/nginxtests.sh` |
+| `h2_server_tokens.t` | 11/14 | 3 | `TEST_LIST=h2_server_tokens.t bash bench/nginxtests.sh` |
+| `h2_ssl_proxy_protocol.t` | 2/5 | 3 | `TEST_LIST=h2_ssl_proxy_protocol.t bash bench/nginxtests.sh` |
+| `h2_ssl_verify_client.t` | 2/5 | 3 | `TEST_LIST=h2_ssl_verify_client.t bash bench/nginxtests.sh` |
+| `h2_proxy_cache.t` | 9/11 | 2 | `TEST_LIST=h2_proxy_cache.t bash bench/nginxtests.sh` |
+| `h2_proxy_protocol.t` | 3/5 | 2 | `TEST_LIST=h2_proxy_protocol.t bash bench/nginxtests.sh` |
+| `h2_auth_request.t` | 3/4 | 1 | `TEST_LIST=h2_auth_request.t bash bench/nginxtests.sh` |
+| `h2_error_page.t` | 3/4 | 1 | `TEST_LIST=h2_error_page.t bash bench/nginxtests.sh` |
+| `h2_limit_conn.t` | 5/6 | 1 | `TEST_LIST=h2_limit_conn.t bash bench/nginxtests.sh` |
+| `h2_limit_req.t` | 8/9 | 1 | `TEST_LIST=h2_limit_req.t bash bench/nginxtests.sh` |
+| `h2_proxy_request_buffering_redirect.t` | 2/3 | 1 | `TEST_LIST=h2_proxy_request_buffering_redirect.t bash bench/nginxtests.sh` |
+| `h2_proxy_ssl.t` | 2/3 | 1 | `TEST_LIST=h2_proxy_ssl.t bash bench/nginxtests.sh` |
+| `h2_host.t` | 52/62 | -4 | `TEST_LIST=h2_host.t bash bench/nginxtests.sh` |
+
+#### 反向代理
+
+| 用例 | 结果 | 未对齐 | 复现 |
+|---|---|---|---|
+| `proxy_keepalive.t` | 15/51 | 36 | `TEST_LIST=proxy_keepalive.t bash bench/nginxtests.sh` |
+| `proxy_protocol2.t` | 5/30 | 25 | `TEST_LIST=proxy_protocol2.t bash bench/nginxtests.sh` |
+| `proxy_protocol.t` | 4/26 | 22 | `TEST_LIST=proxy_protocol.t bash bench/nginxtests.sh` |
+| `proxy_ssl_certificate_cache.t` | 0/22 | 22 | `TEST_LIST=proxy_ssl_certificate_cache.t bash bench/nginxtests.sh` |
+| `proxy_protocol2_tlv.t` | 2/16 | 14 | `TEST_LIST=proxy_protocol2_tlv.t bash bench/nginxtests.sh` |
+| `proxy_request_buffering_chunked.t` | 14/24 | 10 | `TEST_LIST=proxy_request_buffering_chunked.t bash bench/nginxtests.sh` |
+| `proxy_request_buffering.t` | 11/20 | 9 | `TEST_LIST=proxy_request_buffering.t bash bench/nginxtests.sh` |
+| `proxy_request_buffering_ssl.t` | 11/20 | 9 | `TEST_LIST=proxy_request_buffering_ssl.t bash bench/nginxtests.sh` |
+| `proxy_merge_headers.t` | 5/13 | 8 | `TEST_LIST=proxy_merge_headers.t bash bench/nginxtests.sh` |
+| `proxy_protocol_unix.t` | 0/7 | 7 | `TEST_LIST=proxy_protocol_unix.t bash bench/nginxtests.sh` |
+| `proxy_unix.t` | 0/7 | 7 | `TEST_LIST=proxy_unix.t bash bench/nginxtests.sh` |
+| `proxy_limit_rate2.t` | 0/6 | 6 | `TEST_LIST=proxy_limit_rate2.t bash bench/nginxtests.sh` |
+| `proxy_unfinished.t` | 11/17 | 6 | `TEST_LIST=proxy_unfinished.t bash bench/nginxtests.sh` |
+| `proxy_upstream_cookie.t` | 15/21 | 6 | `TEST_LIST=proxy_upstream_cookie.t bash bench/nginxtests.sh` |
+| `proxy_xar.t` | 12/18 | 6 | `TEST_LIST=proxy_xar.t bash bench/nginxtests.sh` |
+| `proxy_implicit.t` | 0/5 | 5 | `TEST_LIST=proxy_implicit.t bash bench/nginxtests.sh` |
+| `proxy_non_idempotent.t` | 5/10 | 5 | `TEST_LIST=proxy_non_idempotent.t bash bench/nginxtests.sh` |
+| `proxy_ssl_conf_command.t` | 0/5 | 5 | `TEST_LIST=proxy_ssl_conf_command.t bash bench/nginxtests.sh` |
+| `proxy_upgrade.t` | 28/33 | 5 | `TEST_LIST=proxy_upgrade.t bash bench/nginxtests.sh` |
+| `proxy_ssl_certificate.t` | 3/7 | 4 | `TEST_LIST=proxy_ssl_certificate.t bash bench/nginxtests.sh` |
+| `proxy_ssl_certificate_vars.t` | 3/7 | 4 | `TEST_LIST=proxy_ssl_certificate_vars.t bash bench/nginxtests.sh` |
+| `proxy_chunked.t` | 2/5 | 3 | `TEST_LIST=proxy_chunked.t bash bench/nginxtests.sh` |
+| `proxy_method.t` | 3/6 | 3 | `TEST_LIST=proxy_method.t bash bench/nginxtests.sh` |
+| `proxy_next_upstream_tries.t` | 7/10 | 3 | `TEST_LIST=proxy_next_upstream_tries.t bash bench/nginxtests.sh` |
+| `proxy_pass_request.t` | 2/5 | 3 | `TEST_LIST=proxy_pass_request.t bash bench/nginxtests.sh` |
+| `proxy_ssl_crl.t` | 4/7 | 3 | `TEST_LIST=proxy_ssl_crl.t bash bench/nginxtests.sh` |
+| `proxy_ssl_verify.t` | 5/8 | 3 | `TEST_LIST=proxy_ssl_verify.t bash bench/nginxtests.sh` |
+| `proxy_protocol_ipv6.t` | 3/5 | 2 | `TEST_LIST=proxy_protocol_ipv6.t bash bench/nginxtests.sh` |
+| `proxy_set_body.t` | 2/4 | 2 | `TEST_LIST=proxy_set_body.t bash bench/nginxtests.sh` |
+| `proxy_store.t` | 9/11 | 2 | `TEST_LIST=proxy_store.t bash bench/nginxtests.sh` |
+| `proxy_variables.t` | 4/6 | 2 | `TEST_LIST=proxy_variables.t bash bench/nginxtests.sh` |
+| `proxy_cache_lock_ssi.t` | 3/4 | 1 | `TEST_LIST=proxy_cache_lock_ssi.t bash bench/nginxtests.sh` |
+| `proxy_connection_headers.t` | 4/7 | 1 | `TEST_LIST=proxy_connection_headers.t bash bench/nginxtests.sh` |
+| `proxy_ssl_certificate_empty.t` | 3/4 | 1 | `TEST_LIST=proxy_ssl_certificate_empty.t bash bench/nginxtests.sh` |
+| `proxy_ssl_name.t` | 10/11 | 1 | `TEST_LIST=proxy_ssl_name.t bash bench/nginxtests.sh` |
+| `proxy_ssl_verify_ip.t` | 4/10 | 0 | `TEST_LIST=proxy_ssl_verify_ip.t bash bench/nginxtests.sh` |
+
+#### gRPC
+
+| 用例 | 结果 | 未对齐 | 复现 |
+|---|---|---|---|
+| `grpc.t` | 2/152 | 150 | `TEST_LIST=grpc.t bash bench/nginxtests.sh` |
+| `grpc_ssl.t` | 2/40 | 38 | `TEST_LIST=grpc_ssl.t bash bench/nginxtests.sh` |
+| `grpc_request_buffering.t` | 0/14 | 14 | `TEST_LIST=grpc_request_buffering.t bash bench/nginxtests.sh` |
+| `grpc_next_upstream.t` | 3/11 | 8 | `TEST_LIST=grpc_next_upstream.t bash bench/nginxtests.sh` |
+
+#### TLS
+
+| 用例 | 结果 | 未对齐 | 复现 |
+|---|---|---|---|
+| `ssl_certificate_cache.t` | 0/16 | 16 | `TEST_LIST=ssl_certificate_cache.t bash bench/nginxtests.sh` |
+| `ssl_proxy_protocol.t` | 4/20 | 16 | `TEST_LIST=ssl_proxy_protocol.t bash bench/nginxtests.sh` |
+| `ssl_ocsp.t` | 3/17 | 14 | `TEST_LIST=ssl_ocsp.t bash bench/nginxtests.sh` |
+| `ssl_certificate.t` | 0/13 | 13 | `TEST_LIST=ssl_certificate.t bash bench/nginxtests.sh` |
+| `ssl.t` | 14/23 | 9 | `TEST_LIST=ssl.t bash bench/nginxtests.sh` |
+| `ssl_verify_depth.t` | 2/11 | 9 | `TEST_LIST=ssl_verify_depth.t bash bench/nginxtests.sh` |
+| `ssl_sni_protocols.t` | 0/6 | 6 | `TEST_LIST=ssl_sni_protocols.t bash bench/nginxtests.sh` |
+| `ssl_certificate_aux.t` | 0/5 | 5 | `TEST_LIST=ssl_certificate_aux.t bash bench/nginxtests.sh` |
+| `ssl_conf_command.t` | 0/5 | 5 | `TEST_LIST=ssl_conf_command.t bash bench/nginxtests.sh` |
+| `ssl_crl.t` | 2/7 | 5 | `TEST_LIST=ssl_crl.t bash bench/nginxtests.sh` |
+| `ssl_password_file.t` | 0/5 | 5 | `TEST_LIST=ssl_password_file.t bash bench/nginxtests.sh` |
+| `ssl_proxy_upgrade.t` | 27/32 | 5 | `TEST_LIST=ssl_proxy_upgrade.t bash bench/nginxtests.sh` |
+| `ssl_stapling.t` | 7/12 | 5 | `TEST_LIST=ssl_stapling.t bash bench/nginxtests.sh` |
+| `ssl_cache.t` | 2/6 | 4 | `TEST_LIST=ssl_cache.t bash bench/nginxtests.sh` |
+| `ssl_sni_reneg.t` | 6/10 | 4 | `TEST_LIST=ssl_sni_reneg.t bash bench/nginxtests.sh` |
+| `ssl_reject_handshake.t` | 6/9 | 3 | `TEST_LIST=ssl_reject_handshake.t bash bench/nginxtests.sh` |
+| `ssl_cache_reload.t` | 5/7 | 2 | `TEST_LIST=ssl_cache_reload.t bash bench/nginxtests.sh` |
+| `ssl_client_escaped_cert.t` | 3/5 | 2 | `TEST_LIST=ssl_client_escaped_cert.t bash bench/nginxtests.sh` |
+| `ssl_session_reuse.t` | 8/10 | 2 | `TEST_LIST=ssl_session_reuse.t bash bench/nginxtests.sh` |
+| `ssl_verify_client.t` | 14/16 | 2 | `TEST_LIST=ssl_verify_client.t bash bench/nginxtests.sh` |
+| `ssl_certificates.t` | 3/4 | 1 | `TEST_LIST=ssl_certificates.t bash bench/nginxtests.sh` |
+| `ssl_curve.t` | 2/3 | 1 | `TEST_LIST=ssl_curve.t bash bench/nginxtests.sh` |
+| `ssl_session_ticket_key.t` | 3/4 | 1 | `TEST_LIST=ssl_session_ticket_key.t bash bench/nginxtests.sh` |
+| `ssl_verify_client_trusted.t` | 4/5 | 1 | `TEST_LIST=ssl_verify_client_trusted.t bash bench/nginxtests.sh` |
+
+#### http core
+
+| 用例 | 结果 | 未对齐 | 复现 |
+|---|---|---|---|
+| `http_resolver_aaaa.t` | 25/74 | 49 | `TEST_LIST=http_resolver_aaaa.t bash bench/nginxtests.sh` |
+| `http_disable_symlinks.t` | 0/30 | 30 | `TEST_LIST=http_disable_symlinks.t bash bench/nginxtests.sh` |
+| `http_resolver.t` | 15/40 | 24 | `TEST_LIST=http_resolver.t bash bench/nginxtests.sh` |
+| `http_listen.t` | 0/11 | 11 | `TEST_LIST=http_listen.t bash bench/nginxtests.sh` |
+| `http_resolver_cleanup.t` | 0/3 | 3 | `TEST_LIST=http_resolver_cleanup.t bash bench/nginxtests.sh` |
+| `http_resolver_cname.t` | 10/13 | 3 | `TEST_LIST=http_resolver_cname.t bash bench/nginxtests.sh` |
+| `http_resolver_ipv4.t` | 2/5 | 3 | `TEST_LIST=http_resolver_ipv4.t bash bench/nginxtests.sh` |
+
+#### upstream
+
+| 用例 | 结果 | 未对齐 | 复现 |
+|---|---|---|---|
+| `upstream_resolve.t` | 0/20 | 20 | `TEST_LIST=upstream_resolve.t bash bench/nginxtests.sh` |
+| `upstream_max_conns.t` | 0/18 | 18 | `TEST_LIST=upstream_max_conns.t bash bench/nginxtests.sh` |
+| `upstream_resolve_reload.t` | 0/11 | 11 | `TEST_LIST=upstream_resolve_reload.t bash bench/nginxtests.sh` |
+| `upstream_resolver.t` | 0/8 | 8 | `TEST_LIST=upstream_resolver.t bash bench/nginxtests.sh` |
+| `upstream_ip_hash_ipv6.t` | 5/6 | 1 | `TEST_LIST=upstream_ip_hash_ipv6.t bash bench/nginxtests.sh` |
+
+#### mail
+
+| 用例 | 结果 | 未对齐 | 复现 |
+|---|---|---|---|
+| `mail_ssl.t` | 2/21 | 19 | `TEST_LIST=mail_ssl.t bash bench/nginxtests.sh` |
+| `mail_imap_ssl.t` | 7/15 | 8 | `TEST_LIST=mail_imap_ssl.t bash bench/nginxtests.sh` |
+| `mail_max_errors.t` | 14/20 | 6 | `TEST_LIST=mail_max_errors.t bash bench/nginxtests.sh` |
+| `mail_proxy_protocol.t` | 4/10 | 6 | `TEST_LIST=mail_proxy_protocol.t bash bench/nginxtests.sh` |
+| `mail_ssl_conf_command.t` | 0/5 | 5 | `TEST_LIST=mail_ssl_conf_command.t bash bench/nginxtests.sh` |
+| `mail_resolver.t` | 9/13 | 3 | `TEST_LIST=mail_resolver.t bash bench/nginxtests.sh` |
+| `mail_ssl_session_reuse.t` | 7/9 | 2 | `TEST_LIST=mail_ssl_session_reuse.t bash bench/nginxtests.sh` |
+| `mail_proxy_smtp_auth.t` | 8/9 | 1 | `TEST_LIST=mail_proxy_smtp_auth.t bash bench/nginxtests.sh` |
+
+#### uwsgi
+
+| 用例 | 结果 | 未对齐 | 复现 |
+|---|---|---|---|
+| `uwsgi_ssl_certificate.t` | 0/7 | 7 | `TEST_LIST=uwsgi_ssl_certificate.t bash bench/nginxtests.sh` |
+| `uwsgi_ssl_certificate_vars.t` | 0/6 | 6 | `TEST_LIST=uwsgi_ssl_certificate_vars.t bash bench/nginxtests.sh` |
+
+#### FastCGI
+
+| 用例 | 结果 | 未对齐 | 复现 |
+|---|---|---|---|
+| `fastcgi_keepalive.t` | 0/8 | 8 | `TEST_LIST=fastcgi_keepalive.t bash bench/nginxtests.sh` |
+
+
+
+### 非测试类偏差
+
+以下偏差没有对应的 nginx-tests 套件，或无法在本机构造 A/B 对照，单独列出。
+
+| # | 偏差 | 影响 | 复现 |
+|---|---|---|---|
+| N1 | **`unknown directive` 只记 warning，不报错** | nginx 在读到未知指令时 `[emerg]` 退出；ngxrs 打一行 warning 后继续启动。配置里写错指令名的部署会"看起来起来了" | `printf 'events{worker_connections 64;}\nhttp{ bogus_directive_xyz on; server{listen 127.0.0.1:19970;} }\n' > /tmp/c.conf; ngxrs -t -c /tmp/c.conf -p /tmp` → `syntax is ok`；同一份配置 `nginx -t` → `unknown directive` |
+| N2 | **HTTP/3 没有 nginx 参考基线** | 本机参考 nginx 未编译 `--with-http_v3_module`，且系统 OpenSSL 3.0.2 缺少 QUIC TLS API，所以 `h3_headers.t` 的 77 条断言只有我方一侧的数字（28/77），**不能**当作与 nginx 的一致性证据 | `$HOME/nginx-baseline/sbin/nginx -V 2>&1 \| tr ' ' '\n' \| grep -c v3` → `0` |
+| N3 | **HTTP/2 非法 `:authority` / 控制字符：crate 直接重置流** | nginx 对空 authority、含 `/` 或控制字符的 authority、header 值含控制字符回 **400**；`h2` crate 在把请求交给路由之前就发 `RST_STREAM`（`GOAWAY` 对控制字符），因此我们无法回答 400。这正是 `h2_host.t` 4 条失败的原因 | 见 `bench/h2auth_probe.pl`：`perl bench/h2auth_probe.pl` → 前三行 `frames=[RST_STREAM]`、第四行 `frames=[GOAWAY]` |
+| N4 | **HPACK / QPACK 表示选择由 crate 决定** | 我们不能控制 Huffman 编码、动态表索引、post-base index，所以 `h2_headers.t` 73/112、`h3_headers.t` 28/77 无法用"改我们的代码"消除 | `TEST_LIST=h2_headers.t bash bench/nginxtests.sh` |
+| N5 | **14 个可选模块未实现**，`-V` 中显式声明为 `--without-`，相关套件因此跳过而不是伪装通过 | `http_dav/slice/memcached/flv/mp4/geoip/image_filter/xslt/perl/secure_link/gzip_static/userid/browser/mirror` | `ngxrs -V 2>&1 \| tr ' ' '\n' \| grep -- --without` |
+
+## 四、能力矩阵
 
 ## core / 配置
 
@@ -165,6 +469,13 @@
 | `add_header` 作用于代理 / FastCGI 响应 | ✅ | 默认只对 200/201/204/206/301/302/303/304/307/308 生效 |
 | `always` 后缀 | ✅ | 对所有状态码生效 |
 | `$upstream_cache_status` 变量 | ✅ | MISS / HIT / BYPASS |
+
+
+## 五、历史记录
+
+以下为逐轮开发记录，按时间顺序排列，保留原始测量数据以便追溯。
+**其中部分结论已被后续测量推翻**（例如「64 KB p99 好 11 倍」实际上是 nginx
+`sendfile` 的取舍，关掉后它也到 3 ms），标注以 `BENCH.md` 与上表为准。
 
 ## HTTP/2 / TLS 官方用例实测（本轮）
 

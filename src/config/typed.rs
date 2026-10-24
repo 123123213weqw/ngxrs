@@ -8,6 +8,15 @@ use std::time::Duration;
 
 use super::parser::{ConfigError, Directive};
 
+/// `client_body_in_file_only` values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientBodyFileOnly {
+    /// Write the body to a file and keep it.
+    On,
+    /// Write the body to a file and unlink it when the request finishes.
+    Clean,
+}
+
 pub const DEFAULT_CLIENT_MAX_BODY: u64 = 1024 * 1024;
 pub const DEFAULT_KEEPALIVE: Duration = Duration::from_secs(75);
 
@@ -102,6 +111,13 @@ pub struct LocCfg {
     pub sub_filter_last_modified: bool,
     pub gzip: bool,
     pub client_max_body_size: u64,
+    /// `client_body_in_file_only on|clean|off`: write the request body to a
+    /// temp file and expose the path as `$request_body_file`. `clean` also
+    /// unlinks it once the request finishes.
+    pub client_body_in_file_only: Option<ClientBodyFileOnly>,
+    /// `client_body_buffer_size`: bodies up to this size stay in memory unless
+    /// `client_body_in_file_only` forces a file.
+    pub client_body_buffer_size: u64,
     pub headers: Vec<(String, String)>,
     pub error_pages: BTreeMap<u16, String>,
     pub ret: Option<(u16, String)>,
@@ -301,6 +317,8 @@ impl LocCfg {
             sub_filter_last_modified: false,
             gzip: false,
             client_max_body_size: DEFAULT_CLIENT_MAX_BODY,
+            client_body_in_file_only: None,
+            client_body_buffer_size: 8 * 1024,
             headers: Vec::new(),
             error_pages: BTreeMap::new(),
             ret: None,
@@ -1162,6 +1180,10 @@ pub struct Http {
     pub gzip: bool,
     pub server_tokens: bool,
     pub client_max_body_size: u64,
+    /// `client_body_temp_path <path> [level1 [level2 [level3]]]`: where
+    /// `client_body_in_file_only` writes. Defaults to `<prefix>/client_body_temp`,
+    /// which is what nginx reports with an empty prefix-relative name.
+    pub client_body_temp_path: PathBuf,
     pub default_loc: LocCfg,
     /// `ssl_certificate` / `ssl_certificate_key` / `ssl_password_file` from the
     /// `http` block, inherited by any server that does not set its own.
@@ -2369,6 +2391,30 @@ impl Builder {
                     .ok_or_else(|| sem(&d.file, d.line, "gzip requires on|off"))?;
                 cfg.gzip = parse_on_off(v)
                     .ok_or_else(|| sem(&d.file, d.line, format!("invalid gzip value \"{v}\"")))?;
+            }
+            "client_body_in_file_only" => {
+                let v = d.args.first().ok_or_else(|| {
+                    sem(&d.file, d.line, "client_body_in_file_only requires a value")
+                })?;
+                cfg.client_body_in_file_only = match v.as_str() {
+                    "on" => Some(ClientBodyFileOnly::On),
+                    "clean" => Some(ClientBodyFileOnly::Clean),
+                    "off" => None,
+                    _ => {
+                        return Err(sem(
+                            &d.file,
+                            d.line,
+                            format!("invalid client_body_in_file_only value \"{v}\""),
+                        ))
+                    }
+                };
+            }
+            "client_body_buffer_size" => {
+                let v = d.args.first().ok_or_else(|| {
+                    sem(&d.file, d.line, "client_body_buffer_size requires a size")
+                })?;
+                cfg.client_body_buffer_size = parse_size(v)
+                    .ok_or_else(|| sem(&d.file, d.line, format!("invalid size \"{v}\"")))?;
             }
             "client_max_body_size" => {
                 let v = d
@@ -4288,6 +4334,7 @@ pub fn build(
     }
 
     let mut http = Http {
+        client_body_temp_path: PathBuf::new(),
         ssl_certificate: None,
         ssl_certificate_key: None,
         ssl_password_file: None,
@@ -4569,6 +4616,34 @@ pub fn build(
                     _ => return Err(sem(&d.file, d.line, "invalid server_tokens")),
                 };
             }
+            "client_body_temp_path" => {
+                if let Some(v) = d.args.first() {
+                    http.client_body_temp_path = PathBuf::from(v);
+                }
+            }
+            "client_body_in_file_only" => {
+                if let Some(v) = d.args.first() {
+                    let f = match v.as_str() {
+                        "on" => Some(ClientBodyFileOnly::On),
+                        "clean" => Some(ClientBodyFileOnly::Clean),
+                        "off" => None,
+                        _ => {
+                            return Err(sem(
+                                &d.file,
+                                d.line,
+                                format!("invalid client_body_in_file_only value \"{v}\""),
+                            ))
+                        }
+                    };
+                    http.default_loc.client_body_in_file_only = f;
+                }
+            }
+            "client_body_buffer_size" => {
+                if let Some(v) = d.args.first() {
+                    http.default_loc.client_body_buffer_size =
+                        parse_size(v).ok_or_else(|| sem(&d.file, d.line, "invalid size"))?;
+                }
+            }
             "client_max_body_size" => {
                 if let Some(v) = d.args.first() {
                     http.client_max_body_size = if v == "0" {
@@ -4840,6 +4915,11 @@ pub fn build(
     // nginx defaults to `<prefix>/logs/nginx.pid` and `<prefix>/logs/error.log`.
     let pid = Some(pid.unwrap_or_else(|| prefix.join("logs/nginx.pid")));
     let error_log = Some(error_log.unwrap_or_else(|| prefix.join("logs/error.log")));
+
+    // nginx defaults `client_body_temp_path` to `<prefix>/client_body_temp`.
+    if http.client_body_temp_path.as_os_str().is_empty() {
+        http.client_body_temp_path = prefix.join("client_body_temp");
+    }
 
     crate::config::set_maps(http.maps.clone());
     crate::config::set_splits(http.split_clients.clone());

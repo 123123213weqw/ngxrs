@@ -32,6 +32,35 @@ pub enum Body {
     File { file: File, offset: u64, len: u64 },
 }
 
+/// Spill a request body to `client_body_temp_path`, returning the file name.
+///
+/// nginx buffers a body in memory up to `client_body_buffer_size` and writes it
+/// to a temp file beyond that, or always under `client_body_in_file_only`. Once
+/// it is on disk `$request_body` renders empty and `$request_body_file` carries
+/// the path.
+pub fn write_body_file(http: &Http, body: &[u8]) -> Option<std::path::PathBuf> {
+    use std::io::Write;
+    let dir = &http.client_body_temp_path;
+    std::fs::create_dir_all(dir).ok()?;
+    let n = NEXT_BODY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = dir.join(format!("{}{:010}", std::process::id(), n));
+    let mut f = std::fs::File::create(&path).ok()?;
+    f.write_all(body).ok()?;
+    f.flush().ok()?;
+    Some(path)
+}
+
+static NEXT_BODY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Does this location want the body on disk?
+///
+/// `client_body_in_file_only` forces it; otherwise the body spills once it is
+/// larger than `client_body_buffer_size`.
+pub fn body_needs_file(loc: &LocCfg, len: usize) -> bool {
+    loc.client_body_in_file_only.is_some()
+        || (len > 0 && len as u64 > loc.client_body_buffer_size)
+}
+
 pub struct Response {
     pub status: u16,
     /// Dynamic headers that still need `Name: value` rendering.
@@ -326,6 +355,7 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
                     headers: crate::http::request::Headers::default(),
                     body_len: 0,
                     buffered_body: None,
+                    request_body_file: None,
                     chunked: false,
                     keepalive: false,
                     host: None,
@@ -2536,11 +2566,23 @@ impl<'a> ServerVars<'a> {
             // populated on HTTP/2 and HTTP/3, where it arrives before routing.
             // `$request_body_file` needs `client_body_in_file_only`, and the
             // path is threaded in by the caller that wrote the file.
-            "request_body" => self
+            "request_body" => {
+                // Once the body is on disk nginx reports it as empty.
+                if self.req.request_body_file.is_some() {
+                    String::new()
+                } else {
+                    self.req
+                        .buffered_body
+                        .as_ref()
+                        .map(|b| String::from_utf8_lossy(b).to_string())
+                        .unwrap_or_default()
+                }
+            }
+            "request_body_file" => self
                 .req
-                .buffered_body
+                .request_body_file
                 .as_ref()
-                .map(|b| String::from_utf8_lossy(b).to_string())
+                .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default(),
             // Derive from the connection rather than each call site's default:
             // the same `ServerVars` must answer correctly for TLS connections.

@@ -205,6 +205,7 @@ fn synthesize(req: &H3Request, authority: Option<&str>, path: &str, query: &str)
         headers,
         body_len: 0,
         buffered_body: None,
+        request_body_file: None,
         chunked: false,
         keepalive: true,
         host: authority.map(|a| InStr::new(&normalize_host(a))),

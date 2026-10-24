@@ -179,6 +179,17 @@ pub async fn serve<S>(
         // `flow_control().release_capacity` is mandatory: the initial window is
         // 65536 bytes and without it a larger body never arrives, which shows up
         // as "small bodies work, large ones hang".
+        // nginx stops reading as soon as `content-length` bytes have arrived: it
+        // does not wait for the END_STREAM flag. A client that declares a length
+        // and then keeps the stream open therefore gets an answer from nginx and
+        // hung against us -- which is exactly what `h2_request_body_extra.t`'s
+        // "body multi" cases do (they send the body one byte per DATA frame and
+        // never set END_STREAM).
+        let declared_len: Option<u64> = request
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok());
         let max_body = loc.client_max_body_size;
         let mut recv = request.into_body();
         let mut body: Vec<u8> = Vec::new();
@@ -194,6 +205,9 @@ pub async fn serve<S>(
                     }
                     body.extend_from_slice(&chunk);
                     if recv.flow_control().release_capacity(n).is_err() {
+                        break;
+                    }
+                    if declared_len.is_some_and(|l| body.len() as u64 >= l) {
                         break;
                     }
                 }
@@ -220,6 +234,15 @@ pub async fn serve<S>(
                 }
             }
             continue;
+        }
+        // `client_body_in_file_only`, or a body larger than
+        // `client_body_buffer_size`, spills to a temp file: `$request_body`
+        // then renders empty and `$request_body_file` names the file.
+        // `client_body_in_file_only on` writes a file even for an empty body
+        // (`h2_request_body.t`: "request body - empty body file"), while an
+        // empty body never spills on the buffer-size rule.
+        if crate::http::body_needs_file(loc, body.len()) {
+            h1.request_body_file = crate::http::write_body_file(http, &body);
         }
         h1.buffered_body = Some(body);
 
@@ -333,6 +356,7 @@ fn synthesize_request(
         headers,
         body_len: 0,
         buffered_body: None,
+        request_body_file: None,
         chunked: false,
         keepalive: true,
         // nginx's `$host` is normalized: lowercase, port and stray colon

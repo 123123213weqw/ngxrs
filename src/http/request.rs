@@ -148,6 +148,13 @@ pub struct Request {
     /// here. `None` on HTTP/1.1, where `body_len`/`chunked` describe a body
     /// still sitting on the connection.
     pub buffered_body: Option<Vec<u8>>,
+    /// `$request_body_file`: the temp file the body was written to.
+    ///
+    /// nginx spills a body to disk once it exceeds `client_body_buffer_size`,
+    /// and always does so under `client_body_in_file_only`. When this is set the
+    /// body is no longer in memory, so `$request_body` renders empty -- which is
+    /// exactly what `h2_request_body_extra.t` asserts for the 5 KB case.
+    pub request_body_file: Option<std::path::PathBuf>,
     pub chunked: bool,
     pub keepalive: bool,
     pub host: Option<InStr>,
@@ -520,6 +527,7 @@ impl Request {
             headers,
             body_len,
             buffered_body: None,
+            request_body_file: None,
             chunked,
             keepalive,
             host,

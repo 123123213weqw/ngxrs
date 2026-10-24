@@ -276,13 +276,7 @@ pub async fn handle(
         conn.send_100_continue().await?;
     }
 
-    let body = if req.chunked {
-        conn.take_chunked_body(32 * 1024 * 1024).await?
-    } else if req.body_len > 0 {
-        conn.take_body(req.body_len as usize).await?
-    } else {
-        Vec::new()
-    };
+    let body = crate::proxy::take_request_body(conn, req, 32 * 1024 * 1024).await?;
 
     // ---- build the parameter list ----
     let (script_name, path_info) = split_path(path, loc);
@@ -443,6 +437,8 @@ pub async fn handle(
         no_error_page: false,
         trailers: Vec::new(),
         expect_trailers: false,
+
+        headers_finalized: false,
         body: Body::Bytes(body),
     };
     let bytes = crate::http::write_response(
@@ -480,6 +476,8 @@ async fn respond(
         no_error_page: false,
         trailers: Vec::new(),
         expect_trailers: false,
+
+        headers_finalized: false,
         body: Body::Bytes(body),
     };
     let bytes = crate::http::write_response(conn, resp, keepalive, tokens, false).await?;

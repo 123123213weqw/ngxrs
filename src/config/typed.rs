@@ -958,11 +958,17 @@ pub enum LbMethod {
     IpHash,
     /// `hash <key> [consistent]` — the key is a complex value expanded per
     /// request.
-    Hash { key: String, consistent: bool },
+    Hash {
+        key: String,
+        consistent: bool,
+    },
     /// `random [two [least_conn]]`. `two` picks two peers and takes the better
     /// of them; `least_conn` makes that comparison least-connections instead of
     /// the default (fewest requests in flight, then random).
-    Random { two: bool, least_conn: bool },
+    Random {
+        two: bool,
+        least_conn: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1581,11 +1587,14 @@ fn parse_upstream(d: &Directive) -> Result<Upstream, ConfigError> {
             "hash" => {
                 // `hash <complex value> [consistent]`.
                 let key = child.args.first().cloned().unwrap_or_default();
-                let consistent = child.args.get(1).map(|a| a == "consistent").unwrap_or(false);
+                let consistent = child
+                    .args
+                    .get(1)
+                    .map(|a| a == "consistent")
+                    .unwrap_or(false);
                 up.method = LbMethod::Hash { key, consistent };
             }
-            "keepalive_requests" | "keepalive_timeout" | "zone" | "queue" | "resolver" => {
-            }
+            "keepalive_requests" | "keepalive_timeout" | "zone" | "queue" | "resolver" => {}
             other => {
                 return Err(sem(
                     &child.file,
@@ -1600,7 +1609,10 @@ fn parse_upstream(d: &Directive) -> Result<Upstream, ConfigError> {
         return Err(sem(&d.file, d.line, "upstream has no servers"));
     }
     // `hash ... consistent`: build the ketama ring once, nginx-style.
-    if let LbMethod::Hash { consistent: true, .. } = up.method {
+    if let LbMethod::Hash {
+        consistent: true, ..
+    } = up.method
+    {
         up.chash_points = build_chash_points(&up.servers);
     }
     Ok(up)
@@ -1612,7 +1624,11 @@ pub fn crc32_update(crc: u32, data: &[u8]) -> u32 {
     fn table_entry(i: u32) -> u32 {
         let mut c = i;
         for _ in 0..8 {
-            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
         }
         c
     }
@@ -2187,7 +2203,8 @@ impl Builder {
                     .args
                     .first()
                     .ok_or_else(|| sem(&d.file, d.line, "charset requires a value"))?;
-                cfg.charset_utf8 = v.eq_ignore_ascii_case("utf-8") || v.eq_ignore_ascii_case("utf8");
+                cfg.charset_utf8 =
+                    v.eq_ignore_ascii_case("utf-8") || v.eq_ignore_ascii_case("utf8");
             }
             "autoindex" => {
                 let v = d
@@ -2505,7 +2522,11 @@ impl Builder {
                                 sem(&child.file, child.line, "proxy_pass requires a URL")
                             })?;
                             ifb.proxy_pass = Some(parse_proxy_pass(v).ok_or_else(|| {
-                                sem(&child.file, child.line, format!("invalid proxy_pass URL \"{v}\""))
+                                sem(
+                                    &child.file,
+                                    child.line,
+                                    format!("invalid proxy_pass URL \"{v}\""),
+                                )
                             })?);
                             ifb.proxy_upstream_name = proxy_upstream_name(v);
                         }
@@ -2727,7 +2748,11 @@ impl Builder {
                             sem(&child.file, child.line, "proxy_pass requires a URL")
                         })?;
                         le.proxy_pass = Some(parse_proxy_pass(v).ok_or_else(|| {
-                            sem(&child.file, child.line, format!("invalid proxy_pass URL \"{v}\""))
+                            sem(
+                                &child.file,
+                                child.line,
+                                format!("invalid proxy_pass URL \"{v}\""),
+                            )
                         })?);
                         le.proxy_upstream_name = proxy_upstream_name(v);
                     }
@@ -2841,10 +2866,17 @@ impl Builder {
             "proxy_ssl_name" => {
                 cfg.proxy_ssl_name = d.args.first().cloned();
             }
-            "proxy_ssl_verify" | "proxy_ssl_verify_depth" | "proxy_ssl_server_name"
-            | "proxy_ssl_protocols" | "proxy_ssl_ciphers" | "proxy_ssl_trusted_certificate"
-            | "proxy_ssl_crl" | "proxy_ssl_conf_command" | "proxy_ssl_certificate"
-            | "proxy_ssl_certificate_key" | "proxy_ssl_password_file" => {
+            "proxy_ssl_verify"
+            | "proxy_ssl_verify_depth"
+            | "proxy_ssl_server_name"
+            | "proxy_ssl_protocols"
+            | "proxy_ssl_ciphers"
+            | "proxy_ssl_trusted_certificate"
+            | "proxy_ssl_crl"
+            | "proxy_ssl_conf_command"
+            | "proxy_ssl_certificate"
+            | "proxy_ssl_certificate_key"
+            | "proxy_ssl_password_file" => {
                 // Accepted; verified TLS towards an upstream is not implemented
                 // (nginx's default is `proxy_ssl_verify off`).
             }
@@ -2855,7 +2887,9 @@ impl Builder {
                 }
                 // Replace, never append: nginx inherits the whole list from the
                 // enclosing level only when this level declares none.
-                cfg.proxy_redirect_src.get_or_insert_with(Vec::new).push(entry);
+                cfg.proxy_redirect_src
+                    .get_or_insert_with(Vec::new)
+                    .push(entry);
             }
             "proxy_pass" => {
                 let v = d
@@ -5163,4 +5197,3 @@ fn implicit_default(cfg: &LocCfg, prefix: &str) -> Vec<RedirectRule> {
         _ => Vec::new(),
     }
 }
-

@@ -141,6 +141,13 @@ pub struct Request {
     pub version_minor: u8,
     pub headers: Headers,
     pub body_len: u64,
+    /// Request body already in memory.
+    ///
+    /// HTTP/2 and HTTP/3 receive DATA frames on a stream, not on a socket the
+    /// dispatcher can read, so the body is collected before routing and carried
+    /// here. `None` on HTTP/1.1, where `body_len`/`chunked` describe a body
+    /// still sitting on the connection.
+    pub buffered_body: Option<Vec<u8>>,
     pub chunked: bool,
     pub keepalive: bool,
     pub host: Option<InStr>,
@@ -512,6 +519,7 @@ impl Request {
             version_minor,
             headers,
             body_len,
+            buffered_body: None,
             chunked,
             keepalive,
             host,

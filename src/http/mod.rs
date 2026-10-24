@@ -49,6 +49,14 @@ pub struct Response {
     /// every value expands to empty (`ngx_http_headers_filter` sets
     /// `r->expect_trailers` before the values are known).
     pub expect_trailers: bool,
+    /// `add_header` / `add_trailer` have already been applied to `raw`.
+    ///
+    /// The socket-free path (HTTP/2, HTTP/3, SSI, auth subrequests) renders the
+    /// upstream response inside the proxy module, where `$upstream_*` is in
+    /// scope; `finalize_response` must then not apply the location's headers a
+    /// second time. On HTTP/1.1 the proxy streams straight to the client and
+    /// this stays `false`.
+    pub headers_finalized: bool,
     pub body: Body,
 }
 
@@ -68,6 +76,8 @@ impl Response {
             no_error_page: false,
             trailers: Vec::new(),
             expect_trailers: false,
+
+            headers_finalized: false,
             body: Body::Empty,
         }
     }
@@ -81,6 +91,8 @@ impl Response {
             no_error_page: false,
             trailers: Vec::new(),
             expect_trailers: false,
+
+            headers_finalized: false,
             body: Body::Bytes(body),
         }
     }
@@ -95,6 +107,8 @@ impl Response {
             no_error_page: false,
             trailers: Vec::new(),
             expect_trailers: false,
+
+            headers_finalized: false,
             body,
         }
     }
@@ -311,6 +325,7 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
                     version_minor: 0,
                     headers: crate::http::request::Headers::default(),
                     body_len: 0,
+                    buffered_body: None,
                     chunked: false,
                     keepalive: false,
                     host: None,
@@ -386,7 +401,8 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
         // and the difference against a bare tokio server is our parser and
         // connection loop.
         if stop_stage() == 1
-            || *SKIP_AFTER_PARSE.get_or_init(|| std::env::var_os("NGXRS_SKIP_AFTER_PARSE").is_some())
+            || *SKIP_AFTER_PARSE
+                .get_or_init(|| std::env::var_os("NGXRS_SKIP_AFTER_PARSE").is_some())
         {
             let resp = Response::bytes(200, "text/plain", b"hello".to_vec());
             let _ = write_response_ka(&mut conn, resp, true, true, false, None).await;
@@ -1519,10 +1535,7 @@ fn apply_one(
     // `?` drops the request's original args, plain new args are appended to
     // them with `&`, and no `?` at all keeps them verbatim.
     let (uri_tmpl, arg_tmpl) = match rw.replacement.find('?') {
-        Some(q) => (
-            &rw.replacement[..q],
-            Some(&rw.replacement[q + 1..]),
-        ),
+        Some(q) => (&rw.replacement[..q], Some(&rw.replacement[q + 1..])),
         None => (rw.replacement.as_str(), None),
     };
     let drop_args = arg_tmpl.is_some_and(|a| a.ends_with('?'));
@@ -2202,8 +2215,8 @@ pub fn apply_add_headers_ctx(
         // `$upstream_addr` in `add_header` shows every attempt, not just the
         // one that answered; fall back to the single address when the
         // task-local list is empty (h2 spawned paths).
-        let addr_list = crate::timing::variable("upstream_addr")
-            .unwrap_or_else(|| upstream_addr.to_string());
+        let addr_list =
+            crate::timing::variable("upstream_addr").unwrap_or_else(|| upstream_addr.to_string());
         let mut expanded = expand_upstream_vars(value, upstream_headers)
             .replace("$upstream_cache_status", upstream_cache_status)
             .replace("$upstream_addr", &addr_list)
@@ -2518,6 +2531,17 @@ impl<'a> ServerVars<'a> {
                 }
             }
             "request_method" => self.req.method.as_str().to_string(),
+            // nginx exposes the body only once it has been read; over HTTP/1.1
+            // our dispatcher streams it straight to the upstream, so this is
+            // populated on HTTP/2 and HTTP/3, where it arrives before routing.
+            // `$request_body_file` needs `client_body_in_file_only`, and the
+            // path is threaded in by the caller that wrote the file.
+            "request_body" => self
+                .req
+                .buffered_body
+                .as_ref()
+                .map(|b| String::from_utf8_lossy(b).to_string())
+                .unwrap_or_default(),
             // Derive from the connection rather than each call site's default:
             // the same `ServerVars` must answer correctly for TLS connections.
             "scheme" => {
@@ -2816,8 +2840,10 @@ pub fn resolve_target<'a>(
     for le in &cur_loc.limit_except {
         if !le.methods.iter().any(|m| m == req.method.as_str()) {
             if le.proxy_pass.is_some() {
-                proxy_override =
-                    le.proxy_pass.clone().map(|pp| (pp, le.proxy_upstream_name.clone()));
+                proxy_override = le
+                    .proxy_pass
+                    .clone()
+                    .map(|pp| (pp, le.proxy_upstream_name.clone()));
             }
             break;
         }
@@ -2920,7 +2946,6 @@ pub fn resolve_target<'a>(
         vars,
     )
 }
-
 
 #[allow(clippy::too_many_arguments)]
 pub async fn resolve_response_caps(
@@ -3714,7 +3739,15 @@ async fn finalize_response(
 
         // The error page target runs the full rewrite phase too, so a
         // `rewrite ^ http://...` inside it produces the redirect.
-        let redirected = match resolve_target(req, &cur_path, &cur_query, server, cur_loc, http, server_port) {
+        let redirected = match resolve_target(
+            req,
+            &cur_path,
+            &cur_query,
+            server,
+            cur_loc,
+            http,
+            server_port,
+        ) {
             Target::Done(r) => r,
             Target::Loc(p, q, l, _skip, _rw, _set_vars) => {
                 cur_path = p;
@@ -3809,7 +3842,7 @@ async fn finalize_response(
     // expectations are absolute.
     absolutize_location(&mut out.raw, req, cur_loc, server_port, local_addr);
 
-    if !cur_loc.headers.is_empty() || !cur_loc.trailers.is_empty() {
+    if (!cur_loc.headers.is_empty() || !cur_loc.trailers.is_empty()) && !out.headers_finalized {
         // `$sent_http_*` sees the headers produced so far (nginx evaluates
         // add_header left to right, so earlier ones are visible).
         let existing = split_head(&out.raw);
@@ -3921,21 +3954,38 @@ fn forwarded_step(
     loc: &LocCfg,
     recursive: bool,
 ) -> FwdStep {
-    let trusted =
-        |ip| loc.realip_from.iter().any(|(n, b)| cidr_contains(*n, *b, ip));
+    let trusted = |ip| {
+        loc.realip_from
+            .iter()
+            .any(|(n, b)| cidr_contains(*n, *b, ip))
+    };
     let mut rest = value;
     let mut found = false;
     loop {
         if !trusted(addr.0) {
-            return if found { FwdStep::Done } else { FwdStep::Declined };
+            return if found {
+                FwdStep::Done
+            } else {
+                FwdStep::Declined
+            };
         }
         let trimmed = rest.trim_end_matches([' ', ',']);
         let token = match trimmed.rsplit([' ', ',']).next() {
             Some(t) if !t.is_empty() => t,
-            _ => return if found { FwdStep::Done } else { FwdStep::Declined },
+            _ => {
+                return if found {
+                    FwdStep::Done
+                } else {
+                    FwdStep::Declined
+                }
+            }
         };
         let Some(parsed) = parse_addr_port(token) else {
-            return if found { FwdStep::Done } else { FwdStep::Declined };
+            return if found {
+                FwdStep::Done
+            } else {
+                FwdStep::Declined
+            };
         };
         *addr = parsed;
         found = true;
@@ -4825,6 +4875,8 @@ async fn write_redirect(
         no_error_page: false,
         trailers: Vec::new(),
         expect_trailers: false,
+
+        headers_finalized: false,
         body: Body::Bytes(body),
     };
     let bytes = write_response(
@@ -4939,6 +4991,8 @@ pub async fn send_error(
         explicit_len: true,
         trailers: Vec::new(),
         expect_trailers: false,
+
+        headers_finalized: false,
         body: Body::Bytes(body),
     };
     write_response(conn, resp, keepalive, tokens, head_only).await
@@ -5032,6 +5086,7 @@ async fn write_response_inner(
         no_error_page: _,
         trailers,
         expect_trailers,
+        headers_finalized: _,
         body,
     } = resp;
 
@@ -5955,13 +6010,7 @@ fn absolutize_location(
         if lower.starts_with("location:") {
             let value = trimmed[9..].trim();
             if let Some(rest) = value.strip_prefix('/') {
-                let abs = redirect_location(
-                    req,
-                    loc,
-                    &format!("/{rest}"),
-                    listen_port,
-                    local_addr,
-                );
+                let abs = redirect_location(req, loc, &format!("/{rest}"), listen_port, local_addr);
                 out.push_str("Location: ");
                 out.push_str(&abs);
                 out.push_str("\r\n");
@@ -5973,4 +6022,3 @@ fn absolutize_location(
     out.push_str(&String::from_utf8_lossy(&raw[head_end..]));
     *raw = out.into_bytes();
 }
-

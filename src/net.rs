@@ -787,7 +787,29 @@ async fn accept_loop(
                                         .any(|s| cfg.http.server(*s).http2);
                                     let mut head = [0u8; 24];
                                     let avail = if h2_capable {
-                                        peek_available(&stream, &mut head)
+                                        match peek_available(&stream, &mut head) {
+                                            n if n > 0 => n,
+                                            // Nothing has arrived yet. Treating
+                                            // that as "not HTTP/2" is a race: the
+                                            // preface usually lands microseconds
+                                            // after `accept`, so roughly every
+                                            // other connection was misread as
+                                            // HTTP/1.1 and answered with
+                                            // `505`/nothing. Wait briefly for the
+                                            // first bytes instead. A plain HTTP
+                                            // client sends its request line just
+                                            // as promptly, so this costs nothing
+                                            // on the HTTP/1.1 path.
+                                            _ => match tokio::time::timeout(
+                                                Duration::from_millis(100),
+                                                stream.peek(&mut head),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(n)) => n,
+                                                _ => 0,
+                                            },
+                                        }
                                     } else {
                                         0
                                     };

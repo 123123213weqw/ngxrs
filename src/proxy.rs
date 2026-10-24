@@ -208,9 +208,10 @@ fn peer_available(up: usize, sidx: usize, max_fails: u32, fail_timeout: Duration
 /// bumps `fails`.
 fn peer_mark(up: usize, sidx: usize, failed: bool) {
     let mut guard = peer_fail_cell().lock().unwrap_or_else(|e| e.into_inner());
-    let p = guard
-        .entry((up, sidx))
-        .or_insert(PeerFail { fails: 0, checked: std::time::Instant::now() });
+    let p = guard.entry((up, sidx)).or_insert(PeerFail {
+        fails: 0,
+        checked: std::time::Instant::now(),
+    });
     p.checked = std::time::Instant::now();
     if failed {
         p.fails = p.fails.saturating_add(1);
@@ -569,7 +570,12 @@ fn select_order(
 /// whole list (down peers included) by `hash % total_weight`; a peer that is
 /// already tried, down, or failed makes the loop rehash — after 20 tries
 /// nginx falls back to round-robin, which is `None` here.
-fn plain_hash_order(up: &Upstream, idx: usize, key: &str, primaries: &[usize]) -> Option<Vec<usize>> {
+fn plain_hash_order(
+    up: &Upstream,
+    idx: usize,
+    key: &str,
+    primaries: &[usize],
+) -> Option<Vec<usize>> {
     // nginx: `number < 2 || key.len == 0` selects by round-robin instead.
     // `number` is the configured primary count, down peers included.
     let configured = up.servers.iter().filter(|s| !s.backup).count();
@@ -652,9 +658,7 @@ fn chash_order(up: &Upstream, idx: usize, key: &str, primaries: &[usize]) -> Opt
     }
     let key_hash = crate::config::typed::crc32_update(0, key.as_bytes());
     // First index with point.hash >= key_hash (binary search over sorted ring).
-    let start = up
-        .chash_points
-        .partition_point(|&(h, _)| h < key_hash);
+    let start = up.chash_points.partition_point(|&(h, _)| h < key_hash);
     let mut hidx = start;
     let mut steps: u32 = 0;
     let mut order: Vec<usize> = Vec::new();
@@ -808,20 +812,20 @@ fn upstream_target(
         path.to_string()
     } else {
         match &pp.uri {
-        // `proxy_pass http://u/$1$name.html`: the URI part is a complex value,
-        // expanded per request with the location's regex captures.
-        Some(prefix) if prefix.contains('$') => vars.expand(prefix),
-        Some(prefix) => {
-            let cut = loc.prefix_len.min(path.len());
-            let rest = &path[cut..];
-            if prefix.ends_with('/') && rest.starts_with('/') {
-                format!("{}{}", prefix, &rest[1..])
-            } else {
-                format!("{prefix}{rest}")
+            // `proxy_pass http://u/$1$name.html`: the URI part is a complex value,
+            // expanded per request with the location's regex captures.
+            Some(prefix) if prefix.contains('$') => vars.expand(prefix),
+            Some(prefix) => {
+                let cut = loc.prefix_len.min(path.len());
+                let rest = &path[cut..];
+                if prefix.ends_with('/') && rest.starts_with('/') {
+                    format!("{}{}", prefix, &rest[1..])
+                } else {
+                    format!("{prefix}{rest}")
+                }
             }
+            None => path.to_string(),
         }
-        None => path.to_string(),
-    }
     };
     if !query.is_empty() {
         target.push('?');
@@ -1085,13 +1089,7 @@ pub async fn handle(
     }
 
     // Request body (buffered; the static path never needs it).
-    let body = if req.chunked {
-        conn.take_chunked_body(MAX_PROXY_BODY).await?
-    } else if req.body_len > 0 {
-        conn.take_body(req.body_len as usize).await?
-    } else {
-        Vec::new()
-    };
+    let body = take_request_body(conn, req, MAX_PROXY_BODY).await?;
 
     let target_uri =
         dyn_uri.unwrap_or_else(|| upstream_target(path, query, loc, &pp, vars, uri_rewritten));
@@ -1349,6 +1347,8 @@ pub async fn handle(
                         no_error_page: false,
                         trailers: Vec::new(),
                         expect_trailers: false,
+
+                        headers_finalized: false,
                         body: Body::Bytes(entry.body),
                     };
                     let bytes = crate::http::write_response(
@@ -1482,7 +1482,7 @@ pub async fn handle(
             && cand_idx + 1 < candidates.len()
             && method_retryable
             && nu_flags & nu::ANY_HTTP != 0)
-        .then_some(nu_flags);
+            .then_some(nu_flags);
         // First attempt may reuse a pooled socket; if that socket turns out to
         // be dead, retry the same backend once on a fresh connection.
         for attempt in 0..2 {
@@ -1562,7 +1562,7 @@ pub async fn handle(
                                         loc.proxy_ssl_session_reuse,
                                         loc.proxy_connect_timeout,
                                     )
-                                        .await
+                                    .await
                                     {
                                         Ok(t) => t,
                                         Err(e) => {
@@ -1721,12 +1721,7 @@ async fn connect_timeout(addr: SocketAddr, dur: Duration) -> io::Result<UpStream
 ///
 /// The SNI name is `proxy_ssl_name` when configured, else the authority of the
 /// `proxy_pass` URL -- nginx's `u->conf->ssl_name` falls back to `u->host`.
-async fn tls_wrap(
-    tcp: TcpStream,
-    sni: &str,
-    reuse: bool,
-    dur: Duration,
-) -> io::Result<UpStream> {
+async fn tls_wrap(tcp: TcpStream, sni: &str, reuse: bool, dur: Duration) -> io::Result<UpStream> {
     let connector = tls_connector(reuse)?;
     // `proxy_ssl_name` / `u->host` never carries the port, but the authority we
     // keep as `host_header` does (`127.0.0.1:8082`), so strip it here. A bare IP
@@ -2247,7 +2242,8 @@ fn build_upstream_head(
         out.extend_from_slice(b"Connection: close\r\n");
     }
 
-    if !body_of_request.is_empty() || req.body_len > 0 || req.chunked {
+    if !body_of_request.is_empty() || req.body_len > 0 || req.chunked || req.buffered_body.is_some()
+    {
         out.extend_from_slice(b"Content-Length: ");
         out.extend_from_slice(body_of_request.len().to_string().as_bytes());
         out.extend_from_slice(b"\r\n");
@@ -2310,6 +2306,8 @@ async fn serve_cached(
         no_error_page: false,
         trailers: Vec::new(),
         expect_trailers: false,
+
+        headers_finalized: false,
         body: crate::http::Body::Bytes(body),
     };
     // gzip is an output filter in nginx, so a served-from-cache body goes
@@ -2554,6 +2552,8 @@ async fn exchange(
                     no_error_page: false,
                     trailers: Vec::new(),
                     expect_trailers: false,
+
+                    headers_finalized: false,
                     body: crate::http::Body::Bytes(body),
                 };
                 let bytes = crate::http::write_response(
@@ -2856,6 +2856,8 @@ async fn exchange(
                     no_error_page: false,
                     trailers: list,
                     expect_trailers: true,
+
+                    headers_finalized: false,
                     body: if req.method == Method::Head {
                         crate::http::Body::Empty
                     } else {
@@ -3177,6 +3179,31 @@ async fn stream_chunked(
     }
 }
 
+/// The request body, however this connection carries it.
+///
+/// HTTP/1.1 has it on the socket; HTTP/2 and HTTP/3 collected it into
+/// `Request::buffered_body` before routing. One helper so the upstream modules
+/// do not each have to know which.
+pub async fn take_request_body(
+    conn: &mut crate::conn::Conn,
+    req: &Request,
+    max: usize,
+) -> io::Result<Vec<u8>> {
+    if let Some(b) = &req.buffered_body {
+        if b.len() > max {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "body too large"));
+        }
+        return Ok(b.clone());
+    }
+    if req.chunked {
+        conn.take_chunked_body(max).await
+    } else if req.body_len > 0 {
+        conn.take_body(req.body_len as usize).await
+    } else {
+        Ok(Vec::new())
+    }
+}
+
 impl crate::conn::Conn {
     /// Take a Content-Length body into memory (bounded).
     /// Send the interim `100 Continue` nginx emits for `Expect: 100-continue`.
@@ -3386,10 +3413,13 @@ pub async fn fetch(
             }
         };
 
+        // The socket-free path (HTTP/2, HTTP/3, SSI, auth subrequests) carries
+        // the body in memory rather than on a connection it can read.
+        let in_memory = req.buffered_body.as_deref().unwrap_or(&[]);
         let out = build_upstream_head(
             req,
             &target_uri,
-            &[],
+            in_memory,
             loc,
             &pp,
             peer_ip,
@@ -3399,6 +3429,9 @@ pub async fn fetch(
             false,
         );
         if up.write_all(&out).await.is_err() {
+            continue;
+        }
+        if !in_memory.is_empty() && up.write_all(in_memory).await.is_err() {
             continue;
         }
 
@@ -3480,13 +3513,18 @@ pub async fn fetch(
         };
         apply_proxy_redirect(&mut raw, loc, &fetch_vars);
         crate::http::apply_expires(&mut raw, loc, head.status);
-        crate::http::apply_add_headers_full(
+        // Applied here, where `$upstream_*` is in scope, and with the full
+        // `ServerVars` set (`$request_body`, `$cookie_*`, `set` variables).
+        // `headers_finalized` then stops `finalize_response` repeating it.
+        crate::http::apply_add_headers_ctx(
             &mut raw,
             &loc.headers,
             head.status,
             cache_status,
             &upstream_addr_display,
             &upstream_headers,
+            Some(&fetch_vars),
+            &pp.host_header,
         );
 
         // `proxy_cache_use_stale`: an expired entry may stand in for an
@@ -3540,6 +3578,7 @@ pub async fn fetch(
             no_error_page: false,
             trailers: Vec::new(),
             expect_trailers: false,
+            headers_finalized: true,
             body: Body::Bytes(body),
         });
     }
@@ -3641,6 +3680,7 @@ fn cached_response(entry: crate::cache::Cached, loc: &LocCfg, status: &str) -> R
         no_error_page: false,
         trailers: Vec::new(),
         expect_trailers: false,
+        headers_finalized: true,
         body: Body::Bytes(entry.body),
     }
 }
@@ -4152,7 +4192,9 @@ fn rewrite_one(
                 return Some(format!("{}{}", vars.expand(to), &url[from.len()..]));
             }
             crate::config::RedirectRule::Regex { re, to } => {
-                let Some(caps) = re.captures(url) else { continue };
+                let Some(caps) = re.captures(url) else {
+                    continue;
+                };
                 // Positional captures become `$1..$n` for the replacement.
                 let mut expanded = String::new();
                 let bytes = to.as_bytes();
@@ -4193,11 +4235,7 @@ fn rewrite_one(
 /// listening-socket fallback for a missing Host (that address is not available
 /// on the proxy path; nginx only uses it when the request carried no usable
 /// Host, in which case the value is left relative here).
-fn absolute_location(
-    value: &str,
-    loc: &LocCfg,
-    vars: &crate::http::ServerVars<'_>,
-) -> String {
+fn absolute_location(value: &str, loc: &LocCfg, vars: &crate::http::ServerVars<'_>) -> String {
     if !loc.absolute_redirect || !value.starts_with('/') {
         return value.to_string();
     }

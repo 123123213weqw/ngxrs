@@ -460,7 +460,11 @@ fn absolute_form_to_origin(raw: &str) -> Option<String> {
     // BENCH.md, "parse_target" cost).
     let head = raw.as_bytes();
     let matches = |want: &[u8]| {
-        head.len() >= want.len() && head[..want.len()].iter().zip(want).all(|(a, b)| a.eq_ignore_ascii_case(b))
+        head.len() >= want.len()
+            && head[..want.len()]
+                .iter()
+                .zip(want)
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
     };
     if !matches(b"http://") && !matches(b"https://") {
         return None;

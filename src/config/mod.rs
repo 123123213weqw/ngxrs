@@ -6,11 +6,10 @@ pub mod typed;
 
 pub use parser::{ConfigError, Directive};
 pub use typed::{
-    access_denied, access_denied_for, parse_time, AccessLog, AccessRule, CacheZone, Config,
-    FastcgiParam, FastcgiPass, Http, IfBlock, IfCond, KeepaliveDisable, LbMethod, ListenGroup,
-    LocCfg, Match, next_upstream, ProxyPass, ProxyTarget, RedirectRule, Rewrite, RewriteFlag,
-    ScgiPass, Server,
-    Step, Upstream, UpstreamServer, UwsgiPass,
+    access_denied, access_denied_for, next_upstream, parse_time, AccessLog, AccessRule, CacheZone,
+    Config, FastcgiParam, FastcgiPass, Http, IfBlock, IfCond, KeepaliveDisable, LbMethod,
+    ListenGroup, LocCfg, Match, ProxyPass, ProxyTarget, RedirectRule, Rewrite, RewriteFlag,
+    ScgiPass, Server, Step, Upstream, UpstreamServer, UwsgiPass,
 };
 
 use std::path::{Path, PathBuf};

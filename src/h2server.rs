@@ -169,8 +169,59 @@ pub async fn serve<S>(
         let path = request.uri().path().to_string();
         let query = request.uri().query().unwrap_or("").to_string();
         let loc = server.locate(&path);
-        let h1 = synthesize_request(&request, authority.as_deref(), &path, &query);
+        let mut h1 = synthesize_request(&request, authority.as_deref(), &path, &query);
         let head_only = h1.method == Method::Head;
+
+        // ---- request body ----
+        //
+        // The DATA frames live on the stream, not on a socket the dispatcher
+        // can read, so collect them here and hand routing an in-memory body.
+        // `flow_control().release_capacity` is mandatory: the initial window is
+        // 65536 bytes and without it a larger body never arrives, which shows up
+        // as "small bodies work, large ones hang".
+        let max_body = loc.client_max_body_size;
+        let mut recv = request.into_body();
+        let mut body: Vec<u8> = Vec::new();
+        let mut too_large = false;
+        loop {
+            match recv.data().await {
+                Some(Ok(chunk)) => {
+                    let n = chunk.len();
+                    if max_body != u64::MAX && (body.len() + n) as u64 > max_body {
+                        too_large = true;
+                        let _ = recv.flow_control().release_capacity(n);
+                        break;
+                    }
+                    body.extend_from_slice(&chunk);
+                    if recv.flow_control().release_capacity(n).is_err() {
+                        break;
+                    }
+                }
+                Some(Err(_)) | None => break,
+            }
+        }
+
+        if too_large {
+            // nginx answers 413 without draining the rest of the body, and
+            // resets the stream so the client stops sending.
+            let mut b = H2Response::builder().status(StatusCode::PAYLOAD_TOO_LARGE);
+            if let Some(h) = b.headers_mut() {
+                if let Ok(v) = http::header::HeaderValue::from_str(if tokens {
+                    "nginx/1.28.0"
+                } else {
+                    "nginx"
+                }) {
+                    h.insert(http::header::SERVER, v);
+                }
+            }
+            if let Ok(r) = b.body(()) {
+                if let Ok(mut send) = respond.send_response(r, true) {
+                    send.send_data(Bytes::new(), true).ok();
+                }
+            }
+            continue;
+        }
+        h1.buffered_body = Some(body);
 
         let resp =
             crate::http::resolve_response(&h1, &path, &query, server, loc, http, "127.0.0.1", 443)
@@ -281,6 +332,7 @@ fn synthesize_request(
         version_minor: 1,
         headers,
         body_len: 0,
+        buffered_body: None,
         chunked: false,
         keepalive: true,
         // nginx's `$host` is normalized: lowercase, port and stray colon

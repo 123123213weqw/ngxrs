@@ -294,6 +294,36 @@
 
 
 
+### 被 `-V` 门控隐藏的 TLS 套件（本轮首次真实测量）
+
+`Test::Nginx` 的 `has('openssl:1.0.2')` 匹配 `nginx -V` 里的
+`built with OpenSSL <ver>`。ngxrs 用 rustls，不会打印那一行，于是 17 个 TLS
+套件在我们这侧**直接跳过**——既不通过也不失败，等于从未测量。
+
+`bench/tlsgate.sh` 就地给 harness 的这一个判据打补丁（退出时 `trap` 还原），
+把「未知」变成「已测」。实测结果：
+
+| 阶段 | ngxrs / nginx 断言 |
+|---|---|
+| 首次拆开门控 | **14 / 152** |
+| 实现变量证书 + 证书加载失败非致命后 | **32 / 152** |
+
+改善来自两处真实修复：
+
+- **`ssl_certificate` / `ssl_certificate_key` 支持变量**（nginx 1.15.9+）。
+  按 geo / map 的 `default` 分支展开；`ssl_certificate.t` 0/13 → **12/13**。
+- **证书加载失败不再中断监听 socket**。nginx 会记日志继续启动，随后该 server
+  的握手失败——`ssl_certificate $ssl_server_name.crt` 在配置期变量为空，
+  用例正是断言「无响应」。原先我们直接整个 socket 起不来。
+
+剩余未对齐仍很大，主要是三族真实未实现的特性：
+
+| 族 | 未对齐 | 说明 |
+|---|---|---|
+| `*_certificate_cache` | 70 | `ssl_certificate_cache` 指令（证书对象缓存）未实现 |
+| `*_conf_command` | 17 | `ssl_conf_command` 是 OpenSSL 专有配置通道，rustls 无对应物 |
+| `*_ssl_sni_protocols` / `stream_server_name` | 7 | stream 缺 `server_name`，所以 SNI 无法分流 |
+
 ### 非测试类偏差
 
 以下偏差没有对应的 nginx-tests 套件，或无法在本机构造 A/B 对照，单独列出。
@@ -305,6 +335,9 @@
 | N3 | **HTTP/2 非法 `:authority` / 控制字符：crate 直接重置流** | nginx 对空 authority、含 `/` 或控制字符的 authority、header 值含控制字符回 **400**；`h2` crate 在把请求交给路由之前就发 `RST_STREAM`（`GOAWAY` 对控制字符），因此我们无法回答 400。这正是 `h2_host.t` 4 条失败的原因 | 见 `bench/h2auth_probe.pl`：`perl bench/h2auth_probe.pl` → 前三行 `frames=[RST_STREAM]`、第四行 `frames=[GOAWAY]` |
 | N4 | **HPACK / QPACK 表示选择由 crate 决定** | 我们不能控制 Huffman 编码、动态表索引、post-base index，所以 `h2_headers.t` 73/112、`h3_headers.t` 28/77 无法用"改我们的代码"消除 | `TEST_LIST=h2_headers.t bash bench/nginxtests.sh` |
 | N5 | **14 个可选模块未实现**，`-V` 中显式声明为 `--without-`，相关套件因此跳过而不是伪装通过 | `http_dav/slice/memcached/flv/mp4/geoip/image_filter/xslt/perl/secure_link/gzip_static/userid/browser/mirror` | `ngxrs -V 2>&1 \| tr ' ' '\n' \| grep -- --without` |
+| N6 | **`ssl_certificate_cache` / `ssl_conf_command` 被 `-V` 特性门控隐藏** | `Test::Nginx` 的 `has()` 匹配 `-V` 文本，这两个名字不在我们的 `-V` 里，相关套件在我们这侧直接跳过——**不是答错，是压根没跑**。`bench/tlsgate.sh` 在 `-V` 之外单独驱动这批文件（就地给 harness 打补丁，退出时还原），把「未知」变成「已测」 | `bash bench/tlsgate.sh` |
+| N7 | **`suwsgi://`（uwsgi over TLS）未实现** | `uwsgi_pass suwsgi://…` 报 `invalid uwsgi_pass`，配置直接起不来 | `TEST_LIST=uwsgi_ssl_certificate.t bash bench/nginxtests.sh` |
+| N8 | **stream 侧的证书变量未接 stream geo** | `ssl_certificate $one.crt` 在 `stream` 里用的是 http 的 `geo` 表，stream 的 `geo` 不参与，变量展开后为空 | `TEST_LIST=stream_ssl_certificate.t bash bench/tlsgate.sh` |
 
 ## 四、能力矩阵
 

@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rustls::crypto::ring;
@@ -127,6 +127,62 @@ fn decrypt_pkcs8(pem: &[u8], passwords: &[String]) -> io::Result<Option<Vec<u8>>
     ))
 }
 
+/// Expand variables in a `ssl_certificate` / `ssl_certificate_key` path.
+///
+/// nginx has accepted variables here since 1.15.9. The value is evaluated once
+/// per SSL context; for a config-level source such as
+/// `geo $one { default one; }` that means the `default` branch, because there
+/// is no client address at config time. Supporting that case (and `map` /
+/// `split_clients` defaults) covers how the directive is actually used; a
+/// variable that depends on the live request cannot select a certificate
+/// anyway, since the certificate is needed before the request exists.
+fn expand_cert_path(raw: &Path) -> PathBuf {
+    let s = raw.to_string_lossy();
+    if !s.contains('$') {
+        return raw.to_path_buf();
+    }
+    let geos = crate::config::geos();
+    let maps = crate::config::maps();
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'$' {
+                i += 1;
+            }
+            out.push_str(&s[start..i]);
+            continue;
+        }
+        i += 1;
+        let braced = i < bytes.len() && bytes[i] == b'{';
+        if braced {
+            i += 1;
+        }
+        let start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+        let name = &s[start..i];
+        if braced && i < bytes.len() && bytes[i] == b'}' {
+            i += 1;
+        }
+        let value = geos
+            .iter()
+            .find(|g| g.var == name)
+            .and_then(|g| g.default.clone())
+            .or_else(|| {
+                maps.iter()
+                    .find(|m| m.var == name)
+                    .and_then(|m| m.default.clone())
+            })
+            .unwrap_or_default();
+        out.push_str(&value);
+    }
+    PathBuf::from(out)
+}
+
 /// Read a certificate chain and its (possibly encrypted) private key.
 fn load_raw_identity(
     key_path: &Path,
@@ -136,6 +192,8 @@ fn load_raw_identity(
     Vec<rustls::pki_types::CertificateDer<'static>>,
     PrivateKeyDer<'static>,
 )> {
+    let cert_path = &expand_cert_path(cert_path);
+    let key_path = &expand_cert_path(key_path);
     let cert_pem = std::fs::read(cert_path).map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -239,7 +297,23 @@ pub fn build_config(http: &Http, server_idxs: &[usize]) -> io::Result<Arc<Server
             Some(p) => read_passwords(p)?,
             None => Vec::new(),
         };
-        let key_id = load_cert_with(key, cert, &passwords)?;
+        // nginx does not abort startup when a certificate cannot be loaded:
+        // it logs the error and the handshake for that server then fails. That
+        // is observable -- `ssl_certificate.t` configures
+        // `ssl_certificate $ssl_server_name.crt`, where the variable is empty
+        // at config time, and asserts that the socket simply produces no
+        // response. Failing the whole listen socket here would take every other
+        // server on the same socket down with it.
+        let key_id = match load_cert_with(key, cert, &passwords) {
+            Ok(k) => k,
+            Err(e) => {
+                crate::log::error_log(
+                    "error",
+                    &format!("TLS setup for a server on this socket: {e}; continuing without it"),
+                );
+                continue;
+            }
+        };
         for name in &server.names {
             let lower = name.to_ascii_lowercase();
             if lower.is_empty() || lower == "_" || lower.starts_with('~') {

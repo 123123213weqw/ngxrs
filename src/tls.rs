@@ -342,6 +342,320 @@ fn expand_cert_path_with(raw: &Path, server_name: Option<&str>) -> PathBuf {
     PathBuf::from(out)
 }
 
+/// A client certificate returned verbatim, bypassing webpki's parse check.
+///
+/// See `upstream_connector_with_client_cert` for why that check has to be
+/// bypassed: it rejects X.509 v1, which OpenSSL accepts.
+#[derive(Debug)]
+struct FixedClientCert(Arc<CertifiedKey>);
+
+impl rustls::client::ResolvesClientCert for FixedClientCert {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        _sigschemes: &[rustls::SignatureScheme],
+    ) -> Option<Arc<CertifiedKey>> {
+        Some(self.0.clone())
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
+/// A TLS client configuration that presents a client certificate.
+///
+/// `proxy_ssl_certificate` / `uwsgi_ssl_certificate` and their `_key`
+/// counterparts make us authenticate to the upstream. Verification of the
+/// upstream itself stays off unless `proxy_ssl_verify on` is implemented, which
+/// matches nginx's default (`proxy_ssl_verify off`).
+///
+/// Cached per (cert, key) pair: building a `ClientConfig` per connection starts
+/// from an empty session store, so `*_ssl_session_reuse` could never answer
+/// `r`.
+pub fn upstream_connector_with_client_cert(
+    cert: &Path,
+    key: &Path,
+    passwords: &[String],
+    reuse: bool,
+    alpn: &[u8],
+) -> io::Result<tokio_rustls::TlsConnector> {
+    let (certs, key_der) = load_raw_identity(key, cert, passwords)?;
+    // `with_client_auth_cert` runs the certificate through webpki, which rejects
+    // X.509 v1 outright (`UnsupportedCertVersion`). OpenSSL does not, and the
+    // nginx fixtures are v1 self-signed certs, so the whole connection failed
+    // before the handshake. Installing the key through a resolver that returns
+    // it verbatim keeps the same behaviour nginx has here: send what was
+    // configured, let the peer decide.
+    let signing = ring::sign::any_supported_type(&key_der)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("unsupported key: {e}")))?;
+    let ck = Arc::new(CertifiedKey::new(certs.clone(), signing));
+    let provider = rustls::crypto::ring::default_provider();
+    let base = rustls::ClientConfig::builder_with_provider(Arc::new(provider.clone()))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("TLS: {e}")))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(crate::grpc::NoVerify(Arc::new(provider))))
+        .with_client_cert_resolver(Arc::new(FixedClientCert(ck)));
+    let mut cfg = base;
+    // An empty ALPN entry is an illegal protocol name: the peer answers
+    // `DecodeError` on the ServerHello path. Only advertise when asked.
+    if !alpn.is_empty() {
+        cfg.alpn_protocols = vec![alpn.to_vec()];
+    }
+    if !reuse {
+        cfg.resumption = rustls::client::Resumption::disabled();
+    }
+    Ok(tokio_rustls::TlsConnector::from(Arc::new(cfg)))
+}
+
+/// The subject of a DER certificate as OpenSSL's `X509_NAME_oneline` renders
+/// it: `/CN=name`, `/C=US/ST=CA/CN=name`, using `+` between the attribute-value
+/// pairs of one RDN. That is the format `$ssl_client_s_dn` reports.
+///
+/// Only the subject is needed, and only for one variable, so this walks the
+/// handful of TLVs between the outer SEQUENCE and the subject rather than
+/// pulling in a full X.509 parser.
+pub fn der_subject_oneline(der: &[u8]) -> String {
+    fn tlv(buf: &[u8], pos: usize) -> Option<(u8, usize, usize)> {
+        let tag = *buf.get(pos)?;
+        let first = *buf.get(pos + 1)?;
+        if first & 0x80 == 0 {
+            return Some((tag, pos + 2, first as usize));
+        }
+        let n = (first & 0x7f) as usize;
+        if n == 0 || n > 4 || buf.len() < pos + 2 + n {
+            return None;
+        }
+        let mut len = 0usize;
+        for &b in &buf[pos + 2..pos + 2 + n] {
+            len = (len << 8) | b as usize;
+        }
+        Some((tag, pos + 2 + n, len))
+    }
+
+    fn short_name(oid: &[u8]) -> String {
+        // DER contents of the common attribute OIDs.
+        const MAP: &[(&[u8], &str)] = &[
+            (&[0x55, 0x04, 0x03], "CN"),
+            (&[0x55, 0x04, 0x06], "C"),
+            (&[0x55, 0x04, 0x07], "L"),
+            (&[0x55, 0x04, 0x08], "ST"),
+            (&[0x55, 0x04, 0x0a], "O"),
+            (&[0x55, 0x04, 0x0b], "OU"),
+            (&[0x55, 0x04, 0x05], "serialNumber"),
+            (&[0x55, 0x04, 0x09], "street"),
+            (&[0x55, 0x04, 0x0c], "GN"),
+            (&[0x55, 0x04, 0x2a], "SN"),
+            (&[0x55, 0x04, 0x2b], "title"),
+            (&[0x55, 0x04, 0x2e], "DC"),
+            (&[0x55, 0x04, 0x2f], "UID"),
+            (&[0x55, 0x1d, 0x1e], "emailAddress"),
+            (&[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x01], "emailAddress"),
+        ];
+        for (k, v) in MAP {
+            if *k == oid {
+                return (*v).to_string();
+            }
+        }
+        // Unknown OID: render dotted-decimal, as OpenSSL does.
+        if oid.is_empty() {
+            return String::new();
+        }
+        let mut out = String::new();
+        let mut acc: u64 = 0;
+        let mut first = true;
+        for &b in oid {
+            acc = (acc << 7) | (b & 0x7f) as u64;
+            if b & 0x80 == 0 {
+                if first {
+                    let a = acc / 40;
+                    let b2 = acc % 40;
+                    out.push_str(&format!("{}.{}", a.min(2), b2));
+                    first = false;
+                } else {
+                    out.push_str(&format!(".{acc}"));
+                }
+                acc = 0;
+            }
+        }
+        out
+    }
+
+    let Some((_, cert_body, _)) = tlv(der, 0) else {
+        return String::new();
+    };
+    let Some((_, tbs_body, _)) = tlv(der, cert_body) else {
+        return String::new();
+    };
+    let mut pos = tbs_body;
+    // [0] EXPLICIT version, present for v2/v3.
+    if let Some((tag, _, _)) = tlv(der, pos) {
+        if tag == 0xa0 {
+            let (_, body, len) = tlv(der, pos).unwrap();
+            pos = body + len;
+        }
+    }
+    // serialNumber, signature, issuer, validity, subject.
+    for _ in 0..4 {
+        let Some((_, body, len)) = tlv(der, pos) else {
+            return String::new();
+        };
+        pos = body + len;
+    }
+    let Some((_, mut name_pos, name_len)) = tlv(der, pos) else {
+        return String::new();
+    };
+    let name_end = name_pos + name_len;
+
+    let mut out = String::new();
+    // Name ::= SEQUENCE OF SET OF SEQUENCE { OID, value }
+    while name_pos < name_end {
+        let Some((_, set_body, set_len)) = tlv(der, name_pos) else {
+            break;
+        };
+        let set_end = (set_body + set_len).min(name_end);
+        let mut first_in_set = true;
+        let mut p = set_body;
+        while p < set_end {
+            let Some((_, atv_body, atv_len)) = tlv(der, p) else {
+                break;
+            };
+            let atv_end = atv_body + atv_len;
+            if let Some((_, oid_body, oid_len)) = tlv(der, atv_body) {
+                if let Some((_, val_body, val_len)) = tlv(der, oid_body + oid_len) {
+                    let name = short_name(&der[oid_body..oid_body + oid_len]);
+                    let value =
+                        String::from_utf8_lossy(&der[val_body..(val_body + val_len).min(atv_end)]);
+                    if !first_in_set {
+                        out.push('+');
+                    }
+                    out.push('/');
+                    out.push_str(&name);
+                    out.push('=');
+                    out.push_str(&value);
+                    first_in_set = false;
+                }
+            }
+            p = atv_end;
+        }
+        name_pos = set_body + set_len;
+    }
+    out
+}
+
+/// Read every certificate in a PEM file, including OpenSSL's
+/// `TRUSTED CERTIFICATE` blocks.
+///
+/// `openssl x509 -addtrust <purpose> -trustout` re-encodes a certificate with
+/// the `X509_AUX` structure appended and a `TRUSTED CERTIFICATE` PEM label.
+/// `rustls_pemfile::certs` looks only for a `CERTIFICATE` label and finds
+/// nothing, so such a file previously looked like it held no certificate at
+/// all. nginx/OpenSSL read it fine, so a config that works there failed here
+/// with "no PEM certificate in ...".
+///
+/// The DER is a certificate SEQUENCE immediately followed by the aux data, so
+/// the fix is to honour the outer SEQUENCE length and drop the tail. The trust
+/// purposes themselves are OpenSSL-only policy and are ignored, which matches
+/// what they mean for a server: they say "this is trusted for serverAuth", not
+/// "this is a CA".
+fn read_certs(pem: &[u8]) -> io::Result<Vec<CertificateDer<'static>>> {
+    let mut out: Vec<CertificateDer<'static>> = Vec::new();
+    let text = String::from_utf8_lossy(pem);
+    let mut rest = text.as_ref();
+
+    while let Some(begin) = rest.find("-----BEGIN ") {
+        let label_end = match rest[begin..].find("-----\n").or_else(|| rest[begin..].find("-----\r")) {
+            Some(i) => begin + i + 5,
+            None => break,
+        };
+        let label = &rest[begin + 11..label_end - 5];
+        let tagged = label.trim();
+        let end_marker = format!("-----END {tagged}-----");
+        let body_start = label_end;
+        let body_end = match rest[body_start..].find(&end_marker) {
+            Some(i) => body_start + i,
+            None => break,
+        };
+        let body = &rest[body_start..body_end];
+        rest = &rest[body_end + end_marker.len()..];
+
+        let is_cert = tagged == "CERTIFICATE" || tagged == "TRUSTED CERTIFICATE";
+        let is_trusted = tagged == "TRUSTED CERTIFICATE";
+        if !is_cert {
+            continue;
+        }
+        let b64: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        let Ok(der) = base64_decode(&b64) else {
+            continue;
+        };
+        let der = if is_trusted {
+            match der_sequence_len(&der) {
+                Some(n) if n <= der.len() => der[..n].to_vec(),
+                _ => der,
+            }
+        } else {
+            der
+        };
+        out.push(CertificateDer::from(der));
+    }
+
+    if out.is_empty() {
+        // Nothing matched the hand-rolled scan; fall back to rustls_pemfile so
+        // exotic encodings keep working.
+        return rustls_pemfile::certs(&mut pem.clone())
+            .collect::<Result<Vec<_>, _>>();
+    }
+    Ok(out)
+}
+
+/// Total encoded length of a DER SEQUENCE at the start of `der`.
+fn der_sequence_len(der: &[u8]) -> Option<usize> {
+    if der.len() < 2 || der[0] != 0x30 {
+        return None;
+    }
+    let first = der[1];
+    if first & 0x80 == 0 {
+        return Some(2 + first as usize);
+    }
+    let n = (first & 0x7f) as usize;
+    if n == 0 || n > 4 || der.len() < 2 + n {
+        return None;
+    }
+    let mut len = 0usize;
+    for &b in &der[2..2 + n] {
+        len = (len << 8) | b as usize;
+    }
+    Some(2 + n + len)
+}
+
+fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes: Vec<u8> = s.bytes().filter(|&c| c != b'=').collect();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    for b in bytes {
+        let Some(v) = val(b) else { return Err(()) };
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Ok(out)
+}
+
 /// Read a certificate chain and its (possibly encrypted) private key.
 fn load_raw_identity(
     key_path: &Path,
@@ -369,8 +683,7 @@ fn load_raw_identity(
         )
     })?;
 
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem.as_slice())
-        .collect::<Result<Vec<_>, _>>()
+    let certs: Vec<CertificateDer<'static>> = read_certs(&cert_pem)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad certificate: {e}")))?;
     if certs.is_empty() {
         return Err(io::Error::new(
@@ -554,9 +867,8 @@ pub fn build_config(http: &Http, server_idxs: &[usize]) -> io::Result<Arc<Server
         let mut hints = Vec::new();
         for &i in server_idxs {
             if let Some(ca) = &http.server(i).ssl_client_certificate {
-                if let Ok(file) = std::fs::File::open(ca) {
-                    let mut rd = std::io::BufReader::new(file);
-                    for cert in rustls_pemfile::certs(&mut rd).flatten() {
+                {
+                    for cert in read_certs(&std::fs::read(ca).unwrap_or_default()).unwrap_or_default() {
                         if let Ok(anchor) = webpki::anchor_from_trusted_cert(&cert) {
                             // `TrustAnchor::subject` holds the DN *contents*, but
                             // the CertificateRequest's certificate_authorities
@@ -780,7 +1092,7 @@ pub fn build_stream_config(
                 let Ok(bytes) = std::fs::read(path) else {
                     continue;
                 };
-                for c in rustls_pemfile::certs(&mut bytes.as_slice()).flatten() {
+                for c in read_certs(&bytes).unwrap_or_default() {
                     if !store.iter().any(|x| x.as_ref() == c.as_ref()) {
                         store.push(c);
                     }
@@ -809,7 +1121,7 @@ fn ca_hints(ca: Option<&Path>) -> io::Result<Vec<rustls::DistinguishedName>> {
     let mut hints = Vec::new();
     if let Some(path) = ca {
         let bytes = std::fs::read(path)?;
-        for cert in rustls_pemfile::certs(&mut bytes.as_slice()).flatten() {
+        for cert in read_certs(&bytes).unwrap_or_default() {
             if let Ok(anchor) = webpki::anchor_from_trusted_cert(&cert) {
                 hints.push(rustls::DistinguishedName::from(der_sequence(
                     anchor.subject.as_ref(),
@@ -1039,7 +1351,7 @@ pub fn verify_client_chain_multi(
             continue;
         };
         let mut reader = std::io::BufReader::new(file);
-        for cert in rustls_pemfile::certs(&mut reader).flatten() {
+        for cert in read_certs(&std::fs::read(path).unwrap_or_default()).unwrap_or_default() {
             if !trusted.iter().any(|c| c.as_ref() == cert.as_ref()) {
                 trusted.push(cert);
             }
@@ -1123,5 +1435,95 @@ mod tests {
         let wildcard: HashMap<String, u8> = HashMap::new();
         let default = None;
         assert_eq!(select(&exact, &wildcard, &default, Some("nope")), None);
+    }
+}
+
+#[cfg(test)]
+mod cert_read_tests {
+    use super::*;
+
+    /// A minimal, real DER certificate so the length arithmetic is exercised
+    /// against actual ASN.1 rather than a synthetic buffer.
+    fn sample_der() -> Vec<u8> {
+        // Parsed from the fixtures at run time would need openssl; instead build
+        // a SEQUENCE of small integers, which is enough to check the length
+        // logic (the cert *contents* are never inspected here).
+        let mut body = Vec::new();
+        body.push(0x02);
+        body.push(0x01);
+        body.push(0x05);
+        let mut der = vec![0x30, body.len() as u8];
+        der.extend_from_slice(&body);
+        der
+    }
+
+    fn pem(label: &str, der: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut b64 = String::new();
+        for chunk in der.chunks(3) {
+            let n = ((chunk[0] as u32) << 16)
+                | ((chunk.get(1).copied().unwrap_or(0) as u32) << 8)
+                | chunk.get(2).copied().unwrap_or(0) as u32;
+            b64.push(ALPHABET[(n >> 18) as usize & 63] as char);
+            b64.push(ALPHABET[(n >> 12) as usize & 63] as char);
+            b64.push(if chunk.len() > 1 {
+                ALPHABET[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            b64.push(if chunk.len() > 2 {
+                ALPHABET[n as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+        format!("-----BEGIN {label}-----\n{b64}\n-----END {label}-----\n")
+    }
+
+    #[test]
+    fn plain_certificate_is_read() {
+        let der = sample_der();
+        let text = pem("CERTIFICATE", &der);
+        let got = read_certs(text.as_bytes()).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].as_ref(), der.as_slice());
+    }
+
+    #[test]
+    fn trusted_certificate_has_aux_stripped() {
+        let der = sample_der();
+        // `openssl x509 -trustout` appends the X509_AUX structure after the
+        // certificate SEQUENCE and relabels the block.
+        let mut with_aux = der.clone();
+        with_aux.extend_from_slice(&[0x30, 0x0c, 0x30, 0x0a, 0x06, 0x08]);
+        let text = pem("TRUSTED CERTIFICATE", &with_aux);
+        let got = read_certs(text.as_bytes()).unwrap();
+        assert_eq!(got.len(), 1, "trusted block must be read, not skipped");
+        assert_eq!(
+            got[0].as_ref(),
+            der.as_slice(),
+            "aux data must be stripped or webpki sees trailing garbage"
+        );
+    }
+
+    #[test]
+    fn mixed_file_keeps_both() {
+        let a = sample_der();
+        let mut b = sample_der();
+        b[2] = 0x07;
+        let mut text = pem("CERTIFICATE", &a);
+        text.push_str(&pem("TRUSTED CERTIFICATE", &b));
+        let got = read_certs(text.as_bytes()).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].as_ref(), a.as_slice());
+        assert_eq!(got[1].as_ref(), b.as_slice());
+    }
+
+    #[test]
+    fn sequence_len_handles_long_form() {
+        // 0x30 0x82 <hi> <lo> => 4-byte header.
+        let der = vec![0x30, 0x82, 0x01, 0x00, 0x00, 0x00];
+        assert_eq!(der_sequence_len(&der), Some(4 + 256));
     }
 }

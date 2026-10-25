@@ -294,6 +294,34 @@
 
 
 
+### 上游客户端证书与解析错误路径（本轮实现）
+
+实现 `proxy_ssl_certificate` / `uwsgi_ssl_certificate`（含 `_key`、
+`_password_file`）与 `suwsgi://`。过程中修掉四个各自独立的真缺陷：
+
+| 缺陷 | 影响 |
+|---|---|
+| **指令被忽略分支吞掉** | `proxy_ssl_certificate` 在 match 里出现在更早的「接受但忽略」列表中，Rust 的 match 按顺序匹配，所以后面真正的解析分支是死代码。同一类 bug 第三次出现（前两次是 stream 的 `log_format`、`access_log`） |
+| **`write_all` 后没有 `flush`** | TLS 写入只进 rustls 内部缓冲，`suwsgi://` 等一个永远发不出去的请求 |
+| **请求行解析等完整换行** | nginx 逐字节校验、遇到非法字节立刻 400；我们等到 CRLF 为止。所以对端发来不含换行的二进制块（uwsgi/SCGI 报文、或刻意的探测）会让双方互等——**既是兼容性缺口，也是可被利用的连接占用**。现在 `early_reject` 在累积阶段就拒绝 |
+| **解析错误的 400 丢了 TLS 上下文** | `add_header X $ssl_client_verify always` 对解析错误响应也生效（nginx 在握手时就算好该变量）。我们构造的合成请求 `tls: None`，变量渲染为空、头被跳过 |
+
+另外补了 `$ssl_client_s_dn`——字段早就声明但从未赋值，现在用一个最小 DER 遍历
+输出 OpenSSL `X509_NAME_oneline` 的 `/CN=...` 形式。
+
+| 套件 | 之前 | 现在 | nginx |
+|---|---|---|---|
+| `proxy_ssl_certificate.t` | 3/7 | **7/7** | 7/7 |
+| `uwsgi_ssl_certificate.t` | 3/7 | **7/7** | 7/7 |
+| `uwsgi_ssl_certificate_vars.t` | 2/6 | **5/6** | 6/6 |
+| `ssl_certificate_aux.t` | 2/5 | **5/5** | 5/5 |
+
+`ssl_certificate_aux` 的两条根因：`openssl x509 -addtrust … -trustout` 写出的是
+`BEGIN TRUSTED CERTIFICATE` 标签（`rustls_pemfile` 只认 `CERTIFICATE`，整个文件
+被当成没有证书），且证书 SEQUENCE 后面还跟着 14 字节 aux 结构（必须按外层长度截断，
+否则 webpki 看到尾部垃圾）。此外 `ssl_trusted_certificate` 必须与
+`ssl_client_certificate` 一起进校验库——只配前者时我们根本没有信任锚。
+
 ### `ssl_certificate_cache` 与按握手的证书变量（本轮实现）
 
 此前 `ssl_certificate` 的变量是在**配置期**展开的，这是错的。nginx 在 SNI

@@ -220,6 +220,16 @@ pub struct LocCfg {
     pub fastcgi_read_timeout: Duration,
     // ---- uwsgi / scgi ----
     pub uwsgi_pass: Option<UwsgiPass>,
+    /// `proxy_ssl_certificate` / `uwsgi_ssl_certificate`: client certificate
+    /// presented to the upstream.
+    pub proxy_ssl_certificate: Option<PathBuf>,
+    pub proxy_ssl_certificate_key: Option<PathBuf>,
+    pub uwsgi_ssl_certificate: Option<PathBuf>,
+    pub uwsgi_ssl_certificate_key: Option<PathBuf>,
+    /// `*_ssl_password_file`: passwords tried in order for an encrypted
+    /// upstream client key.
+    pub proxy_ssl_password_file: Option<PathBuf>,
+    pub uwsgi_ssl_password_file: Option<PathBuf>,
     pub uwsgi_params: Vec<FastcgiParam>,
     pub scgi_pass: Option<ScgiPass>,
     pub scgi_params: Vec<FastcgiParam>,
@@ -376,6 +386,12 @@ impl LocCfg {
             fastcgi_connect_timeout: Duration::from_secs(60),
             fastcgi_read_timeout: Duration::from_secs(60),
             uwsgi_pass: None,
+            proxy_ssl_certificate: None,
+            proxy_ssl_certificate_key: None,
+            uwsgi_ssl_certificate: None,
+            uwsgi_ssl_certificate_key: None,
+            proxy_ssl_password_file: None,
+            uwsgi_ssl_password_file: None,
             uwsgi_params: Vec::new(),
             scgi_pass: None,
             scgi_params: Vec::new(),
@@ -632,6 +648,8 @@ pub struct FastcgiPass {
 #[derive(Debug, Clone)]
 pub struct UwsgiPass {
     pub addr: SocketAddr,
+    /// `uwsgi_pass suwsgi://` -- the connection is TLS.
+    pub tls: bool,
     pub connect_timeout: Duration,
     pub read_timeout: Duration,
 }
@@ -1053,6 +1071,10 @@ pub struct Server {
     pub ssl_verify_client: u8,
     /// `ssl_client_certificate`: the CA bundle client certs are checked against.
     pub ssl_client_certificate: Option<PathBuf>,
+    /// `ssl_trusted_certificate` (http/server): trust anchors for client
+    /// certificate verification. nginx adds this bundle to the verify store
+    /// alongside `ssl_client_certificate`.
+    pub ssl_trusted_certificate: Option<PathBuf>,
     pub http2: bool,
 }
 
@@ -2949,10 +2971,7 @@ impl Builder {
             | "proxy_ssl_ciphers"
             | "proxy_ssl_trusted_certificate"
             | "proxy_ssl_crl"
-            | "proxy_ssl_conf_command"
-            | "proxy_ssl_certificate"
-            | "proxy_ssl_certificate_key"
-            | "proxy_ssl_password_file" => {
+            | "proxy_ssl_conf_command" => {
                 // Accepted; verified TLS towards an upstream is not implemented
                 // (nginx's default is `proxy_ssl_verify off`).
             }
@@ -3092,10 +3111,15 @@ impl Builder {
                     .args
                     .first()
                     .ok_or_else(|| sem(&d.file, d.line, "uwsgi_pass requires an address"))?;
-                let addr = parse_listen(v)
-                    .ok_or_else(|| sem(&d.file, d.line, format!("invalid uwsgi_pass \"{v}\"")))?;
+                // `suwsgi://` is uwsgi over TLS: nginx strips the scheme,
+                // takes the rest as the address, then wraps the connection.
+                let tls = v.starts_with("suwsgi://");
+                let bare = v.strip_prefix("suwsgi://").unwrap_or(v);
+                let addr = parse_listen(bare)
+                    .ok_or_else(|| sem(&d.file, d.line, format!("invalid uwsgi_pass '{v}'")))?;
                 cfg.uwsgi_pass = Some(UwsgiPass {
                     addr,
+                    tls,
                     connect_timeout: Duration::from_secs(60),
                     read_timeout: Duration::from_secs(60),
                 });
@@ -3186,6 +3210,36 @@ impl Builder {
             | "uwsgi_ssl_server_name"
             | "uwsgi_ssl_verify" => {
                 // Accepted, not yet honoured.
+            }
+            "uwsgi_ssl_certificate" => {
+                if let Some(v) = d.args.first() {
+                    cfg.uwsgi_ssl_certificate = Some(resolve_path(&self.prefix, v));
+                }
+            }
+            "uwsgi_ssl_certificate_key" => {
+                if let Some(v) = d.args.first() {
+                    cfg.uwsgi_ssl_certificate_key = Some(resolve_path(&self.prefix, v));
+                }
+            }
+            "uwsgi_ssl_password_file" => {
+                if let Some(v) = d.args.first() {
+                    cfg.uwsgi_ssl_password_file = Some(resolve_path(&self.prefix, v));
+                }
+            }
+            "proxy_ssl_password_file" => {
+                if let Some(v) = d.args.first() {
+                    cfg.proxy_ssl_password_file = Some(resolve_path(&self.prefix, v));
+                }
+            }
+            "proxy_ssl_certificate" => {
+                if let Some(v) = d.args.first() {
+                    cfg.proxy_ssl_certificate = Some(resolve_path(&self.prefix, v));
+                }
+            }
+            "proxy_ssl_certificate_key" => {
+                if let Some(v) = d.args.first() {
+                    cfg.proxy_ssl_certificate_key = Some(resolve_path(&self.prefix, v));
+                }
             }
             "fastcgi_send_timeout"
             | "fastcgi_buffer_size"
@@ -3611,6 +3665,7 @@ impl Builder {
         let mut cert_cache = CertCacheCfg::default();
         let mut ssl_verify_client: u8 = 0;
         let mut ssl_client_certificate: Option<PathBuf> = None;
+        let mut ssl_trusted_certificate: Option<PathBuf> = None;
 
         for child in block {
             match child.name.as_str() {
@@ -3733,6 +3788,11 @@ impl Builder {
                         ssl_client_certificate = Some(resolve_path(&self.prefix, v));
                     }
                 }
+                "ssl_trusted_certificate" => {
+                    if let Some(v) = child.args.first() {
+                        ssl_trusted_certificate = Some(resolve_path(&self.prefix, v));
+                    }
+                }
                 "ssl_protocols"
                 | "ssl_ciphers"
                 | "ssl_prefer_server_ciphers"
@@ -3744,7 +3804,6 @@ impl Builder {
                 | "ssl_stapling"
                 | "ssl_stapling_verify"
                 | "ssl_buffer_size"
-                | "ssl_trusted_certificate"
                 | "ssl_early_data"
                 | "ssl_conf_command"
                 | "http2_max_field_size"
@@ -3882,6 +3941,7 @@ impl Builder {
                 idx: index,
                 names,
                 ssl_certificate_cache: cert_cache,
+                ssl_trusted_certificate,
                 error_pages: default_loc.error_pages.clone(),
                 default_loc,
                 locations,
@@ -4235,8 +4295,6 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                 | "proxy_ssl_server_name"
                 | "proxy_ssl_verify"
                 | "proxy_requests"
-                | "proxy_ssl_certificate"
-                | "proxy_ssl_certificate_key"
                 | "proxy_ssl_protocols"
                 | "proxy_ssl_ciphers"
                 | "proxy_ssl_trusted_certificate" => {}

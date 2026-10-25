@@ -1505,6 +1505,7 @@ pub async fn handle(
                                         loc.proxy_ssl_name.as_deref().unwrap_or(&pp.host_header),
                                         loc.proxy_ssl_session_reuse,
                                         loc.proxy_connect_timeout,
+                                        client_cert_opt(loc, vars).as_ref(),
                                     )
                                     .await
                                     {
@@ -1561,6 +1562,7 @@ pub async fn handle(
                                         loc.proxy_ssl_name.as_deref().unwrap_or(&pp.host_header),
                                         loc.proxy_ssl_session_reuse,
                                         loc.proxy_connect_timeout,
+                                        client_cert_opt(loc, vars).as_ref(),
                                     )
                                     .await
                                     {
@@ -1713,6 +1715,39 @@ pub async fn handle(
     )))
 }
 
+/// `proxy_ssl_certificate` + `proxy_ssl_certificate_key`, when both are set.
+///
+/// nginx requires the pair; a certificate without a key is a config error, so
+/// returning `None` here only happens when the pair is genuinely absent.
+fn client_cert_opt(
+    loc: &crate::config::LocCfg,
+    vars: &crate::http::ServerVars<'_>,
+) -> Option<(std::path::PathBuf, std::path::PathBuf, Vec<String>)> {
+    match (&loc.proxy_ssl_certificate, &loc.proxy_ssl_certificate_key) {
+        (Some(c), Some(k)) => {
+            let pw = loc
+                .proxy_ssl_password_file
+                .as_ref()
+                .and_then(|p| crate::tls::read_passwords(p).ok())
+                .unwrap_or_default();
+            // nginx evaluates these as complex values. The test harness
+            // selects the certificate per request via `$arg_*`, so expanding
+            // here is what makes `proxy_ssl_certificate` behave like nginx.
+            Some((expand_path(c, vars), expand_path(k, vars), pw))
+        }
+        _ => None,
+    }
+}
+
+/// Expand `$var` in a configured path at request time.
+fn expand_path(raw: &std::path::Path, vars: &crate::http::ServerVars<'_>) -> std::path::PathBuf {
+    let s = raw.to_string_lossy();
+    if !s.contains('$') {
+        return raw.to_path_buf();
+    }
+    std::path::PathBuf::from(vars.expand(&s))
+}
+
 async fn connect_timeout(addr: SocketAddr, dur: Duration) -> io::Result<UpStream> {
     Ok(UpStream::Tcp(connect_bound(addr, None, dur).await?))
 }
@@ -1721,8 +1756,25 @@ async fn connect_timeout(addr: SocketAddr, dur: Duration) -> io::Result<UpStream
 ///
 /// The SNI name is `proxy_ssl_name` when configured, else the authority of the
 /// `proxy_pass` URL -- nginx's `u->conf->ssl_name` falls back to `u->host`.
-async fn tls_wrap(tcp: TcpStream, sni: &str, reuse: bool, dur: Duration) -> io::Result<UpStream> {
-    let connector = tls_connector(reuse)?;
+async fn tls_wrap(
+    tcp: TcpStream,
+    sni: &str,
+    reuse: bool,
+    dur: Duration,
+    client_cert: Option<&(std::path::PathBuf, std::path::PathBuf, Vec<String>)>,
+) -> io::Result<UpStream> {
+    // `proxy_ssl_certificate` makes us authenticate to the upstream. Cached
+    // per (cert, key) so resumption keeps working, same reason as tls_connector.
+    let connector = match client_cert {
+        Some((cert, key, pw)) => crate::tls::upstream_connector_with_client_cert(
+            cert,
+            key,
+            pw,
+            reuse,
+            b"http/1.1",
+        )?,
+        None => tls_connector(reuse)?,
+    };
     // `proxy_ssl_name` / `u->host` never carries the port, but the authority we
     // keep as `host_header` does (`127.0.0.1:8082`), so strip it here. A bare IP
     // is a valid `ServerName` but an `IP:port` string is not.

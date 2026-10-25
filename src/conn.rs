@@ -223,6 +223,8 @@ impl Conn {
             Some(chain) if !chain.is_empty() => {
                 info.client_verify = "NONE".to_string();
                 info.client_cert = crate::tls::der_to_pem(chain[0].as_ref());
+                // `$ssl_client_s_dn` reports the subject, OpenSSL-style.
+                info.client_s_dn = crate::tls::der_subject_oneline(chain[0].as_ref());
             }
             _ => info.client_verify = "NONE".to_string(),
         }
@@ -426,6 +428,38 @@ impl Conn {
         self.set_writing(false);
     }
 
+/// Reject an illegal request line before it is complete.
+///
+/// nginx's `ngx_http_parse_request_line` is a byte-at-a-time state machine: an
+/// invalid character ends the request immediately with 400. Waiting for the
+/// terminating CRLF instead means a peer that sends a binary blob with no
+/// newline -- a uwsgi/SCGI packet arriving on an HTTP port, or a deliberate
+/// slowloris-style probe -- parks the connection indefinitely. That is
+/// observable: `uwsgi_ssl_certificate.t` proxies to an HTTP stub, whose uwsgi
+/// framing has no CRLF, and both sides then wait for each other.
+///
+/// Only the request line is examined here (up to the first LF, or the whole
+/// buffer when no LF has arrived yet); the full parse still runs once the head
+/// is complete.
+fn early_reject(buf: &[u8]) -> bool {
+    let end = memchr::memchr(b'\n', buf).unwrap_or(buf.len());
+    let line = &buf[..end];
+    // Leading empty lines are legal: nginx skips CR/LF before the request line.
+    let start = line
+        .iter()
+        .position(|&b| b != b'\r' && b != b'\n')
+        .unwrap_or(line.len());
+    for &b in &line[start..] {
+        if b == b'\r' {
+            continue;
+        }
+        if b < 0x20 || b == 0x7f {
+            return true;
+        }
+    }
+    false
+}
+
     pub async fn read_request(
         &mut self,
         max_line: usize,
@@ -447,6 +481,9 @@ impl Conn {
                         return Err(RecvError::Bad(e));
                     }
                 }
+            }
+            if Self::early_reject(self.buffered()) {
+                return Err(RecvError::Bad(HttpError::new(400, true)));
             }
             if self.buffered().len() > max_total {
                 return Err(RecvError::Bad(HttpError::new(400, true)));

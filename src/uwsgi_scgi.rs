@@ -215,6 +215,7 @@ async fn run(
     connect_timeout: Duration,
     read_timeout: Duration,
     tokens: bool,
+    tls: Option<&(std::path::PathBuf, std::path::PathBuf, Vec<String>)>,
 ) -> io::Result<Option<Outcome>> {
     // RFC 7231: never send 100 Continue to an HTTP/1.0 client.
     if req.expect_continue && req.version_minor == 1 {
@@ -262,7 +263,7 @@ async fn run(
         scgi_request(&all, &body)
     };
 
-    let mut stream = match tokio::time::timeout(connect_timeout, TcpStream::connect(addr)).await {
+    let tcp = match tokio::time::timeout(connect_timeout, TcpStream::connect(addr)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             eprintln!("ngxrs: [error] {kind} connect {addr} failed: {e}");
@@ -273,9 +274,49 @@ async fn run(
             return Ok(Some(error_out(conn, 504, tokens, req.keepalive).await?));
         }
     };
-    let _ = stream.set_nodelay(true);
+    let _ = tcp.set_nodelay(true);
+    // `suwsgi://` wraps the connection in TLS, presenting the client
+    // certificate from `uwsgi_ssl_certificate` when configured.
+    let mut stream = match tls {
+        Some((cert, key, pw)) => {
+            let connector = match crate::tls::upstream_connector_with_client_cert(
+                cert,
+                key,
+                pw,
+                true,
+                b"",
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("ngxrs: [error] {kind} client certificate: {e}");
+                    return Ok(Some(error_out(conn, 502, tokens, req.keepalive).await?));
+                }
+            };
+            let name = rustls::pki_types::ServerName::try_from(addr.ip().to_string())
+                .map_err(|_| io::Error::other("bad upstream name"))?;
+            match tokio::time::timeout(connect_timeout, connector.connect(name, tcp)).await {
+                Ok(Ok(s)) => crate::proxy::UpStream::Tls(Box::new(s)),
+                Ok(Err(e)) => {
+                    eprintln!("ngxrs: [error] {kind} TLS handshake {addr} failed: {e}");
+                    return Ok(Some(error_out(conn, 502, tokens, req.keepalive).await?));
+                }
+                Err(_) => {
+                    eprintln!("ngxrs: [error] {kind} TLS handshake {addr} timed out");
+                    return Ok(Some(error_out(conn, 504, tokens, req.keepalive).await?));
+                }
+            }
+        }
+        None => crate::proxy::UpStream::Tcp(tcp),
+    };
     if let Err(e) = stream.write_all(&packet).await {
         eprintln!("ngxrs: [error] {kind} write failed: {e}");
+        return Ok(Some(error_out(conn, 502, tokens, req.keepalive).await?));
+    }
+    // Over TLS the packet only lands in rustls' internal buffer until a flush,
+    // so `suwsgi://` would wait forever for a reply to a request never sent.
+    // A no-op for plain TCP.
+    if let Err(e) = stream.flush().await {
+        eprintln!("ngxrs: [error] {kind} flush failed: {e}");
         return Ok(Some(error_out(conn, 502, tokens, req.keepalive).await?));
     }
 
@@ -388,9 +429,27 @@ pub async fn handle_uwsgi(
     query: &str,
     loc: &crate::config::LocCfg,
     tokens: bool,
+    vars: &crate::http::ServerVars<'_>,
 ) -> io::Result<Option<Outcome>> {
     let Some(pass) = &loc.uwsgi_pass else {
         return Ok(None);
+    };
+    // `suwsgi://` needs a client certificate; without one the handshake cannot
+    // succeed, so report 502 like any other upstream setup failure.
+    let cert_pair: Option<(std::path::PathBuf, std::path::PathBuf, Vec<String>)> = if pass.tls {
+        match (&loc.uwsgi_ssl_certificate, &loc.uwsgi_ssl_certificate_key) {
+            (Some(c), Some(k)) => Some((
+                std::path::PathBuf::from(vars.expand(&c.to_string_lossy())),
+                std::path::PathBuf::from(vars.expand(&k.to_string_lossy())),
+                loc.uwsgi_ssl_password_file
+                    .as_ref()
+                    .and_then(|p| crate::tls::read_passwords(p).ok())
+                    .unwrap_or_default(),
+            )),
+            _ => return Ok(Some(error_out(conn, 502, tokens, req.keepalive).await?)),
+        }
+    } else {
+        None
     };
     run(
         conn,
@@ -404,6 +463,7 @@ pub async fn handle_uwsgi(
         pass.connect_timeout,
         pass.read_timeout,
         tokens,
+        cert_pair.as_ref(),
     )
     .await
 }
@@ -431,6 +491,7 @@ pub async fn handle_scgi(
         pass.connect_timeout,
         pass.read_timeout,
         tokens,
+        None,
     )
     .await
 }

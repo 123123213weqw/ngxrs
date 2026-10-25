@@ -360,7 +360,35 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
                     keepalive: false,
                     host: None,
                     expect_continue: false,
-                    tls: None,
+                    // The TLS facts belong to the connection, not the request:
+                    // nginx fills `$ssl_client_verify` at handshake time, so it
+                    // is available even for a request the parser rejects. The
+                    // per-server verdict is recomputed here against the default
+                    // server, which is the one nginx uses on this path.
+                    tls: conn.tls_info().map(|mut info| {
+                        if default_server.ssl_verify_client != 0 {
+                            if let Some(chain) = conn.peer_chain() {
+                                if !chain.is_empty() {
+                                    let mut bundles: Vec<&std::path::Path> = Vec::new();
+                                    if let Some(p) = default_server.ssl_client_certificate.as_deref()
+                                    {
+                                        bundles.push(p);
+                                    }
+                                    if let Some(p) =
+                                        default_server.ssl_trusted_certificate.as_deref()
+                                    {
+                                        bundles.push(p);
+                                    }
+                                    info.client_verify =
+                                        match crate::tls::verify_client_chain_multi(bundles, &chain) {
+                                            Ok(()) => "SUCCESS".to_string(),
+                                            Err(reason) => format!("FAILED:{reason}"),
+                                        };
+                                }
+                            }
+                        }
+                        std::sync::Arc::new(info)
+                    }),
                     started: std::time::Instant::now(),
                 };
                 let mut resp = error_response(e.status, default_server.server_tokens);
@@ -450,10 +478,20 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
                 let chain = conn.peer_chain();
                 let mismatch = match &chain {
                     Some(c) if !c.is_empty() => {
-                        match crate::tls::verify_client_chain(
-                            srv.ssl_client_certificate.as_deref(),
-                            c,
-                        ) {
+                        // nginx adds both bundles to the verify store:
+                        // `ssl_client_certificate` also defines the CA names
+                        // sent in the CertificateRequest, while
+                        // `ssl_trusted_certificate` only contributes trust
+                        // anchors (`ngx_ssl_trusted_certificate`). A config that
+                        // sets just the latter must still verify.
+                        let mut bundles: Vec<&std::path::Path> = Vec::new();
+                        if let Some(p) = srv.ssl_client_certificate.as_deref() {
+                            bundles.push(p);
+                        }
+                        if let Some(p) = srv.ssl_trusted_certificate.as_deref() {
+                            bundles.push(p);
+                        }
+                        match crate::tls::verify_client_chain_multi(bundles, c) {
                             // `optional_no_ca` tolerates a chain it cannot
                             // validate, but still reports FAILED.
                             Ok(()) => None,
@@ -4470,9 +4508,34 @@ async fn dispatch(
 
     // ---- uwsgi / scgi ----
     if loc.uwsgi_pass.is_some() {
-        if let Some(o) =
-            crate::uwsgi_scgi::handle_uwsgi(conn, req, path, query, loc, server.server_tokens)
-                .await?
+        // `*_ssl_certificate` and friends are complex values, so the uwsgi
+        // handler needs the same variable view the other upstreams get.
+        let uwsgi_vars = ServerVars {
+            req,
+            path,
+            query,
+            server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
+            server_port: listen_port,
+            peer_ip: client_ip,
+            peer_port,
+            scheme: "http",
+            document_root: loc.root.to_str().unwrap_or(""),
+            upstream_cache_status: "",
+            custom: &set_vars,
+            connection_requests: state.requests,
+            connection_time: 0,
+            sent: &[],
+        };
+        if let Some(o) = crate::uwsgi_scgi::handle_uwsgi(
+            conn,
+            req,
+            path,
+            query,
+            loc,
+            server.server_tokens,
+            &uwsgi_vars,
+        )
+        .await?
         {
             return Ok(o);
         }

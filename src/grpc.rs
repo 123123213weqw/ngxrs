@@ -18,7 +18,7 @@ use crate::http::Response;
 /// nginx's defaults are `grpc_ssl_verify off` and `proxy_ssl_verify off`, i.e.
 /// the upstream certificate is not validated, so this mirrors that exactly.
 #[derive(Debug)]
-struct NoVerify(Arc<rustls::crypto::CryptoProvider>);
+pub struct NoVerify(pub Arc<rustls::crypto::CryptoProvider>);
 
 impl rustls::client::danger::ServerCertVerifier for NoVerify {
     fn verify_server_cert(

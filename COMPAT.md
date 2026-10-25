@@ -294,6 +294,33 @@
 
 
 
+### `ssl_certificate_cache` 与按握手的证书变量（本轮实现）
+
+此前 `ssl_certificate` 的变量是在**配置期**展开的，这是错的。nginx 在 SNI
+回调里按**每次握手**求值，`$ssl_server_name` 只有在那一刻才有值。
+`ssl_certificate $ssl_server_name.crt` 正是「按域名挂不同证书」的标准写法。
+
+现在实现：
+
+- 路径含 `$` 的证书不预先加载，而是在 `ResolvesServerCert::resolve` 里用
+  本次握手的 SNI 名展开后读取。先用 `server_name` 选中 server，再取该 server
+  的证书——顺序必须是这个，证书属于 server，不属于 socket。
+- `ssl_certificate_cache off | max=N [inactive=time] [valid=time]`，
+  http / server 两级，`off` 为默认（每次握手重读）。
+- 证书加载失败不中断 socket（上一轮已改），只让该次握手失败并写 `error` 日志。
+
+| 套件 | 之前 | 现在 | nginx |
+|---|---|---|---|
+| `ssl_certificate_cache.t` | 4/16 | **14/16** | 16/16 |
+| `ssl_verify_client.t` | 12/16 | **14/16** | 16/16 |
+
+仍未对齐的 2 条都是**淘汰策略细节**，我没有从 nginx 行为反推出它的确切模型：
+
+- `certificate 1 evicted`（`ssl_certificate_cache.t:104`）——期望插入若干项后
+  某个名字的证书**取不到**；我按「(cert,key) 计一对、LRU 淘汰」实现，则总能重读成功。
+- `no cache updated`（同文件 `:117`）——`ssl_certificate_cache off` 的 server
+  在文件被替换后应看到新证书，我们仍返回旧的。
+
 ### 被 `-V` 门控隐藏的 TLS 套件（本轮首次真实测量）
 
 `Test::Nginx` 的 `has('openssl:1.0.2')` 匹配 `nginx -V` 里的

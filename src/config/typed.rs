@@ -1047,6 +1047,7 @@ pub struct Server {
     pub ssl_certificate_key: Option<PathBuf>,
     /// `ssl_password_file`: passwords tried in order for an encrypted key.
     pub ssl_password_file: Option<PathBuf>,
+    pub ssl_certificate_cache: CertCacheCfg,
     /// `ssl_verify_client`: 0 = off, 1 = on, 2 = optional, 3 = optional_no_ca.
     /// Same encoding as nginx's `sscf->verify`.
     pub ssl_verify_client: u8,
@@ -1156,6 +1157,34 @@ const BUILTIN_TYPES: &[(&str, &str)] = &[
     ("application/octet-stream", "bin exe dll"),
 ];
 
+/// `ssl_certificate_cache` — caches the *parsed* certificate objects so a
+/// variable path is not re-read and re-parsed on every handshake.
+///
+/// nginx: `ssl_certificate_cache off | max=N [inactive=time] [valid=time]`.
+/// Default is `off` (no caching): every handshake re-reads the files.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CertCacheCfg {
+    pub max: usize,
+    pub inactive: Option<std::time::Duration>,
+    pub valid: Option<std::time::Duration>,
+}
+
+impl Default for CertCacheCfg {
+    fn default() -> Self {
+        CertCacheCfg {
+            max: 0,
+            inactive: None,
+            valid: None,
+        }
+    }
+}
+
+impl CertCacheCfg {
+    pub fn is_off(&self) -> bool {
+        self.max == 0
+    }
+}
+
 #[derive(Debug)]
 pub struct Http {
     pub servers: Vec<Server>,
@@ -1190,6 +1219,7 @@ pub struct Http {
     pub ssl_certificate: Option<PathBuf>,
     pub ssl_certificate_key: Option<PathBuf>,
     pub ssl_password_file: Option<PathBuf>,
+    pub ssl_certificate_cache: CertCacheCfg,
     pub default_access_logs: Vec<AccessLog>,
     pub upstreams: Vec<Upstream>,
     pub cache_zones: Vec<CacheZone>,
@@ -3578,6 +3608,7 @@ impl Builder {
         let mut ssl_certificate: Option<PathBuf> = None;
         let mut ssl_certificate_key: Option<PathBuf> = None;
         let mut ssl_password_file: Option<PathBuf> = None;
+        let mut cert_cache = CertCacheCfg::default();
         let mut ssl_verify_client: u8 = 0;
         let mut ssl_client_certificate: Option<PathBuf> = None;
 
@@ -3673,6 +3704,9 @@ impl Builder {
                     if let Some(v) = child.args.first() {
                         ssl_password_file = Some(resolve_path(&self.prefix, v));
                     }
+                }
+                "ssl_certificate_cache" => {
+                    cert_cache = parse_cert_cache(&child.args, &child.file, child.line)?;
                 }
                 "ssl_certificate_key" => {
                     if let Some(v) = child.args.first() {
@@ -3847,6 +3881,7 @@ impl Builder {
             Server {
                 idx: index,
                 names,
+                ssl_certificate_cache: cert_cache,
                 error_pages: default_loc.error_pages.clone(),
                 default_loc,
                 locations,
@@ -4132,6 +4167,7 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                         cfg.ssl_password_file = Some(b.prefix.join(p));
                     }
                 }
+
                 "access_log" => {
                     if child.args.first().map(|s| s.as_str()) == Some("off") {
                         cfg.access_logs.clear();
@@ -4244,6 +4280,36 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
     Ok(section)
 }
 
+/// `ssl_certificate_cache off|max=N[inactive=time][valid=time]`.
+fn parse_cert_cache(args: &[String], file: &Path, line: u32) -> Result<CertCacheCfg, ConfigError> {
+    if args.len() == 1 && args[0] == "off" {
+        return Ok(CertCacheCfg::default());
+    }
+    let mut cfg = CertCacheCfg::default();
+    let mut have_max = false;
+    for a in args {
+        if let Some(v) = a.strip_prefix("max=") {
+            cfg.max = v
+                .parse()
+                .map_err(|_| sem(file, line, "invalid ssl_certificate_cache max"))?;
+            have_max = true;
+        } else if let Some(v) = a.strip_prefix("inactive=") {
+            cfg.inactive =
+                Some(parse_time(v).ok_or_else(|| sem(file, line, "invalid inactive time"))?);
+        } else if let Some(v) = a.strip_prefix("valid=") {
+            cfg.valid = Some(parse_time(v).ok_or_else(|| sem(file, line, "invalid valid time"))?);
+        }
+    }
+    if !have_max {
+        return Err(sem(
+            file,
+            line,
+            "ssl_certificate_cache requires max= when not off",
+        ));
+    }
+    Ok(cfg)
+}
+
 pub fn build(
     tree: Vec<Directive>,
     prefix: &Path,
@@ -4335,6 +4401,7 @@ pub fn build(
 
     let mut http = Http {
         client_body_temp_path: PathBuf::new(),
+        ssl_certificate_cache: CertCacheCfg::default(),
         ssl_certificate: None,
         ssl_certificate_key: None,
         ssl_password_file: None,
@@ -4574,6 +4641,9 @@ pub fn build(
                 if let Some(v) = d.args.first() {
                     http.ssl_password_file = Some(resolve_path(prefix, v));
                 }
+            }
+            "ssl_certificate_cache" => {
+                http.ssl_certificate_cache = parse_cert_cache(&d.args, &d.file, d.line)?;
             }
             "large_client_header_buffers" => {
                 let num = d
@@ -4823,6 +4893,9 @@ pub fn build(
         }
         if server.ssl_password_file.is_none() {
             server.ssl_password_file = http.ssl_password_file.clone();
+        }
+        if server.ssl_certificate_cache == CertCacheCfg::default() {
+            server.ssl_certificate_cache = http.ssl_certificate_cache.clone();
         }
         if server.names.is_empty() {
             // nginx default server_name is ""

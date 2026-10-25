@@ -17,7 +17,103 @@ use rustls::ServerConfig;
 
 use crate::config::{Http, Server};
 
-/// Selects a certificate by SNI name, falling back to the default server.
+/// A certificate whose path contains variables.
+///
+/// nginx resolves these **per handshake**, in the SNI callback, where
+/// `$ssl_server_name` is known. Resolving at config time (an earlier
+/// simplification here) is wrong: `ssl_certificate $ssl_server_name.crt` is the
+/// canonical way to serve a certificate per name, and at config time the
+/// variable has no value at all.
+#[derive(Debug)]
+struct CertTemplate {
+    cert: PathBuf,
+    key: PathBuf,
+    passwords: Vec<String>,
+    cache: crate::config::typed::CertCacheCfg,
+}
+
+/// One cache entry. `loaded` is when the files were read; `used` drives LRU
+/// eviction when `max` is reached and `inactive` eviction on the manager pass.
+#[derive(Debug)]
+struct CacheEntry {
+    key: Arc<CertifiedKey>,
+    loaded: std::time::Instant,
+    used: std::time::Instant,
+}
+
+#[derive(Debug, Default)]
+struct CertCacheState {
+    map: HashMap<String, CacheEntry>,
+}
+
+impl CertCacheState {
+    fn lookup(
+        &mut self,
+        cfg: &crate::config::typed::CertCacheCfg,
+        key: &str,
+        tpl: &CertTemplate,
+    ) -> io::Result<Arc<CertifiedKey>> {
+        let now = std::time::Instant::now();
+        if !cfg.is_off() {
+            let mut expired = false;
+            if let Some(e) = self.map.get(key) {
+                if let Some(valid) = cfg.valid {
+                    expired = now.duration_since(e.loaded) >= valid;
+                }
+                if !expired {
+                    let hit = e.key.clone();
+                    if let Some(e) = self.map.get_mut(key) {
+                        e.used = now;
+                    }
+                    return Ok(hit);
+                }
+            }
+            if expired {
+                self.map.remove(key);
+            }
+        }
+
+        let loaded = load_cert_with(&tpl.key, &tpl.cert, &tpl.passwords)?;
+
+        if !cfg.is_off() {
+            // Evict the least recently used entry once `max` is reached.
+            while self.map.len() >= cfg.max {
+                let victim = self
+                    .map
+                    .iter()
+                    .min_by_key(|(_, e)| e.used)
+                    .map(|(k, _)| k.clone());
+                match victim {
+                    Some(v) => {
+                        self.map.remove(&v);
+                    }
+                    None => break,
+                }
+            }
+            self.map.insert(
+                key.to_string(),
+                CacheEntry {
+                    key: loaded.clone(),
+                    loaded: now,
+                    used: now,
+                },
+            );
+        }
+        Ok(loaded)
+    }
+
+    /// `inactive`: drop entries not used for that long. Called on every lookup
+    /// rather than from a timer -- nginx has a cache manager process, but the
+    /// observable behaviour is the same and this needs no extra thread.
+    fn sweep(&mut self, cfg: &crate::config::typed::CertCacheCfg) {
+        if let Some(inactive) = cfg.inactive {
+            let now = std::time::Instant::now();
+            self.map
+                .retain(|_, e| now.duration_since(e.used) < inactive);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SniResolver {
     /// Exact name -> key.
@@ -25,6 +121,36 @@ pub struct SniResolver {
     /// `*.example.com` style wildcards, keyed without the leading `*.`.
     wildcard: HashMap<String, Arc<CertifiedKey>>,
     default: Option<Arc<CertifiedKey>>,
+    /// Server index for each name, used to pick a template.
+    name_to_server: HashMap<String, usize>,
+    template_default: Option<usize>,
+    templates: HashMap<usize, Arc<CertTemplate>>,
+    cache: std::sync::Mutex<CertCacheState>,
+}
+
+/// nginx's lookup order: exact name, then single-label wildcard, then default.
+fn select_server(
+    name_to_server: &HashMap<String, usize>,
+    default: &Option<usize>,
+    name: Option<&str>,
+) -> Option<usize> {
+    if let Some(name) = name {
+        let lower = name.to_ascii_lowercase();
+        if let Some(&i) = name_to_server.get(&lower) {
+            return Some(i);
+        }
+        if let Some((_, rest)) = lower.split_once('.') {
+            if let Some(&i) = name_to_server.get(&format!("*.{rest}")) {
+                return Some(i);
+            }
+        }
+    }
+    *default
+}
+
+/// Expand `$ssl_server_name` (and geo/map defaults) in a certificate path.
+fn expand_handshake_path(raw: &Path, server_name: Option<&str>) -> PathBuf {
+    expand_cert_path_with(raw, server_name)
 }
 
 /// nginx's lookup order: exact name, then single-label wildcard, then default.
@@ -48,15 +174,45 @@ fn select<'a, T>(
     default.as_ref()
 }
 
-impl SniResolver {
-    fn pick(&self, name: Option<&str>) -> Option<Arc<CertifiedKey>> {
-        select(&self.exact, &self.wildcard, &self.default, name).cloned()
-    }
-}
-
 impl ResolvesServerCert for SniResolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        self.pick(hello.server_name())
+        let name = hello.server_name();
+        // A variable certificate is resolved per handshake, exactly as nginx
+        // does in its SNI callback: the file is read when the name is known.
+        if let Some(idx) = select_server(&self.name_to_server, &self.template_default, name) {
+            if let Some(tpl) = self.templates.get(&idx) {
+                let cert = expand_handshake_path(&tpl.cert, name);
+                let key = expand_handshake_path(&tpl.key, name);
+                let expanded = CertTemplate {
+                    cert,
+                    key,
+                    passwords: tpl.passwords.clone(),
+                    cache: tpl.cache.clone(),
+                };
+                let ck = self.cache.lock();
+                let mut guard = match ck {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                guard.sweep(&expanded.cache);
+                let cache_key = format!(
+                    "{}|{}",
+                    expanded.cert.to_string_lossy(),
+                    expanded.key.to_string_lossy()
+                );
+                match guard.lookup(&expanded.cache, &cache_key, &expanded) {
+                    Ok(k) => return Some(k),
+                    Err(e) => {
+                        crate::log::error_log(
+                            "error",
+                            &format!("ssl_certificate for \"{}\" not loaded: {e}", name.unwrap_or("")),
+                        );
+                        return None;
+                    }
+                }
+            }
+        }
+        select(&self.exact, &self.wildcard, &self.default, name).cloned()
     }
 }
 
@@ -136,7 +292,7 @@ fn decrypt_pkcs8(pem: &[u8], passwords: &[String]) -> io::Result<Option<Vec<u8>>
 /// `split_clients` defaults) covers how the directive is actually used; a
 /// variable that depends on the live request cannot select a certificate
 /// anyway, since the certificate is needed before the request exists.
-fn expand_cert_path(raw: &Path) -> PathBuf {
+fn expand_cert_path_with(raw: &Path, server_name: Option<&str>) -> PathBuf {
     let s = raw.to_string_lossy();
     if !s.contains('$') {
         return raw.to_path_buf();
@@ -168,16 +324,19 @@ fn expand_cert_path(raw: &Path) -> PathBuf {
         if braced && i < bytes.len() && bytes[i] == b'}' {
             i += 1;
         }
-        let value = geos
-            .iter()
-            .find(|g| g.var == name)
-            .and_then(|g| g.default.clone())
-            .or_else(|| {
-                maps.iter()
-                    .find(|m| m.var == name)
-                    .and_then(|m| m.default.clone())
-            })
-            .unwrap_or_default();
+        let value = if name == "ssl_server_name" {
+            server_name.unwrap_or("").to_string()
+        } else {
+            geos.iter()
+                .find(|g| g.var == name)
+                .and_then(|g| g.default.clone())
+                .or_else(|| {
+                    maps.iter()
+                        .find(|m| m.var == name)
+                        .and_then(|m| m.default.clone())
+                })
+                .unwrap_or_default()
+        };
         out.push_str(&value);
     }
     PathBuf::from(out)
@@ -192,8 +351,8 @@ fn load_raw_identity(
     Vec<rustls::pki_types::CertificateDer<'static>>,
     PrivateKeyDer<'static>,
 )> {
-    let cert_path = &expand_cert_path(cert_path);
-    let key_path = &expand_cert_path(key_path);
+    let cert_path = &expand_cert_path_with(cert_path, None);
+    let key_path = &expand_cert_path_with(key_path, None);
     let cert_pem = std::fs::read(cert_path).map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -284,6 +443,12 @@ pub fn build_config(http: &Http, server_idxs: &[usize]) -> io::Result<Arc<Server
     let mut exact: HashMap<String, Arc<CertifiedKey>> = HashMap::new();
     let mut wildcard: HashMap<String, Arc<CertifiedKey>> = HashMap::new();
     let mut default: Option<Arc<CertifiedKey>> = None;
+    // Server selection has to happen before the certificate decision: a
+    // variable certificate belongs to a *server*, so we need to know which
+    // server the SNI name lands on before expanding anything.
+    let mut name_to_server: HashMap<String, usize> = HashMap::new();
+    let mut templates: HashMap<usize, Arc<CertTemplate>> = HashMap::new();
+    let mut default_server: Option<usize> = None;
 
     for &idx in server_idxs {
         let server: &Server = http.server(idx);
@@ -293,10 +458,41 @@ pub fn build_config(http: &Http, server_idxs: &[usize]) -> io::Result<Arc<Server
         };
         // `ssl_password_file` is inherited from the http block, so the server
         // already carries the effective path.
+        if default_server.is_none() {
+            default_server = Some(idx);
+        }
+        for name in &server.names {
+            let lower = name.to_ascii_lowercase();
+            if lower.is_empty() || lower == "_" || lower.starts_with('~') {
+                continue;
+            }
+            name_to_server.insert(lower.clone(), idx);
+            if let Some(rest) = lower.strip_prefix('.') {
+                name_to_server.insert(format!("*.{rest}"), idx);
+            }
+        }
         let passwords = match &server.ssl_password_file {
             Some(p) => read_passwords(p)?,
             None => Vec::new(),
         };
+        // A path with a variable is resolved per handshake, not here.
+        if cert.to_string_lossy().contains('$') || key.to_string_lossy().contains('$') {
+            templates.insert(
+                idx,
+                Arc::new(CertTemplate {
+                    cert: cert.clone(),
+                    key: key.clone(),
+                    passwords,
+                    cache: server.ssl_certificate_cache.clone(),
+                }),
+            );
+            if default.is_none() && !templates.is_empty() && default_server == Some(idx) {
+                // The default server's certificate is produced at handshake
+                // time; leave `default` empty so `resolve` takes the template
+                // path for it.
+            }
+            continue;
+        }
         // nginx does not abort startup when a certificate cannot be loaded:
         // it logs the error and the handshake for that server then fails. That
         // is observable -- `ssl_certificate.t` configures
@@ -338,6 +534,10 @@ pub fn build_config(http: &Http, server_idxs: &[usize]) -> io::Result<Arc<Server
         exact,
         wildcard,
         default,
+        name_to_server,
+        template_default: default_server,
+        templates,
+        cache: std::sync::Mutex::new(CertCacheState::default()),
     });
 
     // Offer a client certificate whenever any server on this socket asks for
@@ -557,6 +757,10 @@ pub fn build_stream_config(
         exact: HashMap::new(),
         wildcard: HashMap::new(),
         default: Some(key_id),
+        name_to_server: HashMap::new(),
+        template_default: None,
+        templates: HashMap::new(),
+        cache: std::sync::Mutex::new(CertCacheState::default()),
     });
     let mut cfg = match verify {
         0 => ServerConfig::builder()
@@ -627,6 +831,10 @@ pub fn build_mail_config_with(
         exact: HashMap::new(),
         wildcard: HashMap::new(),
         default: Some(key_id),
+        name_to_server: HashMap::new(),
+        template_default: None,
+        templates: HashMap::new(),
+        cache: std::sync::Mutex::new(CertCacheState::default()),
     });
     let mut cfg = ServerConfig::builder()
         .with_no_client_auth()

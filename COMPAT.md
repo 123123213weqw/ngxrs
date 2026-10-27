@@ -13,7 +13,7 @@
 
 | 项 | 命令 | 当前结果 |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 104 文件，WORSE=0 TRUNC=0（nginx 1650 / ngxrs 1655 断言） |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 106 文件，WORSE=0 TRUNC=0 |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
 | 单元测试 | `cargo test --release` | **PASS** — 156 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
@@ -364,6 +364,13 @@ nginx 数的是「解析后仍然存活的分段」，现在由解析器自己�
 
 `map` 的正则捕获（`~(...) $1;`、`~(?P<ncap>...) $ncap;`）也补齐了。
 
+**`set` 与 `split_clients`**（`stream_set.t` 3/4 → 4/4、`stream_split_clients.t` 2/3 → 3/3）：
+nginx 的 `set` 在 rewrite 阶段执行、`return` 在 content 阶段，所以配置文件里的书写顺序
+不影响结果 —— `stream_set.t` 把 `return` 写在两条 `set` **前面**，仍要求两条都生效
+（`$map_var` 被 `set` 覆盖成 `new`，而 `$set_var` 拿到的是覆盖**之前**的 `original`）。
+实现按声明顺序逐条展开进一个累加表，正好复现这个先后。`$connection` 也补上了
+（`split_clients $connection` 用它做种子）。
+
 ### `disable_symlinks`（`http_disable_symlinks.t` 14/28 → 29/30）
 
 按 `ngx_open_file` 的 walk 实现：从 `from` 前缀（缺省 `/`）开始，逐段用 `lstat`
@@ -390,7 +397,7 @@ nginx 数的是「解析后仍然存活的分段」，现在由解析器自己�
 
 ## 二、声明的测试清单
 
-清单在 `bench/declared.txt`，**104 个文件**，选取规则是机械的：
+清单在 `bench/declared.txt`，**106 个文件**，选取规则是机械的：
 
 1. 落在范围内（**参考构建 `-V` 能编出来的模块**：http core + proxy/cache/gzip/
    TLS/HTTP2/realip/auth_request/slice/sub/secure_link/dav/stub_status/gzip_static/

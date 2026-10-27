@@ -49,10 +49,16 @@ pub struct StreamServer {
     pub logger: std::sync::Arc<crate::log::Logger>,
     /// `proxy_protocol on`: prefix the upstream connection with a PROXY header.
     pub proxy_protocol: bool,
-    /// `geo` / `map` blocks from `stream {}`. Shared rather than copied: they are
-    /// read-only and evaluated per connection.
+    /// `geo` / `map` / `split_clients` blocks from `stream {}`. Shared rather
+    /// than copied: they are read-only and evaluated per connection.
     pub geos: std::sync::Arc<Vec<crate::geo::GeoDef>>,
     pub maps: std::sync::Arc<Vec<crate::mapping::MapDef>>,
+    pub splits: std::sync::Arc<Vec<crate::split::SplitClients>>,
+    /// `set $name value`, evaluated in order before `return`. nginx runs `set`
+    /// in the rewrite phase and `return` from the content phase, so the textual
+    /// order in the config does not matter -- `stream_set.t` puts `return`
+    /// first and expects the `set`s to have run.
+    pub sets: Vec<(String, String)>,
 }
 
 pub struct StreamConfig {
@@ -176,6 +182,8 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                 let write_pp = server.proxy_protocol;
                 let geos = server.geos.clone();
                 let maps = server.maps.clone();
+                let splits = server.splits.clone();
+                let sets = server.sets.clone();
                 let verify_mode = server.client_verify;
                 let client_ca = server.client_ca.clone();
                 let trusted_ca = server.trusted_ca.clone();
@@ -187,6 +195,24 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                         let local_addr = client
                             .local_addr()
                             .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+                        let mut base = base_vars(peer, local_addr, &maps, &geos, &splits);
+                        // `set` values may reference earlier `set`s, so they are
+                        // expanded one at a time into an accumulating map.
+                        let mut custom = std::collections::HashMap::new();
+                        for (name, value) in &sets {
+                            // A fresh view each round, so the borrow of `custom`
+                            // ends before it is extended.
+                            let expanded = {
+                                let mut view = crate::streamvars::Vars {
+                                    custom: &custom,
+                                    ..base
+                                };
+                                view.custom = &custom;
+                                view.expand(value)
+                            };
+                            custom.insert(name.clone(), expanded);
+                        }
+                        base.custom = &custom;
                         answer_stream_return(
                             client,
                             tls,
@@ -195,7 +221,7 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                             &client_ca,
                             &trusted_ca,
                             alog.as_mut(),
-                            &base_vars(peer, local_addr, &maps, &geos),
+                            &base,
                         )
                         .await;
                         drop(alog);
@@ -464,6 +490,7 @@ fn base_vars<'a>(
     local: SocketAddr,
     maps: &'a [crate::mapping::MapDef],
     geos: &'a [crate::geo::GeoDef],
+    splits: &'a [crate::split::SplitClients],
 ) -> crate::streamvars::Vars<'a> {
     crate::streamvars::Vars {
         peer,
@@ -472,8 +499,15 @@ fn base_vars<'a>(
         maps,
         geos,
         ssl: None,
+        custom: &NO_CUSTOM,
+        splits,
+        connection: crate::stats::accepted(),
     }
 }
+
+/// The empty `set` table, for the phase before any `set` has been evaluated.
+static NO_CUSTOM: std::sync::LazyLock<std::collections::HashMap<String, String>> =
+    std::sync::LazyLock::new(std::collections::HashMap::new);
 
 async fn answer_stream_return(
     mut client: TcpStream,
@@ -504,6 +538,9 @@ async fn answer_stream_return(
                         maps: base.maps,
                         geos: base.geos,
                         ssl: Some((&verify, &cert, r)),
+                        custom: base.custom,
+                        splits: base.splits,
+                        connection: base.connection,
                     };
                     let body = v.expand(text);
                     let _ = &mut v;

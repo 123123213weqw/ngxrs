@@ -25,12 +25,22 @@ pub struct Vars<'a> {
     pub maps: &'a [MapDef],
     pub geos: &'a [GeoDef],
     pub ssl: Option<(&'a str, &'a str, bool)>, // (verify, cert, reused)
+    /// Values produced by `set`, which override both the built-ins and any
+    /// `map`/`geo` of the same name (`stream_set.t`).
+    pub custom: &'a std::collections::HashMap<String, String>,
+    /// `split_clients` buckets, resolved like a `map`.
+    pub splits: &'a [crate::split::SplitClients],
+    /// `$connection`: 1 for the first connection to this worker.
+    pub connection: u64,
 }
 
 impl Vars<'_> {
     /// Resolve one variable name (without the `$`). `None` means "no such
     /// variable", which renders as the empty string.
     pub fn get(&self, name: &str) -> Option<String> {
+        if let Some(v) = self.custom.get(name) {
+            return Some(v.clone());
+        }
         Some(match name {
             "remote_addr" => self.peer.ip().to_string(),
             "remote_port" => self.peer.port().to_string(),
@@ -47,7 +57,8 @@ impl Vars<'_> {
             "status" => "200".to_string(),
             "bytes_sent" | "bytes_received" => "0".to_string(),
             "session_time" => "0.000".to_string(),
-            "connection" | "connection_requests" => "1".to_string(),
+            "connection" => self.connection.to_string(),
+            "connection_requests" => "1".to_string(),
             "ssl_session_reused" => match self.ssl {
                 Some((_, _, true)) => "r".to_string(),
                 Some(_) => ".".to_string(),
@@ -62,6 +73,10 @@ impl Vars<'_> {
                 }
                 if let Some(g) = self.geos.iter().find(|g| g.var == name) {
                     return Some(self.eval_geo(g));
+                }
+                if let Some(sc) = self.splits.iter().find(|s| s.var == name) {
+                    let key = self.expand(&sc.source);
+                    return Some(sc.pick(&key).unwrap_or_default().to_string());
                 }
                 return None;
             }
@@ -169,6 +184,11 @@ fn binary_addr(a: &SocketAddr) -> String {
 }
 
 #[cfg(test)]
+thread_local! {
+    static CUSTOM: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -180,6 +200,9 @@ mod tests {
             maps,
             geos,
             ssl: None,
+            custom: &CUSTOM.with(|c| c.clone()),
+            splits: &[],
+            connection: 1,
         }
     }
 

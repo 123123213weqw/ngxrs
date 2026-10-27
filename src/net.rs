@@ -260,6 +260,7 @@ pub fn serve(cfg: Config) -> io::Result<()> {
     };
     let stream_geos = std::sync::Arc::new(cfg.stream.geos.clone());
     let stream_maps = std::sync::Arc::new(cfg.stream.maps.clone());
+    let stream_splits = std::sync::Arc::new(cfg.stream.splits.clone());
     for sc in &cfg.stream.servers {
         let mut backends = Vec::new();
         if let Some(pp) = &sc.proxy_pass {
@@ -294,6 +295,8 @@ pub fn serve(cfg: Config) -> io::Result<()> {
             proxy_protocol: sc.proxy_protocol,
             geos: stream_geos.clone(),
             maps: stream_maps.clone(),
+            splits: stream_splits.clone(),
+            sets: sc.sets.clone(),
         });
     }
     let stream_cfg = Arc::new(stream_cfg);

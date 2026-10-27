@@ -1453,6 +1453,8 @@ pub struct StreamSection {
     pub geos: Vec<crate::geo::GeoDef>,
     /// `map` blocks in `stream {}` context, likewise separate from http.
     pub maps: Vec<crate::mapping::MapDef>,
+    /// `split_clients` blocks in `stream {}` context.
+    pub splits: Vec<crate::split::SplitClients>,
 }
 
 #[derive(Debug, Clone)]
@@ -1489,6 +1491,8 @@ pub struct StreamServerCfg {
     pub ssl_client_certificate: Option<PathBuf>,
     /// `ssl_trusted_certificate`: extra chain-building certificates.
     pub ssl_trusted_certificate: Option<PathBuf>,
+    /// `set $name value` in a stream server, applied in order before `return`.
+    pub sets: Vec<(String, String)>,
     /// `access_log` of this stream server; empty means none.
     pub access_logs: Vec<AccessLog>,
     /// `proxy_protocol on`: prefix the upstream connection with a HAProxy
@@ -4415,6 +4419,28 @@ fn parse_geo(d: &Directive) -> Result<crate::geo::GeoDef, ConfigError> {
     Ok(def)
 }
 
+/// A `split_clients $source $result { ... }` block, shared by `http` and
+/// `stream`.
+fn parse_split_clients(d: &Directive) -> Result<crate::split::SplitClients, ConfigError> {
+    if d.args.len() < 2 {
+        return Err(sem(
+            &d.file,
+            d.line,
+            "split_clients needs $source and $result",
+        ));
+    }
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for c in d.block.as_deref().unwrap_or(&[]) {
+        // The percentage is the *directive name* (`51.2%` is lexed as a bare
+        // token) and the value is its single argument.
+        if let Some(v) = c.args.first() {
+            entries.push((c.name.clone(), v.clone()));
+        }
+    }
+    crate::split::SplitClients::parse(&d.args[0], d.args[1].trim_start_matches('$'), &entries)
+        .map_err(|e| sem(&d.file, d.line, e))
+}
+
 /// A `map $source $result { ... }` block, shared by `http` and `stream`.
 fn parse_map(d: &Directive) -> Result<crate::mapping::MapDef, ConfigError> {
     if d.args.len() < 2 {
@@ -4515,8 +4541,8 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             "server" => server_dirs.push(d),
             "geo" => section.geos.push(parse_geo(d)?),
             "map" => section.maps.push(parse_map(d)?),
+            "split_clients" => section.splits.push(parse_split_clients(d)?),
             "resolver"
-            | "split_clients"
             | "limit_conn_zone"
             | "limit_req_zone"
             | "variables_hash_max_size"
@@ -4641,6 +4667,7 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             ssl_verify_client: stream_verify_client,
             ssl_client_certificate: stream_client_ca.clone(),
             ssl_trusted_certificate: stream_trusted.clone(),
+            sets: Vec::new(),
             access_logs: stream_access_logs.clone(),
             proxy_protocol: false,
             listen_proxy_protocol: false,
@@ -4675,6 +4702,14 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                 }
                 "proxy_pass" => {
                     cfg.proxy_pass = child.args.first().cloned();
+                }
+                "set" => {
+                    if let Some(name) = child.args.first() {
+                        cfg.sets.push((
+                            name.trim_start_matches('$').to_string(),
+                            child.args[1..].join(" "),
+                        ));
+                    }
                 }
                 "proxy_protocol" => {
                     // `proxy_protocol on` prefixes the upstream with a PROXY
@@ -5010,31 +5045,7 @@ pub fn build(
             "server" => server_dirs.push(d.clone()),
             "geo" => http.geos.push(parse_geo(d)?),
             "map" => http.maps.push(parse_map(d)?),
-            "split_clients" => {
-                // split_clients $source $result { 51.2% .one; * .other; }
-                if d.args.len() < 2 {
-                    return Err(sem(
-                        &d.file,
-                        d.line,
-                        "split_clients needs $source and $result",
-                    ));
-                }
-                let mut entries: Vec<(String, String)> = Vec::new();
-                for c in d.block.as_deref().unwrap_or(&[]) {
-                    // The percentage is the *directive name* (`51.2%` is lexed
-                    // as a bare token) and the value is its single argument.
-                    if let Some(v) = c.args.first() {
-                        entries.push((c.name.clone(), v.clone()));
-                    }
-                }
-                let sc = crate::split::SplitClients::parse(
-                    &d.args[0],
-                    d.args[1].trim_start_matches('$'),
-                    &entries,
-                )
-                .map_err(|e| sem(&d.file, d.line, e))?;
-                http.split_clients.push(sc);
-            }
+            "split_clients" => http.split_clients.push(parse_split_clients(d)?),
             "limit_req_zone" | "limit_conn_zone" => {
                 // limit_req_zone KEY zone=NAME:SIZE rate=Nr/s
                 let key = d

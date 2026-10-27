@@ -58,6 +58,8 @@ rewrite_if.t
 # `stream {}` context, plus repeated `listen` in one stream server.
 stream_geo.t
 stream_map.t
+stream_set.t
+stream_split_clients.t
 
 # ---- resolver ----
 # A + AAAA in parallel, CNAME following with nginx's `process_a` state machine,

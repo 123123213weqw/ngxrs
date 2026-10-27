@@ -13,7 +13,7 @@
 
 | 项 | 命令 | 当前结果 |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 117 文件，WORSE=0 TRUNC=0 |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 119 文件，WORSE=0 TRUNC=0（备用主机 `v100-222`，nginx 1823 / ngxrs 1828） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
 | 单元测试 | `cargo test --release` | **PASS** — 156 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
@@ -612,7 +612,13 @@ add_header ETag foo always;           -> ETag: foo（不是两个）
 - `~/nginx-tests` 用当前 master（与主机的 515 文件版本差 `http_headers.t` 一个文件，
   其余声明清单里的 119 个文件都在）。
 
-**这台机器上的 declared 全量：119 文件 → WORSE=0 TRUNC=0，113 个逐断言一致、5 个更优。**
+**这台机器上的 declared 全量（最终二进制）：119 文件 → WORSE=0 TRUNC=0，
+nginx 1823 / ngxrs 1828 断言，114 个逐断言一致、5 个更优（`http_headers_multi`、
+`http_resolver`、`proxy_cache_range`、`proxy_if`、`proxy_noclose`）。**
+
+环境细节记在这里，便于重建：`fastcgi.t` 需要 `FCGI.so` **及其** `libfcgi.so.0`
+（`libfcgi-perl` 与 `libfcgi0ldbl` 两个包），只装前者时该文件在两侧都是 0 断言、
+被计为 SKIP 而不是 SAME —— 上一轮正是漏了这个。
 
 ### access_log 系列全部打平，`open_log_file_cache` 三个 bug 被 A/B 抓出来
 
@@ -636,7 +642,7 @@ add_header ETag foo always;           -> ETag: foo（不是两个）
 
 ## 二、声明的测试清单
 
-清单在 `bench/declared.txt`，**117 个文件**，选取规则是机械的：
+清单在 `bench/declared.txt`，**119 个文件**，选取规则是机械的：
 
 1. 落在范围内（**参考构建 `-V` 能编出来的模块**：http core + proxy/cache/gzip/
    TLS/HTTP2/realip/auth_request/slice/sub/secure_link/dav/stub_status/gzip_static/

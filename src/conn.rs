@@ -184,6 +184,12 @@ pub struct Conn {
     /// socket asked for one. `$proxy_protocol_*` and `real_ip_header
     /// proxy_protocol` read it; nothing else does.
     pub proxy_protocol: Option<std::sync::Arc<crate::proxyproto::Pp>>,
+    /// Bytes of the request head as received, for `$request_length`
+    /// (`ngx_http_request_t.request_length` counts the same thing).
+    pub last_head_len: u64,
+    /// Total bytes of the last response written (head + body), for
+    /// `$bytes_sent`.
+    pub last_bytes_sent: u64,
     /// `limit_rate` for the response in flight, in bytes per second (0 = off),
     /// and how many leading bytes escape throttling (`limit_rate_after`).
     pub limit_rate: u64,
@@ -262,6 +268,8 @@ impl Conn {
             reading: false,
             writing: false,
             proxy_protocol: None,
+            last_head_len: 0,
+            last_bytes_sent: 0,
             limit_rate: 0,
             limit_rate_after: 0,
             rate_bytes: 0,
@@ -509,6 +517,9 @@ fn early_reject(buf: &[u8]) -> bool {
                 crate::stats::request_started();
                 match parsed {
                     Ok(req) => {
+                        // `pos` includes the terminating blank line, which is
+                        // what nginx counts too.
+                        self.last_head_len = pos as u64;
                         self.consume(pos);
                         return Ok(Some(req));
                     }

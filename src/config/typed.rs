@@ -194,6 +194,9 @@ pub struct LocCfg {
     pub limit_conns: Vec<LimitConn>,
     /// `error_log` directives that apply to this location, in order.
     pub error_logs: Vec<LogSpec>,
+    /// `open_log_file_cache`, which governs the `access_log` files declared at
+    /// this level.
+    pub open_log_file_cache: OpenFileCache,
     /// `log_not_found on|off`: whether a missing file is written to the error
     /// log as `open() ... failed (2: No such file or directory)` (nginx default
     /// on).
@@ -382,6 +385,7 @@ impl LocCfg {
             access_logs: None,
             charset_utf8: false,
             error_logs: Vec::new(),
+            open_log_file_cache: OpenFileCache::default(),
             log_not_found: true,
             limit_req_log_level: crate::log::Level::Error,
             limit_conn_log_level: crate::log::Level::Error,
@@ -1202,6 +1206,35 @@ pub struct AccessLog {
     pub if_cond: Option<String>,
     /// `escape=default|json|none`; `None` means "take the format's own mode".
     pub escape: Option<Escape>,
+    /// The `open_log_file_cache` in force where this `access_log` was declared.
+    pub cache: OpenFileCache,
+}
+
+/// `open_log_file_cache max=N [inactive=T] [min_uses=N] [valid=T]`.
+///
+/// nginx caches the *file handle*, so a log file that is renamed keeps receiving
+/// lines while its handle is held, and one that falls out of the cache has to be
+/// reopened by path (`access_log.t` proves both by renaming a directory).
+#[derive(Debug, Clone, Copy)]
+pub struct OpenFileCache {
+    pub max: usize,
+    pub inactive: Duration,
+    pub min_uses: u32,
+    pub valid: Duration,
+    /// `open_file_cache_errors`: remember a failed open so it is not retried.
+    pub errors: bool,
+}
+
+impl Default for OpenFileCache {
+    fn default() -> Self {
+        OpenFileCache {
+            max: 0,
+            inactive: Duration::from_secs(60),
+            min_uses: 1,
+            valid: Duration::from_secs(60),
+            errors: false,
+        }
+    }
 }
 
 /// `access_log ... escape=` modes.
@@ -1274,6 +1307,7 @@ pub fn parse_access_log(args: &[String], prefix: &std::path::Path) -> Option<Acc
         format,
         if_cond,
         escape,
+        cache: OpenFileCache::default(),
     })
 }
 
@@ -2642,6 +2676,7 @@ impl Builder {
                     let (text, esc) = resolve_format(&self.log_formats, &al.format);
                     al.format = text;
                     al.escape = al.escape.or(Some(esc));
+                    al.cache = cfg.open_log_file_cache;
                     logs.push(al);
                 }
             }
@@ -3449,6 +3484,40 @@ impl Builder {
                         dynamic: false,
                     });
                 }
+            }
+            "open_log_file_cache" => {
+                // `open_log_file_cache max=N [inactive=T] [min_uses=N] [valid=T]`,
+                // and the bare `off`/`min_uses=N` forms. `off` is the default,
+                // expressed as `max = 0`.
+                let mut c = OpenFileCache::default();
+                for a in &d.args {
+                    if a == "off" {
+                        c.max = 0;
+                    } else if let Some(v) = a.strip_prefix("max=") {
+                        c.max = v.parse().unwrap_or(0);
+                    } else if let Some(v) = a.strip_prefix("min_uses=") {
+                        c.min_uses = v.parse().unwrap_or(1);
+                    } else if let Some(v) = a.strip_prefix("inactive=") {
+                        c.inactive = parse_time(v).unwrap_or(c.inactive);
+                    } else if let Some(v) = a.strip_prefix("valid=") {
+                        c.valid = parse_time(v).unwrap_or(c.valid);
+                    }
+                }
+                cfg.open_log_file_cache = c;
+            }
+            "open_file_cache_errors" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "open_file_cache_errors requires on|off"))?;
+                let on = parse_on_off(v).ok_or_else(|| {
+                    sem(
+                        &d.file,
+                        d.line,
+                        format!("invalid open_file_cache_errors value \"{v}\""),
+                    )
+                })?;
+                cfg.open_log_file_cache.errors = on;
             }
             "log_not_found" => {
                 let v = d
@@ -5175,6 +5244,7 @@ pub fn build(
             format: "combined".to_string(),
             if_cond: None,
             escape: Some(Escape::Default),
+            cache: OpenFileCache::default(),
         }],
         log_formats: LogFormats::default(),
     };

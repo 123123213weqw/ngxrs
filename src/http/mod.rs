@@ -336,6 +336,9 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
         // and made a restart look like a cache miss.
         let idle_shutdown = is_shutting_down() && conn.buffered().is_empty();
         let prof_parse = crate::prof::start();
+        // `$pipe`: bytes for this request were already in the buffer while the
+        // previous one was still being handled.
+        let pipelined = !conn.buffered().is_empty() && served > 0;
         let read = if idle_shutdown {
             Err(())
         } else if NO_IDLE_TIMER.with(|v| *v) {
@@ -594,6 +597,9 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
                     400,
                     0,
                     std::time::Duration::ZERO,
+                    0,
+                    0,
+                    false,
                     (&log_peer_ip, &log_peer_port),
                     &[],
                     None,
@@ -800,6 +806,9 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
             status,
             bytes,
             elapsed,
+            conn.last_head_len + req.body_len,
+            conn.last_bytes_sent,
+            pipelined,
             (&remote_eff.0, &remote_eff.1),
             &sent,
             loc.access_logs.as_deref(),
@@ -5986,13 +5995,21 @@ async fn write_response_inner(
         return r.map(|_| 0);
     }
 
+    // `$bytes_sent` counts the whole response; the body length that this
+    // function returns feeds `$body_bytes_sent` instead.
+    let mut total_sent: u64 = 0;
     let result = match body {
         Body::Empty => {
             if chunked {
                 out.extend_from_slice(b"0\r\n");
                 push_trailers(&mut out, &trailers);
             }
-            conn.write_all(&out).await.map(|_| 0)
+            let n = out.len() as u64;
+            let r = conn.write_all(&out).await.map(|_| 0);
+            if r.is_ok() {
+                total_sent = n;
+            }
+            r
         }
         Body::Bytes(b) => {
             if chunked {
@@ -6003,10 +6020,20 @@ async fn write_response_inner(
                 }
                 out.extend_from_slice(b"0\r\n");
                 push_trailers(&mut out, &trailers);
-                conn.write_all(&out).await.map(|_| b.len() as u64)
+                let n = out.len() as u64;
+                let r = conn.write_all(&out).await.map(|_| b.len() as u64);
+                if r.is_ok() {
+                    total_sent = n;
+                }
+                r
             } else {
                 out.extend_from_slice(&b);
-                conn.write_all(&out).await.map(|_| b.len() as u64)
+                let n = out.len() as u64;
+                let r = conn.write_all(&out).await.map(|_| b.len() as u64);
+                if r.is_ok() {
+                    total_sent = n;
+                }
+                r
             }
         }
         // Small files: one write beats header+sendfile (two syscalls, two
@@ -6037,6 +6064,7 @@ async fn write_response_inner(
             }
         }
         Body::File { file, offset, len } => {
+            let head_len = out.len() as u64;
             if conn.tcp_nopush {
                 conn.set_cork(true);
                 let w = conn.write_all(&out).await;
@@ -6046,18 +6074,28 @@ async fn write_response_inner(
                 } else {
                     let sent = conn.send_file(&file, offset, len).await;
                     conn.set_cork(false);
+                    if sent.is_ok() {
+                        total_sent = head_len + len;
+                    }
                     sent
                 }
             } else if let Err(e) = conn.write_all(&out).await {
                 Err(e)
             } else {
-                conn.send_file(&file, offset, len).await
+                let sent = conn.send_file(&file, offset, len).await;
+                if sent.is_ok() {
+                    total_sent = head_len + len;
+                }
+                sent
             }
         }
     };
 
     out.clear();
     conn.out = out;
+    if result.is_ok() {
+        conn.last_bytes_sent = total_sent;
+    }
     result
 }
 
@@ -6641,7 +6679,14 @@ fn log_access(
     query: &str,
     status: u16,
     bytes: u64,
-    _elapsed: Duration,
+    elapsed: Duration,
+    // `$request_length`: the head bytes as received plus the body.
+    request_length: u64,
+    // `$bytes_sent`: the whole response, head included.
+    bytes_sent: u64,
+    // `$pipe`: `p` when this request was already buffered behind another on the
+    // same connection, `.` otherwise.
+    pipelined: bool,
     // `$remote_addr` / `$remote_port` as `real_ip_*` left them; the raw socket
     // address is only the starting point.
     remote: (&str, &str),
@@ -6688,6 +6733,18 @@ fn log_access(
     // `$server_addr` is the socket's local address; nginx falls back to the
     // configured listen address when the socket has none.
     let server_addr = group.addr.ip().to_string();
+    let request_length_s = request_length.to_string();
+    let bytes_sent_s = bytes_sent.to_string();
+    // `$request_time` is seconds with millisecond precision.
+    let request_time_s = format!("{:.3}", elapsed.as_secs_f64());
+    // `$msec`: the current time with milliseconds (`now` is whole seconds, so
+    // the sub-second part comes from the wall clock here).
+    let wall = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let msec_s = format!("{}.{:03}", wall.as_secs(), wall.subsec_millis());
+    // `$time_iso8601`: local time with the numeric offset.
+    let iso8601_s = util::iso8601_time(now);
     // `$binary_remote_addr`: the packed address bytes, escaped by the writer.
     let binary_remote_addr = match remote.0.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(v4)) => v4.octets().iter().map(|b| *b as char).collect(),
@@ -6748,6 +6805,12 @@ fn log_access(
         ("upstream_status", &t_upstatus),
         ("request_id", &req.request_id),
         ("server_addr", &server_addr),
+        ("bytes_sent", &bytes_sent_s),
+        ("request_length", &request_length_s),
+        ("request_time", &request_time_s),
+        ("msec", &msec_s),
+        ("time_iso8601", &iso8601_s),
+        ("pipe", if pipelined { "p" } else { "." }),
         ("binary_remote_addr", &binary_remote_addr),
         // `$http_*` arrive from the request's own view so a header that is
         // absent renders as `-` (nginx's not-found rule) while one that is
@@ -6819,7 +6882,7 @@ fn log_access(
             }
             None => log.path.clone(),
         };
-        ctx.logger.access(&path, line);
+        ctx.logger.access_cached(&path, line, log.cache);
     }
 }
 

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// nginx's severity ordering: `debug` is the lowest, `emerg` the highest.
 /// A sink configured with level L receives every message with severity >= L.
@@ -285,58 +285,57 @@ pub fn error_log(level: &str, msg: &str) {
 }
 
 pub struct Logger {
-    tx: Option<Sender<(PathBuf, String)>>,
+    tx: Option<Sender<Record>>,
     handle: Option<JoinHandle<()>>,
+}
+
+/// One line to append, with the `open_log_file_cache` in force for it.
+pub struct Record {
+    pub path: PathBuf,
+    pub line: String,
+    pub cache: crate::config::OpenFileCache,
+}
+
+/// One entry of `open_log_file_cache`.
+struct Cached {
+    writer: Option<BufWriter<File>>,
+    created: Instant,
+    last_used: Instant,
+    /// How often this path has been logged, for `min_uses`.
+    uses: u32,
+    /// This log's `inactive`, so the sweep does not need a global policy.
+    inactive: Duration,
 }
 
 impl Logger {
     pub fn new() -> std::io::Result<Self> {
-        let (tx, rx) = channel::<(PathBuf, String)>();
+        let (tx, rx) = channel::<Record>();
         let handle = std::thread::Builder::new()
             .name("ngxrs-log".to_string())
             .spawn(move || {
-                let mut files: HashMap<PathBuf, BufWriter<File>> = HashMap::new();
+                let mut files: HashMap<PathBuf, Cached> = HashMap::new();
                 loop {
                     match rx.recv_timeout(Duration::from_millis(50)) {
-                        Ok((path, line)) => {
-                            if !files.contains_key(&path) {
-                                if let Some(parent) = path.parent() {
-                                    if !parent.as_os_str().is_empty() {
-                                        let _ = std::fs::create_dir_all(parent);
-                                    }
-                                }
-                                match OpenOptions::new().create(true).append(true).open(&path) {
-                                    Ok(f) => {
-                                        files.insert(
-                                            path.clone(),
-                                            BufWriter::with_capacity(64 * 1024, f),
-                                        );
-                                    }
-                                    Err(e) => {
-                                        eprintln!(
-                                            "ngxrs: [error] cannot open access log {}: {}",
-                                            path.display(),
-                                            e
-                                        );
-                                        continue;
-                                    }
-                                }
-                            }
-                            if let Some(w) = files.get_mut(&path) {
-                                let _ = w.write_all(line.as_bytes());
-                                let _ = w.write_all(b"\n");
-                            }
+                        Ok(Record { path, line, cache }) => {
+                            append_line(&mut files, &path, &line, cache);
                         }
                         Err(RecvTimeoutError::Timeout) => {
                             for w in files.values_mut() {
-                                let _ = w.flush();
+                                if let Some(b) = w.writer.as_mut() {
+                                    let _ = b.flush();
+                                }
                             }
+                            // `inactive`: an entry unused for that long is
+                            // dropped, closing its handle.
+                            files.retain(|_, e| e.last_used.elapsed() < e.inactive);
                         }
                         Err(RecvTimeoutError::Disconnected) => break,
                     }
                 }
                 for w in files.values_mut() {
-                    let _ = w.flush();
+                    if let Some(b) = w.writer.as_mut() {
+                        let _ = b.flush();
+                    }
                 }
             })?;
         Ok(Logger {
@@ -346,8 +345,22 @@ impl Logger {
     }
 
     pub fn access(&self, path: &Path, line: String) {
+        self.access_cached(path, line, crate::config::OpenFileCache::default());
+    }
+
+    /// Append with an explicit `open_log_file_cache` policy.
+    pub fn access_cached(
+        &self,
+        path: &Path,
+        line: String,
+        cache: crate::config::OpenFileCache,
+    ) {
         if let Some(tx) = &self.tx {
-            let _ = tx.send((path.to_path_buf(), line));
+            let _ = tx.send(Record {
+                path: path.to_path_buf(),
+                line,
+                cache,
+            });
         }
     }
 }
@@ -359,4 +372,105 @@ impl Drop for Logger {
             let _ = h.join();
         }
     }
+}
+
+/// Append one log line, honouring `open_log_file_cache`.
+///
+/// The observable rules, all three of which `access_log.t` pins down by renaming
+/// a directory out from under the log files:
+///
+///   * a handle that is cached and still within `valid` keeps receiving lines
+///     even after the path disappears -- the writes go to the inode;
+///   * a path logged fewer than `min_uses` times is opened and closed per line,
+///     so it breaks the moment the path is gone;
+///   * `max` bounds the number of *entries*, so a fourth path evicts the
+///     least-recently-used one and its lines then fail the same way.
+fn append_line(
+    files: &mut HashMap<PathBuf, Cached>,
+    path: &Path,
+    line: &str,
+    cache: crate::config::OpenFileCache,
+) {
+    let now = Instant::now();
+    if cache.max == 0 {
+        // `open_log_file_cache off`: every line opens and closes the file, which
+        // is also what nginx does without the directive.
+        if let Some(mut f) = open_log(path) {
+            let _ = f.write_all(line.as_bytes());
+            let _ = f.write_all(b"\n");
+            let _ = f.flush();
+        }
+        return;
+    }
+
+    if let Some(e) = files.get_mut(path) {
+        e.uses += 1;
+        e.last_used = now;
+        let still_valid = now.duration_since(e.created) < cache.valid;
+        if let Some(w) = e.writer.as_mut().filter(|_| still_valid) {
+            let _ = w.write_all(line.as_bytes());
+            let _ = w.write_all(b"\n");
+            return;
+        }
+        // Either the entry never kept a handle (`min_uses` not reached) or its
+        // validity expired: reopen by path. A failure drops the line.
+        e.writer = None;
+        if let Some(f) = open_log(path) {
+            let mut w = BufWriter::with_capacity(64 * 1024, f);
+            let _ = w.write_all(line.as_bytes());
+            let _ = w.write_all(b"\n");
+            if e.uses >= cache.min_uses {
+                e.writer = Some(w);
+                e.created = now;
+            } else {
+                let _ = w.flush();
+            }
+        }
+        return;
+    }
+
+    // First line for this path.
+    let mut entry = Cached {
+        writer: None,
+        created: now,
+        last_used: now,
+        uses: 1,
+        inactive: cache.inactive,
+    };
+    if let Some(f) = open_log(path) {
+        let mut w = BufWriter::with_capacity(64 * 1024, f);
+        let _ = w.write_all(line.as_bytes());
+        let _ = w.write_all(b"\n");
+        if entry.uses >= cache.min_uses {
+            entry.writer = Some(w);
+        } else {
+            let _ = w.flush();
+        }
+    }
+    files.insert(path.to_path_buf(), entry);
+
+    // Evict least-recently-used entries beyond `max`.
+    while files.len() > cache.max {
+        let Some(oldest) = files
+            .iter()
+            .min_by_key(|(_, e)| e.last_used)
+            .map(|(p, _)| p.clone())
+        else {
+            break;
+        };
+        if let Some(mut e) = files.remove(&oldest) {
+            if let Some(b) = e.writer.as_mut() {
+                let _ = b.flush();
+            }
+        }
+    }
+}
+
+fn open_log(path: &Path) -> Option<File> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+    OpenOptions::new().create(true).append(true).open(path).ok()
 }

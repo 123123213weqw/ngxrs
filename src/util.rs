@@ -804,3 +804,30 @@ pub fn new_request_id() -> String {
     }
     out
 }
+
+/// `$time_iso8601`: `1970-09-28T12:00:00+06:00`, in the server's local zone
+/// (`ngx_http_log_iso8601` formats `tm_gmtoff` as `+06:00`).
+pub fn iso8601_time(ts: i64) -> String {
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        let t = ts as libc::time_t;
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return String::new();
+        }
+        let off = tm.tm_gmtoff;
+        let sign = if off < 0 { '-' } else { '+' };
+        let abs = off.unsigned_abs();
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec,
+            sign,
+            abs / 3600,
+            (abs % 3600) / 60
+        )
+    }
+}

@@ -9,6 +9,7 @@ mod auth;
 mod cache;
 mod config;
 mod conn;
+mod dav;
 mod cookie;
 mod fastcgi;
 mod geo;

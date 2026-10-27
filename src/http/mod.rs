@@ -594,10 +594,16 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
         // other handler discards it (nginx behaves the same for static
         // content). Draining here for an upstream-backed location would make
         // the module read an already-empty body and block forever.
+        // A DAV `PUT` reads the body itself (`ngx_http_read_client_request_body`
+        // in `ngx_http_dav_put_handler`), so it belongs on this list too: the
+        // request body used to be drained above and the handler then blocked
+        // waiting for bytes that had already been thrown away.
+        let dav_put = req.method == Method::Put && loc.dav_methods & crate::dav::flags::PUT != 0;
         let proxy_target = loc.proxy_pass.is_some()
             || loc.fastcgi_pass.is_some()
             || loc.uwsgi_pass.is_some()
-            || loc.scgi_pass.is_some();
+            || loc.scgi_pass.is_some()
+            || dav_put;
         if req.chunked {
             if !proxy_target {
                 if req.expect_continue {
@@ -4704,6 +4710,54 @@ async fn dispatch(
         query
     };
 
+    // ---- WebDAV ----
+    // nginx's `ngx_http_dav_module` sits between the static handler (which
+    // declines every method but GET/HEAD/POST) and the upstream modules, so a
+    // location with both `dav_methods` and `proxy_pass` answers a PUT here.
+    if loc.dav_methods != 0 {
+        let max = http.client_max_body_size as usize;
+        if let Some(mut resp) = crate::dav::handle(conn, req, path, loc, max).await? {
+            let mut dav_vars = set_vars.clone();
+            let resp = finalize_response(
+                req,
+                &mut resp,
+                path,
+                query,
+                server,
+                http,
+                client_ip,
+                peer_port,
+                listen_port,
+                captures,
+                &mut dav_vars,
+                state,
+                local_addr,
+            )
+            .await;
+            let status = resp.status;
+            let sent = if sent_headers_needed(server) {
+                split_head(&resp.raw)
+            } else {
+                Vec::new()
+            };
+            let bytes = write_response_ka(
+                conn,
+                resp,
+                keepalive_allowed,
+                server.server_tokens,
+                req.method == Method::Head,
+                None,
+            )
+            .await?;
+            return Ok(Outcome {
+                status,
+                bytes,
+                close: !keepalive_allowed,
+                sent,
+            });
+        }
+    }
+
     // ---- gRPC ----
     if loc.grpc_pass.is_some() {
         let grpc_vars = ServerVars {
@@ -5199,6 +5253,20 @@ fn keepalive_policy(req: &Request, loc: &LocCfg, state: ConnState) -> bool {
 /// Build the `Location` for a redirect, honouring `absolute_redirect`,
 /// `server_name_in_redirect` and `port_in_redirect` (nginx's
 /// `ngx_http_header_filter` logic).
+///
+/// Public because `ngx_http_header_filter` applies it to *any* `Location`
+/// starting with `/` -- the DAV module's 201 included, which is what `dav.t`
+/// checks with `absolute_redirect off`.
+pub fn absolute_location(
+    req: &Request,
+    loc: &LocCfg,
+    raw_location: &str,
+    listen_port: u16,
+    local_addr: &str,
+) -> String {
+    redirect_location(req, loc, raw_location, listen_port, local_addr)
+}
+
 fn redirect_location(
     req: &Request,
     loc: &LocCfg,

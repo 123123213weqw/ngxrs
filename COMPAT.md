@@ -13,9 +13,9 @@
 
 | 项 | 命令 | 当前结果 |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 92 文件，WORSE=0 TRUNC=0（nginx 1271 / ngxrs 1275 断言） |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 95 文件，WORSE=0 TRUNC=0（nginx 1393 / ngxrs 1397 断言） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
-| 单元测试 | `cargo test --release` | **PASS** — 138 passed |
+| 单元测试 | `cargo test --release` | **PASS** — 141 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
 
 ## 一之二、2026-10-27 轮：范围纠偏、realip 信任判定、auth_basic
@@ -231,9 +231,39 @@ value，捕获与命名变量在同一遍里替换。现在合并成一个展开
 
 声明清单 **89 → 92 文件**（新增 `fastcgi.t`、`secure_link.t`、`rewrite_if.t`）。
 
+## 一之五、2026-10-27 第四轮：`ngx_http_dav_module`（122 条断言）
+
+三个 dav 文件从 25/122 到 **122/122**（`dav.t` 96/96、`dav_chunked.t` 8/8、`dav_utf8.t` 18/18）。
+实现照 `ngx_http_dav_module.c` 逐段转录，五个方法：
+
+| 方法 | 成功 | 拒绝 |
+|---|---|---|
+| PUT | 201 新建 / 204 覆盖 | 409 集合 URI、501 带 `Content-Range`、500 父目录缺失且未开 `create_full_put_path` |
+| DELETE | 204 | 404 不存在、409 目录 URI 无尾斜杠、400 `Depth` 不合规、415 带 body、409 `min_delete_depth` |
+| MKCOL | 201 | 405 已存在、409 无尾斜杠/父目录缺失、415 带 body |
+| COPY | 204 文件 / 201 集合 | 412 `Overwrite: F`、409 集合/非集合不匹配、400 坏的 `Destination`/`Overwrite`/`Depth`、404 源不存在 |
+| MOVE | 204 文件 / 201 集合 | 同 COPY，且 `Depth` 必须 infinity |
+
+踩到的三个坑，都只有跑测试才会暴露：
+
+1. **请求体被提前丢掉了**。主循环对「非上游」location 会 `drain_body`，而 DAV 的 PUT
+   自己读 body（`ngx_http_read_client_request_body`）。原来 PUT 走到 handler 时 body
+   已经没了，`take_body` 于是永远等 10 个字节 —— 客户端等到超时，我们记 499。
+   现在 PUT + `dav_methods` 含 PUT 与 proxy/fastcgi 同等对待。
+2. **`ngx_dir_access`**：`create_full_put_path` 建出来的目录如果直接用 `dav_access`
+   （默认 0600），目录没有 `x` 位，随后往里写文件必然 EACCES → 403。
+   nginx 的 `ngx_dir_access(a) = a | (a & 0444) >> 2` 正是补上执行位。
+3. **`absolute_redirect` 对 201 的 `Location` 同样生效**（`ngx_http_header_filter`
+   看的是头，不是状态码）。`dav.t` 用 `absolute_redirect off` 断言相对路径，所以
+   `redirect_location` 提到 `absolute_location` 公开复用。
+
+另外 `dav_access` 的解析有个反直觉之处，也照抄了：起点是 `0600`，而一旦出现
+`user:` 就把 owner 位清零再按参数 OR 回去 —— 所以 `user:rw group:r all:r` 是 0644
+而不是 0744。
+
 ## 二、声明的测试清单
 
-清单在 `bench/declared.txt`，**92 个文件**，选取规则是机械的：
+清单在 `bench/declared.txt`，**95 个文件**，选取规则是机械的：
 
 1. 落在范围内（**参考构建 `-V` 能编出来的模块**：http core + proxy/cache/gzip/
    TLS/HTTP2/realip/auth_request/slice/sub/secure_link/dav/stub_status/gzip_static/

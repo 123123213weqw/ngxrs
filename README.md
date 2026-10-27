@@ -40,11 +40,12 @@ python3 tests/parity.py         # 差分测试：同一请求分别打 nginx / n
 - **日志**：`error_log` 八个级别（debug…emerg）在 main/http/server/location/stream/mail 各上下文，多目的地、`stderr`、`syslog:` 走 RFC 3164
 - **其它**：`gzip`、`add_header`/`add_trailer`（含 `$sent_http_*`、`$sent_trailer_*`）、`expires`、`access_log`、`allow`/`deny`/`limit_except`、`limit_req`/`limit_conn`、`map`、`geo`
 - **realip**：`set_real_ip_from`（地址 / CIDR / 主机名 / `unix:`）、`real_ip_header`、`real_ip_recursive`。**peer 先受信才采信头**，`$remote_addr` 不可被任意客户端改写
+- **WebDAV**：`dav_methods PUT DELETE MKCOL COPY MOVE`、`dav_access`、`create_full_put_path`、`min_delete_depth`，以及 `Depth`/`Overwrite`/`Destination`
 - **auth**：`auth_basic`（`{PLAIN}`/`{SHA}`/`{SSHA}`/`crypt(3)`/`$apr1$`，`auth_basic_user_file` 支持变量）、`auth_request` + `auth_request_set`、`satisfy all|any`；`secure_link` 新式与老式两种签名
 - **HTTP/3 (QUIC)**：`listen ... quic`，quinn + h3，请求复用同一套路由/内容管线（**QPACK 编码由 `h3` crate 决定，未与 nginx 逐位一致**）
 - **TLS / HTTP2 / stream**：TLS 1.2–1.3 + SNI（精确/通配/默认回落选证）、客户端证书（`ssl_verify_client`，http 与 stream 两侧）、加密私钥（`ssl_password_file`，PKCS#8 PBES2）、ALPN `h2`（复用同一套路由表）、`stream {}` TCP/UDP 转发 + `listen ... ssl` TLS 终止 + `proxy_ssl`（上游 TLS、会话复用）
 
-**未实现**：mail 侧客户端证书校验、`auth_request` 指向 uwsgi/SCGI 上游、`fastcgi_cache`、`slice`、`dav`。
+**未实现**：mail 侧客户端证书校验、`auth_request` 指向 uwsgi/SCGI 上游、`fastcgi_cache`、`slice`。
 
 **已知差距（有实测数字，见 COMPAT.md）**：HTTP/2 帧级细节（HPACK 编码选择、连接级错误帧形状）因底层用 `h2` crate 而无法逐帧对齐，`h2.t` 116/144（nginx 144/144）、`h3_headers.t` 28/77（无 nginx 对照，本机 nginx 无 v3 模块）；1 KB 静态吞吐约 0.95× nginx，64 KB 尾延迟 p99 显著更低。
 逐项兼容矩阵与已知语义差异见 [COMPAT.md](COMPAT.md)。
@@ -65,8 +66,8 @@ bash bench/fcgi.sh    # FastCGI / uwsgi / SCGI / stream TCP-UDP 14 项
 **绝对通过率没有意义**——nginx-tests master 依赖比 CPAN 更新的 `Test::Nginx`，很多用例对真 nginx 也是失败/阻塞。
 这两个脚本只报"nginx 过而 ngxrs 不过"的断言，那才是真缺陷。
 
-最近一次声明清单 A/B：**92 个文件，nginx 1271 / ngxrs 1275 条断言，0 条「nginx 过而我们不过」**，
-其中 88 个逐断言一致、4 个我们更多（`http_headers_multi.t`、`proxy_cache_range.t`、`proxy_if.t`、`proxy_noclose.t`）。
+最近一次声明清单 A/B：**95 个文件，nginx 1393 / ngxrs 1397 条断言，0 条「nginx 过而我们不过」**，
+其中 91 个逐断言一致、4 个我们更多（`http_headers_multi.t`、`proxy_cache_range.t`、`proxy_if.t`、`proxy_noclose.t`）。
 范围内仍不一致的文件、缺口与复现命令逐条列在 [COMPAT.md](COMPAT.md) 第三节。
 
 ## 性能

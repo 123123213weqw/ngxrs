@@ -53,6 +53,14 @@ realip_remote_port.t
 # variables in it.
 rewrite_if.t
 
+# ---- dav ----
+# `dav_methods PUT DELETE MKCOL COPY MOVE`, `dav_access`,
+# `create_full_put_path`, `min_delete_depth`, and the `Depth`/`Overwrite`/
+# `Destination` headers.
+dav.t
+dav_chunked.t
+dav_utf8.t
+
 # ---- secure_link ----
 # Both styles: `secure_link`+`secure_link_md5` (base64url MD5, optional
 # expiry) and the old `secure_link_secret` path form, including inheritance.

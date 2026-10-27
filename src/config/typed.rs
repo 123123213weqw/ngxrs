@@ -229,6 +229,18 @@ pub struct LocCfg {
     pub fastcgi_params: Vec<FastcgiParam>,
     pub fastcgi_index: Option<String>,
     pub fastcgi_split_path_info: Option<regex::Regex>,
+    /// `dav_methods`: bitmask of the WebDAV methods this location serves
+    /// (`crate::dav::flags`). Zero -- the default, and what `off` means -- makes
+    /// the DAV module decline entirely.
+    pub dav_methods: u32,
+    /// `dav_access`: mode for entries the DAV module creates (default 0600).
+    pub dav_access: u32,
+    /// `create_full_put_path on`: create the missing parent directories of a
+    /// PUT target.
+    pub dav_create_full_put_path: bool,
+    /// `min_delete_depth`: how many path segments a DELETE URI needs before it
+    /// is allowed (nginx default 0 = no check).
+    pub dav_min_delete_depth: u32,
     /// `secure_link` (new style): a complex value holding `hash[,expires]`.
     ///
     /// The three `secure_link*` fields follow `ngx_http_secure_link_merge_conf`:
@@ -418,6 +430,10 @@ impl LocCfg {
             fastcgi_params: Vec::new(),
             fastcgi_index: None,
             fastcgi_split_path_info: None,
+            dav_methods: 0,
+            dav_access: 0o600,
+            dav_create_full_put_path: false,
+            dav_min_delete_depth: 0,
             secure_link_set: false,
             secure_link_md5_set: false,
             secure_link_secret_set: false,
@@ -3226,6 +3242,81 @@ impl Builder {
                         dynamic: false,
                     });
                 }
+            }
+            "dav_methods" => {
+                cfg.dav_methods = 0;
+                for a in &d.args {
+                    cfg.dav_methods |= match a.as_str() {
+                        "PUT" => crate::dav::flags::PUT,
+                        "DELETE" => crate::dav::flags::DELETE,
+                        "MKCOL" => crate::dav::flags::MKCOL,
+                        "COPY" => crate::dav::flags::COPY,
+                        "MOVE" => crate::dav::flags::MOVE,
+                        // `off` contributes nothing, which is also the default.
+                        _ => 0,
+                    };
+                }
+            }
+            "dav_access" => {
+                // `ngx_conf_set_access_slot`: start from 0600, and naming
+                // `user:` clears those bits before they are OR-ed back in.
+                let mut access = 0u32;
+                let mut user = 0o600u32;
+                for a in &d.args {
+                    let (shift, rest) = if let Some(r) = a.strip_prefix("user:") {
+                        user = 0;
+                        (6u32, r)
+                    } else if let Some(r) = a.strip_prefix("group:") {
+                        (3u32, r)
+                    } else if let Some(r) = a.strip_prefix("all:") {
+                        (0u32, r)
+                    } else {
+                        return Err(sem(
+                            &d.file,
+                            d.line,
+                            format!("invalid dav_access value \"{a}\""),
+                        ));
+                    };
+                    let bits = match rest {
+                        "rw" => 6u32,
+                        "r" => 4u32,
+                        _ => {
+                            return Err(sem(
+                                &d.file,
+                                d.line,
+                                format!("invalid dav_access value \"{a}\""),
+                            ))
+                        }
+                    };
+                    access |= bits << shift;
+                }
+                cfg.dav_access = access | user;
+            }
+            "create_full_put_path" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "create_full_put_path requires on|off"))?;
+                cfg.dav_create_full_put_path = parse_on_off(v).ok_or_else(|| {
+                    sem(
+                        &d.file,
+                        d.line,
+                        format!("invalid create_full_put_path value \"{v}\""),
+                    )
+                })?;
+            }
+            "min_delete_depth" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "min_delete_depth requires a number"))?;
+                cfg.dav_min_delete_depth = v.parse().map_err(|_| {
+                    sem(
+                        &d.file,
+                        d.line,
+                        format!("invalid min_delete_depth value \"{v}\""),
+                    )
+                })?;
             }
             "secure_link" => {
                 cfg.secure_link = d.args.first().cloned();

@@ -1,7 +1,7 @@
 //! Typed, nginx-shaped configuration model.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -159,6 +159,10 @@ pub struct LocCfg {
     /// replaces the inherited one.
     pub realip_from: Vec<(std::net::IpAddr, u8)>,
     pub realip_from_set: bool,
+    /// `set_real_ip_from unix:`: a peer on a unix socket is trusted. nginx
+    /// keeps this apart from the address list because a unix peer has no
+    /// address to match against (`$remote_addr` reads `unix:`).
+    pub realip_from_unix: bool,
     /// `real_ip_header` (nginx default `X-Real-IP`).
     pub real_ip_header: String,
     /// `real_ip_recursive` (default off).
@@ -352,6 +356,7 @@ impl LocCfg {
             proxy_bind: None,
             realip_from: Vec::new(),
             realip_from_set: false,
+            realip_from_unix: false,
             real_ip_header: "X-Real-IP".to_string(),
             real_ip_recursive: false,
             limit_reqs: Vec::new(),
@@ -1439,6 +1444,36 @@ pub fn parse_realip_cidr(s: &str) -> Option<(std::net::IpAddr, u8)> {
     }
 }
 
+/// `set_real_ip_from` value → the networks it trusts.
+///
+/// nginx accepts three shapes: a literal address or CIDR, a hostname (resolved
+/// with getaddrinfo at configuration time, which is why `set_real_ip_from
+/// localhost` works), and `unix:` (handled by the caller — it produces no
+/// address at all). A name that fails to resolve is a configuration error in
+/// nginx; here it is reported as a warning and contributes nothing.
+pub fn resolve_realip_from(s: &str) -> Result<Vec<(std::net::IpAddr, u8)>, String> {
+    if let Some(cidr) = parse_realip_cidr(s) {
+        return Ok(vec![cidr]);
+    }
+    if s.contains('/') || s.is_empty() {
+        return Err(format!("invalid parameter \"{s}\""));
+    }
+    // `to_socket_addrs` is getaddrinfo(3) with the port stripped, which is
+    // exactly what `ngx_inet_resolve_host` does for this directive.
+    let addrs: Vec<(std::net::IpAddr, u8)> = (s, 0u16)
+        .to_socket_addrs()
+        .map_err(|e| format!("host not found in \"{s}\" ({e})"))?
+        .map(|a| {
+            let ip = a.ip();
+            (ip, if ip.is_ipv4() { 32 } else { 128 })
+        })
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("host not found in \"{s}\""));
+    }
+    Ok(addrs)
+}
+
 pub fn parse_time(s: &str) -> Option<Duration> {
     // nginx's time grammar sums unit tokens in any order: `1h30m`, `1d 12h`,
     // `500` (bare seconds). A bare number must end the value.
@@ -2318,7 +2353,10 @@ impl Builder {
                     .args
                     .first()
                     .ok_or_else(|| sem(&d.file, d.line, "auth_basic_user_file requires a path"))?;
-                cfg.auth_basic.user_file = Some(PathBuf::from(v));
+                // nginx resolves a relative path against the configuration
+                // prefix; a `$var` in the value survives as text and is
+                // expanded per request, so the anchoring happens first.
+                cfg.auth_basic.user_file = Some(resolve_path(&self.prefix, v));
             }
             "auth_request" => {
                 let v = d.args.first().map(|s| s.as_str()).unwrap_or("");
@@ -2675,14 +2713,23 @@ impl Builder {
             }
             "internal" => cfg.internal = true,
             "set_real_ip_from" => {
-                // First directive in this scope replaces the inherited list.
+                // First directive in this scope replaces the inherited list,
+                // `unix:` entries included: nginx keeps both shapes in one
+                // per-scope array (`NGX_HTTP_REALIP_UNIX` is just another cidr
+                // family), so `merge_loc_conf` copies or replaces them together.
                 if !cfg.realip_from_set {
                     cfg.realip_from.clear();
+                    cfg.realip_from_unix = false;
                     cfg.realip_from_set = true;
                 }
                 if let Some(v) = d.args.first() {
-                    if let Some(cidr) = parse_realip_cidr(v) {
-                        cfg.realip_from.push(cidr);
+                    if v == "unix:" {
+                        cfg.realip_from_unix = true;
+                    } else {
+                        match resolve_realip_from(v) {
+                            Ok(cidrs) => cfg.realip_from.extend(cidrs),
+                            Err(e) => self.warn(d, e),
+                        }
                     }
                 }
             }
@@ -3577,6 +3624,12 @@ impl Builder {
         // so the raw list must start empty here. Leaving the parent's entries in
         // place made a parent's `off` outrank a child's own rule.
         cfg.proxy_redirect_src = None;
+        // `set_real_ip_from` follows nginx's array merge: a location with no
+        // directive inherits the parent's list, one with any directive replaces
+        // it entirely. Clearing the "already declared" flag is what makes the
+        // first directive in this scope replace instead of append -- without it
+        // a nested location silently grew the parent's list.
+        cfg.realip_from_set = false;
         // Cookie rewrites are replaced, not inherited-into.
         cfg.cookie_domains_set = false;
         cfg.cookie_paths_set = false;
@@ -5292,6 +5345,48 @@ mod tests {
         assert_eq!(
             parse_listen("[::]:8083"),
             Some(SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 8083)))
+        );
+    }
+
+    #[test]
+    fn realip_from_forms() {
+        // Literal, CIDR, hostname (resolved through getaddrinfo) and `unix:`
+        // are the four shapes nginx accepts.
+        assert_eq!(
+            resolve_realip_from("192.0.2.1").unwrap(),
+            vec![(std::net::IpAddr::from([192, 0, 2, 1]), 32)]
+        );
+        assert_eq!(
+            resolve_realip_from("192.0.2.0/24").unwrap(),
+            vec![(std::net::IpAddr::from([192, 0, 2, 0]), 24)]
+        );
+        let local = resolve_realip_from("localhost").unwrap();
+        assert!(local.contains(&(std::net::IpAddr::from([127, 0, 0, 1]), 32)));
+        assert!(local.iter().all(|(_, b)| *b == 32 || *b == 128));
+        // A name that does not resolve is reported, not silently dropped.
+        assert!(resolve_realip_from("no-such-host.invalid").is_err());
+        assert!(resolve_realip_from("").is_err());
+    }
+
+    #[test]
+    fn realip_unix_is_not_an_address() {
+        let c = build_from(
+            "events {}\nhttp { server { listen 8080; location / {\n\
+             set_real_ip_from unix:;\n\
+             set_real_ip_from 10.0.0.0/8;\n\
+             location /nested { set_real_ip_from 127.0.0.1; }\n\
+             } } }\n",
+        );
+        let loc = &c.http.servers[0].locations[0].cfg;
+        assert!(loc.realip_from_unix);
+        assert_eq!(loc.realip_from, vec![(std::net::IpAddr::from([10, 0, 0, 0]), 8)]);
+        // A nested scope that declares any `set_real_ip_from` replaces the
+        // inherited list as a whole, `unix:` entries included.
+        let nested = &c.http.servers[0].locations[0].nested[0].cfg;
+        assert!(!nested.realip_from_unix);
+        assert_eq!(
+            nested.realip_from,
+            vec![(std::net::IpAddr::from([127, 0, 0, 1]), 32)]
         );
     }
 

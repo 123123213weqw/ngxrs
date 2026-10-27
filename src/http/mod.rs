@@ -795,7 +795,14 @@ async fn access_phase(
         }
         if basic_on {
             let header = req.headers.get("authorization");
-            codes.push(match crate::auth::check(&loc.auth_basic, header) {
+            // `auth_basic_user_file` may contain variables; a relative path is
+            // already anchored to the configuration prefix at parse time.
+            let path = loc
+                .auth_basic
+                .user_file
+                .as_ref()
+                .map(|p| std::path::PathBuf::from(vars.expand(&p.to_string_lossy())));
+            codes.push(match crate::auth::check(&loc.auth_basic, header, path.as_deref()) {
                 crate::auth::Verdict::Ok => 0,
                 crate::auth::Verdict::Reject => 401,
             });
@@ -4083,15 +4090,33 @@ fn forwarded_step(
 
 /// The address `real_ip_*` rewrites `$remote_addr` to, if any
 /// (`ngx_http_realip_handler` + `ngx_http_get_forwarded_addr`).
+///
+/// `peer` is `None` for a unix-socket connection, which has no address to
+/// match against; `set_real_ip_from unix:` is what trusts those peers.
 fn realip_effective(
     loc: &LocCfg,
     req: &Request,
-    peer: std::net::IpAddr,
+    peer: Option<std::net::IpAddr>,
 ) -> Option<(std::net::IpAddr, u16)> {
-    if loc.realip_from.is_empty() {
+    if loc.realip_from.is_empty() && !loc.realip_from_unix {
         return None;
     }
-    let mut addr = (peer, 0u16);
+    // The peer must be trusted before its header is believed. Skipping this
+    // lets any client set `$remote_addr` — and with it `allow`/`deny`,
+    // the `limit_req`/`limit_conn` keys and `access_log` — by sending
+    // `X-Real-IP`. nginx checks the peer first (`ngx_http_realip_handler`:
+    // `ngx_cidr_match(c->sockaddr, ...)` before the header is used).
+    let peer_trusted = match peer {
+        Some(ip) => loc.realip_from.iter().any(|(n, b)| cidr_contains(*n, *b, ip)),
+        None => loc.realip_from_unix,
+    };
+    if !peer_trusted {
+        return None;
+    }
+    let mut addr = (
+        peer.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+        0u16,
+    );
     if loc.real_ip_header.eq_ignore_ascii_case("X-Forwarded-For") {
         let values: Vec<&str> = req.headers.get_all("x-forwarded-for").collect();
         // nginx reverts the header list and walks it last-received first.
@@ -4247,14 +4272,15 @@ async fn dispatch(
     // `real_ip_*`: a trusted proxy's header rewrites $remote_addr. The
     // rewritten and original values are per-request variables, so every
     // later ServerVars sees them through the custom map.
-    if let Ok(peer) = conn.peer_ip_str().parse::<std::net::IpAddr>() {
-        if let Some((ip, port)) = realip_effective(loc, req, peer) {
+    // A unix-socket peer has no address (`$remote_addr` reads `unix:`), so it
+    // is passed as `None` and trusted only via `set_real_ip_from unix:`.
+    let peer_str = conn.peer_ip_str();
+    let peer_addr = peer_str.parse::<std::net::IpAddr>().ok();
+    if peer_addr.is_some() || peer_str == "unix:" {
+        if let Some((ip, port)) = realip_effective(loc, req, peer_addr) {
             set_vars.insert("remote_addr".to_string(), ip.to_string());
             set_vars.insert("remote_port".to_string(), port.to_string());
-            set_vars.insert(
-                "realip_remote_addr".to_string(),
-                conn.peer_ip_str().to_string(),
-            );
+            set_vars.insert("realip_remote_addr".to_string(), peer_str.to_string());
             set_vars.insert("realip_remote_port".to_string(), peer_port.to_string());
         }
         let _ = &set_vars;

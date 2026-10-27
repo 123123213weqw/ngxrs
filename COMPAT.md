@@ -13,17 +13,86 @@
 
 | 项 | 命令 | 当前结果 |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 76 文件，WORSE=0 TRUNC=0（nginx 1003 / ngxrs 1007 断言） |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 83 文件，WORSE=0 TRUNC=0（nginx 1086 / ngxrs 1090 断言） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
-| 单元测试 | `cargo test --release` | **PASS** — 122 passed |
+| 单元测试 | `cargo test --release` | **PASS** — 130 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
+
+## 一之二、2026-10-27 轮：范围纠偏、realip 信任判定、auth_basic
+
+三条都是同机 A/B 实测，不是推断。
+
+### 1. 声明范围此前按「nginx 默认构建」写，与参考二进制不符
+
+`~/nginx-baseline/sbin/nginx -V` 的 configure 参数里有
+`--with-http_realip_module --with-http_auth_request_module --with-http_slice_module
+--with-http_sub_module --with-http_secure_link_module --with-http_dav_module
+--with-http_stub_status_module --with-http_gzip_static_module --with-threads
+--with-stream --with-stream_ssl_module --with-stream_realip_module
+--with-mail --with-mail_ssl_module`。这些模块**在范围内**，此前却被当成「默认构建没有」
+排除掉了。按修正后的范围跑 20 个此前从未计分的文件：
+
+| 结果 | 文件 |
+|---|---|
+| SAME（12） | `realip.t` 10/10、`realip_remote_addr.t` 6/6、`realip_remote_port.t` 6/6、`auth_request_satisfy.t` 20/20、`auth_request_set.t` 8/8、`sub_filter_merge.t` 3/3、`stub_status.t` 36/36、`limit_req.t` 8/8、`limit_req_delay.t` 6/6、`limit_conn.t` 10/10、`limit_conn_complex.t` 6/6 |
+| WORSE（8，共 42 断言） | `slice.t` 23、`secure_link.t` 6、`limit_req2.t` 5、`realip_hostname.t` 2、`auth_basic.t` 2、`sub_filter_multi.t` 2、`auth_request.t` 1、`sub_filter.t` 1 |
+
+其中 12 个持平的文件里 6 个（`realip_remote_addr/port`、`auth_request_satisfy/set`、
+`limit_req*`、`limit_conn*`）已加入声明清单——它们本来就是通过状态，只是从未被计分。
+声明清单 **76 → 83 文件**。
+
+`bench/nginxtests.sh` 里那张 `SKIP_ALWAYS` 表是死代码：定义了却从未被引用，
+而且名单里 `realip auth_request limit_req limit_conn secure_link sub` 全都已实现。
+已删除，改为指向 `bench/declared.txt`。
+
+### 2. realip：`$remote_addr` 可被任意客户端伪造（已修）
+
+修复前，只要某个 location 配了**任意** `set_real_ip_from`，非 `X-Forwarded-For` 的
+头（默认 `X-Real-IP`）就不做信任判定，直接采信。同机 A/B（静态文件，peer 127.0.0.1，
+`set_real_ip_from 192.0.2.0/24`，带 `X-Real-IP: 192.0.2.1`）：
+
+```
+nginx : X-IP: 127.0.0.1      ngxrs(修前): X-IP: 192.0.2.1
+```
+
+`$remote_addr` 是 `allow`/`deny`、`limit_req`/`limit_conn` 的键和 `access_log` 的内容，
+所以这是一个可绕过访问控制的问题。nginx 在 `ngx_http_realip_handler` 里先做
+`ngx_cidr_match(c->sockaddr, ...)` 再取值；现在同样先判 peer 是否受信。
+
+同一处补齐了另外两种取值形式（`realip_hostname.t` 由 4/6 → 6/6）：
+
+- `set_real_ip_from <hostname>`：配置期用 `getaddrinfo` 解析（等价
+  `ngx_inet_resolve_host`）；解析失败按 nginx 的报错文本写进告警，不再静默丢弃。
+- `set_real_ip_from unix:`：unix socket 的 peer 没有地址（`$remote_addr` 是 `unix:`），
+  单独用 `realip_from_unix` 记，只有显式写了 `unix:` 才信任。
+
+修后同一组 A/B：`/u`(不受信) 127.0.0.1、`/t`(受信) 192.0.2.1、`/h`(主机名) 192.0.2.1、
+`/none`(未配置) 127.0.0.1，四项与 nginx 逐字节一致。
+
+### 3. auth_basic：`$apr1$` 与变量路径（已修，27/27）
+
+- `$apr1$`（Apache `htpasswd -m` 的默认格式）此前落到 `crypt(3)`，而本机 libxcrypt
+  不认这个前缀（`crypt("password","$apr1$salt$...")` 返回 `*0`），nginx 则自带
+  `ngx_crypt_apr1`。现在在 `src/auth.rs` 内实现 apr1（含所需的最小 MD5），
+  以 `auth_basic.t` 的向量 `$apr1$salt$Xxd1irWT9ycqoYxGFn4cb.` 与 RFC 1321 向量做单测。
+- `auth_basic_user_file $arg_f`：原样存成路径，永远打不开。现在配置期先把相对路径
+  锚到配置前缀、请求期再展开变量。同一处也顺带修正了**静态相对路径**的解析。
+
+### 仍有的偏差（下一轮）
+
+- `auth_request.t` 19/22：子请求打到 `fastcgi_pass` location 时返回 500 而非上游状态。
+  `fastcgi::handle` 直接写连接，子请求需要缓冲版 `Response`，属于重构而非补丁，未在本轮动。
+- `slice.t` 23 条：`ngx_http_slice_module` 未实现。
+- `secure_link.t` 6 条、`limit_req2.t` 5 条、`sub_filter.t` 1 条 / `sub_filter_multi.t` 2 条：未实现或语义差异。
 
 ## 二、声明的测试清单
 
-清单在 `bench/declared.txt`，**76 个文件**，选取规则是机械的：
+清单在 `bench/declared.txt`，**83 个文件**，选取规则是机械的：
 
-1. 落在范围内（默认构建 nginx 1.28 的 http core + proxy/cache/gzip/TLS/HTTP2/
-   fastcgi/uwsgi/scgi/grpc/stream/mail）；
+1. 落在范围内（**参考构建 `-V` 能编出来的模块**：http core + proxy/cache/gzip/
+   TLS/HTTP2/realip/auth_request/slice/sub/secure_link/dav/stub_status/gzip_static/
+   fastcgi/uwsgi/scgi/grpc/stream/mail。此前写作「默认构建」，与参考二进制不符，
+   已按 `-V` 更正；reference 编不出来的一律出范围）；
 2. **两边都真的产出了断言**——两边都跳过的套件什么也证明不了，已被排除；
 3. 没有任何断言在 nginx 通过而我们失败；
 4. 我方没有截断（两边断言行数相同）。

@@ -38,6 +38,12 @@ pub enum Body {
 /// to a temp file beyond that, or always under `client_body_in_file_only`. Once
 /// it is on disk `$request_body` renders empty and `$request_body_file` carries
 /// the path.
+/// The error `take_body`/`take_chunked_body` report when the limit is exceeded,
+/// so a caller can answer 413 rather than 400.
+pub fn body_too_large() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, "body too large")
+}
+
 pub fn write_body_file(http: &Http, body: &[u8]) -> Option<std::path::PathBuf> {
     use std::io::Write;
     let dir = &http.client_body_temp_path;
@@ -51,6 +57,13 @@ pub fn write_body_file(http: &Http, body: &[u8]) -> Option<std::path::PathBuf> {
 }
 
 static NEXT_BODY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Does any `add_header` value reference `$request_body` (or its file)?
+fn references_body_var(headers: &[(String, String)]) -> bool {
+    headers
+        .iter()
+        .any(|(_, v)| v.contains("$request_body"))
+}
 
 /// Does this location want the body on disk?
 ///
@@ -618,18 +631,90 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
         // request body used to be drained above and the handler then blocked
         // waiting for bytes that had already been thrown away.
         let dav_put = req.method == Method::Put && loc.dav_methods & crate::dav::flags::PUT != 0;
+        // `$request_body` has a get_handler, so nginx reads the body the first
+        // time the variable is evaluated -- which is the `add_header` after the
+        // upstream answered. The body therefore has to be in memory *before*
+        // dispatch, not consumed by the upstream module. `body_chunked.t` is
+        // exactly this: a chunked request proxied onward, whose response carries
+        // `X-Body: $request_body`.
+        let body_vars = references_body_var(&loc.headers)
+            || loc.ret.as_ref().map(|(_, t)| t.contains("$request_body")).unwrap_or(false)
+            // An `error_page` target runs as an internal subrequest after the
+            // upstream failed, and `$request_body` is still readable there --
+            // which needs the body to have been kept, not consumed by the
+            // upstream module (`proxy_request_buffering.t`, "body in error
+            // page").
+            || !loc.error_pages.is_empty();
         let proxy_target = loc.proxy_pass.is_some()
             || loc.fastcgi_pass.is_some()
             || loc.uwsgi_pass.is_some()
             || loc.scgi_pass.is_some()
-            || dav_put;
+            || dav_put
+            || body_vars;
+        // Read it here rather than in the upstream module, so both the module and
+        // the variable see the same bytes.
+        if body_vars && (req.chunked || req.body_len > 0) {
+            if req.expect_continue {
+                let _ = conn.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
+            }
+            // `client_max_body_size` bounds a chunked body too, and the limit is
+            // enforced while reading rather than after (`body_chunked.t`,
+            // "body too large").
+            let limit = if loc.client_max_body_size == u64::MAX {
+                crate::proxy::MAX_PROXY_BODY
+            } else {
+                (loc.client_max_body_size as usize).min(crate::proxy::MAX_PROXY_BODY)
+            };
+            let read = if req.chunked {
+                conn.take_chunked_body(limit).await
+            } else if req.body_len > limit as u64 {
+                Err(body_too_large())
+            } else {
+                conn.take_body(req.body_len as usize).await
+            };
+            match read {
+                Ok(b) => {
+                    // `client_body_in_file_only`, or a body over
+                    // `client_body_buffer_size`, spills to a temp file; then
+                    // `$request_body` renders empty and `$request_body_file`
+                    // names the file (`body_needs_file`).
+                    if body_needs_file(loc, b.len()) {
+                        req.request_body_file = write_body_file(http, &b);
+                    }
+                    req.buffered_body = Some(b);
+                }
+                Err(e) => {
+                    // A body over the limit is 413; broken chunk framing is 400.
+                    let status = if e.kind() == std::io::ErrorKind::InvalidData
+                        && e.to_string() == "body too large"
+                    {
+                        413
+                    } else {
+                        400
+                    };
+                    let _ = send_error(&mut conn, status, server.server_tokens, false, false).await;
+                    break;
+                }
+            }
+        }
         if req.chunked {
             if !proxy_target {
                 if req.expect_continue {
                     let _ = conn.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
                 }
-                if conn.drain_chunked().await.is_err() {
-                    break;
+                let limit = if loc.client_max_body_size == u64::MAX {
+                    usize::MAX
+                } else {
+                    loc.client_max_body_size as usize
+                };
+                match conn.drain_chunked_limited(limit).await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        let status = if e.to_string() == "body too large" { 413 } else { 400 };
+                        let _ =
+                            send_error(&mut conn, status, server.server_tokens, false, false).await;
+                        break;
+                    }
                 }
             }
         } else if req.body_len > 0 {
@@ -642,6 +727,7 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
                     let _ = conn.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
                 }
                 if conn.drain_body(req.body_len).await.is_err() {
+                    let _ = send_error(&mut conn, 400, server.server_tokens, false, false).await;
                     break;
                 }
             }

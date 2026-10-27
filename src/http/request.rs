@@ -461,8 +461,25 @@ impl Request {
         // ---- framing -----------------------------------------------------
         let mut chunked = false;
         if let Some(te) = headers.get("transfer-encoding") {
+            // `Transfer-Encoding` is an HTTP/1.1 mechanism; nginx answers 400
+            // for it on an HTTP/1.0 request (`body_chunked.t`, "transfer
+            // encoding in HTTP/1.0 requests").
+            if version_minor == 0 {
+                return Err(HttpError::new(400, true));
+            }
+            // nginx requires the *final* codings to be `chunked` and answers 501
+            // for anything else -- `identity`, `chunked, identity`.
             let last = te.rsplit(',').next().unwrap_or("").trim();
             if !last.eq_ignore_ascii_case("chunked") {
+                return Err(HttpError::new(501, true));
+            }
+            // The same coding twice is a broken framing.
+            let codings: Vec<&str> = te
+                .split(',')
+                .map(|c| c.trim())
+                .filter(|c| !c.is_empty())
+                .collect();
+            if codings.len() != 1 {
                 return Err(HttpError::new(501, true));
             }
             chunked = true;

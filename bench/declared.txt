@@ -61,6 +61,14 @@ stream_map.t
 stream_set.t
 stream_split_clients.t
 
+# ---- request body ----
+# `$request_body` / `$request_body_file` (the body has to be in memory before
+# dispatch, because the variable is read by `add_header` after the upstream
+# answered), `client_body_buffer_size` / `client_body_in_file_only` spilling,
+# `client_max_body_size` for chunked bodies, and chunk-framing validation.
+body.t
+body_chunked.t
+
 # ---- resolver ----
 # A + AAAA in parallel, CNAME following with nginx's `process_a` state machine,
 # TTL/`valid=` caching, per-name server rotation, resend, and TCP fallback on a

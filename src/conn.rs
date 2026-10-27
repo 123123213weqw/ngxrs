@@ -563,6 +563,52 @@ fn early_reject(buf: &[u8]) -> bool {
     }
 
     /// Discard a chunked request body (trailers included).
+    /// `drain_chunked`, but counting the de-chunked bytes against `limit`.
+    ///
+    /// `client_max_body_size` bounds a chunked body exactly like a
+    /// `Content-Length` one, and nginx enforces it as the bytes arrive rather
+    /// than after the fact (`body_chunked.t`, "body too large").
+    pub async fn drain_chunked_limited(&mut self, limit: usize) -> io::Result<()> {
+        let mut total = 0usize;
+        loop {
+            let line = self.read_line().await?;
+            let size_str = std::str::from_utf8(&line)
+                .ok()
+                .map(|s| s.split(';').next().unwrap_or("").trim().to_string())
+                .unwrap_or_default();
+            let size = u64::from_str_radix(&size_str, 16)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))?;
+            if size == 0 {
+                loop {
+                    let l = self.read_line().await?;
+                    if l.is_empty() {
+                        return Ok(());
+                    }
+                }
+            }
+            total = total.saturating_add(size as usize);
+            if total > limit {
+                return Err(crate::http::body_too_large());
+            }
+            let need = size + 2;
+            while (self.buffered().len() as u64) < need {
+                if self.fill().await? == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "chunk truncated",
+                    ));
+                }
+            }
+            if &self.buffered()[size as usize..need as usize] != b"\r\n" {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bad chunk terminator",
+                ));
+            }
+            self.consume(need as usize);
+        }
+    }
+
     pub async fn drain_chunked(&mut self) -> io::Result<()> {
         loop {
             let line = self.read_line().await?;
@@ -590,6 +636,15 @@ fn early_reject(buf: &[u8]) -> bool {
                         "chunk truncated",
                     ));
                 }
+            }
+            // The two bytes after the data must be CRLF. A chunk that claims 4
+            // bytes but is followed by 8 is a broken framing, which nginx reports
+            // as 400 (`body_chunked.t`, "runaway chunk").
+            if &self.buffered()[size as usize..need as usize] != b"\r\n" {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bad chunk terminator",
+                ));
             }
             self.consume(need as usize);
         }

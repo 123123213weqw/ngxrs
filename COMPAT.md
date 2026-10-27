@@ -13,7 +13,7 @@
 
 | 项 | 命令 | 当前结果 |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 106 文件，WORSE=0 TRUNC=0 |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 108 文件，WORSE=0 TRUNC=0（nginx 1694 / ngxrs 1699 断言） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
 | 单元测试 | `cargo test --release` | **PASS** — 156 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
@@ -395,9 +395,45 @@ nginx 的 `set` 在 rewrite 阶段执行、`return` 在 content 阶段，所以�
 我们的 `alias` 存的是配置期解析好的 `PathBuf`，没有模板。这条要动 `map_path` 的
 签名（4 个调用点）以及每个调用点的变量视图，本轮没做，因此这个文件**未进声明清单**。
 
+## 一之十、2026-10-27 第九轮：请求体（`body.t` 17/17、`body_chunked.t` 8/20 → 20/20）
+
+`$request_body` / `$request_body_file` 在 HTTP/1.1 上是**恒为空**的：注释里写的是
+「h1 由上游模块直接流式转发，只有 h2/h3 会在路由前缓冲」。但 `$request_body` 在 nginx
+里是带 get_handler 的变量，第一次读的时候就把 body 读进来 —— 而第一次读几乎总是
+上游应答之后的那个 `add_header`。
+
+现在的规则：**只要本 location 会用到这个变量，body 就在 dispatch 之前读进内存**。
+判据是本轮实际用到的三处：`add_header` 的值、`return` 的文本、以及 `error_page`
+是否存在（内部子请求里 `$request_body` 仍然可读，而 body 已经不能被上游模块吃掉）。
+读进来之后按 `body_needs_file` 决定落盘：`client_body_in_file_only`，或长度超过
+`client_body_buffer_size`。落盘时 `$request_body` 为空、`$request_body_file` 有值，
+与 nginx 一致。
+
+同时修了三个请求体层面的真实缺陷：
+
+1. **`client_max_body_size` 对 chunked 请求完全不生效**。它只在 `Content-Length` 分支
+   检查过，chunked 一路读到 32 MB 上限为止。现在在读取过程中按累计长度判定
+   （`drain_chunked_limited`），超限 413。
+2. **chunk 分帧不校验**。`4\r\nSEE-THIS\r\n` 这种「声明 4 字节却跟 8 字节」的请求，
+   nginx 报 400；我们把多余字节当下一段去解析，结果正常 200。现在要求数据后的两字节
+   是 CRLF、且 `read_line` 读到的是空行，否则 400。
+3. **`Transfer-Encoding` 在 HTTP/1.0 请求上被接受**。nginx 报 400。顺带把
+   `chunked, identity` 之类（末尾不是 `chunked`，或多个编码）从 501 的判定收紧到
+   nginx 的口径。
+
+### 一个明确的已知缺口：`proxy_request_buffering`
+
+`proxy_request_buffering` 这个指令**连解析都没有做**（配置里写了等于没写）。
+`proxy_request_buffering.t` 里剩的两条是这个缺口的直接后果：用例自己监听 8082，
+期望被测服务器在校验完请求头后就**立刻连上来**、然后一边收一边转发 body。我们现在
+永远先读完整个 body 再连接，所以 `accept()` 超时。
+
+要做得把连接与请求体的发送顺序拆开（先连、写头、再边读边写），并让 `Content-Length`
+在没有缓冲体时取自 `req.body_len`。这动的是热路径，本轮没做，记在这里。
+
 ## 二、声明的测试清单
 
-清单在 `bench/declared.txt`，**106 个文件**，选取规则是机械的：
+清单在 `bench/declared.txt`，**108 个文件**，选取规则是机械的：
 
 1. 落在范围内（**参考构建 `-V` 能编出来的模块**：http core + proxy/cache/gzip/
    TLS/HTTP2/realip/auth_request/slice/sub/secure_link/dav/stub_status/gzip_static/

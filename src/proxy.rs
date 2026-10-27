@@ -15,7 +15,7 @@ use crate::http::request::{Method, Request};
 use crate::http::{write_head, Body, Outcome, Response};
 use crate::util::reason;
 
-const MAX_PROXY_BODY: usize = 32 * 1024 * 1024;
+pub const MAX_PROXY_BODY: usize = 32 * 1024 * 1024;
 
 // ---- per-upstream bookkeeping -------------------------------------------
 
@@ -1116,7 +1116,35 @@ pub async fn handle(
     }
 
     // Request body (buffered; the static path never needs it).
-    let body = take_request_body(conn, req, MAX_PROXY_BODY).await?;
+    // `client_max_body_size` applies here too, and nginx enforces it while
+    // reading the body -- a chunked request over the limit is a 413, not a
+    // completed upstream call (`body_chunked.t`, "body too large").
+    let body_limit = if loc.client_max_body_size == u64::MAX {
+        MAX_PROXY_BODY
+    } else {
+        (loc.client_max_body_size as usize).min(MAX_PROXY_BODY)
+    };
+    let body = match take_request_body(conn, req, body_limit).await {
+        Ok(b) => b,
+        Err(e) if e.to_string() == "body too large" => {
+            let resp = crate::http::error_response(413, tokens);
+            let bytes = crate::http::write_response(
+                conn,
+                resp,
+                req.keepalive,
+                tokens,
+                req.method == Method::Head,
+            )
+            .await?;
+            return Ok(Some(written(Outcome {
+                status: 413,
+                bytes,
+                close: false,
+                sent: Vec::new(),
+            })));
+        }
+        Err(e) => return Err(e),
+    };
 
     let target_uri =
         dyn_uri.unwrap_or_else(|| upstream_target(path, query, loc, &pp, vars, uri_rewritten));
@@ -3305,7 +3333,7 @@ impl crate::conn::Conn {
 
     pub async fn take_body(&mut self, len: usize) -> io::Result<Vec<u8>> {
         if len > MAX_PROXY_BODY {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "body too large"));
+            return Err(crate::http::body_too_large());
         }
         let mut out = Vec::with_capacity(len);
         self.take_into(&mut out, len).await?;
@@ -3335,10 +3363,18 @@ impl crate::conn::Conn {
                 break;
             }
             if out.len() + size as usize > max {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "body too large"));
+                return Err(crate::http::body_too_large());
             }
             self.take_into(&mut out, size as usize).await?;
-            let _crlf = self.read_line_pub().await?;
+            // The line after the data must be empty: nginx answers 400 when it
+            // is not (`body_chunked.t`, "runaway chunk").
+            let tail = self.read_line_pub().await?;
+            if !tail.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bad chunk terminator",
+                ));
+            }
         }
         Ok(out)
     }

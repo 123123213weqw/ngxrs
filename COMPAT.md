@@ -13,7 +13,7 @@
 
 | 项 | 命令 | 当前结果 |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 99 文件，WORSE=0 TRUNC=0（nginx 1470 / ngxrs 1474 断言） |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 100 文件，WORSE=0 TRUNC=0（nginx 1509 / ngxrs 1513 断言） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
 | 单元测试 | `cargo test --release` | **PASS** — 147 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
@@ -294,7 +294,7 @@ value，捕获与命名变量在同一遍里替换。现在合并成一个展开
 
 ## 二、声明的测试清单
 
-清单在 `bench/declared.txt`，**99 个文件**，选取规则是机械的：
+清单在 `bench/declared.txt`，**100 个文件**，选取规则是机械的：
 
 1. 落在范围内（**参考构建 `-V` 能编出来的模块**：http core + proxy/cache/gzip/
    TLS/HTTP2/realip/auth_request/slice/sub/secure_link/dav/stub_status/gzip_static/
@@ -309,29 +309,47 @@ value，捕获与命名变量在同一遍里替换。现在合并成一个展开
 
 ## 三、已知偏差（全量扫描，逐项带复现）
 
-以下是对**全部 348 个在范围内文件**跑 A/B 的结果。共 **185 个文件 / 1733 条断言**
-未对齐。每行的「复现」列是一条可直接执行的命令。
+### 口径修正（2026-10-27）
 
-不在声明清单里的文件都在这里被列出——这份表就是「还差什么」的穷举。
+这一节此前写的是「全部 348 个在范围内文件 / 185 文件 / 1733 条断言」。
+那个数字来自一次**范围更窄**的扫描：`bench/ntscan.sh` 的排除正则把
+dav / slice / secure_link / realip / auth_request / sub / limit_* / h2 / ssl /
+grpc / mail / resolver / proxy_protocol 全排除了，也就是把这些家族「还没实现」
+当成了事实，而其中多数是实现过的。按 `nginx -V` 的真实范围重扫：
 
-### 差异总账（全量 348 文件扫描）
+```
+LIMIT=400 bash bench/ntscan.sh      # 默认已是 *.t 减去参考 nginx 编不出来的模块
+files compared=314  same=173  better=7  worse=134   (skipped=86)
+total assertions where ngxrs loses: 795
+```
 
-口径：`WORSE` = nginx 通过而 ngxrs 不通过；`TRUNC` = 我方断言行少于 nginx（跑不完）。
-二者合计 **185 个文件 / 1733 条断言** 尚未对齐。
+**314 个文件可比，134 个仍有差距，795 条断言。** 这个数比旧表小，只是因为
+旧表的 348 里有一半两边都跑不动（`skipped=86` 是两边都没产断言的）。
 
-| 特性域 | 文件数 | 未对齐断言 | 主因 |
-|---|---|---|---|
-| stream（TCP/UDP） | 70 | 523 | 只实现了 `listen`/`proxy_pass`/`return`/TLS 终止与少量 upstream；nginx 的 179 条 stream 指令大部分缺失 |
-| HTTP/2 | 28 | 361 | 帧级/HPACK 由 `h2` crate 拥有；请求体缓冲与优先级更新未实现 |
-| 反向代理 | 36 | 251 | PROXY protocol、`proxy_request_buffering off`、证书缓存、`merge_headers`、`xar`/`cookie` 变量族未实现 |
-| gRPC | 4 | 210 | 上游帧细节与 `next_upstream` |
-| TLS | 24 | 136 | OCSP/stapling/CRL、`verify_depth`、renegotiation、证书缓存 |
-| http core | 7 | 123 | `disable_symlinks`、resolver 的 AAAA/CNAME、TTL 语义 |
-| upstream | 5 | 58 | `max_conns`、动态解析（`resolve`） |
-| mail | 8 | 50 | TLS 会话复用、`max_errors`、PROXY protocol、resolver |
-| uwsgi | 2 | 13 | SSL 证书变量 |
-| FastCGI | 1 | 8 | 上游 keepalive |
-| **合计** | **185** | **1733** | |
+注意这次扫描跑在 PROXY protocol 与 dav 落盘之前，`proxy_protocol*.t`、
+`ssl_proxy_protocol.t`、`dav*.t` 的差距在扫描之后已经被消掉，下面「按剩余断言排序」
+是扫描当时的快照。
+
+### 剩余差距排序（扫描快照，已完成项已标注）
+
+| 断言 | 用例 | 状态 |
+|---|---|---|
+| 49 | `http_resolver_aaaa.t` | 缺：resolver 的 AAAA/CNAME 与 TTL 语义 |
+| 36 | `proxy_keepalive.t` | 缺：上游 keepalive 的连接复用细节 |
+| 33 | `autoindex_format.t` | **已修**（json/jsonp/xml） |
+| 25 | `http_resolver.t` | 同上 |
+| 23 | `proxy_protocol2.t` | **已修** |
+| 20 | `proxy_protocol.t` | **已修** |
+| 19 | `stream_geo.t` | 缺：stream 侧 `geo` |
+| 18 | `slice.t` | 缺：`ngx_http_slice_filter_module` |
+| 18 | `h2_absolute_redirect.t` | 缺：h2 上的 `absolute_redirect` |
+| 14 | `ssl_proxy_protocol.t` | **已修** |
+| 14 | `proxy_protocol2_tlv.t` | **已修** |
+| 14 | `ssl_ocsp.t` | 缺：OCSP stapling |
+| 14 | `http_disable_symlinks.t` | 缺：`disable_symlinks` |
+| 12 | `stream_upstream_max_conns.t` | 缺：`max_conns` |
+
+每行的复现命令：`TEST_LIST=<用例名> bash bench/nginxtests.sh`。
 
 #### stream（TCP/UDP）
 

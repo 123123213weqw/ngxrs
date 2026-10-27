@@ -31,7 +31,7 @@ python3 tests/parity.py         # 差分测试：同一请求分别打 nginx / n
 
 - **配置**：自研 nginx 语法解析（引号/转义/`${var}`/`include` 通配）、`-t` 自检、`-T` dump、`-e`/`-g`、`-s reload|stop|quit|reopen`、SIGHUP 热重载、优雅停机
 - **HTTP/1.1**：keepalive、pipelining、Host 虚拟主机（精确/最长通配/尾缀/正则，完整 `server_name` 优先级）、`Expect: 100-continue`、定长与 chunked 请求体
-- **静态文件**：`sendfile(2)`、ETag/Last-Modified、条件请求、Range（单段 + 多段 `multipart/byteranges`）、index、autoindex、301、`try_files`
+- **静态文件**：`sendfile(2)`、ETag/Last-Modified、条件请求、Range（单段 + 多段 `multipart/byteranges`）、index、autoindex（`autoindex_format html|json|jsonp|xml`）、301、`try_files`
 - **路由**：location 全优先级、`rewrite`（last/break/redirect/permanent）、`if`/`set`、`return`、`error_page`（`=code`、外部 URL、内部 location、重跑 rewrite）
 - **反向代理**：`proxy_pass`（URI 前缀/变量）、`upstream`（rr/`least_conn`/`ip_hash`、weight/backup/down）、连接池 `keepalive`、WebSocket 101 双向管道、`proxy_bind`（源地址绑定）、`proxy_force_ranges`
 - **缓存**：`proxy_cache`（`levels`/`keys_zone`/`max_size`/`inactive`）、`proxy_cache_valid`、Vary 变体、cache lock、`proxy_cache_revalidate`（304 → `REVALIDATED`）、`STALE`/`UPDATING`、`proxy_cookie_domain|path|flags`、`proxy_intercept_errors`
@@ -67,8 +67,8 @@ bash bench/fcgi.sh    # FastCGI / uwsgi / SCGI / stream TCP-UDP 14 项
 **绝对通过率没有意义**——nginx-tests master 依赖比 CPAN 更新的 `Test::Nginx`，很多用例对真 nginx 也是失败/阻塞。
 这两个脚本只报"nginx 过而 ngxrs 不过"的断言，那才是真缺陷。
 
-最近一次声明清单 A/B：**99 个文件，nginx 1470 / ngxrs 1474 条断言，0 条「nginx 过而我们不过」**，
-其中 95 个逐断言一致、4 个我们更多（`http_headers_multi.t`、`proxy_cache_range.t`、`proxy_if.t`、`proxy_noclose.t`）。
+最近一次声明清单 A/B：**100 个文件，nginx 1509 / ngxrs 1513 条断言，0 条「nginx 过而我们不过」**，
+其中 96 个逐断言一致、4 个我们更多（`http_headers_multi.t`、`proxy_cache_range.t`、`proxy_if.t`、`proxy_noclose.t`）。
 范围内仍不一致的文件、缺口与复现命令逐条列在 [COMPAT.md](COMPAT.md) 第三节。
 
 ## 性能

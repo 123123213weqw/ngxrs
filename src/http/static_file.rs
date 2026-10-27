@@ -104,6 +104,14 @@ pub fn respond_fs_indexed(
     http: &Http,
     expanded_index: Option<&[String]>,
 ) -> io::Result<Response> {
+    // `autoindex_format jsonp` needs `?callback=`, which only the raw target
+    // carries.
+    let query = req
+        .raw_target
+        .split_once('?')
+        .map(|(_, q)| q.to_string())
+        .unwrap_or_default();
+    let query = query.as_str();
     // nginx splits the method check in two. Anything outside GET/HEAD/POST is
     // rejected *before* the path is resolved, so TRACE or DELETE to a missing
     // file is 405 rather than 404. POST is only rejected once the target is
@@ -211,7 +219,7 @@ pub fn respond_fs_indexed(
         }
 
         if loc.autoindex {
-            return autoindex(fs_path, uri, loc, http);
+            return autoindex(fs_path, uri, query, loc, http);
         }
         return Ok(Response::empty(403));
     }
@@ -650,7 +658,13 @@ pub fn parse_range(header: &str, size: u64) -> RangeSpec {
 /// to `NAME_LEN - 3` columns and suffixed with `..>`.
 const AUTOINDEX_NAME_LEN: usize = 50;
 
-fn autoindex(dir: &Path, uri: &str, loc: &LocCfg, http: &Http) -> io::Result<Response> {
+fn autoindex(
+    dir: &Path,
+    uri: &str,
+    query: &str,
+    loc: &LocCfg,
+    http: &Http,
+) -> io::Result<Response> {
     let mut entries: Vec<(String, bool, u64, i64)> = Vec::new();
     for e in std::fs::read_dir(dir)? {
         let e = match e {
@@ -670,6 +684,16 @@ fn autoindex(dir: &Path, uri: &str, loc: &LocCfg, http: &Http) -> io::Result<Res
     // `ngx_http_autoindex_cmp_entries` puts every directory before every file,
     // then compares names -- not one flat name sort.
     entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    // `autoindex_format` picks the body; the entry list (and its ordering) is
+    // shared, which is why nginx builds `entries` first and formats after.
+    match loc.autoindex_format {
+        crate::config::AutoindexFormat::Json | crate::config::AutoindexFormat::Jsonp => {
+            return Ok(autoindex_json(&entries, loc, query));
+        }
+        crate::config::AutoindexFormat::Xml => return Ok(autoindex_xml(&entries)),
+        crate::config::AutoindexFormat::Html => {}
+    }
 
     let mut html = String::with_capacity(1024 + entries.len() * 96);
     html.push_str("<html>\r\n<head><title>Index of ");
@@ -706,6 +730,147 @@ fn autoindex(dir: &Path, uri: &str, loc: &LocCfg, http: &Http) -> io::Result<Res
     let resp = Response::bytes(200, "text/html", html.into_bytes());
     let _ = http;
     Ok(resp)
+}
+
+/// `ngx_escape_json`: `\` and `"` are backslash-escaped, control characters
+/// become `\n`/`\r`/`\t`/`\b`/`\f` or `\u00XX`. Bytes above 0x1f pass
+/// through untouched, so a UTF-8 name comes back byte-identical -- which is why
+/// this writes bytes rather than chars.
+fn escape_json(name: &str, out: &mut Vec<u8>) {
+    for b in name.bytes() {
+        if b > 0x1f {
+            if b == b'\\' || b == b'"' {
+                out.push(b'\\');
+            }
+            out.push(b);
+            continue;
+        }
+        out.push(b'\\');
+        match b {
+            b'\n' => out.push(b'n'),
+            b'\r' => out.push(b'r'),
+            b'\t' => out.push(b't'),
+            0x08 => out.push(b'b'),
+            0x0c => out.push(b'f'),
+            _ => out.extend_from_slice(format!("u00{:02X}", b).as_bytes()),
+        }
+    }
+}
+
+/// `ngx_http_autoindex_json`: the same object shape for `json` and `jsonp`,
+/// with an optional callback wrapper.
+///
+/// The field order and the surrounding whitespace are nginx's, byte for byte,
+/// because the body is compared directly: `[\r\n{ "name":"x", ... },\r\n]`.
+fn autoindex_json(entries: &[(String, bool, u64, i64)], loc: &LocCfg, query: &str) -> Response {
+    let mut out: Vec<u8> = Vec::with_capacity(64 + entries.len() * 128);
+    let callback = if matches!(
+        loc.autoindex_format,
+        crate::config::AutoindexFormat::Jsonp
+    ) {
+        // `ngx_http_autoindex_jsonp_callback`: the `callback` argument, but only
+        // if it is a plain identifier (`[A-Za-z0-9_.]`, at most 128 bytes).
+        // Anything else makes nginx log and emit bare JSON.
+        callback_arg(query)
+    } else {
+        None
+    };
+    if let Some(cb) = &callback {
+        out.extend_from_slice(b"/* callback */\r\n");
+        out.extend_from_slice(cb.as_bytes());
+        out.push(b'(');
+    }
+    out.push(b'[');
+    for (name, is_dir, size, mtime) in entries {
+        out.extend_from_slice(b"\r\n{ \"name\":\"");
+        escape_json(name, &mut out);
+        out.extend_from_slice(b"\", \"type\":\"");
+        out.extend_from_slice(if *is_dir { &b"directory"[..] } else { &b"file"[..] });
+        out.extend_from_slice(b"\", \"mtime\":\"");
+        out.extend_from_slice(http_time(*mtime).as_bytes());
+        if *is_dir {
+            out.push(b'"');
+        } else {
+            out.extend_from_slice(b"\", \"size\":");
+            out.extend_from_slice(size.to_string().as_bytes());
+        }
+        out.extend_from_slice(b" },");
+    }
+    if !entries.is_empty() {
+        out.pop();
+    }
+    out.extend_from_slice(b"\r\n]");
+    if callback.is_some() {
+        out.extend_from_slice(b");");
+    }
+    Response::bytes(200, "application/json", out)
+}
+
+/// `ngx_http_autoindex_xml`, byte for byte.
+fn autoindex_xml(entries: &[(String, bool, u64, i64)]) -> Response {
+    let mut out = String::with_capacity(64 + entries.len() * 96);
+    out.push_str("<?xml version=\"1.0\"?>\r\n<list>\r\n");
+    for (name, is_dir, size, mtime) in entries {
+        let ty = if *is_dir { "directory" } else { "file" };
+        out.push('<');
+        out.push_str(ty);
+        out.push_str(" mtime=\"");
+        out.push_str(&iso_time(*mtime));
+        if !*is_dir {
+            out.push_str("\" size=\"");
+            out.push_str(&size.to_string());
+        }
+        out.push_str("\">");
+        out.push_str(&escape_html(name));
+        out.push_str("</");
+        out.push_str(ty);
+        out.push_str(">\r\n");
+    }
+    out.push_str("</list>\r\n");
+    Response::bytes(200, "text/xml; charset=utf-8", out.into_bytes())
+}
+
+/// The `callback` query argument when it is a valid JSONP identifier.
+fn callback_arg(query: &str) -> Option<String> {
+    let value = query
+        .split('&')
+        .filter_map(|p| p.split_once('='))
+        .find(|(k, _)| *k == "callback")
+        .map(|(_, v)| v)?;
+    if value.len() > 128 {
+        return None;
+    }
+    if value.is_empty() {
+        // `?callback=` means "no wrapper", which is bare JSON.
+        return None;
+    }
+    if value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+    {
+        Some(value.to_string())
+    } else {
+        None
+    }
+}
+
+/// `ngx_http_time`: `Wed, 31 Dec 1986 10:00:00 GMT`.
+fn http_time(ts: i64) -> String {
+    crate::util::http_date(ts)
+}
+
+/// The XML timestamp form: `1986-12-31T10:00:00Z` (`ngx_http_autoindex_xml`
+/// calls `ngx_gmtime` and prints the fields).
+fn iso_time(ts: i64) -> String {
+    let days = ts.div_euclid(86_400);
+    let secs = ts.rem_euclid(86_400);
+    let (y, mo, d) = crate::util::civil_from_days(days);
+    format!(
+        "{y:04}-{mo:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
 }
 
 /// Render one directory entry's label, returning it together with the number of

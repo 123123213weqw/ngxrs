@@ -53,6 +53,12 @@ realip_remote_port.t
 # variables in it.
 rewrite_if.t
 
+# ---- autoindex ----
+# `autoindex_format html|json|jsonp|xml`. nginx's JSON/XML bodies are compared
+# byte for byte, including the fact that entry names are emitted as raw UTF-8
+# bytes and only `\\`, `"` and control characters are escaped.
+autoindex_format.t
+
 # ---- PROXY protocol ----
 # `listen ... proxy_protocol` (v1 text and v2 binary with TLVs),
 # `$proxy_protocol_*`, `real_ip_header proxy_protocol`, and `stream`'s

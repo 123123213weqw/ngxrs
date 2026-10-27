@@ -18,6 +18,15 @@ pub enum ClientBodyFileOnly {
 }
 
 pub const DEFAULT_CLIENT_MAX_BODY: u64 = 1024 * 1024;
+
+/// `autoindex_format`: which body `autoindex on` produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoindexFormat {
+    Html,
+    Json,
+    Jsonp,
+    Xml,
+}
 pub const DEFAULT_KEEPALIVE: Duration = Duration::from_secs(75);
 
 #[derive(Debug, Clone)]
@@ -73,6 +82,8 @@ pub struct LocCfg {
     pub alias_prefix_len: usize,
     pub index: Vec<String>,
     pub autoindex: bool,
+    /// `autoindex_format html|json|jsonp|xml` (nginx default `html`).
+    pub autoindex_format: AutoindexFormat,
     /// `charset utf-8`, which makes autoindex count name lengths in characters
     /// instead of bytes when it truncates a too-long entry.
     pub charset_utf8: bool,
@@ -357,6 +368,7 @@ impl LocCfg {
             alias_prefix_len: 0,
             index: vec!["index.html".to_string()],
             autoindex: false,
+            autoindex_format: AutoindexFormat::Html,
             ssi: false,
             empty_gif: false,
             stub_status: false,
@@ -2418,6 +2430,25 @@ impl Builder {
                     .ok_or_else(|| sem(&d.file, d.line, "charset requires a value"))?;
                 cfg.charset_utf8 =
                     v.eq_ignore_ascii_case("utf-8") || v.eq_ignore_ascii_case("utf8");
+            }
+            "autoindex_format" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "autoindex_format requires a value"))?;
+                cfg.autoindex_format = match v.as_str() {
+                    "html" => AutoindexFormat::Html,
+                    "json" => AutoindexFormat::Json,
+                    "jsonp" => AutoindexFormat::Jsonp,
+                    "xml" => AutoindexFormat::Xml,
+                    _ => {
+                        return Err(sem(
+                            &d.file,
+                            d.line,
+                            format!("invalid autoindex_format value \"{v}\""),
+                        ))
+                    }
+                };
             }
             "autoindex" => {
                 let v = d

@@ -1170,10 +1170,111 @@ pub struct Upstream {
     pub chash_points: Vec<(u32, usize)>,
 }
 
+/// `log_format` definitions, split by the escape mode they were declared with.
+///
+/// `log_format json escape=json '...'` binds the escaping to the *format*, not
+/// to the `access_log` that uses it (`access_log.t` has three formats over the
+/// same text differing only in `escape=`).
+#[derive(Debug, Clone, Default)]
+pub struct LogFormats {
+    pub text: std::collections::HashMap<String, String>,
+    pub escape: std::collections::HashMap<String, Escape>,
+}
+
+impl LogFormats {
+    pub fn get(&self, name: &str) -> Option<&String> {
+        self.text.get(name)
+    }
+    pub fn insert(&mut self, name: String, text: String, escape: Escape) {
+        self.text.insert(name.clone(), text);
+        self.escape.insert(name, escape);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AccessLog {
     pub path: PathBuf,
+    /// The path as written when it contains `$`: `access_log .../varlog_${arg_logname}`
+    /// picks a file per request (`access_log.t`, "varlog").
+    pub path_template: Option<String>,
     pub format: String,
+    /// `if=<value>`: log only when the expanded value is neither empty nor "0".
+    pub if_cond: Option<String>,
+    /// `escape=default|json|none`; `None` means "take the format's own mode".
+    pub escape: Option<Escape>,
+}
+
+/// `access_log ... escape=` modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Escape {
+    /// Escape `"`, `\` and control characters as `\xXX` (nginx's default).
+    #[default]
+    Default,
+    Json,
+    None,
+}
+
+/// `log_format` name -> (text, escape). `combined` is built in.
+fn resolve_format(formats: &LogFormats, name: &str) -> (String, Escape) {
+    if name == "combined" {
+        return ("combined".to_string(), Escape::Default);
+    }
+    match formats.text.get(name) {
+        Some(t) => (
+            t.clone(),
+            formats.escape.get(name).copied().unwrap_or_default(),
+        ),
+        None => ("combined".to_string(), Escape::Default),
+    }
+}
+
+/// Build an `AccessLog` from an `access_log` directive's arguments.
+///
+/// `buffer=`, `gzip` and `flush=` are accepted and ignored: our writer is
+/// unbuffered, which is observably equivalent for the suites (nginx's own
+/// buffering only delays the write).
+pub fn parse_access_log(args: &[String], prefix: &std::path::Path) -> Option<AccessLog> {
+    let raw = args.first()?;
+    let mut format = "combined".to_string();
+    let mut if_cond = None;
+    let mut escape: Option<Escape> = None;
+    for (i, a) in args.iter().enumerate().skip(1) {
+        if let Some(v) = a.strip_prefix("if=") {
+            if_cond = Some(v.to_string());
+        } else if let Some(v) = a.strip_prefix("escape=") {
+            escape = Some(match v {
+                "json" => Escape::Json,
+                "none" => Escape::None,
+                _ => Escape::Default,
+            });
+        } else if a.starts_with("buffer=") || a.starts_with("flush=") || a == "gzip" {
+            continue;
+        } else if i == 1 {
+            format = a.clone();
+        }
+    }
+    let (path, path_template) = if raw.contains('$') {
+        // Keep the template for per-request expansion; resolve the static prefix
+        // so a relative path still lands under the prefix directory.
+        let expanded_for_dir = match raw.rfind('/') {
+            Some(slash) => format!("{}/", &raw[..slash]),
+            None => String::new(),
+        };
+        let dir = resolve_path(prefix, &expanded_for_dir);
+        (
+            dir.join(raw.rsplit('/').next().unwrap_or(raw)),
+            Some(raw.clone()),
+        )
+    } else {
+        (resolve_path(prefix, raw), None)
+    };
+    Some(AccessLog {
+        path,
+        path_template,
+        format,
+        if_cond,
+        escape,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -1399,7 +1500,7 @@ pub struct Http {
     pub geos: Vec<crate::geo::GeoDef>,
     pub limit_req_zones: Vec<LimitReqZone>,
     pub limit_conn_zones: Vec<LimitConnZone>,
-    pub log_formats: HashMap<String, String>,
+    pub log_formats: LogFormats,
 }
 
 /// A declared `limit_req_zone`.
@@ -2171,7 +2272,7 @@ struct Builder {
     /// `log_format name 'fmt'` seen at http scope. Location-level `access_log`
     /// needs it too, and nginx allows the format to be defined before any
     /// server that uses it.
-    log_formats: HashMap<String, String>,
+    log_formats: LogFormats,
 }
 
 impl Builder {
@@ -2535,19 +2636,13 @@ impl Builder {
                 let logs = cfg.access_logs.get_or_insert_with(Vec::new);
                 if d.args.first().map(|s| s.as_str()) == Some("off") {
                     logs.clear();
-                } else if let Some(path) = d.args.first() {
-                    let fmt = match d.args.get(1).map(|s| s.as_str()).unwrap_or("combined") {
-                        "combined" => "combined".to_string(),
-                        name => self
-                            .log_formats
-                            .get(name)
-                            .cloned()
-                            .unwrap_or_else(|| "combined".to_string()),
-                    };
-                    logs.push(AccessLog {
-                        path: resolve_path(&self.prefix, path),
-                        format: fmt,
-                    });
+                } else if let Some(mut al) = parse_access_log(&d.args, &self.prefix) {
+                    // Resolve the format name against this level's
+                    // `log_format` blocks.
+                    let (text, esc) = resolve_format(&self.log_formats, &al.format);
+                    al.format = text;
+                    al.escape = al.escape.or(Some(esc));
+                    logs.push(al);
                 }
             }
             "auth_basic" => {
@@ -4071,7 +4166,7 @@ impl Builder {
         d: &Directive,
         index: usize,
         http_default: &LocCfg,
-        log_formats: &HashMap<String, String>,
+        log_formats: &LogFormats,
         http_keepalive: Duration,
         http_tokens: bool,
         http_http2: bool,
@@ -4173,22 +4268,12 @@ impl Builder {
                         access_logs.clear();
                         access_log_off = true;
                     } else if !access_log_off {
-                        let path = match child.args.first() {
-                            Some(p) => p,
-                            None => continue,
-                        };
-                        let format =
-                            match child.args.get(1).map(|s| s.as_str()).unwrap_or("combined") {
-                                "combined" => "combined".to_string(),
-                                name => log_formats
-                                    .get(name)
-                                    .cloned()
-                                    .unwrap_or_else(|| "combined".to_string()),
-                            };
-                        access_logs.push(AccessLog {
-                            path: resolve_path(&self.prefix, path),
-                            format,
-                        });
+                        if let Some(mut al) = parse_access_log(&child.args, &self.prefix) {
+                            let (text, esc) = resolve_format(log_formats, &al.format);
+                            al.format = text;
+                            al.escape = al.escape.or(Some(esc));
+                            access_logs.push(al);
+                        }
                     }
                 }
                 "keepalive_timeout" => {
@@ -4542,7 +4627,7 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
     let mut stream_client_ca: Option<PathBuf> = None;
     let mut stream_trusted: Option<PathBuf> = None;
     // `log_format` in stream context, and the stream-level `access_log`.
-    let mut stream_log_formats: HashMap<String, String> = HashMap::new();
+    let mut stream_log_formats = LogFormats::default();
     let mut stream_access_logs: Vec<AccessLog> = Vec::new();
     let mut stream_proxy_ssl = false;
     // `stream { proxy_protocol on; }`: the default every server inherits.
@@ -4621,29 +4706,24 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             }
             "log_format" => {
                 if d.args.len() >= 2 {
-                    let start = if d.args.get(1).is_some_and(|a| a.starts_with("escape=")) {
-                        2
-                    } else {
-                        1
+                    let (start, esc) = match d.args.get(1).and_then(|a| a.strip_prefix("escape="))
+                    {
+                        Some("json") => (2, Escape::Json),
+                        Some("none") => (2, Escape::None),
+                        Some(_) => (2, Escape::Default),
+                        None => (1, Escape::Default),
                     };
-                    stream_log_formats.insert(d.args[0].clone(), d.args[start..].concat());
+                    stream_log_formats.insert(d.args[0].clone(), d.args[start..].concat(), esc);
                 }
             }
             "access_log" => {
                 if d.args.first().map(|s| s.as_str()) == Some("off") {
                     stream_access_logs.clear();
-                } else if let Some(path) = d.args.first() {
-                    let fmt = match d.args.get(1).map(|s| s.as_str()).unwrap_or("combined") {
-                        "combined" => "combined".to_string(),
-                        name => stream_log_formats
-                            .get(name)
-                            .cloned()
-                            .unwrap_or_else(|| "combined".to_string()),
-                    };
-                    stream_access_logs.push(AccessLog {
-                        path: b.prefix.join(path),
-                        format: fmt,
-                    });
+                } else if let Some(mut al) = parse_access_log(&d.args, &b.prefix) {
+                    let (text, esc) = resolve_format(&stream_log_formats, &al.format);
+                    al.format = text;
+                    al.escape = al.escape.or(Some(esc));
+                    stream_access_logs.push(al);
                 }
             }
             "ssl_verify_client" => {
@@ -4822,19 +4902,11 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                 "access_log" => {
                     if child.args.first().map(|s| s.as_str()) == Some("off") {
                         cfg.access_logs.clear();
-                    } else if let Some(path) = child.args.first() {
-                        let fmt = match child.args.get(1).map(|s| s.as_str()).unwrap_or("combined")
-                        {
-                            "combined" => "combined".to_string(),
-                            name => stream_log_formats
-                                .get(name)
-                                .cloned()
-                                .unwrap_or_else(|| "combined".to_string()),
-                        };
-                        cfg.access_logs.push(AccessLog {
-                            path: b.prefix.join(path),
-                            format: fmt,
-                        });
+                    } else if let Some(mut al) = parse_access_log(&child.args, &b.prefix) {
+                        let (text, esc) = resolve_format(&stream_log_formats, &al.format);
+                        al.format = text;
+                        al.escape = al.escape.or(Some(esc));
+                        cfg.access_logs.push(al);
                     }
                 }
                 "ssl_verify_client" => {
@@ -4985,7 +5057,7 @@ pub fn build(
     let mut b = Builder {
         prefix: prefix.to_path_buf(),
         warnings: Vec::new(),
-        log_formats: HashMap::new(),
+        log_formats: LogFormats::default(),
     };
 
     // nginx defaults to a single worker; `auto` expands to the CPU count.
@@ -5099,9 +5171,12 @@ pub fn build(
         limit_conn_zones: Vec::new(),
         default_access_logs: vec![AccessLog {
             path: prefix.join("logs/access.log"),
+            path_template: None,
             format: "combined".to_string(),
+            if_cond: None,
+            escape: Some(Escape::Default),
         }],
-        log_formats: HashMap::new(),
+        log_formats: LogFormats::default(),
     };
 
     // ---- http-level: globals first, then servers -------------------------
@@ -5317,14 +5392,15 @@ pub fn build(
                     let name = d.args[0].clone();
                     // `log_format name escape=json '...'`: the escape parameter
                     // is not a format string.
-                    let start = if d.args.get(1).is_some_and(|a| a.starts_with("escape=")) {
-                        2
-                    } else {
-                        1
+                    let (start, esc) = match d.args.get(1).and_then(|a| a.strip_prefix("escape=")) {
+                        Some("json") => (2, Escape::Json),
+                        Some("none") => (2, Escape::None),
+                        Some(_) => (2, Escape::Default),
+                        None => (1, Escape::Default),
                     };
                     let fmt = d.args[start..].concat();
-                    http.log_formats.insert(name.clone(), fmt.clone());
-                    b.log_formats.insert(name, fmt);
+                    http.log_formats.insert(name.clone(), fmt.clone(), esc);
+                    b.log_formats.insert(name, fmt, esc);
                 }
             }
             "access_log" => {
@@ -5334,19 +5410,11 @@ pub fn build(
                 }
                 if d.args.first().map(|s| s.as_str()) == Some("off") {
                     http.default_access_logs.clear();
-                } else if let Some(path) = d.args.first() {
-                    let fmt = match d.args.get(1).map(|s| s.as_str()).unwrap_or("combined") {
-                        "combined" => "combined".to_string(),
-                        name => http
-                            .log_formats
-                            .get(name)
-                            .cloned()
-                            .unwrap_or_else(|| "combined".to_string()),
-                    };
-                    http.default_access_logs.push(AccessLog {
-                        path: resolve_path(prefix, path),
-                        format: fmt,
-                    });
+                } else if let Some(mut al) = parse_access_log(&d.args, prefix) {
+                    let (text, esc) = resolve_format(&http.log_formats, &al.format);
+                    al.format = text;
+                    al.escape = al.escape.or(Some(esc));
+                    http.default_access_logs.push(al);
                 }
             }
             "root"

@@ -351,6 +351,7 @@ fn synthesize_request(
     }
     Request {
         proxy_protocol: None,
+        request_id: crate::util::new_request_id(),
         method,
         raw_target: target,
         version_minor: 1,

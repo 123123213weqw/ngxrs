@@ -13,7 +13,9 @@ if [[ ! -d "$TESTS_DIR" ]]; then
 fi
 REF_BIN="${REF_BIN:-$NGINX_BIN}"
 BIN="$ROOT/target/release/ngxrs"
-OUT="$ROOT/bench/run/ntscan"
+# Honour an `OUT=` from the environment: a plain assignment silently overwrote
+# the previous run's results, which is how a baseline gets lost mid-comparison.
+OUT="${OUT:-$ROOT/bench/run/ntscan}"
 mkdir -p "$OUT"
 
 LIMIT="${LIMIT:-40}"

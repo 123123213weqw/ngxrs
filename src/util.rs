@@ -783,3 +783,24 @@ pub fn strftime_gmt(ts: i64, fmt: &str) -> String {
     }
     out
 }
+
+/// A `$request_id`: 16 random bytes as 32 lowercase hex digits.
+///
+/// nginx fills `ngx_http_request_t.request_id` from the RNG when the variable is
+/// first asked for; generating it at parse time is equivalent and simpler.
+pub fn new_request_id() -> String {
+    let mut raw = [0u8; 16];
+    // `ring` is already a dependency (it backs rustls), so this needs no new
+    // crate. A failure would leave all-zero bytes; the id is only an
+    // identifier, not a secret, but ask again once before giving up.
+    use ring::rand::SecureRandom;
+    if ring::rand::SystemRandom::new().fill(&mut raw).is_err() {
+        let _ = ring::rand::SystemRandom::new().fill(&mut raw);
+    }
+    let mut out = String::with_capacity(32);
+    for b in raw {
+        out.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
+        out.push(char::from_digit((b & 0xf) as u32, 16).unwrap_or('0'));
+    }
+    out
+}

@@ -376,6 +376,7 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
                     method: Method::Get,
                     raw_target: "/".to_string(),
                     proxy_protocol: None,
+                    request_id: crate::util::new_request_id(),
                     version_minor: 0,
                     headers: crate::http::request::Headers::default(),
                     body_len: 0,
@@ -3092,6 +3093,9 @@ impl<'a> ServerVars<'a> {
             "document_root" => self.document_root.to_string(),
             "request_filename" => format!("{}{}", self.document_root, self.path),
             "upstream_cache_status" => self.upstream_cache_status.to_string(),
+            // `$request_id`: 32 lowercase hex digits, generated once per request
+            // so the header, an SSI subrequest and the log line all agree.
+            "request_id" => self.req.request_id.clone(),
             // One entry per upstream attempt, ", "-joined (nginx's
             // `u->state` list); empty when this request never proxied.
             "upstream_addr" | "upstream_status" => {
@@ -6671,11 +6675,25 @@ fn log_access(
     let bytes_s = bytes.to_string();
     let port_s = group.addr.port().to_string();
     let host = req.host.as_deref().unwrap_or("");
-    let ua = req.headers.get("user-agent").unwrap_or("");
-    let referer = req.headers.get("referer").unwrap_or("");
+    // nginx's log writer prints `-` when a variable is *not found*, which is the
+    // case for `$http_referer` / `$http_user_agent` when the header is absent —
+    // a header that is present but empty prints as "". Keeping `None` here and
+    // leaving such names out of the table is what produces `"-" "-"` in the
+    // combined format (`access_log.t`, "default log format").
+    let referer_opt = req.headers.get("referer");
+    let ua_opt = req.headers.get("user-agent");
     let server_name = server.names.first().map(|s| s.as_str()).unwrap_or("");
     let peer = remote.0.to_string();
     let peer_port = remote.1.to_string();
+    // `$server_addr` is the socket's local address; nginx falls back to the
+    // configured listen address when the socket has none.
+    let server_addr = group.addr.ip().to_string();
+    // `$binary_remote_addr`: the packed address bytes, escaped by the writer.
+    let binary_remote_addr = match remote.0.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.octets().iter().map(|b| *b as char).collect(),
+        Ok(std::net::IpAddr::V6(v6)) => v6.octets().iter().map(|b| *b as char).collect(),
+        Err(_) => String::new(),
+    };
 
     // `$sent_http_*` values, resolved up front so the slice can borrow them.
     // Repeated headers are comma-joined, like nginx's `$sent_http_*`.
@@ -6703,6 +6721,7 @@ fn log_access(
     let t_addr = crate::timing::variable("upstream_addr").unwrap_or_default();
     let t_upstatus = crate::timing::variable("upstream_status").unwrap_or_default();
     let scheme = if req.tls.is_some() { "https" } else { "http" };
+    let xff = req.headers.get("x-forwarded-for").unwrap_or("").to_string();
 
     let mut vars: Vec<(&str, &str)> = vec![
         ("remote_addr", &peer),
@@ -6717,8 +6736,7 @@ fn log_access(
         ("args", query),
         ("status", &status_s),
         ("body_bytes_sent", &bytes_s),
-        ("http_referer", referer),
-        ("http_user_agent", ua),
+
         ("host", host),
         ("server_name", server_name),
         ("server_port", &port_s),
@@ -6728,15 +6746,122 @@ fn log_access(
         ("upstream_response_time", &t_response),
         ("upstream_addr", &t_addr),
         ("upstream_status", &t_upstatus),
+        ("request_id", &req.request_id),
+        ("server_addr", &server_addr),
+        ("binary_remote_addr", &binary_remote_addr),
+        // `$http_*` arrive from the request's own view so a header that is
+        // absent renders as `-` (nginx's not-found rule) while one that is
+        // present but empty renders as "".
+        ("http_x_forwarded_for", &xff),
     ];
+    // Absent headers become not-found, which the expander renders as `-`.
+    if let Some(v) = referer_opt {
+        vars.push(("http_referer", v));
+    }
+    if let Some(v) = ua_opt {
+        vars.push(("http_user_agent", v));
+    }
     vars.extend(sent_refs);
+
+    // `$arg_*` and every `$http_*` are ordinary variables in a `log_format` (and
+    // in an `access_log ... if=` condition), so they have to be in the table.
+    let mut extra: Vec<(String, String)> = Vec::new();
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        extra.push((format!("arg_{}", k.to_ascii_lowercase()), v.to_string()));
+    }
+    for (k, v) in req.headers.iter() {
+        extra.push((
+            format!("http_{}", k.to_ascii_lowercase().replace('-', "_")),
+            v.to_string(),
+        ));
+    }
+    for (k, v) in &extra {
+        if !vars.iter().any(|(n, _)| n == k) {
+            vars.push((k.as_str(), v.as_str()));
+        }
+    }
 
     let vars = &vars[..];
 
     for log in logs {
-        let line = expand_log(&log.format, vars, now);
-        ctx.logger.access(&log.path, line);
+        // `if=<value>`: write only when the expanded value is neither empty nor
+        // "0" (`ngx_http_log_module`). The value is a complex value, so
+        // `if=$arg_logme$arg_logmetoo` concatenates two variables.
+        if let Some(cond) = &log.if_cond {
+            // A complex value: absent variables are empty, not `-`.
+            let expanded = if cond.contains('$') {
+                expand_log_full(cond, vars, now, crate::config::Escape::None, "")
+            } else {
+                cond.clone()
+            };
+            // The expander renders unresolved names as "-", but nginx compares
+            // the *value*; an absent variable therefore means "do not log".
+            if expanded.is_empty() || expanded == "0" {
+                continue;
+            }
+        }
+        let line = expand_log_escaped(
+            &log.format,
+            vars,
+            now,
+            log.escape.unwrap_or_default(),
+        );
+        // A path with `$` is a complex value: `varlog_${arg_logname}` names a
+        // file per request.
+        let path = match &log.path_template {
+            Some(tmpl) => {
+                let name = expand_log(tmpl, vars, now);
+                match path_prefix_of(&log.path, tmpl) {
+                    Some(dir) => dir.join(name.rsplit('/').next().unwrap_or(&name)),
+                    None => log.path.clone(),
+                }
+            }
+            None => log.path.clone(),
+        };
+        ctx.logger.access(&path, line);
     }
+}
+
+/// The directory part of a template path, so a raw `$` value cannot escape it.
+fn path_prefix_of(resolved: &std::path::Path, tmpl: &str) -> Option<std::path::PathBuf> {
+    let slash = tmpl.rfind('/')?;
+    let _ = resolved;
+    Some(std::path::PathBuf::from(&tmpl[..slash]))
+}
+
+/// `access_log ... escape=`: nginx escapes `"`, `\` and every byte below 0x20.
+fn escape_log_value(line: &str, mode: crate::config::Escape) -> String {
+    use crate::config::Escape;
+    if mode == Escape::None {
+        return line.to_string();
+    }
+    let mut out = String::with_capacity(line.len() + 8);
+    for b in line.bytes() {
+        match mode {
+            Escape::Json => match b {
+                b'"' => out.push_str("\\\""),
+                b'\\' => out.push_str("\\\\"),
+                b'\n' => out.push_str("\\n"),
+                b'\r' => out.push_str("\\r"),
+                b'\t' => out.push_str("\\t"),
+                0x08 => out.push_str("\\b"),
+                0x0c => out.push_str("\\f"),
+                b if b < 0x20 => out.push_str(&format!("\\u{:04X}", b)),
+                b => out.push(b as char),
+            },
+            // nginx's default table escapes 0x00-0x1F, `"` (0x22), `\` (0x5C)
+            // and 0x7F as `\xXX` -- it does **not** use `\"` or `\\`
+            // (`access_log.t`, "escape - default").
+            _ => match b {
+                b if b < 0x20 || b == 0x7f || b == b'"' || b == b'\\' => {
+                    out.push_str(&format!("\\x{:02X}", b))
+                }
+                b => out.push(b as char),
+            },
+        }
+    }
+    out
 }
 
 /// nginx's built-in `combined` format, used whenever `access_log` names no
@@ -6745,6 +6870,44 @@ pub const COMBINED: &str = "$remote_addr - $remote_user [$time_local] \"$request
 $status $body_bytes_sent \"$http_referer\" \"$http_user_agent\"";
 
 pub(crate) fn expand_log(fmt: &str, vars: &[(&str, &str)], now: i64) -> String {
+    expand_log_full(fmt, vars, now, crate::config::Escape::None, "-")
+}
+
+/// `expand_log` with `access_log ... escape=` applied to each **substituted
+/// value**.
+///
+/// nginx escapes the value, not the format: the quotes a `log_format` writes
+/// literally stay quotes, which is exactly what the first `access_log.t`
+/// assertion checks.
+pub(crate) fn expand_log_escaped(
+    fmt: &str,
+    vars: &[(&str, &str)],
+    now: i64,
+    escape: crate::config::Escape,
+) -> String {
+    // The default mode prints `-` for a variable it cannot resolve; `none` and
+    // `json` use nginx's unescaped ops, which write nothing at all
+    // (`access_log.t`, "escape - none" vs "escape - default").
+    let missing = match escape {
+        crate::config::Escape::Default => "-",
+        _ => "",
+    };
+    expand_log_full(fmt, vars, now, escape, missing)
+}
+
+/// The shared expander.
+///
+/// `missing` is what an unresolved name renders as: `-` in a log line, but the
+/// empty string when the text is a **complex value** being evaluated -- an
+/// `access_log ... if=$a$b` with both absent concatenates two empties, it does
+/// not produce `--`.
+pub(crate) fn expand_log_full(
+    fmt: &str,
+    vars: &[(&str, &str)],
+    now: i64,
+    escape: crate::config::Escape,
+    missing: &str,
+) -> String {
     let fmt = if fmt == "combined" { COMBINED } else { fmt };
     let mut out = String::with_capacity(fmt.len() + 64);
     let bytes = fmt.as_bytes();
@@ -6752,20 +6915,51 @@ pub(crate) fn expand_log(fmt: &str, vars: &[(&str, &str)], now: i64) -> String {
     let time_local = util::log_time(now);
     while i < bytes.len() {
         if bytes[i] == b'$' {
-            let mut matched = false;
-            for (name, val) in vars {
-                if bytes[i + 1..].starts_with(name.as_bytes()) {
-                    if *name == "time_local" {
-                        out.push_str(&time_local);
-                    } else {
-                        out.push_str(val);
+            // `${name}`: the braced spelling, needed when the name is followed
+            // by more identifier characters (`varlog_${arg_logname}`, and
+            // `index ${server_name}.html` in the rewrite module).
+            if bytes.get(i + 1) == Some(&b'{') {
+                if let Some(close) = fmt[i + 2..].find('}') {
+                    let name = &fmt[i + 2..i + 2 + close];
+                    let val = vars.iter().find(|(n, _)| *n == name).map(|(_, v)| *v);
+                    match val {
+                        Some(v) if name == "time_local" => {
+                            out.push_str(&escape_log_value(&time_local, escape))
+                        }
+                        Some(v) => out.push_str(&escape_log_value(v, escape)),
+                        None => out.push_str(missing),
                     }
-                    i += 1 + name.len();
-                    matched = true;
-                    break;
+                    i += 1 + 1 + close + 1;
+                    continue;
                 }
             }
-            if matched {
+            // Longest match that ends on a name boundary. Matching a prefix in
+            // list order silently split `$request_id` into `$request` + "_id",
+            // which is exactly what `request_id.t` caught: the log line read
+            // `GET /log HTTP/1.0_id`.
+            let mut best: Option<(&str, &str)> = None;
+            for (name, val) in vars {
+                if !bytes[i + 1..].starts_with(name.as_bytes()) {
+                    continue;
+                }
+                let end = i + 1 + name.len();
+                // A name may not be followed by more identifier characters.
+                if let Some(next) = bytes.get(end) {
+                    if next.is_ascii_alphanumeric() || *next == b'_' {
+                        continue;
+                    }
+                }
+                if best.map_or(true, |(b, _)| name.len() > b.len()) {
+                    best = Some((name, val));
+                }
+            }
+            if let Some((name, val)) = best {
+                if name == "time_local" {
+                    out.push_str(&escape_log_value(&time_local, escape));
+                } else {
+                    out.push_str(&escape_log_value(val, escape));
+                }
+                i += 1 + name.len();
                 continue;
             }
             // nginx logs "-" for a variable it cannot resolve.
@@ -6775,7 +6969,7 @@ pub(crate) fn expand_log(fmt: &str, vars: &[(&str, &str)], now: i64) -> String {
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == b'_')
                 .count();
             if n > 0 {
-                out.push('-');
+                out.push_str(missing);
                 i += 1 + n;
                 continue;
             }

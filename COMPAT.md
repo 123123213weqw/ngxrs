@@ -13,7 +13,7 @@
 
 | 项 | 命令 | 当前结果 |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 116 文件，WORSE=0 TRUNC=0（nginx 1780 / ngxrs 1785 断言） |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 117 文件，WORSE=0 TRUNC=0 |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
 | 单元测试 | `cargo test --release` | **PASS** — 156 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
@@ -535,9 +535,46 @@ add_header ETag foo always;           -> ETag: foo（不是两个）
 `proxy_ssl_name` 是复杂值（`proxy_ssl_name x${server_port}x`），现在按连接展开 ——
 `stream_proxy_ssl_name_complex.t` 之前拿到空串。
 
+## 一之十四、2026-10-27 第十三轮：`$request_id` 与访问日志的写入细节
+
+`request_id.t` 4/14 → **14/14**（已入清单）。`access_log.t` 6/21 → **19/21**（未入清单，
+见下）。`access_log_variables.t` 3/8（未入清单）。
+
+### `$request_id`
+
+16 字节随机数渲染成 32 个小写十六进制字符，**每个请求生成一次**，所以响应头、SSI 子请求
+和日志行拿到的是同一个值。随机源用已有的 `ring`（rustls 的底座），不新增依赖。
+
+### 日志写入器修掉的四个真实缺陷
+
+1. **变量名按前缀匹配，最长者不优先**。`$request_id` 被拆成 `$request` + `_id`，日志里
+   出现 `GET /log HTTP/1.0_id`。现在按「最长匹配且后面不是标识符字符」选。
+2. **`${name}` 花括号形式不支持**。`access_log .../varlog_${arg_logname}` 直接写出了
+   字面文件名 `varlog_${arg_logname}`。同一个缺陷上一轮在 `index ${server_name}.html`
+   里出现过 —— 两处各自实现了展开器，现在都支持。
+3. **`escape=` 语义搞错了两处**。它属于 `log_format`（`log_format json escape=json ...`），
+   而我们只从 `access_log` 上读；另外默认模式把 `"` 写成 `\"`，nginx 写的是 `\x22`
+   （转义表：0x00–0x1F、`"`、`\`、0x7F 全部走 `\xXX`）。`none`/`json` 两种模式还有个
+   反直觉之处：**变量不存在时什么都不写**，而默认模式写 `-`（nginx 用的是另一组 op）。
+4. **`$arg_*` / 其余 `$http_*` 在日志格式里解析不出来**，`if=$arg_logme` 因此永远为假 ——
+   过滤掉的不是该过滤的，而是全部。
+
+### 仍未实现（已记录，未入清单）
+
+- **`open_log_file_cache`**：`access_log.t` 剩的 2 条是 `max=3` 的 LRU 淘汰与 `min_uses=2`
+  的缓存门槛。这需要一个真正的文件句柄缓存（测试还会重命名目录来证明句柄被持有）。
+- **`access_log_variables.t` 的 5 条**：`$time_iso8601`、`$msec`、`$request_length`、
+  `$bytes_sent`、`$pipe`。nginx 对这几个用「不转义」的专用 op，且 `$request_length`
+  要统计请求行 + 头 + body 的总字节。
+
+### 工具修正
+
+`bench/ntscan.sh` 的 `OUT=` 是普通赋值，我传 `OUT=...` 时被忽略并覆盖了上一次的扫描结果，
+基线因此丢失（从本地副本找回）。现在改为 `${OUT:-...}`，每次扫描可以写到独立目录。
+
 ## 二、声明的测试清单
 
-清单在 `bench/declared.txt`，**116 个文件**，选取规则是机械的：
+清单在 `bench/declared.txt`，**117 个文件**，选取规则是机械的：
 
 1. 落在范围内（**参考构建 `-V` 能编出来的模块**：http core + proxy/cache/gzip/
    TLS/HTTP2/realip/auth_request/slice/sub/secure_link/dav/stub_status/gzip_static/

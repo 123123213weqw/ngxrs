@@ -168,6 +168,9 @@ pub struct Request {
     /// the connection. Like `tls`, it belongs to the connection but nginx
     /// exposes it through the request's variables.
     pub proxy_protocol: Option<std::sync::Arc<crate::proxyproto::Pp>>,
+    /// `$request_id`: 16 random bytes as 32 lowercase hex digits, fixed for the
+    /// life of the request (`request_id.t`).
+    pub request_id: String,
     /// When the request head finished parsing. Backs `$request_time`.
     pub started: std::time::Instant,
 }
@@ -556,6 +559,7 @@ impl Request {
             expect_continue,
             tls: None,
             proxy_protocol: None,
+            request_id: crate::util::new_request_id(),
             started: std::time::Instant::now(),
         })
     }

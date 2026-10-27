@@ -257,6 +257,8 @@ pub fn serve(cfg: Config) -> io::Result<()> {
     // nginx opens every configured `error_log` at load time, so a location log
     // exists even if nothing is ever written to it.
     crate::config::typed::preopen_location_error_logs(&cfg.http);
+    // Likewise the static `access_log` files: nginx creates them at load time.
+    crate::config::typed::preopen_access_logs(&cfg.http);
 
     // Resolve `stream {}` backends (names -> upstream blocks) once.
     let mut stream_cfg = crate::stream::StreamConfig {

@@ -902,6 +902,41 @@ pub fn parse_log_spec(prefix: &Path, args: &[String]) -> Option<LogSpec> {
 /// nginx opens all configured logs while loading the configuration; a test that
 /// reads an empty log then gets `""` rather than a missing file
 /// (`index.t`, `log_not_found off`).
+/// Create the directory and file for every *static* `access_log` path, the way
+/// nginx opens them while loading the configuration.
+///
+/// A path containing `$` is deliberately skipped: those are opened per request,
+/// and nginx would not create their directory either.
+pub fn preopen_access_logs(http: &Http) {
+    fn one(log: &AccessLog) {
+        if log.path_template.is_some() {
+            return;
+        }
+        if let Some(parent) = log.path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log.path);
+    }
+    fn walk(locs: &[Location]) {
+        for l in locs {
+            if let Some(logs) = &l.cfg.access_logs {
+                logs.iter().for_each(one);
+            }
+            walk(&l.nested);
+        }
+    }
+    http.default_access_logs.iter().for_each(one);
+    for srv in &http.servers {
+        srv.access_logs.iter().for_each(one);
+        walk(&srv.locations);
+    }
+}
+
 pub fn preopen_location_error_logs(http: &Http) {
     fn walk(locs: &[Location]) {
         for l in locs {

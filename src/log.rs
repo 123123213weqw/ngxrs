@@ -466,11 +466,142 @@ fn append_line(
     }
 }
 
+/// Open a log file for appending.
+///
+/// **No directory creation here.** nginx opens every configured log at startup
+/// (`ngx_conf_open_file`), and at request time `ngx_open_cached_file` only ever
+/// opens the path. That difference is observable: `access_log.t` renames a
+/// directory away and expects the lines whose handle is no longer cached to be
+/// dropped, which cannot happen if the runtime open recreates the directory.
+/// `preopen_access_logs` does the startup half.
 fn open_log(path: &Path) -> Option<File> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            let _ = std::fs::create_dir_all(parent);
+    OpenOptions::new().create(true).append(true).open(path).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::OpenFileCache;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "ngxrs-log-{}-{}-{}",
+            tag,
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+    fn lines(path: &Path) -> usize {
+        std::fs::read_to_string(path)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    fn cache(max: usize, min_uses: u32) -> OpenFileCache {
+        OpenFileCache {
+            max,
+            inactive: Duration::from_secs(20),
+            min_uses,
+            valid: Duration::from_secs(60),
+            errors: true,
         }
     }
-    OpenOptions::new().create(true).append(true).open(path).ok()
+
+    /// The rule `access_log.t`'s "cache - cached 1" proves: a handle cached
+    /// within `valid` keeps writing to the inode after the path is renamed away.
+    #[test]
+    fn cached_handle_survives_a_rename() {
+        let d = scratch("cached");
+        let mut files = HashMap::new();
+        let p = d.join("a.log");
+        append_line(&mut files, &p, "one", cache(3, 1));
+        append_line(&mut files, &p, "two", cache(3, 1));
+        // Rename the directory: the path is gone, the handle is not.
+        let moved = d.with_extension("moved");
+        let _ = std::fs::remove_dir_all(&moved);
+        std::fs::rename(&d, &moved).unwrap();
+        append_line(&mut files, &p, "three", cache(3, 1));
+        for e in files.values_mut() {
+            if let Some(w) = e.writer.as_mut() {
+                let _ = w.flush();
+            }
+        }
+        assert_eq!(lines(&moved.join("a.log")), 3);
+        // The old path was not recreated.
+        assert!(!d.exists());
+    }
+
+    /// And "cache - min_uses": below the threshold each line opens by path, so
+    /// the third line is lost once the path is gone.
+    #[test]
+    fn below_min_uses_the_line_is_dropped_after_a_rename() {
+        let d = scratch("minuses");
+        let mut files = HashMap::new();
+        let p = d.join("a.log");
+        append_line(&mut files, &p, "one", cache(3, 2));
+        let moved = d.with_extension("moved");
+        let _ = std::fs::remove_dir_all(&moved);
+        std::fs::rename(&d, &moved).unwrap();
+        append_line(&mut files, &p, "two", cache(3, 2));
+        for e in files.values_mut() {
+            if let Some(w) = e.writer.as_mut() {
+                let _ = w.flush();
+            }
+        }
+        assert_eq!(lines(&moved.join("a.log")), 1);
+    }
+
+    /// "cache - closed lru": `max` bounds the number of entries, so adding a
+    /// fourth evicts the least recently used one, whose later lines then fail.
+    #[test]
+    fn max_evicts_the_least_recently_used_entry() {
+        let d = scratch("lru");
+        let mut files = HashMap::new();
+        let names = ["lru", "once", "first", "second"];
+        for n in names {
+            let p = d.join(n);
+            append_line(&mut files, &p, "l1", cache(3, 2));
+            append_line(&mut files, &p, "l2", cache(3, 2));
+        }
+        assert_eq!(files.len(), 3, "max=3 must bound the entry count");
+        assert!(!files.contains_key(&d.join("lru")), "lru should be evicted");
+        for e in files.values_mut() {
+            if let Some(w) = e.writer.as_mut() {
+                let _ = w.flush();
+            }
+        }
+        // The evicted path loses its line after the directory disappears.
+        let moved = d.with_extension("moved");
+        let _ = std::fs::remove_dir_all(&moved);
+        std::fs::rename(&d, &moved).unwrap();
+        append_line(&mut files, &d.join("lru"), "l3", cache(3, 2));
+        append_line(&mut files, &d.join("first"), "l3", cache(3, 2));
+        for e in files.values_mut() {
+            if let Some(w) = e.writer.as_mut() {
+                let _ = w.flush();
+            }
+        }
+        assert_eq!(lines(&moved.join("lru")), 2);
+        assert_eq!(lines(&moved.join("first")), 3);
+    }
+
+    /// Without `open_log_file_cache` every line opens and closes, which is what
+    /// nginx does when the directive is absent.
+    #[test]
+    fn cache_off_opens_per_line() {
+        let d = scratch("off");
+        let mut files = HashMap::new();
+        let p = d.join("a.log");
+        append_line(&mut files, &p, "one", OpenFileCache::default());
+        append_line(&mut files, &p, "two", OpenFileCache::default());
+        assert!(files.is_empty(), "no entry may be kept when caching is off");
+        assert_eq!(lines(&p), 2);
+    }
 }

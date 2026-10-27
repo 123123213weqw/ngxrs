@@ -599,9 +599,13 @@ grpc / mail / resolver / proxy_protocol 全排除了，也就是把这些家族�
 
 ```
 LIMIT=400 bash bench/ntscan.sh      # 默认已是 *.t 减去参考 nginx 编不出来的模块
-files compared=314  same=173  better=7  worse=134   (skipped=86)
-total assertions where ngxrs loses: 795
+files compared=314  same=193  better=8  worse=113   (skipped=86)
+total assertions where ngxrs loses: 476
 ```
+
+（会话开始时同口径为 `same=173 better=7 worse=134`、`795` 条；随后每轮重扫都对比
+基线文件列表，本轮的 113 个 WORSE 文件与基线是**子集关系** —— 没有任何文件新变差，
+消失的 21 个是这轮修掉的。）
 
 **314 个文件可比，134 个仍有差距，795 条断言。** 这个数比旧表小，只是因为
 旧表的 348 里有一半两边都跑不动（`skipped=86` 是两边都没产断言的）。

@@ -61,6 +61,11 @@ stream_map.t
 stream_set.t
 stream_split_clients.t
 
+# ---- index ----
+# `index` as a complex value, its internal redirect (`$uri` changes), absolute
+# index names, the redirect-cycle 500, and `log_not_found`.
+index.t
+
 # ---- headers ----
 # `add_header` with `always`, the special-header names (`ETag`/`Last-Modified`
 # are *set*, so an empty value clears them), and `expires` in every form

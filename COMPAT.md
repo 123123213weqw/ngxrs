@@ -13,7 +13,7 @@
 
 | 项 | 命令 | 当前结果 |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 109 文件，WORSE=0 TRUNC=0（nginx 1724 / ngxrs 1729 断言） |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 110 文件，WORSE=0 TRUNC=0（nginx 1740 / ngxrs 1745 断言） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
 | 单元测试 | `cargo test --release` | **PASS** — 156 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
@@ -462,9 +462,40 @@ add_header ETag foo always;           -> ETag: foo（不是两个）
 之前我们对空值直接 `continue`，于是静态处理器的 `ETag` 留着，`headers.t` 的
 "good add_header always empty" 失败。现在空值对这两个名字是**删除**。
 
+## 一之十二、2026-10-27 第十一轮：`index.t`（9/16 → 16/16）
+
+`index` 的语义不是「就地返回目录里的那个文件」，而是**内部重定向**：`$uri` 变成索引文件
+的 URI，location 重新匹配。这正是 `index.t` 用 `add_header X-URI $uri` 断言的东西：
+
+| 请求 | 配置 | nginx 行为 |
+|---|---|---|
+| `/` | 默认 `index.html` | 内部重定向到 `/index.html`（`$uri` 变了） |
+| `/redirect/` | `index /re.html` | **绝对**名 → 重定向到 `/re.html`，且**不看目录是否存在** |
+| `/loop/` | `index /loop/` | 重定向回自身 → 10 次后 **500** |
+| `/many/` | `index nonexisting.html many.html` | 逐个别名尝试，命中 `many.html` → `/many/many.html` |
+| `/var/` | `index $server_name.html` | 复杂值，展开成 `localhost.html` |
+| `/va2/` | `index ${server_name}.html` | 同上，`${}` 花括号形式 |
+
+顺带补了三处：
+
+1. **`$server_name` / `$host` 在 `rewrite` 模块的变量视图里是空的**（`RwVars::get_var`
+   没有它们），所以 `index $server_name.html` 展开成 `.html`。现在补上。
+2. **`${name}` 花括号形式不被识别**，`index ${server_name}.html` 会在 `<` 处断掉。
+3. **`log_not_found`**：nginx 对每个缺失的静态文件写一行
+   `open() "..." failed (2: No such file or directory)` 到 error log，`off` 时不写。
+   我们此前完全不写，而且 **location 级 `error_log` 文件在没有任何内容时不会创建** ——
+   nginx 在加载配置时就打开所有日志。现在启动时预打开（`preopen_location_error_logs`）。
+
+### 一个被 `bench/pair.sh` 抓到的回归
+
+第一版把「不带尾斜杠的目录 URI」也重定向到了 `index.html`，于是 `/sub` 返回 200 而不是
+301。nginx 是 `ngx_http_static_handler` **先**发 301，索引模块根本不会跑到。声明清单全过、
+`bench/all.sh` 的 `static-protocol` 却从 19/19 掉到 18/19 —— 这条差分用例比 nginx-tests
+更能覆盖「目录 + 无尾斜杠」，值得记住。
+
 ## 二、声明的测试清单
 
-清单在 `bench/declared.txt`，**109 个文件**，选取规则是机械的：
+清单在 `bench/declared.txt`，**110 个文件**，选取规则是机械的：
 
 1. 落在范围内（**参考构建 `-V` 能编出来的模块**：http core + proxy/cache/gzip/
    TLS/HTTP2/realip/auth_request/slice/sub/secure_link/dav/stub_status/gzip_static/

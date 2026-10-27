@@ -100,6 +100,36 @@ pub fn map_path(uri: &str, loc: &LocCfg) -> PathBuf {
     }
 }
 
+/// `log_not_found`: nginx writes the failed `open()` to the error log at
+/// `error` level, unless the location turned it off.
+///
+/// The message is nginx's own shape -- `open() "..." failed (2: No such file or
+/// directory), client: ..., server: ..., request: "..."` -- because
+/// `index.t` greps the log for `error`.
+fn log_missing_file(loc: &LocCfg, http: &Http, req: &Request, path: &Path) {
+    if !loc.log_not_found {
+        return;
+    }
+    let msg = format!(
+        "open() \"{}\" failed (2: No such file or directory), client: {}, server: {}, request: \"{} {}\"",
+        path.display(),
+        "-",
+        loc.server_name,
+        req.method.as_str(),
+        req.raw_target
+    );
+    if loc.error_logs.is_empty() {
+        crate::log::error_log("error", &msg);
+    } else {
+        for spec in &loc.error_logs {
+            if let Some(sink) = crate::log::sink_cached(&spec.dest, spec.level) {
+                crate::log::log_to(&[sink], crate::log::Level::Error, &msg);
+            }
+        }
+    }
+    let _ = http;
+}
+
 pub fn respond_fs(
     req: &Request,
     fs_path: &Path,
@@ -148,7 +178,10 @@ pub fn respond_fs_indexed(
     let file = match File::open(fs_path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Ok(Response::empty(403)),
-        Err(_) => return Ok(Response::empty(404)),
+        Err(_) => {
+            log_missing_file(loc, http, req, fs_path);
+            return Ok(Response::empty(404));
+        }
     };
     let meta = match file.metadata() {
         Ok(m) => m,
@@ -245,6 +278,7 @@ pub fn respond_fs_indexed(
     }
 
     if uri.ends_with('/') {
+        log_missing_file(loc, http, req, fs_path);
         return Ok(Response::empty(404));
     }
 
@@ -1252,4 +1286,52 @@ pub fn symlinks_disallowed(path: &Path, loc: &LocCfg, document_root: &Path) -> b
         i = end + 1;
     }
     false
+}
+
+/// `ngx_http_index_handler`'s redirect decision: for a directory URI whose
+/// `index` list names an existing file, the response is an **internal redirect**
+/// to that file's URI, not an in-place serve.
+///
+/// That distinction is the whole point of `index.t`: `$uri` has to change, so
+/// `/` with the default `index.html` reports `/index.html` in `add_header X-URI`,
+/// and `index /re.html` (an absolute name) redirects to a *different* location
+/// entirely. A redirect whose target is the URI it came from is a cycle, and
+/// nginx answers 500 after its internal-redirect limit -- `/loop/` with
+/// `index /loop/`.
+///
+/// `None` means "no index matched", so the caller falls through to the
+/// directory handling (autoindex, or 403).
+pub fn index_redirect(uri: &str, loc: &LocCfg, expanded: Option<&[String]>) -> Option<String> {
+    if loc.index.is_empty() {
+        return None;
+    }
+    // The index handler runs only for a URI with a trailing slash. A directory
+    // URI *without* one is the static handler's 301 first -- `ngx_http_static_handler`
+    // redirects before the index module is ever reached, so `/sub` must stay a
+    // 301 rather than becoming `/sub/index.html`.
+    if !uri.ends_with('/') {
+        return None;
+    }
+    let fs_path = map_path(uri, loc);
+    let base = uri.to_string();
+    for (i, spec) in loc.index.iter().enumerate() {
+        let name = match expanded {
+            Some(list) => list.get(i).cloned().unwrap_or_else(|| spec.clone()),
+            None => spec.clone(),
+        };
+        if name.is_empty() {
+            continue;
+        }
+        // An absolute index names a URI, not a file inside this directory.
+        if name.starts_with('/') {
+            return Some(name);
+        }
+        if std::fs::metadata(fs_path.join(&name))
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+        {
+            return Some(format!("{base}{name}"));
+        }
+    }
+    None
 }

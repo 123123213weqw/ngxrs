@@ -194,6 +194,10 @@ pub struct LocCfg {
     pub limit_conns: Vec<LimitConn>,
     /// `error_log` directives that apply to this location, in order.
     pub error_logs: Vec<LogSpec>,
+    /// `log_not_found on|off`: whether a missing file is written to the error
+    /// log as `open() ... failed (2: No such file or directory)` (nginx default
+    /// on).
+    pub log_not_found: bool,
     /// `limit_req_log_level`: severity of the "limiting requests" message.
     pub limit_req_log_level: crate::log::Level,
     /// `limit_conn_log_level`: severity of "limiting connections".
@@ -378,6 +382,7 @@ impl LocCfg {
             access_logs: None,
             charset_utf8: false,
             error_logs: Vec::new(),
+            log_not_found: true,
             limit_req_log_level: crate::log::Level::Error,
             limit_conn_log_level: crate::log::Level::Error,
             limit_req_dry_run: false,
@@ -887,6 +892,26 @@ pub fn parse_log_spec(prefix: &Path, args: &[String]) -> Option<LogSpec> {
 }
 
 /// Turn specs into live sinks.
+/// Open every `error_log` a location declares, so the file exists even when
+/// nothing is ever written to it.
+///
+/// nginx opens all configured logs while loading the configuration; a test that
+/// reads an empty log then gets `""` rather than a missing file
+/// (`index.t`, `log_not_found off`).
+pub fn preopen_location_error_logs(http: &Http) {
+    fn walk(locs: &[Location]) {
+        for l in locs {
+            open_sinks(&l.cfg.error_logs);
+            walk(&l.nested);
+        }
+    }
+    for srv in &http.servers {
+        open_sinks(&srv.default_loc.error_logs);
+        walk(&srv.locations);
+    }
+    open_sinks(&http.default_loc.error_logs);
+}
+
 pub fn open_sinks(specs: &[LogSpec]) -> Vec<std::sync::Arc<crate::log::Sink>> {
     let mut out = Vec::new();
     for spec in specs {
@@ -3326,6 +3351,15 @@ impl Builder {
                     });
                 }
             }
+            "log_not_found" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "log_not_found requires on|off"))?;
+                cfg.log_not_found = parse_on_off(v).ok_or_else(|| {
+                    sem(&d.file, d.line, format!("invalid log_not_found value \"{v}\""))
+                })?;
+            }
             "disable_symlinks" => {
                 let mut mode = None;
                 let mut from = None;
@@ -3907,7 +3941,7 @@ impl Builder {
                 // Accepted, not yet honoured.
             }
             "limit_rate" | "limit_rate_after" | "sendfile" | "tcp_nopush" | "tcp_nodelay"
-            | "server_tokens" | "default_type" | "merge_slashes" | "log_not_found"
+            | "server_tokens" | "default_type" | "merge_slashes"
             | "open_file_cache" | "etag" | "msie_padding" => {
                 // Accepted at this scope but not yet plumbed through: handled at
                 // http/server level where relevant, otherwise silently accepted.
@@ -5561,6 +5595,11 @@ impl Location {
 }
 
 impl Server {
+    /// `$server_name`: the first configured name, as nginx reports it.
+    pub fn name_display(&self) -> &str {
+        self.names.first().map(|s| s.as_str()).unwrap_or("")
+    }
+
     /// nginx's `auto_redirect`: a request for `/foo` is answered with a 301 to
     /// `/foo/` when a location named `/foo/` exists.
     pub fn auto_redirect(&self, path: &str) -> Option<String> {

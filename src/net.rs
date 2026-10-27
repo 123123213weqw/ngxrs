@@ -254,6 +254,10 @@ pub fn serve(cfg: Config) -> io::Result<()> {
 
     crate::tls::init_crypto();
 
+    // nginx opens every configured `error_log` at load time, so a location log
+    // exists even if nothing is ever written to it.
+    crate::config::typed::preopen_location_error_logs(&cfg.http);
+
     // Resolve `stream {}` backends (names -> upstream blocks) once.
     let mut stream_cfg = crate::stream::StreamConfig {
         servers: Vec::new(),

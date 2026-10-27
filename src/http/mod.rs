@@ -1358,6 +1358,9 @@ struct RwVars<'a> {
     query: &'a str,
     vars: &'a std::collections::HashMap<String, String>,
     server_port: u16,
+    /// `$server_name` / `$host`: `index $server_name.html` is a documented
+    /// pattern (`index.t`, "var").
+    server_name: &'a str,
     /// The location whose `if` is being evaluated. `disable_symlinks` is a
     /// location directive, and a `-f` test has to honour it.
     loc: Option<&'a LocCfg>,
@@ -1370,6 +1373,22 @@ fn get_var(name: &str, v: &RwVars<'_>) -> String {
     }
     match bare {
         "uri" | "document_uri" => v.path.to_string(),
+        "server_name" => v
+            .vars
+            .get("server_name")
+            .cloned()
+            .unwrap_or_else(|| v.server_name.trim_start_matches('.').to_string()),
+        "host" => v
+            .vars
+            .get("host")
+            .cloned()
+            .unwrap_or_else(|| {
+                v.req
+                    .host
+                    .as_ref()
+                    .map(|h| h.to_string())
+                    .unwrap_or_default()
+            }),
         "request_uri" => v.req.raw_target.clone(),
         "args" | "query_string" => v.query.to_string(),
         "request_method" => v.req.method.as_str().to_string(),
@@ -1567,6 +1586,7 @@ fn apply_rewrites_parts(
         seed,
         // The server-level pass has no location of its own.
         None,
+        server.name_display(),
     )
     .0
 }
@@ -1599,6 +1619,8 @@ fn apply_rewrites_full(
     // The location these `if` blocks belong to, for `-f` and friends, which
     // have to honour `disable_symlinks`.
     if_loc: Option<&LocCfg>,
+    // `$server_name` inside `set` / `if`.
+    if_server_name: &str,
 ) -> (RewriteOutcome, std::collections::HashMap<String, String>) {
     let mut uri = path.to_string();
     let mut args = query.to_string();
@@ -1639,6 +1661,7 @@ fn apply_rewrites_full(
                     query: &args,
                     vars: &vars,
                     server_port,
+                    server_name: if_server_name,
                     loc: if_loc,
                 };
                 let expanded = expand_vars(value, &ctx);
@@ -1671,6 +1694,7 @@ fn apply_rewrites_full(
                     server_port,
                     &mut matched,
                     if_loc,
+                    server.name_display(),
                 ) {
                     return (out, vars);
                 }
@@ -1719,6 +1743,7 @@ fn run_if(
     // outcome", and `proxy_pass` inside `if` needs that difference.
     matched: &mut bool,
     if_loc: Option<&LocCfg>,
+    if_server_name: &str,
 ) -> Option<RewriteOutcome> {
     let cond = {
         let ctx = RwVars {
@@ -1727,6 +1752,7 @@ fn run_if(
             query: args,
             vars,
             server_port,
+            server_name: if_server_name,
             loc: if_loc,
         };
         eval_cond(&ifb.cond, &ctx)
@@ -1742,6 +1768,7 @@ fn run_if(
             query: args,
             vars,
             server_port,
+            server_name: if_server_name,
             loc: if_loc,
         };
         let expanded = expand_vars(value, &ctx);
@@ -1936,6 +1963,18 @@ fn expand_vars(spec: &str, v: &RwVars<'_>) -> String {
             .count();
         out.push_str(&spec[start..i]);
         if n == 0 {
+            // `${name}` is the braced spelling, needed when the name is
+            // followed by more identifier characters -- `index ${server_name}.html`
+            // (`index.t`, "var 2").
+            if rest.starts_with('{') {
+                if let Some(close) = rest.find('}') {
+                    let name = &rest[1..close];
+                    out.push_str(&get_var(name, v));
+                    i += 1 + close + 1;
+                    start = i;
+                    continue;
+                }
+            }
             out.push('$');
             i += 1;
         } else {
@@ -2006,6 +2045,7 @@ fn expand_replacement(
         query,
         vars,
         server_port,
+        server_name: "",
         loc: None,
     };
     let mut out = String::with_capacity(tmpl.len());
@@ -3305,6 +3345,7 @@ pub fn resolve_target<'a>(
             &mut proxy_override_missing,
             &secure_link_seed(cur_loc, req),
             Some(cur_loc),
+            server.name_display(),
         );
         vars.extend(phase_vars);
         // The location loop starts each pass with an empty map, so the secure
@@ -3358,6 +3399,41 @@ pub fn resolve_target<'a>(
             }
             None => {}
         }
+    }
+
+    // `ngx_http_index_handler`: a directory whose `index` matches becomes an
+    // internal redirect, so `$uri` changes to the index file and location
+    // matching runs again. A redirect that lands back on a directory repeats
+    // until nginx's limit, which is a 500 (`index.t`, `/loop/`).
+    let mut index_hops = 0usize;
+    loop {
+        let expanded_index: Option<Vec<String>> = if cur_loc.index.iter().any(|i| i.contains('$')) {
+            let ctx = RwVars {
+                req,
+                path: &cur_path,
+                query: &cur_query,
+                vars: &vars,
+                server_port,
+                server_name: server.name_display(),
+                loc: Some(cur_loc),
+            };
+            Some(cur_loc.index.iter().map(|i| expand_vars(i, &ctx)).collect())
+        } else {
+            None
+        };
+        let Some(target) = static_file::index_redirect(
+            &cur_path,
+            cur_loc,
+            expanded_index.as_deref(),
+        ) else {
+            break;
+        };
+        index_hops += 1;
+        if index_hops > 10 {
+            return Target::Done(error_response(500, server.server_tokens));
+        }
+        cur_path = target;
+        cur_loc = server.locate(&cur_path);
     }
 
     // A matching `if` installed the proxy handler but left it without a target:
@@ -4389,6 +4465,7 @@ async fn finalize_response(
             query: &cur_query,
             vars: custom,
             server_port,
+            server_name: server.name_display(),
             loc: Some(cur_loc),
         };
         expand_vars(spec, &ctx)

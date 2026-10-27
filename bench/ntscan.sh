@@ -17,15 +17,22 @@ OUT="$ROOT/bench/run/ntscan"
 mkdir -p "$OUT"
 
 LIMIT="${LIMIT:-40}"
-# Categories ngxrs actually implements.
-# Keep this list honest and broad: a narrower pattern silently omits whole
-# protocol families (h2_*, ssl_*, grpc_*) and makes the headline look better
-# than it is. Suites for unimplemented modules are expected to show as losses.
-PATTERN="${PATTERN:-http_*.t proxy_*.t upstream_*.t range_*.t fastcgi_*.t scgi_*.t uwsgi_*.t stream*.t h2_*.t ssl_*.t grpc_*.t}"
+# Default: every suite. The point of this scan is the *whole* remaining gap, so
+# narrowing the pattern silently shrinks the headline.
+PATTERN="${PATTERN:-*.t}"
+
+# Suites the reference build cannot provide. Derived from
+# `nginx-baseline/sbin/nginx -V` (see COMPAT.md); everything else -- dav, slice,
+# secure_link, realip, auth_request, sub, stub_status, h2, ssl, grpc, mail,
+# stream, resolver, proxy_protocol -- IS buildable there and therefore counts.
+# An earlier version excluded dav/slice/secure_link/realip/h2/ssl/grpc/mail
+# here as well, which hid whole families we implement and made the "what is
+# left" list look shorter than it is.
+OUT_OF_SCOPE="${OUT_OF_SCOPE:-addition auth_delay image_filter mp4 flv geoip random_index memcached perl lua js njs xslt mirror quic h3 http_v3 h3_ mp4_}"
 
 # shellcheck disable=SC2086
 files=$(cd "$TESTS_DIR" && ls $PATTERN 2>/dev/null \
-  | grep -vE '^(addition|sub|slice|auth_|dav|mirror|xslt|perl|lua|js|njs|image_filter|mp4|flv|geoip|random_index|limit_|secure_link|realip|rewrite_log|debug|h2|h3|quic|ssl|grpc|memcached|mail|proxy_protocol|resolver)' \
+  | grep -vE "^($(echo "$OUT_OF_SCOPE" | tr ' ' '|'))" \
   | head -n "$LIMIT")
 
 outcomes() {

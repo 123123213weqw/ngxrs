@@ -1272,6 +1272,9 @@ struct RwVars<'a> {
     query: &'a str,
     vars: &'a std::collections::HashMap<String, String>,
     server_port: u16,
+    /// The location whose `if` is being evaluated. `disable_symlinks` is a
+    /// location directive, and a `-f` test has to honour it.
+    loc: Option<&'a LocCfg>,
 }
 
 fn get_var(name: &str, v: &RwVars<'_>) -> String {
@@ -1302,7 +1305,22 @@ fn get_var(name: &str, v: &RwVars<'_>) -> String {
                 "?".to_string()
             }
         }
-        "request_filename" | "document_root" => String::new(),
+        // Both were empty, which made `if (-f $request_filename)` never match --
+        // `http_disable_symlinks.t`'s "if (if_not_owner, same uid)" pins this
+        // down because the `if` has to answer 204 rather than fall through to
+        // the static handler.
+        "document_root" => match v.loc {
+            Some(loc) => static_file::document_root_of(loc)
+                .to_string_lossy()
+                .to_string(),
+            None => String::new(),
+        },
+        "request_filename" => match v.loc {
+            Some(loc) => static_file::map_path(v.path, loc)
+                .to_string_lossy()
+                .to_string(),
+            None => String::new(),
+        },
         _ => {
             if let Some(h) = bare.strip_prefix("http_") {
                 let key = h.replace('_', "-");
@@ -1363,10 +1381,16 @@ fn eval_cond(cond: &IfCond, v: &RwVars<'_>) -> bool {
             // the whole string as a name and always answer empty.
             let p = expand_vars(path_expr, v);
             let path = std::path::Path::new(&p);
+            // A path `disable_symlinks` refuses is not a file as far as the test
+            // is concerned (`ngx_open_file` fails with ELOOP).
+            let refused = v
+                .loc
+                .map(|loc| static_file::symlinks_disallowed(path, loc, &loc.root))
+                .unwrap_or(false);
             let hit = match kind {
-                'f' => path.is_file(),
-                'd' => path.is_dir(),
-                'e' => path.exists(),
+                'f' => !refused && path.is_file(),
+                'd' => !refused && path.is_dir(),
+                'e' => !refused && path.exists(),
                 'x' => {
                     use std::os::unix::fs::PermissionsExt;
                     path.metadata()
@@ -1455,6 +1479,8 @@ fn apply_rewrites_parts(
         &mut ignored_seen,
         &mut ignored_missing,
         seed,
+        // The server-level pass has no location of its own.
+        None,
     )
     .0
 }
@@ -1484,6 +1510,9 @@ fn apply_rewrites_full(
     // get_handler, so the first read -- the `if` that a config always has --
     // computes it. Seeding reproduces that without a lazy callback.
     seed: &[(&str, String)],
+    // The location these `if` blocks belong to, for `-f` and friends, which
+    // have to honour `disable_symlinks`.
+    if_loc: Option<&LocCfg>,
 ) -> (RewriteOutcome, std::collections::HashMap<String, String>) {
     let mut uri = path.to_string();
     let mut args = query.to_string();
@@ -1524,6 +1553,7 @@ fn apply_rewrites_full(
                     query: &args,
                     vars: &vars,
                     server_port,
+                    loc: if_loc,
                 };
                 let expanded = expand_vars(value, &ctx);
                 vars.insert(name.trim_start_matches('$').to_string(), expanded);
@@ -1554,6 +1584,7 @@ fn apply_rewrites_full(
                     default_type,
                     server_port,
                     &mut matched,
+                    if_loc,
                 ) {
                     return (out, vars);
                 }
@@ -1601,6 +1632,7 @@ fn run_if(
     // condition was false" from "the condition held but produced no terminal
     // outcome", and `proxy_pass` inside `if` needs that difference.
     matched: &mut bool,
+    if_loc: Option<&LocCfg>,
 ) -> Option<RewriteOutcome> {
     let cond = {
         let ctx = RwVars {
@@ -1609,6 +1641,7 @@ fn run_if(
             query: args,
             vars,
             server_port,
+            loc: if_loc,
         };
         eval_cond(&ifb.cond, &ctx)
     };
@@ -1623,6 +1656,7 @@ fn run_if(
             query: args,
             vars,
             server_port,
+            loc: if_loc,
         };
         let expanded = expand_vars(value, &ctx);
         vars.insert(name.trim_start_matches('$').to_string(), expanded);
@@ -1886,6 +1920,7 @@ fn expand_replacement(
         query,
         vars,
         server_port,
+        loc: None,
     };
     let mut out = String::with_capacity(tmpl.len());
     let b = tmpl.as_bytes();
@@ -3168,6 +3203,7 @@ pub fn resolve_target<'a>(
             &mut if_proxy_seen,
             &mut proxy_override_missing,
             &secure_link_seed(cur_loc, req),
+            Some(cur_loc),
         );
         vars.extend(phase_vars);
         // The location loop starts each pass with an empty map, so the secure
@@ -5518,6 +5554,12 @@ fn try_files_action(req: &Request, path: &str, loc: &LocCfg) -> Option<TryFilesA
         };
 
         let fs_path = static_file::map_path(&uri, loc);
+        // `disable_symlinks` refuses the open, and try_files moves on to the
+        // next candidate -- `/try_on/try` is such a case: the symlink is
+        // rejected and `$uri.html` answers.
+        if static_file::symlinks_disallowed(&fs_path, loc, &loc.root) {
+            continue;
+        }
         let meta = std::fs::metadata(&fs_path).ok();
         match (meta, want_dir) {
             (Some(m), true) if m.is_dir() => return Some(TryFilesAction::Serve(uri)),

@@ -13,7 +13,7 @@
 
 | 项 | 命令 | 当前结果 |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 102 文件，WORSE=0 TRUNC=0（nginx 1622 / ngxrs 1627 断言） |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 104 文件，WORSE=0 TRUNC=0（nginx 1650 / ngxrs 1655 断言） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
 | 单元测试 | `cargo test --release` | **PASS** — 156 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
@@ -342,9 +342,55 @@ nginx 数的是「解析后仍然存活的分段」，现在由解析器自己�
 仍未对齐：`range_charset.t` 4 条（`charset`/`source_charset` 重编码后的 Range —— 偏移量
 必须落在重编码后的字节上，现在是先切片再重编码）。
 
+## 一之九、2026-10-27 第八轮：stream `geo`/`map`、`disable_symlinks`
+
+### stream `geo` / `map`（`stream_geo.t` 2/21 → 21/21，`stream_map.t` 2/7 → 7/7）
+
+`stream {}` 里的 `geo` 和 `map` 此前是「接受但忽略」，`return` 也只认 `$ssl_*`。
+现在两者都是 `stream` 的变量，与 http 的同名块互不相干（`ngx_stream_geo_module`
+注册自己的变量表）。
+
+三个只有对照源码才拿得到的细节：
+
+1. **无法解析的源地址按 `INADDR_NONE` 查表**。`ngx_stream_geo_addr` 解析失败时
+   返回 `NGX_ERROR`，调用方随即用 `INADDR_NONE`（`255.255.255.255`）查树 ——
+   也就是落到**最不具体的那条**（`0.0.0.0/0`），而不是 `default`。
+   `stream_geo.t` 的 `geo world`（`$var` 映射不到任何端口 → 空串）必须答 `world`。
+2. **`ranges` 模式是「后插入者覆盖重叠段」**，nginx 的 `ngx_http_geo_add_range`
+   把已有区间切成左右两段再把新值放进中间。所以 `geo_insert*` 三条都取**最后**
+   声明的值 —— 原来按「最窄区间胜出」实现，碰巧在这几条上结果相同，但不是同一语义。
+3. **`listen` 在 stream server 里可以重复**，每条开一个 socket。原来只保留最后一个，
+   于是 `stream_map.t` 里四条 `listen` 只剩一条，客户端连不上，整个文件崩在第三条断言。
+
+`map` 的正则捕获（`~(...) $1;`、`~(?P<ncap>...) $ncap;`）也补齐了。
+
+### `disable_symlinks`（`http_disable_symlinks.t` 14/28 → 29/30）
+
+按 `ngx_open_file` 的 walk 实现：从 `from` 前缀（缺省 `/`）开始，逐段用 `lstat`
+判断；`on` 遇到任何符号链接即 ELOOP（→ 403），`if_not_owner` 只拒绝
+「链接与目标 owner 不同」的那些。三处调用点都要生效：
+
+- 静态文件（403）；
+- `try_files`（该候选**失败并继续下一个** —— `/try_on/try` 因此落到 `$uri.html`）；
+- `if (-f $request_filename)`（该测试为假，于是落到静态处理器再答 403）。
+
+`from=` 的判定照 `ngx_http_core_set_disable_symlinks`：前缀必须真的出现在路径里、
+`from.len == path.len` 时检查**整个关闭**、`path[from.len]` 或 `path[from.len-1]`
+必须是 `/`。`$document_root` 取**展开后的** root/alias（`r->doc_root` 是
+`ngx_http_map_uri_to_path` 里赋的值），这正是 `"from=" exact match` 那条的成因：
+`alias /srv/$1` 展开后与文件名相等 → 关闭检查。
+
+顺带修了 `$request_filename` / `$document_root` 在 `if`/`set` 里**恒为空**
+（`RwVars::get_var` 直接返回 `String::new()`），否则 `if (-f $request_filename)`
+永远不成立。
+
+**仍未对齐（1 条）**：`"from=" exact match` 需要 `alias` 支持变量（`alias /srv/$1`）。
+我们的 `alias` 存的是配置期解析好的 `PathBuf`，没有模板。这条要动 `map_path` 的
+签名（4 个调用点）以及每个调用点的变量视图，本轮没做，因此这个文件**未进声明清单**。
+
 ## 二、声明的测试清单
 
-清单在 `bench/declared.txt`，**102 个文件**，选取规则是机械的：
+清单在 `bench/declared.txt`，**104 个文件**，选取规则是机械的：
 
 1. 落在范围内（**参考构建 `-V` 能编出来的模块**：http core + proxy/cache/gzip/
    TLS/HTTP2/realip/auth_request/slice/sub/secure_link/dav/stub_status/gzip_static/

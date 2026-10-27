@@ -54,9 +54,17 @@ impl GeoDef {
     }
 
     /// `1.2.3.0/24 value` or, in `ranges` mode, `1.2.3.4-1.2.3.9 value`.
+    ///
+    /// In `ranges` mode a later entry takes over the part it covers: nginx's
+    /// `ngx_http_geo_add_range` splits the existing interval into a left and a
+    /// right remainder and puts the new value in the middle. Subtracting first
+    /// and appending afterwards gives the same disjoint set, which is why
+    /// `geo_insert` / `geo_insert_before` / `geo_insert_after` in `geo.t` all
+    /// expect the *last* declared value.
     pub fn add(&mut self, key: &str, value: String) -> bool {
         if self.ranges {
             if let Some((s, e)) = parse_range(key) {
+                self.subtract(s.0, e.0, s.1);
                 self.ranges_v.push(Range {
                     start: s.0,
                     end: e.0,
@@ -80,41 +88,45 @@ impl GeoDef {
     /// against nginx 1.28 by `geo.t`'s "ranges delete" cases).
     pub fn delete(&mut self, key: &str) {
         if let Some((s, e)) = parse_range(key) {
-            let (ds, de, dv6) = (s.0, e.0, s.1);
-            if ds > de {
+            if s.0 > e.0 {
                 return;
             }
-            let mut out = Vec::with_capacity(self.ranges_v.len() + 2);
-            for r in self.ranges_v.drain(..) {
-                if r.v6 != dv6 || r.end < ds || r.start > de {
-                    out.push(r);
-                    continue;
-                }
-                // Left remainder.
-                if r.start < ds {
-                    out.push(Range {
-                        start: r.start,
-                        end: ds - 1,
-                        v6: r.v6,
-                        value: r.value.clone(),
-                    });
-                }
-                // Right remainder.
-                if r.end > de {
-                    out.push(Range {
-                        start: de + 1,
-                        end: r.end,
-                        v6: r.v6,
-                        value: r.value,
-                    });
-                }
-            }
-            self.ranges_v = out;
+            self.subtract(s.0, e.0, s.1);
             return;
         }
         if let Some((net, prefix)) = parse_cidr(key) {
             self.cidrs.retain(|c| !(c.net == net && c.prefix == prefix));
         }
+    }
+
+    /// Remove `[start, end]` from every overlapping interval, keeping the
+    /// remainders. Shared by `add` (which then appends the new value) and
+    /// `delete`.
+    fn subtract(&mut self, start: u128, end: u128, v6: bool) {
+        let mut out = Vec::with_capacity(self.ranges_v.len() + 2);
+        for r in self.ranges_v.drain(..) {
+            if r.v6 != v6 || r.end < start || r.start > end {
+                out.push(r);
+                continue;
+            }
+            if r.start < start {
+                out.push(Range {
+                    start: r.start,
+                    end: start - 1,
+                    v6: r.v6,
+                    value: r.value.clone(),
+                });
+            }
+            if r.end > end {
+                out.push(Range {
+                    start: end + 1,
+                    end: r.end,
+                    v6: r.v6,
+                    value: r.value,
+                });
+            }
+        }
+        self.ranges_v = out;
     }
 
     /// `proxy <addr>`: mark a trusted proxy address.
@@ -168,24 +180,24 @@ impl GeoDef {
     }
 
     pub fn lookup(&self, addr: &str) -> Option<&str> {
-        let ip: IpAddr = addr.trim().parse().ok()?;
+        // A source that is not an address at all is looked up as `INADDR_NONE`
+        // (`ngx_stream_geo_addr` returns NGX_ERROR and the caller substitutes
+        // it). That lands on the least specific entry -- the `0.0.0.0/0` one,
+        // or `default` -- which is why `stream_geo.t` expects `world` when its
+        // `$var` source maps to nothing.
+        let ip: IpAddr = match addr.trim().parse() {
+            Ok(ip) => ip,
+            Err(_) => IpAddr::V4(std::net::Ipv4Addr::BROADCAST),
+        };
 
         if self.ranges {
             let (n, v6) = to_num(ip)?;
-            let mut best: Option<(u128, &str)> = None;
+            // The intervals are kept disjoint by `subtract`, so the first
+            // containing entry is the answer.
             for r in &self.ranges_v {
-                if r.v6 != v6 {
-                    continue;
+                if r.v6 == v6 && n >= r.start && n <= r.end {
+                    return Some(&r.value);
                 }
-                if n >= r.start && n <= r.end {
-                    let span = r.end - r.start;
-                    if best.map_or(true, |(b, _)| span < b) {
-                        best = Some((span, &r.value));
-                    }
-                }
-            }
-            if let Some((_, v)) = best {
-                return Some(v);
             }
             return self.default.as_deref();
         }
@@ -304,5 +316,36 @@ mod tests {
         assert_eq!(g.lookup("127.0.0.1"), Some("loopback"));
         assert_eq!(g.lookup("10.10.3.5"), Some("default"));
         assert_eq!(g.lookup("9.9.9.9"), Some("default"));
+    }
+
+    /// The `geo_insert*` cases from `geo.t`/`stream_geo.t`: a later range takes
+    /// over the part it covers, splitting the earlier one.
+    #[test]
+    fn ranges_insert_overrides_by_order() {
+        let mut g = GeoDef::new(Some("$arg_ip".into()), "v".into());
+        g.set_ranges();
+        g.set_default("default".into());
+        g.add("127.0.0.0-127.0.0.255", "test".into());
+        g.add("127.0.0.1-127.0.0.2", "test2".into());
+        g.add("127.0.0.1-127.0.0.1", "loopback".into());
+        assert_eq!(g.lookup("127.0.0.1"), Some("loopback"));
+        assert_eq!(g.lookup("127.0.0.2"), Some("test2"));
+        assert_eq!(g.lookup("127.0.0.0"), Some("test"));
+        assert_eq!(g.lookup("127.0.0.3"), Some("test"));
+
+        // Inserting before the existing start, then after it.
+        let mut b = GeoDef::new(None, "v".into());
+        b.set_ranges();
+        b.add("127.0.0.0-127.0.0.255", "test".into());
+        b.add("127.0.0.0-127.0.0.1", "loopback".into());
+        assert_eq!(b.lookup("127.0.0.1"), Some("loopback"));
+        assert_eq!(b.lookup("127.0.0.2"), Some("test"));
+
+        let mut a = GeoDef::new(None, "v".into());
+        a.set_ranges();
+        a.add("127.0.0.0-127.0.0.255", "test".into());
+        a.add("127.0.0.1-127.0.0.255", "loopback".into());
+        assert_eq!(a.lookup("127.0.0.1"), Some("loopback"));
+        assert_eq!(a.lookup("127.0.0.0"), Some("test"));
     }
 }

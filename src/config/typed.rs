@@ -19,6 +19,14 @@ pub enum ClientBodyFileOnly {
 
 pub const DEFAULT_CLIENT_MAX_BODY: u64 = 1024 * 1024;
 
+/// `disable_symlinks`: whether a symlink in the path is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Symlinks {
+    Off,
+    On,
+    IfNotOwner,
+}
+
 /// `autoindex_format`: which body `autoindex on` produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoindexFormat {
@@ -252,6 +260,11 @@ pub struct LocCfg {
     /// `min_delete_depth`: how many path segments a DELETE URI needs before it
     /// is allowed (nginx default 0 = no check).
     pub dav_min_delete_depth: u32,
+    /// `disable_symlinks on|if_not_owner [from=part]`.
+    pub disable_symlinks: Symlinks,
+    /// The `from=` part of `disable_symlinks`, kept as written so
+    /// `$document_root` still expands per request.
+    pub disable_symlinks_from: Option<String>,
     /// `resolver <addr>`: consulted for hosts that only appear at request time.
     /// nginx allows this in http, server and location, with the innermost
     /// winning; each directive instance has its own cache.
@@ -453,6 +466,8 @@ impl LocCfg {
             dav_access: 0o600,
             dav_create_full_put_path: false,
             dav_min_delete_depth: 0,
+            disable_symlinks: Symlinks::Off,
+            disable_symlinks_from: None,
             resolver: None,
             resolver_timeout: None,
             secure_link_set: false,
@@ -1432,6 +1447,12 @@ pub struct Config {
 pub struct StreamSection {
     pub servers: Vec<StreamServerCfg>,
     pub upstreams: Vec<StreamUpstream>,
+    /// `geo` blocks in `stream {}` context. They are a separate namespace from
+    /// the http ones: `ngx_stream_geo_module` registers its own variables, and
+    /// a name may exist in both sections with different meanings.
+    pub geos: Vec<crate::geo::GeoDef>,
+    /// `map` blocks in `stream {}` context, likewise separate from http.
+    pub maps: Vec<crate::mapping::MapDef>,
 }
 
 #[derive(Debug, Clone)]
@@ -3294,6 +3315,33 @@ impl Builder {
                     });
                 }
             }
+            "disable_symlinks" => {
+                let mut mode = None;
+                let mut from = None;
+                for (i, a) in d.args.iter().enumerate() {
+                    if let Some(v) = a.strip_prefix("from=") {
+                        from = Some(v.to_string());
+                    } else if i == 0 {
+                        mode = Some(match a.as_str() {
+                            "off" => Symlinks::Off,
+                            "on" => Symlinks::On,
+                            "if_not_owner" => Symlinks::IfNotOwner,
+                            _ => {
+                                return Err(sem(
+                                    &d.file,
+                                    d.line,
+                                    format!("invalid disable_symlinks value \"{a}\""),
+                                ))
+                            }
+                        });
+                    }
+                }
+                let mode = mode.ok_or_else(|| {
+                    sem(&d.file, d.line, "disable_symlinks requires on|off|if_not_owner")
+                })?;
+                cfg.disable_symlinks = mode;
+                cfg.disable_symlinks_from = from;
+            }
             "resolver" => {
                 // nginx allows `resolver` in http, server and location; the
                 // instance is per directive, and its cache belongs to it.
@@ -4327,6 +4375,80 @@ impl Builder {
 }
 
 /// Parse the `stream {}` block: upstreams first, then listeners.
+/// A `geo [$source] $result { ... }` block, shared by `http` and `stream`.
+///
+/// `include` inside the block is expanded before this runs, so an included file
+/// contributes ordinary `key value;` directives.
+fn parse_geo(d: &Directive) -> Result<crate::geo::GeoDef, ConfigError> {
+    let (source, var) = match d.args.as_slice() {
+        [v] => (None, v.trim_start_matches('$').to_string()),
+        [src, v] => (Some(src.clone()), v.trim_start_matches('$').to_string()),
+        _ => return Err(sem(&d.file, d.line, "geo needs $variable")),
+    };
+    let mut def = crate::geo::GeoDef::new(source, var);
+    for c in d.block.as_deref().unwrap_or(&[]) {
+        match c.name.as_str() {
+            "ranges" => def.set_ranges(),
+            "proxy_recursive" => def.proxy_recursive = true,
+            "proxy" => {
+                if let Some(v) = c.args.first() {
+                    def.add_proxy(v);
+                }
+            }
+            "default" => {
+                if let Some(v) = c.args.first() {
+                    def.set_default(v.clone());
+                }
+            }
+            "delete" => {
+                if let Some(v) = c.args.first() {
+                    def.delete(v);
+                }
+            }
+            key => {
+                if let Some(v) = c.args.first() {
+                    def.add(key, v.clone());
+                }
+            }
+        }
+    }
+    Ok(def)
+}
+
+/// A `map $source $result { ... }` block, shared by `http` and `stream`.
+fn parse_map(d: &Directive) -> Result<crate::mapping::MapDef, ConfigError> {
+    if d.args.len() < 2 {
+        return Err(sem(&d.file, d.line, "map needs $source and $result"));
+    }
+    let mut def = crate::mapping::MapDef {
+        source: d.args[0].clone(),
+        var: d.args[1].trim_start_matches('$').to_string(),
+        hostnames: false,
+        volatile: false,
+        default: None,
+        entries: Vec::new(),
+    };
+    for c in d.block.as_deref().unwrap_or(&[]) {
+        match c.name.as_str() {
+            "hostnames" => def.hostnames = true,
+            "volatile" => def.volatile = true,
+            "default" => def.default = c.args.first().cloned(),
+            _ => {
+                // `key value;` -- the lexer already unescaped `\k`.
+                if let Some(v) = c.args.first() {
+                    // `\include` escapes a directive-looking key.
+                    let key = c.name.strip_prefix('\\').unwrap_or(&c.name).to_string();
+                    def.entries.push(crate::mapping::Entry {
+                        key,
+                        value: v.clone(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(def)
+}
+
 /// `ssl_verify_client off|on|optional|optional_no_ca` in stream context.
 fn verify_client_mode(d: &Directive) -> Result<u8, ConfigError> {
     match d.args.first().map(|s| s.as_str()) {
@@ -4391,9 +4513,9 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                 section.upstreams.push(StreamUpstream { name, backends });
             }
             "server" => server_dirs.push(d),
+            "geo" => section.geos.push(parse_geo(d)?),
+            "map" => section.maps.push(parse_map(d)?),
             "resolver"
-            | "map"
-            | "geo"
             | "split_clients"
             | "limit_conn_zone"
             | "limit_req_zone"
@@ -4524,19 +4646,22 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             listen_proxy_protocol: false,
         };
         let mut have_listen = false;
+        let mut listens: Vec<SocketAddr> = Vec::new();
         for child in sd.block.as_ref().map(|x| x.as_slice()).unwrap_or(&[]) {
             match child.name.as_str() {
                 "listen" => {
                     let a = child.args.first().ok_or_else(|| {
                         sem(&child.file, child.line, "listen requires an address")
                     })?;
-                    cfg.listen = parse_listen(a).ok_or_else(|| {
+                    let addr = parse_listen(a).ok_or_else(|| {
                         sem(
                             &child.file,
                             child.line,
                             format!("invalid listen address \"{a}\""),
                         )
                     })?;
+                    cfg.listen = addr;
+                    listens.push(addr);
                     if child.args[1..].iter().any(|p| p == "udp") {
                         cfg.udp = true;
                     }
@@ -4701,7 +4826,19 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
         if !per_server_proxy_timeout {
             cfg.proxy_timeout = stream_proxy_timeout;
         }
-        section.servers.push(cfg);
+        // `listen` is repeatable in a stream server, and nginx opens one socket
+        // per directive. Collapsing them to one address dropped every listener
+        // but the last, which is what `stream_map.t` (four `listen` lines in one
+        // server) ran into.
+        if listens.is_empty() {
+            section.servers.push(cfg);
+        } else {
+            for addr in listens {
+                let mut c = cfg.clone();
+                c.listen = addr;
+                section.servers.push(c);
+            }
+        }
     }
     Ok(section)
 }
@@ -4871,75 +5008,8 @@ pub fn build(
     for d in &http_roots {
         match d.name.as_str() {
             "server" => server_dirs.push(d.clone()),
-            "geo" => {
-                // geo [$source] $result { ... }
-                let (source, var) = match d.args.as_slice() {
-                    [v] => (None, v.trim_start_matches('$').to_string()),
-                    [src, v] => (Some(src.clone()), v.trim_start_matches('$').to_string()),
-                    _ => return Err(sem(&d.file, d.line, "geo needs $variable")),
-                };
-                let mut def = crate::geo::GeoDef::new(source, var);
-                for c in d.block.as_deref().unwrap_or(&[]) {
-                    match c.name.as_str() {
-                        "ranges" => def.set_ranges(),
-                        "proxy_recursive" => def.proxy_recursive = true,
-                        "proxy" => {
-                            if let Some(v) = c.args.first() {
-                                def.add_proxy(v);
-                            }
-                        }
-                        "default" => {
-                            if let Some(v) = c.args.first() {
-                                def.set_default(v.clone());
-                            }
-                        }
-                        "delete" => {
-                            if let Some(v) = c.args.first() {
-                                def.delete(v);
-                            }
-                        }
-                        key => {
-                            if let Some(v) = c.args.first() {
-                                def.add(key, v.clone());
-                            }
-                        }
-                    }
-                }
-                http.geos.push(def);
-            }
-            "map" => {
-                // map $source $result { ... }
-                if d.args.len() < 2 {
-                    return Err(sem(&d.file, d.line, "map needs $source and $result"));
-                }
-                let mut def = crate::mapping::MapDef {
-                    source: d.args[0].clone(),
-                    var: d.args[1].trim_start_matches('$').to_string(),
-                    hostnames: false,
-                    volatile: false,
-                    default: None,
-                    entries: Vec::new(),
-                };
-                for c in d.block.as_deref().unwrap_or(&[]) {
-                    match c.name.as_str() {
-                        "hostnames" => def.hostnames = true,
-                        "volatile" => def.volatile = true,
-                        "default" => def.default = c.args.first().cloned(),
-                        _ => {
-                            // `key value;` — the lexer already unescaped `\k`.
-                            if let Some(v) = c.args.first() {
-                                // `\include` escapes a directive-looking key.
-                                let key = c.name.strip_prefix('\\').unwrap_or(&c.name).to_string();
-                                def.entries.push(crate::mapping::Entry {
-                                    key,
-                                    value: v.clone(),
-                                });
-                            }
-                        }
-                    }
-                }
-                http.maps.push(def);
-            }
+            "geo" => http.geos.push(parse_geo(d)?),
+            "map" => http.maps.push(parse_map(d)?),
             "split_clients" => {
                 // split_clients $source $result { 51.2% .one; * .other; }
                 if d.args.len() < 2 {

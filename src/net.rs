@@ -258,6 +258,8 @@ pub fn serve(cfg: Config) -> io::Result<()> {
     let mut stream_cfg = crate::stream::StreamConfig {
         servers: Vec::new(),
     };
+    let stream_geos = std::sync::Arc::new(cfg.stream.geos.clone());
+    let stream_maps = std::sync::Arc::new(cfg.stream.maps.clone());
     for sc in &cfg.stream.servers {
         let mut backends = Vec::new();
         if let Some(pp) = &sc.proxy_pass {
@@ -290,6 +292,8 @@ pub fn serve(cfg: Config) -> io::Result<()> {
             access_logs: sc.access_logs.clone(),
             logger: ctx.logger.clone(),
             proxy_protocol: sc.proxy_protocol,
+            geos: stream_geos.clone(),
+            maps: stream_maps.clone(),
         });
     }
     let stream_cfg = Arc::new(stream_cfg);

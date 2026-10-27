@@ -66,6 +66,20 @@ fn small_content(req: &Request, loc: &LocCfg) -> Option<Response> {
     None
 }
 
+/// The directory `$document_root` names for this request: the configured
+/// `root`, or the `alias` itself -- both *without* the URI remainder.
+///
+/// nginx sets `r->doc_root` inside `ngx_http_map_uri_to_path`, so for a regex
+/// location with `alias /srv/$1` it is the *expanded* alias. That is why
+/// `disable_symlinks on from=$document_root` stops checking exactly where the
+/// alias ends (`http_disable_symlinks.t`, `"from=" exact match`).
+pub fn document_root_of(loc: &LocCfg) -> PathBuf {
+    match &loc.alias {
+        Some(alias) => alias.clone(),
+        None => loc.root.clone(),
+    }
+}
+
 pub fn map_path(uri: &str, loc: &LocCfg) -> PathBuf {
     match &loc.alias {
         Some(alias) => {
@@ -121,6 +135,12 @@ pub fn respond_fs_indexed(
         crate::http::Method::Get | crate::http::Method::Head | crate::http::Method::Post
     ) {
         return Ok(Response::empty(405));
+    }
+
+    // `disable_symlinks` refuses before the open: nginx's walk with `O_NOFOLLOW`
+    // fails with ELOOP, which the static handler reports as 403.
+    if symlinks_disallowed(fs_path, loc, &document_root_of(loc)) {
+        return Ok(Response::empty(403));
     }
 
     // Open first, then fstat: one syscall less than statx+open, and no TOCTOU
@@ -1154,4 +1174,82 @@ mod tests {
         assert!(etag_list_matches("W/\"a-1\"", "\"a-1\""));
         assert!(!etag_list_matches("\"a-1\"", "\"b-2\""));
     }
+}
+
+// ---- disable_symlinks -----------------------------------------------------
+
+/// `disable_symlinks on|if_not_owner [from=part]`.
+///
+/// nginx opens the path one component at a time from the `from` prefix (or from
+/// `/`) with `O_NOFOLLOW`, so a single symlink anywhere in the checked suffix is
+/// ELOOP -- which the static handler reports as 403. `if_not_owner` allows a
+/// symlink whose target has the same owner as the link itself
+/// (`ngx_openat_file_owner`).
+pub fn symlinks_disallowed(path: &Path, loc: &LocCfg, document_root: &Path) -> bool {
+    if loc.disable_symlinks == crate::config::Symlinks::Off {
+        return false;
+    }
+    let full = path.to_string_lossy();
+    let start = match &loc.disable_symlinks_from {
+        None => 1,
+        Some(from) => {
+            let from = if from == "$document_root" {
+                document_root.to_string_lossy().to_string()
+            } else {
+                from.clone()
+            };
+            let from = from.trim_end_matches('/');
+            if from.is_empty() || !full.starts_with(from) {
+                // nginx leaves `disable_symlinks` at its configured value but
+                // with no `from`, which means the whole path is checked.
+                1
+            } else if from.len() == full.len() {
+                // `from` is the file itself: checks are off entirely.
+                return false;
+            } else if full.as_bytes().get(from.len()) == Some(&b'/') {
+                from.len() + 1
+            } else if full.as_bytes().get(from.len().wrapping_sub(1)) == Some(&b'/') {
+                from.len()
+            } else {
+                1
+            }
+        }
+    };
+    let bytes = full.as_bytes();
+    let mut i = start;
+    while i <= bytes.len() {
+        let end = bytes[i..]
+            .iter()
+            .position(|b| *b == b'/')
+            .map(|p| i + p)
+            .unwrap_or(bytes.len());
+        let component = &full[i.min(full.len())..end];
+        if !component.is_empty() && component != "." && component != ".." {
+            let mut cur = PathBuf::from(&full[..end]);
+            // `symlink_metadata` is lstat: this asks about the component itself,
+            // not what it points at.
+            if let Ok(link) = std::fs::symlink_metadata(&cur) {
+                if link.file_type().is_symlink() {
+                    match loc.disable_symlinks {
+                        crate::config::Symlinks::On => return true,
+                        crate::config::Symlinks::IfNotOwner => {
+                            use std::os::unix::fs::MetadataExt;
+                            match std::fs::metadata(&cur) {
+                                Ok(target) if target.uid() == link.uid() => {}
+                                // Same owner (or the target vanished) allows it.
+                                _ => return true,
+                            }
+                        }
+                        crate::config::Symlinks::Off => {}
+                    }
+                }
+            }
+            cur.clear();
+        }
+        if end >= bytes.len() {
+            break;
+        }
+        i = end + 1;
+    }
+    false
 }

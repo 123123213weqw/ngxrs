@@ -52,6 +52,47 @@ impl MapDef {
         self.default.as_deref()
     }
 
+    /// Like [`MapDef::lookup`], but also returns the regex captures so a value
+    /// template using `$1` or `$name` can be expanded.
+    ///
+    /// nginx compiles the value as a script whose capture references are the
+    /// map's own (`ngx_http_map_module`'s `ngx_http_map_regex`), which is what
+    /// `stream_map.t` checks with `~(...)  $1;` and `~(?P<ncap>...)  $ncap;`.
+    pub fn lookup_with_captures(
+        &self,
+        input: &str,
+    ) -> Option<(&str, Vec<(String, String)>)> {
+        if self.hostnames {
+            let v = self.lookup_hostnames(input)?;
+            return Some((v, Vec::new()));
+        }
+        for e in &self.entries {
+            if e.key.starts_with('~') {
+                continue;
+            }
+            if e.key == input {
+                return Some((&e.value, Vec::new()));
+            }
+        }
+        for e in &self.entries {
+            if let Some(re) = compile_regex(&e.key) {
+                if let Some(caps) = re.captures(input) {
+                    let mut out = Vec::new();
+                    for (i, name) in re.capture_names().enumerate() {
+                        let Some(m) = caps.get(i) else { continue };
+                        if let Some(n) = name {
+                            out.push((n.to_string(), m.as_str().to_string()));
+                        }
+                        // Numeric names as nginx spells them: `$1`..
+                        out.push((i.to_string(), m.as_str().to_string()));
+                    }
+                    return Some((&e.value, out));
+                }
+            }
+        }
+        self.default.as_deref().map(|d| (d, Vec::new()))
+    }
+
     fn lookup_hostnames(&self, input: &str) -> Option<&str> {
         let needle = normalize_host(input);
 

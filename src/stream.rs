@@ -49,6 +49,10 @@ pub struct StreamServer {
     pub logger: std::sync::Arc<crate::log::Logger>,
     /// `proxy_protocol on`: prefix the upstream connection with a PROXY header.
     pub proxy_protocol: bool,
+    /// `geo` / `map` blocks from `stream {}`. Shared rather than copied: they are
+    /// read-only and evaluated per connection.
+    pub geos: std::sync::Arc<Vec<crate::geo::GeoDef>>,
+    pub maps: std::sync::Arc<Vec<crate::mapping::MapDef>>,
 }
 
 pub struct StreamConfig {
@@ -170,6 +174,8 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                 let reuse = server.proxy_ssl_session_reuse;
                 let sni = server.proxy_ssl_name.clone();
                 let write_pp = server.proxy_protocol;
+                let geos = server.geos.clone();
+                let maps = server.maps.clone();
                 let verify_mode = server.client_verify;
                 let client_ca = server.client_ca.clone();
                 let trusted_ca = server.trusted_ca.clone();
@@ -178,6 +184,9 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                 tokio::spawn(async move {
                     // `return <text>` answers without touching an upstream.
                     if let Some(text) = return_text {
+                        let local_addr = client
+                            .local_addr()
+                            .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
                         answer_stream_return(
                             client,
                             tls,
@@ -186,6 +195,7 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                             &client_ca,
                             &trusted_ca,
                             alog.as_mut(),
+                            &base_vars(peer, local_addr, &maps, &geos),
                         )
                         .await;
                         drop(alog);
@@ -448,6 +458,23 @@ impl Drop for StreamAccessLog {
     }
 }
 
+/// A `Vars` with no TLS facts yet: the handshake, when there is one, fills them.
+fn base_vars<'a>(
+    peer: SocketAddr,
+    local: SocketAddr,
+    maps: &'a [crate::mapping::MapDef],
+    geos: &'a [crate::geo::GeoDef],
+) -> crate::streamvars::Vars<'a> {
+    crate::streamvars::Vars {
+        peer,
+        local,
+        udp: false,
+        maps,
+        geos,
+        ssl: None,
+    }
+}
+
 async fn answer_stream_return(
     mut client: TcpStream,
     tls: Option<std::sync::Arc<rustls::ServerConfig>>,
@@ -456,6 +483,7 @@ async fn answer_stream_return(
     client_ca: &Option<std::path::PathBuf>,
     trusted_ca: &Option<std::path::PathBuf>,
     log: Option<&mut StreamAccessLog>,
+    base: &crate::streamvars::Vars<'_>,
 ) {
     let reused = match tls {
         Some(sc) => {
@@ -469,7 +497,16 @@ async fn answer_stream_return(
                     );
                     let (verify, cert) =
                         client_cert_vars(t.get_ref().1, verify_mode, client_ca, trusted_ca);
-                    let body = expand(text, r, &verify, &cert);
+                    let mut v = crate::streamvars::Vars {
+                        peer: base.peer,
+                        local: base.local,
+                        udp: base.udp,
+                        maps: base.maps,
+                        geos: base.geos,
+                        ssl: Some((&verify, &cert, r)),
+                    };
+                    let body = v.expand(text);
+                    let _ = &mut v;
                     let _ = t.write_all(body.as_bytes()).await;
                     let _ = t.flush().await;
                     let _ = t.shutdown().await;
@@ -489,18 +526,12 @@ async fn answer_stream_return(
             // A `return` in a non-ssl stream server sees no TLS facts at all,
             // which is why `$ssl_client_verify:$ssl_client_cert` renders as
             // `:` there.
-            let body = expand(text, false, "", "");
+            let body = base.expand(text);
             let _ = client.write_all(body.as_bytes()).await;
             let _ = client.shutdown().await;
             return;
         }
     };
-}
-
-fn expand(text: &str, reused: bool, verify: &str, cert: &str) -> String {
-    text.replace("$ssl_session_reused", if reused { "r" } else { "." })
-        .replace("$ssl_client_verify", verify)
-        .replace("$ssl_client_cert", cert)
 }
 
 /// `$ssl_client_verify` and `$ssl_client_cert` for a stream connection.

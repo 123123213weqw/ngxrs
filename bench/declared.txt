@@ -53,6 +53,12 @@ realip_remote_port.t
 # variables in it.
 rewrite_if.t
 
+# ---- stream geo / map ----
+# `geo` (CIDR and `ranges`, `default`, `delete`, `include`) and `map` in
+# `stream {}` context, plus repeated `listen` in one stream server.
+stream_geo.t
+stream_map.t
+
 # ---- resolver ----
 # A + AAAA in parallel, CNAME following with nginx's `process_a` state machine,
 # TTL/`valid=` caching, per-name server rotation, resend, and TCP fallback on a

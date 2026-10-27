@@ -1,0 +1,244 @@
+//! Stream variables, for `return` (and anything else that needs `$name`).
+//!
+//! `ngx_stream_*_module` registers variables the same way the http modules do,
+//! with one namespace per section: a `geo` block in `stream {}` creates stream
+//! variables, and the http ones are invisible here. Two things follow, and both
+//! are asserted by `stream_geo.t`:
+//!
+//!   * a `geo` source may itself be a variable (`geo $var $geo_from_var`), so
+//!     resolution recurses -- `map` first, then `geo`, then the connection;
+//!   * a source that is not an address at all (`$var` = `loopback`) makes the
+//!     lookup fall through to `geo`'s `default`, rather than erroring.
+
+use std::net::SocketAddr;
+
+use crate::geo::GeoDef;
+use crate::mapping::MapDef;
+
+/// Everything a stream variable may read.
+pub struct Vars<'a> {
+    pub peer: SocketAddr,
+    pub local: SocketAddr,
+    /// `proxy` addressed this server? nginx reports `PROXY` for a connection
+    /// that carried a header, `TCP`/`UDP` otherwise.
+    pub udp: bool,
+    pub maps: &'a [MapDef],
+    pub geos: &'a [GeoDef],
+    pub ssl: Option<(&'a str, &'a str, bool)>, // (verify, cert, reused)
+}
+
+impl Vars<'_> {
+    /// Resolve one variable name (without the `$`). `None` means "no such
+    /// variable", which renders as the empty string.
+    pub fn get(&self, name: &str) -> Option<String> {
+        Some(match name {
+            "remote_addr" => self.peer.ip().to_string(),
+            "remote_port" => self.peer.port().to_string(),
+            "server_addr" => self.local.ip().to_string(),
+            "server_port" => self.local.port().to_string(),
+            "binary_remote_addr" => binary_addr(&self.peer),
+            "protocol" => {
+                if self.udp {
+                    "UDP".to_string()
+                } else {
+                    "TCP".to_string()
+                }
+            }
+            "status" => "200".to_string(),
+            "bytes_sent" | "bytes_received" => "0".to_string(),
+            "session_time" => "0.000".to_string(),
+            "connection" | "connection_requests" => "1".to_string(),
+            "ssl_session_reused" => match self.ssl {
+                Some((_, _, true)) => "r".to_string(),
+                Some(_) => ".".to_string(),
+                // No TLS at all: the variable does not exist.
+                None => return None,
+            },
+            "ssl_client_verify" => self.ssl.map(|(v, _, _)| v.to_string())?,
+            "ssl_client_cert" => self.ssl.map(|(_, c, _)| c.to_string())?,
+            _ => {
+                if let Some(m) = self.maps.iter().find(|m| m.var == name) {
+                    return Some(self.eval_map(m));
+                }
+                if let Some(g) = self.geos.iter().find(|g| g.var == name) {
+                    return Some(self.eval_geo(g));
+                }
+                return None;
+            }
+        })
+    }
+
+    fn eval_map(&self, m: &MapDef) -> String {
+        let input = self.expand(&m.source);
+        match m.lookup_with_captures(&input) {
+            Some((value, caps)) => self.expand_with(value, &caps),
+            None => String::new(),
+        }
+    }
+
+    fn eval_geo(&self, g: &GeoDef) -> String {
+        // `geo` with no source reads `$remote_addr`; with one, that variable.
+        let addr = match &g.source {
+            Some(src) => self.expand(src),
+            None => self.peer.ip().to_string(),
+        };
+        g.lookup(&addr)
+            .map(|v| v.to_string())
+            .or_else(|| g.default.clone())
+            .unwrap_or_default()
+    }
+
+    /// Expand every `$name` in `text`.
+    ///
+    /// A single pass, so a value that itself contains `$` is never re-expanded
+    /// -- nginx compiles these at config time and does the same.
+    pub fn expand(&self, text: &str) -> String {
+        self.expand_with(text, &[])
+    }
+
+    /// Expand with a capture table in scope, which is how a `map` value
+    /// template reaches `$1` / `$ncap`.
+    pub fn expand_with(&self, text: &str, caps: &[(String, String)]) -> String {
+        if !text.contains('$') {
+            return text.to_string();
+        }
+        let mut out = String::with_capacity(text.len() + 16);
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != b'$' {
+                let start = i;
+                while i < bytes.len() && bytes[i] != b'$' {
+                    i += 1;
+                }
+                // Slice, not byte-push: a UTF-8 literal must stay byte-identical.
+                out.push_str(&text[start..i]);
+                continue;
+            }
+            i += 1;
+            if i < bytes.len() && bytes[i] == b'{' {
+                let close = text[i..].find('}').map(|p| i + p);
+                if let Some(end) = close {
+                    let name = &text[i + 1..end];
+                    out.push_str(&self.resolve(name, caps).unwrap_or_default());
+                    i = end + 1;
+                    continue;
+                }
+            }
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            if start == i {
+                // A lone `$`: nginx keeps it.
+                out.push('$');
+                continue;
+            }
+            out.push_str(&self.resolve(&text[start..i], caps).unwrap_or_default());
+        }
+        out
+    }
+}
+
+impl Vars<'_> {
+    /// A name in scope: the capture table first (a `map`'s `$1` shadows
+    /// nothing, because nginx keeps captures in a separate array), then the
+    /// ordinary variables.
+    fn resolve(&self, name: &str, caps: &[(String, String)]) -> Option<String> {
+        if let Some((_, v)) = caps.iter().find(|(k, _)| k == name) {
+            return Some(v.clone());
+        }
+        self.get(name)
+    }
+}
+
+/// `$binary_remote_addr`: the packed address as raw bytes.
+fn binary_addr(a: &SocketAddr) -> String {
+    match a.ip() {
+        std::net::IpAddr::V4(v) => v
+            .octets()
+            .iter()
+            .map(|b| (*b as char).to_string())
+            .collect(),
+        std::net::IpAddr::V6(v) => v
+            .octets()
+            .iter()
+            .map(|b| (*b as char).to_string())
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vars<'a>(maps: &'a [MapDef], geos: &'a [GeoDef]) -> Vars<'a> {
+        Vars {
+            peer: "127.0.0.1:5000".parse().unwrap(),
+            local: "127.0.0.1:8080".parse().unwrap(),
+            udp: false,
+            maps,
+            geos,
+            ssl: None,
+        }
+    }
+
+    #[test]
+    fn connection_variables() {
+        let (maps, geos) = (Vec::new(), Vec::new());
+        let v = vars(&maps, &geos);
+        assert_eq!(v.expand("$remote_addr"), "127.0.0.1");
+        assert_eq!(v.expand("$server_port"), "8080");
+        assert_eq!(v.expand("a${remote_port}b"), "a5000b");
+        // An unknown name is the empty string, not a literal.
+        assert_eq!(v.expand("x$nope.y"), "x.y");
+        // No `$` at all: returned untouched, byte for byte.
+        assert_eq!(v.expand("模様"), "模様");
+    }
+
+    #[test]
+    fn map_then_geo() {
+        // `map $server_port $var { ... }` feeding `geo $var $g`.
+        let mut m = MapDef {
+            source: "$server_port".into(),
+            var: "var".into(),
+            hostnames: false,
+            volatile: false,
+            default: None,
+            entries: Vec::new(),
+        };
+        m.entries.push(crate::mapping::Entry {
+            key: "8080".into(),
+            value: "192.0.2.1".into(),
+        });
+        let mut g = GeoDef::new(Some("$var".into()), "g".into());
+        g.set_default("default".into());
+        g.add("192.0.2.0/24", "test".into());
+        g.add("127.0.0.0/8", "loopback".into());
+        let (maps, geos) = (vec![m], vec![g]);
+        let v = vars(&maps, &geos);
+        assert_eq!(v.expand("$var"), "192.0.2.1");
+        assert_eq!(v.expand("$g"), "test");
+    }
+
+    #[test]
+    fn a_non_address_source_falls_through_to_default() {
+        let mut m = MapDef {
+            source: "$server_port".into(),
+            var: "var".into(),
+            hostnames: false,
+            volatile: false,
+            default: None,
+            entries: Vec::new(),
+        };
+        m.entries.push(crate::mapping::Entry {
+            key: "8080".into(),
+            value: "loopback".into(),
+        });
+        let mut g = GeoDef::new(Some("$var".into()), "g".into());
+        g.set_default("default".into());
+        g.add("127.0.0.0/8", "loopback".into());
+        let (maps, geos) = (vec![m], vec![g]);
+        assert_eq!(vars(&maps, &geos).expand("$g"), "default");
+    }
+}

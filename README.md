@@ -41,6 +41,7 @@ python3 tests/parity.py         # 差分测试：同一请求分别打 nginx / n
 - **其它**：`gzip`、`add_header`/`add_trailer`（含 `$sent_http_*`、`$sent_trailer_*`）、`expires`、`access_log`、`allow`/`deny`/`limit_except`、`limit_req`/`limit_conn`、`map`、`geo`
 - **PROXY protocol**：`listen ... proxy_protocol`（v1 与 v2 二进制，含 TLV）、`$proxy_protocol_*`、`real_ip_header proxy_protocol`、`stream` 侧 `proxy_protocol on`
 - **realip**：`set_real_ip_from`（地址 / CIDR / 主机名 / `unix:`）、`real_ip_header`、`real_ip_recursive`。**peer 先受信才采信头**，`$remote_addr` 不可被任意客户端改写
+- **stream 变量**：`geo`（CIDR/`ranges`/`default`/`delete`/`include`）、`map`（含正则捕获）、重复 `listen`
 - **WebDAV**：`dav_methods PUT DELETE MKCOL COPY MOVE`、`dav_access`、`create_full_put_path`、`min_delete_depth`，以及 `Depth`/`Overwrite`/`Destination`
 - **auth**：`auth_basic`（`{PLAIN}`/`{SHA}`/`{SSHA}`/`crypt(3)`/`$apr1$`，`auth_basic_user_file` 支持变量）、`auth_request` + `auth_request_set`、`satisfy all|any`；`secure_link` 新式与老式两种签名
 - **HTTP/3 (QUIC)**：`listen ... quic`，quinn + h3，请求复用同一套路由/内容管线（**QPACK 编码由 `h3` crate 决定，未与 nginx 逐位一致**）
@@ -67,8 +68,8 @@ bash bench/fcgi.sh    # FastCGI / uwsgi / SCGI / stream TCP-UDP 14 项
 **绝对通过率没有意义**——nginx-tests master 依赖比 CPAN 更新的 `Test::Nginx`，很多用例对真 nginx 也是失败/阻塞。
 这两个脚本只报"nginx 过而 ngxrs 不过"的断言，那才是真缺陷。
 
-最近一次声明清单 A/B：**102 个文件，nginx 1622 / ngxrs 1627 条断言，0 条「nginx 过而我们不过」**，
-其中 97 个逐断言一致、5 个我们更多（`http_headers_multi.t`、`proxy_cache_range.t`、`proxy_if.t`、`proxy_noclose.t`）。
+最近一次声明清单 A/B：**104 个文件，nginx 1650 / ngxrs 1655 条断言，0 条「nginx 过而我们不过」**，
+其中 99 个逐断言一致、5 个我们更多（`http_headers_multi.t`、`proxy_cache_range.t`、`proxy_if.t`、`proxy_noclose.t`）。
 范围内仍不一致的文件、缺口与复现命令逐条列在 [COMPAT.md](COMPAT.md) 第三节。
 
 ## 性能

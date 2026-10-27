@@ -5313,8 +5313,13 @@ async fn dispatch(
     // meaning for a 101 tunnel).
     let has_sub_filter = !loc.sub_filters.is_empty() || !loc.sub_filter_inherited.is_empty();
     let upgrade = req.headers.get("upgrade").is_some();
+    // `charset` is a header *and* body filter. The header half can run on a
+    // streamed reply, but the body half cannot, so a location that converts
+    // takes the buffered path -- nginx likewise cannot recode while streaming.
+    let charset_active = !matches!(loc.charset, crate::config::CharsetSpec::Off);
     let wants_buffered = loc.ssi
         || (has_sub_filter && !upgrade)
+        || (charset_active && !upgrade)
         || (loc.gzip && crate::gzip::accepts_gzip(req) && loc.proxy_cache.is_none());
     let mut ssi_proxied: Option<Response> = None;
     if loc.proxy_pass.is_some() && wants_buffered && req.method != Method::Head {
@@ -5491,6 +5496,15 @@ async fn dispatch(
         && req.method != Method::Head
     {
         apply_sub_filter(resp, loc, &vars)
+    } else {
+        resp
+    };
+    // `charset` runs last in the header-filter chain: nginx installs it as the
+    // top header filter, so it sees whatever SSI/sub_filter produced.
+    let resp = if !matches!(loc.charset, crate::config::CharsetSpec::Off)
+        || !matches!(loc.source_charset, crate::config::CharsetSpec::Off)
+    {
+        apply_charset(resp, loc, http, &vars)
     } else {
         resp
     };
@@ -6262,6 +6276,156 @@ fn apply_sub_filter(mut resp: Response, loc: &LocCfg, vars: &ServerVars<'_>) -> 
     resp.explicit_len = false;
     resp.body = Body::Bytes(filters.apply(&body, &ctype).unwrap_or(body));
     resp
+}
+
+/// `ngx_http_charset_header_filter` + body filter.
+fn apply_charset(
+    mut resp: Response,
+    loc: &LocCfg,
+    http: &Http,
+    vars: &ServerVars<'_>,
+) -> Response {
+    let ctype = header_value(&resp, "content-type").unwrap_or_default();
+    let has_encoding = header_value(&resp, "content-encoding")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    let decision = crate::charset::decide(
+        &http.charsets,
+        &ctype,
+        has_encoding,
+        &loc.charset,
+        &loc.source_charset,
+        loc.charset_types.as_deref(),
+        loc.override_charset,
+        // `charset $arg_c`: the escape hatch is the same expander every other
+        // complex value in this location uses.
+        |name| Some(vars.expand(&format!("${name}"))),
+    );
+    match decision {
+        crate::charset::Decision::Skip => resp,
+        crate::charset::Decision::Declare(name) => {
+            set_charset_param(&mut resp, &name);
+            resp
+        }
+        crate::charset::Decision::Recode(name, map, reverse) => {
+            // The declared direction is (map.src -> map.dst); a reverse request
+            // swaps which side is utf-8 as well.
+            let (src_utf8, dst_utf8) = if reverse {
+                (
+                    http.charsets.names[map.dst].utf8,
+                    http.charsets.names[map.src].utf8,
+                )
+            } else {
+                (
+                    http.charsets.names[map.src].utf8,
+                    http.charsets.names[map.dst].utf8,
+                )
+            };
+            // The entity is no longer byte-identical to the origin's.
+            let body = take_body(&mut resp);
+            let recoded = crate::charset::recode(&body, &map, src_utf8, dst_utf8, reverse);
+            set_charset_param(&mut resp, &name);
+            if recoded.len() != body.len() || src_utf8 || dst_utf8 {
+                // nginx clears the length for a main request whenever a utf-8
+                // side is involved, and re-emits an exact length here either
+                // way; the upstream's copy has to go regardless.
+                strip_header(&mut resp, "Content-Length");
+                resp.explicit_len = false;
+            } else {
+                strip_header(&mut resp, "Content-Length");
+                resp.explicit_len = false;
+            }
+            resp.body = Body::Bytes(recoded);
+            resp
+        }
+    }
+}
+
+/// Read a header from `resp`, whether it is dynamic or pre-rendered.
+fn header_value(resp: &Response, name: &str) -> Option<String> {
+    if let Some((_, v)) = resp
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+    {
+        return Some(v.clone());
+    }
+    split_head(&resp.raw)
+        .into_iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v)
+}
+
+/// Append `; charset=<name>` to the response's Content-Type.
+///
+/// The header may live in `headers` (built dynamically) or be pre-rendered in
+/// `raw` (the static fast path). Both are handled, and never both at once: a
+/// second `Content-Type` line would be emitted otherwise.
+fn set_charset_param(resp: &mut Response, name: &str) {
+    let Some(ct) = header_value(resp, "content-type") else {
+        return;
+    };
+    // nginx rewrites the parameter list, so an existing `charset=` is replaced
+    // rather than duplicated.
+    let media = crate::charset::split_content_type(&ct).0.to_string();
+    let updated = format!("{media}; charset={name}");
+
+    for (k, v) in resp.headers.iter_mut() {
+        if k.eq_ignore_ascii_case("content-type") {
+            *v = updated.clone();
+            return;
+        }
+    }
+
+    // Pre-rendered head: replace that one line, keep every other byte.
+    let mut out = Vec::with_capacity(resp.raw.len() + updated.len());
+    let mut replaced = false;
+    for line in split_head(&resp.raw) {
+        let (k, v) = line;
+        if !replaced && k.eq_ignore_ascii_case("content-type") {
+            out.extend_from_slice(format!("Content-Type: {updated}\r\n").as_bytes());
+            replaced = true;
+        } else {
+            out.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
+        }
+    }
+    if replaced {
+        // `split_head` yields only headers; re-attach the body untouched.
+        let tail = find_crlfcrlf(&resp.raw)
+            .map(|p| resp.raw[p + 4..].to_vec())
+            .unwrap_or_default();
+        out.extend_from_slice(&tail);
+        resp.raw = out;
+    } else {
+        resp.headers.push(("Content-Type".to_string(), updated));
+    }
+}
+
+fn find_crlfcrlf(b: &[u8]) -> Option<usize> {
+    b.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// Take the response body out, materialising a file into memory.
+fn take_body(resp: &mut Response) -> Vec<u8> {
+    match std::mem::replace(&mut resp.body, Body::Empty) {
+        Body::Empty => Vec::new(),
+        Body::Bytes(b) => b,
+        Body::File { file, offset, len } => {
+            use std::os::unix::fs::FileExt;
+            let mut buf = vec![0u8; len as usize];
+            let mut read = 0usize;
+            while read < buf.len() {
+                match file.read_at(&mut buf[read..], offset + read as u64) {
+                    Ok(0) => break,
+                    Ok(n) => read += n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            buf.truncate(read);
+            buf
+        }
+    }
 }
 
 async fn apply_ssi_inner(

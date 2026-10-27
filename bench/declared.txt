@@ -86,6 +86,16 @@ request_id.t
 access_log.t
 access_log_variables.t
 
+# ---- charset filter ----
+# `charset` / `source_charset` / `charset_types` / `override_charset` /
+# `charset_map`, including the reverse direction of a declared map (one
+# `charset_map B A` serves B->A and A->B, like nginx's two table registrations).
+charset.t
+# `gzip_static`: a sibling `.gz` replaces the entity, with Content-Type still
+# taken from the original name -- and the combination with charset, where a
+# response that *would* need recoding is left completely alone.
+charset_gzip_static.t
+
 # ---- index ----
 # `index` as a complex value, its internal redirect (`$uri` changes), absolute
 # index names, the redirect-cycle 500, and `log_not_found`.

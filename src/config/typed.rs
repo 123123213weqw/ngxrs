@@ -194,6 +194,18 @@ pub struct LocCfg {
     pub limit_conns: Vec<LimitConn>,
     /// `error_log` directives that apply to this location, in order.
     pub error_logs: Vec<LogSpec>,
+    /// `gzip_static on|off|always`: serve a sibling `.gz` when the client
+    /// accepts gzip (`ngx_http_gzip_static_module`).
+    pub gzip_static: bool,
+    /// `charset <name|off|$var>`: the charset to declare and convert to.
+    pub charset: CharsetSpec,
+    /// `source_charset <name|$var>`: what the response is assumed to be in.
+    pub source_charset: CharsetSpec,
+    /// `charset_types`: content types the filter applies to. `None` means the
+    /// nginx default list.
+    pub charset_types: Option<Vec<String>>,
+    /// `override_charset on`: replace a charset the response already declares.
+    pub override_charset: bool,
     /// `open_log_file_cache`, which governs the `access_log` files declared at
     /// this level.
     pub open_log_file_cache: OpenFileCache,
@@ -385,6 +397,11 @@ impl LocCfg {
             access_logs: None,
             charset_utf8: false,
             error_logs: Vec::new(),
+            gzip_static: false,
+            charset: CharsetSpec::default(),
+            source_charset: CharsetSpec::default(),
+            charset_types: None,
+            override_charset: false,
             open_log_file_cache: OpenFileCache::default(),
             log_not_found: true,
             limit_req_log_level: crate::log::Level::Error,
@@ -907,6 +924,34 @@ pub fn parse_log_spec(prefix: &Path, args: &[String]) -> Option<LogSpec> {
 ///
 /// A path containing `$` is deliberately skipped: those are opened per request,
 /// and nginx would not create their directory either.
+/// Turn the parsed `charset_map` blocks into the runtime registry.
+///
+/// nginx registers both names of every `charset_map`, and that registration is
+/// what makes `charset A; source_charset B;` resolvable at all -- the names are
+/// not built in.
+pub fn build_charsets(http: &mut Http) {
+    let defs: Vec<_> = http.charset_maps.clone();
+    let mut set = crate::charset::Charsets::default();
+    for ((src_name, dst_name), pairs) in defs {
+        let src = set.get_or_add(&src_name);
+        let dst = set.get_or_add(&dst_name);
+        let src_utf8 = set.names[src].utf8;
+        let dst_utf8 = set.names[dst].utf8;
+        let mut map = crate::charset::build_map(src, dst, src_utf8, dst_utf8);
+        let mut len = 0usize;
+        for (from, to) in pairs {
+            crate::charset::add_pair(&mut map, dst_utf8, from, &to, &mut len);
+        }
+        if dst_utf8 && len > 0 {
+            // nginx averages the encoded width over the declared characters.
+            let n = set.names[dst].length.max(1);
+            set.names[dst].length = (n + len / 2).max(1);
+        }
+        set.maps.push(map);
+    }
+    http.charsets = set;
+}
+
 pub fn preopen_access_logs(http: &Http) {
     fn one(log: &AccessLog) {
         if log.path_template.is_some() {
@@ -1249,6 +1294,16 @@ pub struct AccessLog {
     pub cache: Option<OpenFileCache>,
 }
 
+/// A `charset` / `source_charset` value: `off`, a literal name, or a variable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CharsetSpec {
+    #[default]
+    Off,
+    Name(String),
+    /// `charset $arg_c`: resolved per request.
+    Var(String),
+}
+
 /// `open_log_file_cache max=N [inactive=T] [min_uses=N] [valid=T]`.
 ///
 /// nginx caches the *file handle*, so a log file that is renamed keeps receiving
@@ -1529,6 +1584,11 @@ impl CertCacheCfg {
 
 #[derive(Debug)]
 pub struct Http {
+    /// `charset_map` blocks, in declaration order: `((src, dst), pairs)`.
+    pub charset_maps: Vec<((String, String), Vec<(u8, Vec<u8>)>)>,
+    /// The resolved charset registry and mapping tables, built from
+    /// `charset_maps` once the configuration is complete.
+    pub charsets: crate::charset::Charsets,
     pub servers: Vec<Server>,
     pub groups: Vec<ListenGroup>,
     /// `listen ... quic` sockets (UDP), kept apart from the TCP groups.
@@ -2668,14 +2728,22 @@ impl Builder {
                 cfg.index = d.args.clone();
             }
             "charset" => {
-                // Only utf-8 matters to autoindex, which counts name widths in
-                // characters rather than bytes when the charset is utf-8.
+                // Two consumers: the charset filter (declare + recode), and
+                // autoindex, which counts name widths in characters rather than
+                // bytes when the charset is utf-8.
                 let v = d
                     .args
                     .first()
                     .ok_or_else(|| sem(&d.file, d.line, "charset requires a value"))?;
                 cfg.charset_utf8 =
                     v.eq_ignore_ascii_case("utf-8") || v.eq_ignore_ascii_case("utf8");
+                cfg.charset = if v == "off" {
+                    CharsetSpec::Off
+                } else if let Some(name) = v.strip_prefix('$') {
+                    CharsetSpec::Var(name.to_string())
+                } else {
+                    CharsetSpec::Name(v.clone())
+                };
             }
             "autoindex_format" => {
                 let v = d
@@ -3522,6 +3590,44 @@ impl Builder {
                         dynamic: false,
                     });
                 }
+            }
+            "gzip_static" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "gzip_static requires on|off"))?;
+                // `always` sends the `.gz` even without `Accept-Encoding`, which
+                // no suite exercises; treat it as `on` and note it.
+                cfg.gzip_static = matches!(v.as_str(), "on" | "always");
+            }
+            "source_charset" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "source_charset requires a value"))?;
+                cfg.source_charset = if v == "off" {
+                    CharsetSpec::Off
+                } else if let Some(name) = v.strip_prefix('$') {
+                    CharsetSpec::Var(name.to_string())
+                } else {
+                    CharsetSpec::Name(v.clone())
+                };
+            }
+            "charset_types" => {
+                if d.args.len() == 1 && d.args[0] == "*" {
+                    cfg.charset_types = Some(vec!["*".to_string()]);
+                } else {
+                    cfg.charset_types = Some(d.args.clone());
+                }
+            }
+            "override_charset" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "override_charset requires on|off"))?;
+                cfg.override_charset = parse_on_off(v).ok_or_else(|| {
+                    sem(&d.file, d.line, format!("invalid override_charset value \"{v}\""))
+                })?;
             }
             "open_log_file_cache" => {
                 // `open_log_file_cache max=N [inactive=T] [min_uses=N] [valid=T]`,
@@ -5246,6 +5352,8 @@ pub fn build(
     }
 
     let mut http = Http {
+        charset_maps: Vec::new(),
+        charsets: crate::charset::Charsets::default(),
         client_body_temp_path: PathBuf::new(),
         ssl_certificate_cache: CertCacheCfg::default(),
         ssl_certificate: None,
@@ -5353,6 +5461,32 @@ pub fn build(
                         for ext in &t.args {
                             http.mime.insert(&t.name, ext);
                         }
+                    }
+                }
+            }
+            "charset_map" => {
+                // `charset_map <src> <dst> { <hex> <hex>; ... }`. Both names are
+                // registered as charsets even without a built-in table, and the
+                // pairs are the *only* mapping that will exist between them.
+                if d.args.len() == 2 {
+                    if let Some(block) = &d.block {
+                        let mut pairs = Vec::new();
+                        for p in block {
+                            // Our `Directive` keeps the first token as `name`,
+                            // so nginx's two-element `58 59` is `name` + one arg.
+                            if p.args.len() == 1 {
+                                if let (Ok(from), Ok(to)) = (
+                                    u8::from_str_radix(&p.name, 16),
+                                    parse_hex_bytes(&p.args[0]),
+                                ) {
+                                    pairs.push((from, to));
+                                }
+                            }
+                        }
+                        http.charset_maps.push((
+                            (d.args[0].clone(), d.args[1].clone()),
+                            pairs,
+                        ));
                     }
                 }
             }
@@ -5760,6 +5894,10 @@ pub fn build(
         http.client_body_temp_path = prefix.join("client_body_temp");
     }
 
+    // The `charset_map` blocks become the runtime registry here, once every
+    // block has been seen.
+    build_charsets(&mut http);
+
     crate::config::set_maps(http.maps.clone());
     crate::config::set_splits(http.split_clients.clone());
     crate::config::set_geos(http.geos.clone());
@@ -6162,4 +6300,22 @@ fn implicit_default(cfg: &LocCfg, prefix: &str) -> Vec<RedirectRule> {
         },
         _ => Vec::new(),
     }
+}
+
+/// Decode the hex byte string on the right-hand side of a `charset_map` pair
+/// (`58` -> [0x58], `0410` -> [0xD0, 0x90]).
+fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, ()> {
+    if s.is_empty() || s.len() % 2 != 0 {
+        return Err(());
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let hi = (b[i] as char).to_digit(16).ok_or(())?;
+        let lo = (b[i + 1] as char).to_digit(16).ok_or(())?;
+        out.push((hi * 16 + lo) as u8);
+        i += 2;
+    }
+    Ok(out)
 }

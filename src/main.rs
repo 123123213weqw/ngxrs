@@ -7,6 +7,7 @@ static GLOBAL: alloccnt::Counting = alloccnt::Counting;
 
 mod auth;
 mod cache;
+mod charset;
 mod config;
 mod conn;
 mod dav;

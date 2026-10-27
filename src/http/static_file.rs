@@ -183,11 +183,34 @@ pub fn respond_fs_indexed(
             return Ok(Response::empty(404));
         }
     };
-    let meta = match file.metadata() {
+    let mut meta = match file.metadata() {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Ok(Response::empty(403)),
         Err(_) => return Ok(Response::empty(404)),
     };
+
+    // ---- gzip_static (ngx_http_gzip_static_module) -----------------------
+    //
+    // A sibling `<path>.gz` is sent instead of the file when the client accepts
+    // gzip. The Content-Type still comes from the *original* name, and the
+    // entity really is the compressed one, so length/ETag/Range all describe
+    // the `.gz`. nginx only does this for a regular file that exists.
+    let mut file = file;
+    let mut gzip_static = false;
+    if loc.gzip_static && !meta.is_dir() && crate::gzip::accepts_gzip(req) {
+        let mut gz = fs_path.as_os_str().to_os_string();
+        gz.push(".gz");
+        let gz = std::path::PathBuf::from(gz);
+        if let Ok(f) = File::open(&gz) {
+            if let Ok(m) = f.metadata() {
+                if m.is_file() {
+                    file = f;
+                    meta = m;
+                    gzip_static = true;
+                }
+            }
+        }
+    }
 
     // POST is only known to be disallowed now that the target exists; a
     // directory answers 403 (no index, autoindex off) before that check.
@@ -286,7 +309,15 @@ pub fn respond_fs_indexed(
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
-    serve_entry(req, file, &name, meta.len(), meta_mtime(&meta), loc, http)
+    let mut resp = serve_entry(req, file, &name, meta.len(), meta_mtime(&meta), loc, http)?;
+    if gzip_static {
+        // Mark the entity as compressed. The charset filter's rule for a
+        // response that would need recoding is to leave it alone entirely
+        // (`charset_gzip_static.t`, "recode gzip").
+        resp.raw
+            .extend_from_slice(b"Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n");
+    }
+    Ok(resp)
 }
 
 fn meta_mtime(meta: &std::fs::Metadata) -> i64 {

@@ -49,6 +49,8 @@ pub struct StreamServer {
     pub logger: std::sync::Arc<crate::log::Logger>,
     /// `proxy_protocol on`: prefix the upstream connection with a PROXY header.
     pub proxy_protocol: bool,
+    /// `listen ... proxy_protocol`: consume such a header from the client first.
+    pub listen_proxy_protocol: bool,
     /// `geo` / `map` / `split_clients` blocks from `stream {}`. Shared rather
     /// than copied: they are read-only and evaluated per connection.
     pub geos: std::sync::Arc<Vec<crate::geo::GeoDef>>,
@@ -184,18 +186,36 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                 let maps = server.maps.clone();
                 let splits = server.splits.clone();
                 let sets = server.sets.clone();
+                let listen_pp = server.listen_proxy_protocol;
                 let verify_mode = server.client_verify;
                 let client_ca = server.client_ca.clone();
                 let trusted_ca = server.trusted_ca.clone();
                 // One log line per connection, written when the task ends.
                 let mut alog = StreamAccessLog::new(&server, peer, "stream");
                 tokio::spawn(async move {
+                    // `listen ... proxy_protocol`: the header arrives before
+                    // anything else, TLS included, and `$proxy_protocol_*`
+                    // depends on it (`stream_proxy_protocol2_tlv.t`).
+                    let mut client = client;
+                    let pp = if listen_pp {
+                        match crate::proxyproto::read_from(&mut client).await {
+                            Ok(p) => Some(std::sync::Arc::new(p)),
+                            Err(_) => {
+                                let _ = client.shutdown().await;
+                                drop(alog);
+                                return;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     // `return <text>` answers without touching an upstream.
                     if let Some(text) = return_text {
                         let local_addr = client
                             .local_addr()
                             .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
                         let mut base = base_vars(peer, local_addr, &maps, &geos, &splits);
+                        base.proxy_protocol = pp.as_deref();
                         // `set` values may reference earlier `set`s, so they are
                         // expanded one at a time into an accumulating map.
                         let mut custom = std::collections::HashMap::new();
@@ -242,6 +262,42 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                     let _ = upstream.set_nodelay(true);
                     // `proxy_ssl on`: speak TLS to the upstream, then splice.
                     if proxy_ssl {
+                        // `proxy_ssl_name` is a complex value (`proxy_ssl_name
+                        // x${server_port}x`), so it is expanded once per
+                        // connection rather than used verbatim
+                        // (`stream_proxy_ssl_name_complex.t`).
+                        let sni = sni.map(|raw| {
+                            crate::streamvars::Vars {
+                                peer,
+                                local: client_local.unwrap_or(peer),
+                                udp: false,
+                                maps: &maps,
+                                geos: &geos,
+                                ssl: None,
+                                proxy_protocol: None,
+                                custom: &NO_CUSTOM,
+                                splits: &splits,
+                                connection: crate::stats::accepted(),
+                            }
+                            .expand(&raw)
+                        });
+                        // `proxy_protocol on` writes the header before the TLS
+                        // handshake (`stream_proxy_protocol_ssl.t`, "protocol
+                        // on"): the upstream expects PROXY bytes first, then
+                        // ClientHello.
+                        let mut upstream = upstream;
+                        if write_pp {
+                            use tokio::io::AsyncWriteExt;
+                            let local = client_local
+                                .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
+                            if upstream
+                                .write_all(&crate::proxyproto::write(&peer, &local))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
                         let cfg = proxy_tls_config(sni.as_deref().unwrap_or("localhost"), reuse);
                         let name = rustls::pki_types::ServerName::try_from(
                             sni.clone().unwrap_or_else(|| "localhost".to_string()),
@@ -499,6 +555,7 @@ fn base_vars<'a>(
         maps,
         geos,
         ssl: None,
+        proxy_protocol: None,
         custom: &NO_CUSTOM,
         splits,
         connection: crate::stats::accepted(),
@@ -524,26 +581,12 @@ async fn answer_stream_return(
             let acceptor = tokio_rustls::TlsAcceptor::from(sc);
             match acceptor.accept(client).await {
                 Ok(mut t) => {
-                    // rustls reports whether the handshake resumed.
-                    let r = matches!(
-                        t.get_ref().1.handshake_kind(),
-                        Some(rustls::HandshakeKind::Resumed)
-                    );
-                    let (verify, cert) =
-                        client_cert_vars(t.get_ref().1, verify_mode, client_ca, trusted_ca);
-                    let mut v = crate::streamvars::Vars {
-                        peer: base.peer,
-                        local: base.local,
-                        udp: base.udp,
-                        maps: base.maps,
-                        geos: base.geos,
-                        ssl: Some((&verify, &cert, r)),
-                        custom: base.custom,
-                        splits: base.splits,
-                        connection: base.connection,
+                    let facts = ssl_facts(t.get_ref().1, verify_mode, client_ca, trusted_ca);
+                    let v = crate::streamvars::Vars {
+                        ssl: Some(&facts),
+                        ..*base
                     };
                     let body = v.expand(text);
-                    let _ = &mut v;
                     let _ = t.write_all(body.as_bytes()).await;
                     let _ = t.flush().await;
                     let _ = t.shutdown().await;
@@ -569,6 +612,43 @@ async fn answer_stream_return(
             return;
         }
     };
+}
+
+/// The `$ssl_*` facts for a terminated TLS connection.
+fn ssl_facts(
+    conn: &rustls::ServerConnection,
+    verify_mode: u8,
+    client_ca: &Option<std::path::PathBuf>,
+    trusted_ca: &Option<std::path::PathBuf>,
+) -> crate::streamvars::SslFacts {
+    let (client_verify, client_cert) =
+        client_cert_vars(conn, verify_mode, client_ca, trusted_ca);
+    let protocol = match conn.protocol_version() {
+        Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
+        Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2",
+        Some(rustls::ProtocolVersion::TLSv1_1) => "TLSv1.1",
+        Some(rustls::ProtocolVersion::TLSv1_0) => "TLSv1.0",
+        Some(rustls::ProtocolVersion::SSLv3) => "SSLv3",
+        _ => "",
+    }
+    .to_string();
+    crate::streamvars::SslFacts {
+        reused: matches!(
+            conn.handshake_kind(),
+            Some(rustls::HandshakeKind::Resumed)
+        ),
+        // rustls does not expose the session id; TLS 1.3 has none, and the test
+        // accepts it being absent.
+        session_id: String::new(),
+        cipher: conn
+            .negotiated_cipher_suite()
+            .map(|c| format!("{:?}", c.suite()))
+            .unwrap_or_default(),
+        protocol,
+        server_name: conn.server_name().unwrap_or("").to_string(),
+        client_verify,
+        client_cert,
+    }
 }
 
 /// `$ssl_client_verify` and `$ssl_client_cert` for a stream connection.

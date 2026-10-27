@@ -15,6 +15,25 @@ use std::net::SocketAddr;
 use crate::geo::GeoDef;
 use crate::mapping::MapDef;
 
+/// The TLS facts `$ssl_*` report, filled in after the handshake.
+///
+/// `ngx_stream_ssl_module` registers these as ordinary variables, so on a
+/// plaintext connection they are simply *not found* and render as the empty
+/// string -- which is why `stream_ssl_variables.t` expects `:::` from a
+/// non-TLS listener.
+#[derive(Default, Clone)]
+pub struct SslFacts {
+    /// `$ssl_session_reused`: `r` when the handshake resumed, `.` otherwise.
+    pub reused: bool,
+    pub session_id: String,
+    pub cipher: String,
+    /// `TLSv1.3`, `TLSv1.2`, ... (nginx's spelling, not rustls's).
+    pub protocol: String,
+    pub server_name: String,
+    pub client_verify: String,
+    pub client_cert: String,
+}
+
 /// Everything a stream variable may read.
 pub struct Vars<'a> {
     pub peer: SocketAddr,
@@ -24,7 +43,10 @@ pub struct Vars<'a> {
     pub udp: bool,
     pub maps: &'a [MapDef],
     pub geos: &'a [GeoDef],
-    pub ssl: Option<(&'a str, &'a str, bool)>, // (verify, cert, reused)
+    pub ssl: Option<&'a SslFacts>,
+    /// The header consumed by `listen ... proxy_protocol`, which backs
+    /// `$proxy_protocol_addr` / `_port` / `_server_*` / `_tlv_*`.
+    pub proxy_protocol: Option<&'a crate::proxyproto::Pp>,
     /// Values produced by `set`, which override both the built-ins and any
     /// `map`/`geo` of the same name (`stream_set.t`).
     pub custom: &'a std::collections::HashMap<String, String>,
@@ -47,6 +69,15 @@ impl Vars<'_> {
             "server_addr" => self.local.ip().to_string(),
             "server_port" => self.local.port().to_string(),
             "binary_remote_addr" => binary_addr(&self.peer),
+            // `$proxy_protocol_*`: absent without a header, like nginx.
+            "proxy_protocol_addr" => self.proxy_protocol?.src_addr.clone(),
+            "proxy_protocol_port" => {
+                crate::proxyproto::Pp::port_text(self.proxy_protocol?.src_port)
+            }
+            "proxy_protocol_server_addr" => self.proxy_protocol?.dst_addr.clone(),
+            "proxy_protocol_server_port" => {
+                crate::proxyproto::Pp::port_text(self.proxy_protocol?.dst_port)
+            }
             "protocol" => {
                 if self.udp {
                     "UDP".to_string()
@@ -59,15 +90,30 @@ impl Vars<'_> {
             "session_time" => "0.000".to_string(),
             "connection" => self.connection.to_string(),
             "connection_requests" => "1".to_string(),
-            "ssl_session_reused" => match self.ssl {
-                Some((_, _, true)) => "r".to_string(),
-                Some(_) => ".".to_string(),
-                // No TLS at all: the variable does not exist.
-                None => return None,
-            },
-            "ssl_client_verify" => self.ssl.map(|(v, _, _)| v.to_string())?,
-            "ssl_client_cert" => self.ssl.map(|(_, c, _)| c.to_string())?,
+            // Every `$ssl_*` is absent on a plaintext connection.
+            "ssl_session_reused" => {
+                let f = self.ssl?;
+                if f.reused {
+                    "r".to_string()
+                } else {
+                    ".".to_string()
+                }
+            }
+            "ssl_session_id" => self.ssl?.session_id.clone(),
+            "ssl_cipher" => self.ssl?.cipher.clone(),
+            "ssl_protocol" => self.ssl?.protocol.clone(),
+            "ssl_server_name" => self.ssl?.server_name.clone(),
+            "ssl_client_verify" => self.ssl?.client_verify.clone(),
+            "ssl_client_cert" => self.ssl?.client_cert.clone(),
             _ => {
+                if let Some(tlv) = name.strip_prefix("proxy_protocol_tlv_") {
+                    let pp = self.proxy_protocol?;
+                    return match pp.tlv(tlv) {
+                        Ok(Some(v)) => Some(String::from_utf8_lossy(&v).to_string()),
+                        Ok(None) => Some(String::new()),
+                        Err(()) => Some(String::new()),
+                    };
+                }
                 if let Some(m) = self.maps.iter().find(|m| m.var == name) {
                     return Some(self.eval_map(m));
                 }
@@ -184,8 +230,10 @@ fn binary_addr(a: &SocketAddr) -> String {
 }
 
 #[cfg(test)]
-thread_local! {
-    static CUSTOM: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+fn no_custom() -> &'static std::collections::HashMap<String, String> {
+    static EMPTY: std::sync::OnceLock<std::collections::HashMap<String, String>> =
+        std::sync::OnceLock::new();
+    EMPTY.get_or_init(std::collections::HashMap::new)
 }
 
 #[cfg(test)]
@@ -200,7 +248,8 @@ mod tests {
             maps,
             geos,
             ssl: None,
-            custom: &CUSTOM.with(|c| c.clone()),
+            proxy_protocol: None,
+            custom: no_custom(),
             splits: &[],
             connection: 1,
         }

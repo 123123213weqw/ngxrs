@@ -1520,9 +1520,13 @@ pub struct StreamServerCfg {
     pub sets: Vec<(String, String)>,
     /// `access_log` of this stream server; empty means none.
     pub access_logs: Vec<AccessLog>,
-    /// `proxy_protocol on`: prefix the upstream connection with a HAProxy
-    /// PROXY header carrying the client's address (`ngx_proxy_protocol_write`).
-    pub proxy_protocol: bool,
+    /// `proxy_protocol on|off`: prefix the upstream connection with a HAProxy
+    /// PROXY header (`ngx_proxy_protocol_write`).
+    ///
+    /// `None` means "not set here", so the `stream {}`-level value applies --
+    /// `stream_proxy_protocol.t` declares `proxy_protocol on` at stream level
+    /// and turns it off for one server.
+    pub proxy_protocol: Option<bool>,
     /// `listen ... proxy_protocol` in stream: consume such a header from the
     /// client before proxying.
     pub listen_proxy_protocol: bool,
@@ -4541,6 +4545,8 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
     let mut stream_log_formats: HashMap<String, String> = HashMap::new();
     let mut stream_access_logs: Vec<AccessLog> = Vec::new();
     let mut stream_proxy_ssl = false;
+    // `stream { proxy_protocol on; }`: the default every server inherits.
+    let mut stream_proxy_protocol: Option<bool> = None;
     let mut stream_session_reuse = true;
     let mut stream_connect_timeout = std::time::Duration::from_secs(60);
     // nginx's stream default proxy_timeout is 10m.
@@ -4588,7 +4594,6 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             | "limit_req_zone"
             | "variables_hash_max_size"
             | "variables_hash_bucket_size"
-            | "proxy_protocol"
             | "preread_buffer_size"
             | "ssl_protocols"
             | "ssl_ciphers"
@@ -4654,6 +4659,15 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                     stream_trusted = Some(b.prefix.join(p));
                 }
             }
+            "proxy_protocol" => {
+                // `stream { proxy_protocol on; }`: the inherited default.
+                stream_proxy_protocol = Some(
+                    d.args
+                        .first()
+                        .map(|v| v == "on")
+                        .ok_or_else(|| sem(&d.file, d.line, "proxy_protocol requires on|off"))?,
+                );
+            }
             "proxy_ssl" => {
                 if let Some(v) = d.args.first() {
                     match v.as_str() {
@@ -4710,11 +4724,15 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             ssl_trusted_certificate: stream_trusted.clone(),
             sets: Vec::new(),
             access_logs: stream_access_logs.clone(),
-            proxy_protocol: false,
+            proxy_protocol: None,
             listen_proxy_protocol: false,
         };
         let mut have_listen = false;
-        let mut listens: Vec<SocketAddr> = Vec::new();
+        // `(address, ssl)`: `listen ... ssl` is a property of the LISTENER, not of
+        // the server. Sharing one `cfg.ssl` across every `listen` made a plain
+        // `listen 8080` in a server that also had `listen 8443 ssl` try to
+        // handshake TLS (`stream_ssl_variables.t`, "no ssl").
+        let mut listens: Vec<(SocketAddr, bool)> = Vec::new();
         for child in sd.block.as_ref().map(|x| x.as_slice()).unwrap_or(&[]) {
             match child.name.as_str() {
                 "listen" => {
@@ -4729,11 +4747,12 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                         )
                     })?;
                     cfg.listen = addr;
-                    listens.push(addr);
+                    let this_ssl = child.args[1..].iter().any(|p| p == "ssl");
+                    listens.push((addr, this_ssl));
                     if child.args[1..].iter().any(|p| p == "udp") {
                         cfg.udp = true;
                     }
-                    if child.args[1..].iter().any(|p| p == "ssl") {
+                    if this_ssl {
                         cfg.ssl = true;
                     }
                     if child.args[1..].iter().any(|p| p == "proxy_protocol") {
@@ -4753,10 +4772,13 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                     }
                 }
                 "proxy_protocol" => {
-                    // `proxy_protocol on` prefixes the upstream with a PROXY
-                    // header; `off` (the default) leaves the byte stream alone.
-                    cfg.proxy_protocol =
-                        child.args.first().map(|v| v == "on").unwrap_or(false);
+                    cfg.proxy_protocol = Some(
+                        child
+                            .args
+                            .first()
+                            .map(|v| v == "on")
+                            .ok_or_else(|| sem(&child.file, child.line, "proxy_protocol requires on|off"))?,
+                    );
                 }
                 "proxy_timeout" => {
                     if let Some(v) = child.args.first() {
@@ -4902,6 +4924,11 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
         if !per_server_proxy_timeout {
             cfg.proxy_timeout = stream_proxy_timeout;
         }
+        // A server that says nothing inherits the `stream {}` default; the
+        // directive is off when neither mentions it.
+        if cfg.proxy_protocol.is_none() {
+            cfg.proxy_protocol = Some(stream_proxy_protocol.unwrap_or(false));
+        }
         // `listen` is repeatable in a stream server, and nginx opens one socket
         // per directive. Collapsing them to one address dropped every listener
         // but the last, which is what `stream_map.t` (four `listen` lines in one
@@ -4909,9 +4936,10 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
         if listens.is_empty() {
             section.servers.push(cfg);
         } else {
-            for addr in listens {
+            for (addr, this_ssl) in listens {
                 let mut c = cfg.clone();
                 c.listen = addr;
+                c.ssl = this_ssl;
                 section.servers.push(c);
             }
         }

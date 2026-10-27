@@ -484,3 +484,68 @@ pub fn write(client: &std::net::SocketAddr, local: &std::net::SocketAddr) -> Vec
         _ => b"PROXY UNKNOWN\r\n".to_vec(),
     }
 }
+
+/// Read a PROXY header straight off a fresh TCP connection.
+///
+/// The stream module needs this before TLS: `listen ... ssl proxy_protocol` puts
+/// the header in front of the handshake. Reading exactly what the header claims
+/// (never more) means the bytes that follow stay in the socket for the next
+/// layer, which is why this does not use a buffered reader.
+pub async fn read_from(
+    stream: &mut tokio::net::TcpStream,
+) -> std::io::Result<Pp> {
+    use tokio::io::AsyncReadExt;
+    let mut buf: Vec<u8> = Vec::with_capacity(64);
+    // Enough for the v2 fixed part, so the common case is one read.
+    let mut head = [0u8; 16];
+    let mut filled = 0usize;
+    while filled < 16 {
+        let n = stream.read(&mut head[filled..]).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "PROXY protocol header truncated",
+            ));
+        }
+        filled += n;
+    }
+    buf.extend_from_slice(&head);
+    if buf.starts_with(V2_SIGNATURE) {
+        let len = u16::from_be_bytes([buf[14], buf[15]]) as usize;
+        let mut body = vec![0u8; len];
+        stream.read_exact(&mut body).await?;
+        buf.extend_from_slice(&body);
+    } else {
+        // v1: read one byte at a time until CRLF, so nothing past it is taken.
+        loop {
+            if find_crlf(&buf).is_some() {
+                break;
+            }
+            if buf.len() > 107 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "broken PROXY protocol header",
+                ));
+            }
+            let mut b = [0u8; 1];
+            if stream.read(&mut b).await? == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "PROXY protocol header truncated",
+                ));
+            }
+            buf.push(b[0]);
+        }
+    }
+    match parse(&buf) {
+        Ok(Some(p)) => Ok(p.pp),
+        Ok(None) => Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "PROXY protocol header truncated",
+        )),
+        Err(()) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "broken PROXY protocol header",
+        )),
+    }
+}

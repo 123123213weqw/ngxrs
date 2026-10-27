@@ -53,6 +53,18 @@ realip_remote_port.t
 # variables in it.
 rewrite_if.t
 
+# ---- stream PROXY protocol & TLS variables ----
+# `listen ... proxy_protocol` on the stream side (input), `$proxy_protocol_*`
+# including TLVs, the header written before a TLS handshake when `proxy_ssl` and
+# `proxy_protocol` are both on, and the `$ssl_*` facts a terminated connection
+# reports.
+stream_proxy_protocol.t
+stream_proxy_protocol_ssl.t
+stream_proxy_protocol_ipv6.t
+stream_proxy_protocol2_tlv.t
+stream_ssl_variables.t
+stream_proxy_ssl_name_complex.t
+
 # ---- stream geo / map ----
 # `geo` (CIDR and `ranges`, `default`, `delete`, `include`) and `map` in
 # `stream {}` context, plus repeated `listen` in one stream server.

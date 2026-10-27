@@ -13,7 +13,7 @@
 
 | 项 | 命令 | 当前结果 |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 110 文件，WORSE=0 TRUNC=0（nginx 1740 / ngxrs 1745 断言） |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 116 文件，WORSE=0 TRUNC=0（nginx 1780 / ngxrs 1785 断言） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
 | 单元测试 | `cargo test --release` | **PASS** — 156 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
@@ -493,9 +493,51 @@ add_header ETag foo always;           -> ETag: foo（不是两个）
 `bench/all.sh` 的 `static-protocol` 却从 19/19 掉到 18/19 —— 这条差分用例比 nginx-tests
 更能覆盖「目录 + 无尾斜杠」，值得记住。
 
+## 一之十三、2026-10-27 第十二轮：stream 侧的 PROXY protocol 输入与 `$ssl_*`
+
+`stream_proxy_protocol.t` 3/4 → 4/4、`stream_proxy_protocol_ssl.t` 3/4 → 4/4、
+`stream_proxy_protocol2_tlv.t` 3/16 → **16/16**，并修掉两个由「按服务器而不是按监听口」
+建模导致的回归。
+
+### `listen ... proxy_protocol`（输入）此前是死字段
+
+配置里接受，运行时从不消费 —— `listen 127.0.0.1:8080 proxy_protocol;` 的请求
+会把 `PROXY ...` 这行当成业务数据转发给上游。现在连接建立后第一件事就是读它
+（`proxyproto::read_from`）：
+
+- v2 按 16 字节固定头 + 长度字段精确读，**不多读一个字节**；
+- v1 逐字节读到 CRLF —— 慢，但保证紧跟其后的字节留在 socket 里，这对
+  `listen ... ssl proxy_protocol` 是必须的（TLS 握手读的就是这些字节）。
+
+`$proxy_protocol_addr` / `_port` / `_server_addr` / `_server_port` / `_tlv_*`
+也进了 stream 的变量视图。
+
+### `proxy_ssl` + `proxy_protocol` 同时开启时，头写在 TLS 之前
+
+`stream_proxy_protocol_ssl.t` 的上游是一个**先读 PROXY 行、再做 TLS 握手**的守护进程。
+我们的 `proxy_ssl` 分支直接开始握手，上游等不到那行，连接被关闭（`got: undef`）。
+现在在 `proxy_ssl` 分支里先写头再握手。
+
+### 两个回归：按「服务器」而不是按「监听口」建模
+
+这两条是上一轮 `stream set/geo` 引入的，被本轮的全量重扫抓出来：
+
+1. **`listen ... ssl` 是监听口的属性**，不是服务器的。`stream_ssl_variables.t` 在同一个
+   server 里同时有 `listen 8080;` 和 `listen 8443 ssl;` —— 我复制 server 配置时把
+   `ssl: true` 也复制到了 8080 上，于是明文连接也去做 TLS 握手，`got: undef`。
+2. **`proxy_protocol`（输出侧）在 stream 作用域是可继承的**，`off` 只是覆盖。
+   `stream { proxy_protocol on; ... server { proxy_protocol off; } }` 这个组合此前
+   因为字段是 `bool`（默认 false）而丢掉继承，两个测试各失败一条。
+
+顺带补齐 `$ssl_session_id` / `$ssl_cipher` / `$ssl_protocol` / `$ssl_server_name`：
+此前只有 `$ssl_session_reused` / `$ssl_client_verify` / `$ssl_client_cert`，
+`stream_ssl_variables.t` 的 TLS 断言因此输出 `.:::`。
+`proxy_ssl_name` 是复杂值（`proxy_ssl_name x${server_port}x`），现在按连接展开 ——
+`stream_proxy_ssl_name_complex.t` 之前拿到空串。
+
 ## 二、声明的测试清单
 
-清单在 `bench/declared.txt`，**110 个文件**，选取规则是机械的：
+清单在 `bench/declared.txt`，**116 个文件**，选取规则是机械的：
 
 1. 落在范围内（**参考构建 `-V` 能编出来的模块**：http core + proxy/cache/gzip/
    TLS/HTTP2/realip/auth_request/slice/sub/secure_link/dav/stub_status/gzip_static/

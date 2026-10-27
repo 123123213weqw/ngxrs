@@ -331,13 +331,17 @@ fn serve_entry(
     // `multipart/byteranges`, which cannot be expressed as a file slice.
     let mut multipart: Option<Vec<u8>> = None;
 
-    // `max_ranges 0` disables byte ranges entirely; any other value caps how
-    // many spans a request may ask for (nginx ignores the header beyond it).
-    let range_header = req.headers.get("range").filter(|r| match loc.max_ranges {
-        Some(0) => false,
-        Some(max) => (r.matches(',').count() as u32 + 1) <= max,
-        None => true,
-    });
+    // `max_ranges 0` disables byte ranges entirely. Any other value caps how many
+    // *satisfiable* spans a request may ask for, which is a property of the parse
+    // and not of the raw header: counting commas made
+    // `bytes=0-9, -10, 10000-` look like three ranges when only two survive, so
+    // `max_ranges 2` wrongly dropped the header (`range.t`, "max_ranges not
+    // reached bad range").
+    let max_ranges = loc.max_ranges.unwrap_or(u32::MAX) as usize;
+    let range_header = req
+        .headers
+        .get("range")
+        .filter(|_| loc.max_ranges != Some(0));
     if let Some(range) = range_header {
         let if_range_ok = match req.headers.get("if-range") {
             None => true,
@@ -352,40 +356,32 @@ fn serve_entry(
         if if_range_ok {
             // `bytes=0-2,4-` produces one part per span (nginx builds a
             // multipart body); a single span stays a plain 206.
-            if range.contains(',') {
-                match parse_multi_range(range, size) {
-                    MultiRange::Ranges(spans) if spans.len() > 1 => {
-                        let boundary = format!("{:016X}", multipart_seed(req, size));
-                        status = 206;
-                        multipart = Some(read_multipart(&file, &boundary, mime, size, &spans)?);
-                    }
-                    MultiRange::Unsatisfiable => {
-                        status = 416;
-                        len = 0;
-                        content_range = Some((u64::MAX, size));
-                    }
-                    _ => {}
+            // One parser for both shapes: nginx walks the spec once and decides
+            // afterwards whether the result is a plain 206 or a multipart body.
+            match parse_ranges(range, size, max_ranges) {
+                MultiRange::Ranges(spans) if spans.len() == 1 => {
+                    let (start, end) = spans[0];
+                    status = 206;
+                    offset = start;
+                    len = end - start + 1;
+                    content_range = Some((start, end));
                 }
-            } else {
-                match parse_range(range, size) {
-                    RangeSpec::Single(start, end) => {
-                        status = 206;
-                        offset = start;
-                        len = end - start + 1;
-                        content_range = Some((start, end));
-                    }
-                    RangeSpec::Unsatisfiable => {
-                        let body = error_body(416, http.server_tokens);
-                        let mut raw = Vec::with_capacity(160);
-                        raw.extend_from_slice(b"Content-Type: text/html\r\nContent-Length: ");
-                        crate::util::push_u64(&mut raw, body.len() as u64);
-                        raw.extend_from_slice(b"\r\nContent-Range: bytes */");
-                        crate::util::push_u64(&mut raw, size);
-                        raw.extend_from_slice(b"\r\n");
-                        return Ok(Response::raw(416, raw, Body::Bytes(body)));
-                    }
-                    RangeSpec::Ignore => {}
+                MultiRange::Ranges(spans) => {
+                    let boundary = format!("{:016X}", multipart_seed(req, size));
+                    status = 206;
+                    multipart = Some(read_multipart(&file, &boundary, mime, size, &spans)?);
                 }
+                MultiRange::Unsatisfiable => {
+                    let body = error_body(416, http.server_tokens);
+                    let mut raw = Vec::with_capacity(160);
+                    raw.extend_from_slice(b"Content-Type: text/html\r\nContent-Length: ");
+                    crate::util::push_u64(&mut raw, body.len() as u64);
+                    raw.extend_from_slice(b"\r\nContent-Range: bytes */");
+                    crate::util::push_u64(&mut raw, size);
+                    raw.extend_from_slice(b"\r\n");
+                    return Ok(Response::raw(416, raw, Body::Bytes(body)));
+                }
+                MultiRange::Ignore => {}
             }
         }
     }
@@ -478,56 +474,6 @@ pub enum MultiRange {
 ///
 /// Overlapping or out-of-order spans are kept as requested (nginx does not
 /// coalesce them).
-pub fn parse_multi_range(header: &str, size: u64) -> MultiRange {
-    let Some(spec) = header.trim().strip_prefix("bytes=") else {
-        return MultiRange::Ignore;
-    };
-    let mut spans = Vec::new();
-    for part in spec.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let Some((a, b)) = part.split_once('-') else {
-            return MultiRange::Ignore;
-        };
-        let (a, b) = (a.trim(), b.trim());
-        if a.is_empty() {
-            // suffix range: bytes=-N
-            let Ok(n) = b.parse::<u64>() else {
-                return MultiRange::Ignore;
-            };
-            if n == 0 || size == 0 {
-                return MultiRange::Unsatisfiable;
-            }
-            let n = n.min(size);
-            spans.push((size - n, size - 1));
-            continue;
-        }
-        let Ok(start) = a.parse::<u64>() else {
-            return MultiRange::Ignore;
-        };
-        if start >= size {
-            return MultiRange::Unsatisfiable;
-        }
-        let end = if b.is_empty() {
-            size - 1
-        } else {
-            let Ok(e) = b.parse::<u64>() else {
-                return MultiRange::Ignore;
-            };
-            if e < start {
-                return MultiRange::Ignore;
-            }
-            e.min(size - 1)
-        };
-        spans.push((start, end));
-    }
-    if spans.is_empty() {
-        return MultiRange::Ignore;
-    }
-    MultiRange::Ranges(spans)
-}
 
 /// Boundary seed: nginx derives it from the request and the entity size.
 fn multipart_seed(req: &Request, size: u64) -> u64 {
@@ -607,51 +553,147 @@ pub fn multipart_body(
 }
 
 pub fn parse_range(header: &str, size: u64) -> RangeSpec {
-    let spec = match header.trim().strip_prefix("bytes=") {
-        Some(s) => s,
-        None => return RangeSpec::Ignore,
-    };
-    if spec.contains(',') {
-        // multipart/byteranges not implemented yet
-        return RangeSpec::Ignore;
-    }
-    let (a, b) = match spec.split_once('-') {
-        Some(v) => v,
-        None => return RangeSpec::Ignore,
-    };
-
-    if a.is_empty() {
-        // suffix range: bytes=-N
-        let n: u64 = match b.trim().parse() {
-            Ok(v) => v,
-            Err(_) => return RangeSpec::Ignore,
-        };
-        if n == 0 || size == 0 {
-            return RangeSpec::Unsatisfiable;
+    // The single-span view of the same parser, for callers that cannot build a
+    // multipart body.
+    match parse_ranges(header, size, usize::MAX) {
+        MultiRange::Ranges(mut v) if v.len() == 1 => {
+            let (a, b) = v.remove(0);
+            RangeSpec::Single(a, b)
         }
-        let n = n.min(size);
-        return RangeSpec::Single(size - n, size - 1);
+        MultiRange::Ranges(_) => RangeSpec::Ignore,
+        MultiRange::Unsatisfiable => RangeSpec::Unsatisfiable,
+        MultiRange::Ignore => RangeSpec::Ignore,
+    }
+}
+
+/// `ngx_http_range_parse`, transcribed.
+///
+/// Three behaviours here are not the obvious ones, and all three are asserted by
+/// `range.t`:
+///
+///   * a malformed spec is **416**, not "ignore" -- `bytes=alpha`,
+///     `bytes=10-alpha`, `bytes=10` and `bytes=10-11 12-` must all be refused;
+///   * a span that starts past the end is **skipped**, not refused, so
+///     `bytes=0-9, -10, 100000-, 10-19` is a three-part 206. Only when nothing
+///     remains is the answer 416;
+///   * a span that ends before it starts *and* starts at zero makes nginx drop
+///     the whole header (`NGX_DECLINED`), and a set of spans whose total exceeds
+///     the entity does the same -- both answer 200 with the full body.
+pub fn parse_ranges(header: &str, size: u64, max_ranges: usize) -> MultiRange {
+
+    let h = header.trim();
+    if h.len() < 6 || !h[..6].eq_ignore_ascii_case("bytes=") {
+        return MultiRange::Ignore;
+    }
+    let b = h.as_bytes();
+    let mut p = 6usize;
+    let mut spans: Vec<(u64, u64)> = Vec::new();
+    let mut total: u64 = 0;
+
+    loop {
+        let mut start: u64 = 0;
+        let mut end: u64 = 0;
+        let mut suffix = false;
+        // `found` is the jump target: the span is already final.
+        let mut final_span = false;
+
+        while p < b.len() && b[p] == b' ' {
+            p += 1;
+        }
+        if p < b.len() && b[p] != b'-' {
+            if !b[p].is_ascii_digit() {
+                return MultiRange::Unsatisfiable;
+            }
+            while p < b.len() && b[p].is_ascii_digit() {
+                start = match start
+                    .checked_mul(10)
+                    .and_then(|v| v.checked_add((b[p] - b'0') as u64))
+                {
+                    Some(v) => v,
+                    None => return MultiRange::Unsatisfiable,
+                };
+                p += 1;
+            }
+            while p < b.len() && b[p] == b' ' {
+                p += 1;
+            }
+            if p >= b.len() || b[p] != b'-' {
+                return MultiRange::Unsatisfiable;
+            }
+            p += 1;
+            while p < b.len() && b[p] == b' ' {
+                p += 1;
+            }
+            if p >= b.len() || b[p] == b',' {
+                // `bytes=N-`: the end is the entity's end.
+                end = size;
+                final_span = true;
+            }
+        } else if p < b.len() {
+            suffix = true;
+            p += 1;
+        } else {
+            return MultiRange::Unsatisfiable;
+        }
+
+        if !final_span {
+            if p >= b.len() || !b[p].is_ascii_digit() {
+                return MultiRange::Unsatisfiable;
+            }
+            while p < b.len() && b[p].is_ascii_digit() {
+                end = match end
+                    .checked_mul(10)
+                    .and_then(|v| v.checked_add((b[p] - b'0') as u64))
+                {
+                    Some(v) => v,
+                    None => return MultiRange::Unsatisfiable,
+                };
+                p += 1;
+            }
+            while p < b.len() && b[p] == b' ' {
+                p += 1;
+            }
+            if p < b.len() && b[p] != b',' {
+                return MultiRange::Unsatisfiable;
+            }
+            if suffix {
+                start = if end < size { size - end } else { 0 };
+                end = size;
+            } else {
+                // Exclusive end, clamped to the entity.
+                end = if end >= size { size } else { end + 1 };
+            }
+        }
+
+        if start < end {
+            spans.push((start, end - 1));
+            total = match total.checked_add(end - start) {
+                Some(v) => v,
+                None => return MultiRange::Unsatisfiable,
+            };
+            // nginx's `if (ranges-- == 0) return NGX_DECLINED;` fires *after*
+            // the span is pushed, so exactly `max_ranges` spans still answer 206.
+            if spans.len() > max_ranges {
+                return MultiRange::Ignore;
+            }
+        } else if start == 0 {
+            // `NGX_DECLINED`: nginx serves the whole body.
+            return MultiRange::Ignore;
+        }
+
+        if p >= b.len() || b[p] != b',' {
+            break;
+        }
+        p += 1;
     }
 
-    let start: u64 = match a.trim().parse() {
-        Ok(v) => v,
-        Err(_) => return RangeSpec::Ignore,
-    };
-    if start >= size {
-        return RangeSpec::Unsatisfiable;
+    if spans.is_empty() {
+        return MultiRange::Unsatisfiable;
     }
-    let end: u64 = if b.trim().is_empty() {
-        size - 1
-    } else {
-        match b.trim().parse::<u64>() {
-            Ok(v) => v.min(size - 1),
-            Err(_) => return RangeSpec::Ignore,
-        }
-    };
-    if end < start {
-        return RangeSpec::Unsatisfiable;
+    if total > size {
+        return MultiRange::Ignore;
     }
-    RangeSpec::Single(start, end)
+    MultiRange::Ranges(spans)
 }
 
 /// nginx's `NGX_HTTP_AUTOINDEX_NAME_LEN`. A name wider than this is truncated
@@ -1018,6 +1060,92 @@ mod tests {
             parse_range("bytes=0-1,3-4", 1000),
             RangeSpec::Ignore
         ));
+    }
+
+    /// The three behaviours `range.t` pins down, transcribed from
+    /// `ngx_http_range_parse`.
+    #[test]
+    fn range_syntax_errors_are_416_not_ignored() {
+        for h in [
+            "bytes=alpha",
+            "bytes=10-alpha",
+            "bytes=10",
+            "bytes=10-11 12-",
+            "bytes=-",
+            "bytes=",
+            // Wrong unit is still "not ours" and must stay ignored.
+        ] {
+            assert!(
+                matches!(parse_range(h, 1000), RangeSpec::Unsatisfiable),
+                "{h} should be refused"
+            );
+        }
+        for h in ["none", "items=0-1", "BYTES=0-9"] {
+            // `BYTES=` is valid (the comparison is case-insensitive).
+            let expect_ok = h == "BYTES=0-9";
+            let got = parse_range(h, 1000);
+            assert_eq!(
+                matches!(got, RangeSpec::Single(0, 9)),
+                expect_ok,
+                "{h} -> wrong verdict"
+            );
+        }
+    }
+
+    #[test]
+    fn unsatisfiable_spans_are_skipped_when_others_remain() {
+        // `bytes=100000-` alone: nothing left -> 416.
+        assert!(matches!(
+            parse_range("bytes=100000-", 1000),
+            RangeSpec::Unsatisfiable
+        ));
+        // The skipped span may also be the *last* one.
+        match parse_ranges("bytes=0-9, -10, 10000-", 1000, 10) {
+            MultiRange::Ranges(v) => assert_eq!(v, vec![(0, 9), (990, 999)]),
+            other => panic!("expected two spans, got {}", match other {
+                MultiRange::Ignore => "ignore",
+                MultiRange::Unsatisfiable => "unsatisfiable",
+                _ => "?",
+            }),
+        }
+        // Mixed in with satisfiable spans: it is dropped, the rest answer 206.
+        match parse_ranges("bytes=0-9, -10, 100000-, 10-19", 1000, 10) {
+            MultiRange::Ranges(v) => {
+                assert_eq!(v, vec![(0, 9), (990, 999), (10, 19)]);
+            }
+            _ => panic!("expected three spans"),
+        }
+    }
+
+    #[test]
+    fn max_ranges_counts_satisfiable_spans_only() {
+        // `max_ranges 2`: two surviving spans are fine even though the header
+        // named three, because the third starts past the end (`range.t`).
+        assert!(matches!(
+            parse_ranges("bytes=0-9, -10, 10000-", 1000, 2),
+            MultiRange::Ranges(_)
+        ));
+        // Three real spans with `max_ranges 2` -> the header is dropped.
+        assert!(matches!(
+            parse_ranges("bytes=0-9, -10, 10-19", 1000, 2),
+            MultiRange::Ignore
+        ));
+    }
+
+    #[test]
+    fn oversized_and_zero_start_spans_drop_the_header() {
+        // Total longer than the entity -> full 200.
+        assert!(matches!(
+            parse_ranges("bytes=0-10001, 0-0", 1000, 10),
+            MultiRange::Ignore
+        ));
+        // A zero-start span that ends before it starts -> full 200.
+        assert!(matches!(parse_ranges("bytes=0-0", 0, 10), MultiRange::Ignore));
+        // Last-byte-pos past the end is clamped, still a 206.
+        match parse_ranges("bytes=0-10001", 1000, 10) {
+            MultiRange::Ranges(v) => assert_eq!(v, vec![(0, 999)]),
+            _ => panic!("expected one span"),
+        }
     }
 
     #[test]

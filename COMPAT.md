@@ -15,7 +15,7 @@
 |---|---|---|
 | 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 102 文件，WORSE=0 TRUNC=0（nginx 1622 / ngxrs 1627 断言） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
-| 单元测试 | `cargo test --release` | **PASS** — 152 passed |
+| 单元测试 | `cargo test --release` | **PASS** — 156 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
 
 ## 一之二、2026-10-27 轮：范围纠偏、realip 信任判定、auth_basic
@@ -322,6 +322,25 @@ nginx 里这类失败走 `ngx_http_special_response_handler`，所以 `error_pag
 resolver 的两个套件全靠这个把 `$upstream_addr` 暴露出来，因此这条不修，74 条断言里
 四十几条都过不去。这类缺陷之前没被发现，是因为既有用例里 `error_page` 都配在多后端场景，
 那时走的是另一条分支。
+
+## 一之八、2026-10-27 第七轮：Range 解析（`range.t` 31 → 42/43）
+
+`ngx_http_range_parse` 的三个非直觉行为，`range.t` 逐条断言：
+
+1. **语法错误是 416，不是「忽略」**。`bytes=alpha`、`bytes=10-alpha`、`bytes=10`、
+   `bytes=10-11 12-` 必须 416；我们此前一律当成「header 不认识」而返回 200 全量。
+   （`bytes=` 这个单位前缀的比较是大小写不敏感的，那是另一条 Rule。）
+2. **超出末尾的分段是「跳过」而不是「拒绝」**。`bytes=0-9, -10, 100000-, 10-19`
+   是三个分段的 206；只有当所有分段都不可满足时才是 416。
+3. **起点为 0 且终点早于起点的分段会让 nginx 丢掉整个 header**（`NGX_DECLINED`），
+   分段总长超过实体长度也一样 —— 两者都返回 200 全量。
+
+另外 `max_ranges` 此前是**按逗号数**判断的，于是
+`bytes=0-9, -10, 10000-` 在 `max_ranges 2` 下被误判为三段而丢掉整个 header。
+nginx 数的是「解析后仍然存活的分段」，现在由解析器自己计数。
+
+仍未对齐：`range_charset.t` 4 条（`charset`/`source_charset` 重编码后的 Range —— 偏移量
+必须落在重编码后的字节上，现在是先切片再重编码）。
 
 ## 二、声明的测试清单
 

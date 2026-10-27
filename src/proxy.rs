@@ -2384,7 +2384,7 @@ async fn serve_cached(
     let mut status = entry.status;
     let mut body = entry.body.clone();
     if ranges_from_cache {
-        let (s2, raw2, body2) = apply_force_ranges(req, status, &mut raw, body);
+        let (s2, raw2, body2) = apply_force_ranges(req, status, &mut raw, body, loc.max_ranges.unwrap_or(u32::MAX));
         status = s2;
         raw = raw2;
         body = body2;
@@ -2630,7 +2630,8 @@ async fn exchange(
                 let mut status = entry.status;
                 let mut body = entry.body.clone();
                 if ranges_from_cache {
-                    let (s2, raw2, body2) = apply_force_ranges(req, status, &mut raw, body);
+                    let (s2, raw2, body2) =
+                        apply_force_ranges(req, status, &mut raw, body, loc.max_ranges.unwrap_or(u32::MAX));
                     status = s2;
                     raw = raw2;
                     body = body2;
@@ -2928,7 +2929,7 @@ async fn exchange(
         }
         let mut status = head.status;
         if wants_ranges {
-            let (s2, raw2, body2) = apply_force_ranges(req, status, &mut out_raw, payload);
+            let (s2, raw2, body2) = apply_force_ranges(req, status, &mut out_raw, payload, loc.max_ranges.unwrap_or(u32::MAX));
             status = s2;
             out_raw = raw2;
             payload = body2;
@@ -4051,6 +4052,7 @@ fn apply_force_ranges(
     status: u16,
     raw: &mut Vec<u8>,
     body: Vec<u8>,
+    max_ranges: u32,
 ) -> (u16, Vec<u8>, Vec<u8>) {
     if status != 200 {
         return (status, std::mem::take(raw), body);
@@ -4093,7 +4095,7 @@ fn apply_force_ranges(
         .map(|(_, v)| v)
         .unwrap_or_else(|| "text/html".to_string());
 
-    match crate::http::static_file::parse_multi_range(range, size) {
+    match crate::http::static_file::parse_ranges(range, size, max_ranges as usize) {
         crate::http::static_file::MultiRange::Ignore => (status, std::mem::take(raw), body),
         crate::http::static_file::MultiRange::Unsatisfiable => {
             let mut out = Vec::new();

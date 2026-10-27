@@ -11,6 +11,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use crate::config::typed::Http;
 use crate::config::{FastcgiParam, LocCfg};
 use crate::conn::Conn;
 use crate::http::request::Request;
@@ -160,6 +161,15 @@ fn expand(spec: &str, v: &Vars<'_>) -> String {
                 if let Some(h) = name.strip_prefix("http_") {
                     let key = h.replace('_', "-");
                     v.req.headers.get(&key)
+                } else if let Some(want) = name.strip_prefix("arg_") {
+                    // `$arg_*` is needed by `fastcgi_pass $arg_b` and by
+                    // `fastcgi_param X $arg_y`; nginx does not percent-decode
+                    // it, and the key match ignores case.
+                    v.args
+                        .split('&')
+                        .filter_map(|p| p.split_once('='))
+                        .find(|(k, _)| k.eq_ignore_ascii_case(want))
+                        .map(|(_, val)| val)
                 } else {
                     None
                 }
@@ -232,6 +242,8 @@ fn parse_cgi_response(buf: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>, bool)
     };
 
     let mut status = 200u16;
+    let mut status_given = false;
+    let mut have_location = false;
     let mut headers = Vec::new();
     let mut had_length = false;
     for line in head.split(|b| *b == b'\n') {
@@ -252,7 +264,11 @@ fn parse_cgi_response(buf: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>, bool)
                 .next()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(200);
+            status_given = true;
             continue;
+        }
+        if name.eq_ignore_ascii_case("location") {
+            have_location = true;
         }
         if name.eq_ignore_ascii_case("content-length") {
             had_length = true;
@@ -266,6 +282,11 @@ fn parse_cgi_response(buf: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>, bool)
             continue;
         }
         headers.push((name, value));
+    }
+    // `ngx_http_fastcgi_module`: no `Status` line plus a `Location` header is
+    // a 302, which is how a CGI script redirects.
+    if !status_given && have_location {
+        status = 302;
     }
     (status, headers, body, had_length)
 }
@@ -282,11 +303,11 @@ pub async fn fetch(
     path: &str,
     query: &str,
     loc: &LocCfg,
+    http: &Http,
     body: &[u8],
     peer_ip: &str,
 ) -> Option<(Response, bool)> {
     let fcgi = loc.fastcgi_pass.as_ref()?;
-    let addr: SocketAddr = fcgi.addr;
 
     // ---- build the parameter list
     let (script_name, path_info) = split_path(path, loc);
@@ -308,6 +329,21 @@ pub async fn fetch(
         request_uri: &req.raw_target,
         args: query,
         scheme: "http",
+    };
+
+    // `fastcgi_pass $var` is resolved here, once the variables are known. The
+    // value may be an `upstream` name or a literal `host:port`.
+    let addr: SocketAddr = if fcgi.dynamic {
+        let target = expand(&fcgi.spec, &vars);
+        match resolve_dynamic(&target, http) {
+            Some(a) => a,
+            None => {
+                eprintln!("ngxrs: [error] fastcgi_pass \"{target}\" is not a resolvable address");
+                return Some((error_response(502), true));
+            }
+        }
+    } else {
+        fcgi.addr
     };
 
     let mut params: Vec<(String, String)> = Vec::with_capacity(loc.fastcgi_params.len() + 8);
@@ -356,6 +392,7 @@ pub async fn fetch(
     // ---- read the responder's STDOUT ----
     let mut stdout: Vec<u8> = Vec::with_capacity(8192);
     let mut ended = false;
+    let mut caught_stderr = false;
     let mut hdr = [0u8; 8];
     while !ended {
         let read =
@@ -405,12 +442,27 @@ pub async fn fetch(
                 if !msg.is_empty() {
                     eprintln!("ngxrs: [error] fastcgi stderr: {msg}");
                 }
+                // `fastcgi_catch_stderr`: a responder that reports an error on
+                // STDERR is answering 502, not a page with a hole in it.
+                if caught_stderr {
+                    continue;
+                }
+                if loc
+                    .fastcgi_catch_stderr
+                    .iter()
+                    .any(|pat| !pat.is_empty() && msg.contains(pat.as_str()))
+                {
+                    caught_stderr = true;
+                }
             }
             FCGI_END_REQUEST => ended = true,
             _ => {}
         }
     }
 
+    if caught_stderr {
+        return Some((error_response(502), true));
+    }
     let (status, headers, payload, had_length) = parse_cgi_response(&stdout);
     let mut raw = Vec::with_capacity(256);
     for (k, v) in &headers {
@@ -437,6 +489,47 @@ pub async fn fetch(
         headers_finalized: false,
         body: Body::Bytes(payload),
     }, had_length))
+}
+
+/// Resolve a per-request `fastcgi_pass` value: an `upstream` name, or
+/// `host:port`, or `unix:/path`.
+///
+/// nginx's `ngx_http_upstream_init_request` does the same thing: a URL whose
+/// host is an upstream name goes through that upstream, anything else is
+/// parsed as `host:port`.
+fn resolve_dynamic(target: &str, http: &Http) -> Option<SocketAddr> {
+    let target = target.trim();
+    if let Some(rest) = target.strip_prefix("unix:") {
+        // A unix target is not a SocketAddr; the caller cannot express it, so
+        // report it rather than silently connecting to the wrong place.
+        eprintln!("ngxrs: [error] fastcgi_pass unix:{rest} is not supported yet");
+        return None;
+    }
+    let name = match target.rsplit_once(':') {
+        // `host:port` and `[v6]:port` both keep the port after the last colon.
+        Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) && !port.is_empty() => {
+            let _ = host;
+            None
+        }
+        _ => Some(target),
+    };
+    if let Some(name) = name {
+        // No port at all: an upstream name.
+        let up = http.upstreams.iter().find(|u| u.name == name)?;
+        let peer = up.servers.iter().find(|s| !s.down)?;
+        return Some(peer.addr);
+    }
+    if let Some((host, port)) = target.rsplit_once(':') {
+        let port: u16 = port.parse().ok()?;
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            return Some(SocketAddr::new(ip, port));
+        }
+        // A hostname here would need the `resolver` at request time; nginx
+        // resolves a literal upstream host at configuration time instead, so a
+        // name that reaches this point is a configuration error.
+        return None;
+    }
+    None
 }
 
 /// A FastCGI failure, as the status nginx answers for it.
@@ -468,6 +561,7 @@ pub async fn handle(
     path: &str,
     query: &str,
     loc: &LocCfg,
+    http: &Http,
     tokens: bool,
 ) -> io::Result<Option<Outcome>> {
     if loc.fastcgi_pass.is_none() {
@@ -481,7 +575,7 @@ pub async fn handle(
     let body = crate::proxy::take_request_body(conn, req, 32 * 1024 * 1024).await?;
     let peer = conn.peer.ip().to_string();
 
-    let Some((resp, had_length)) = fetch(req, path, query, loc, &body, &peer).await else {
+    let Some((resp, had_length)) = fetch(req, path, query, loc, http, &body, &peer).await else {
         return Ok(None);
     };
     let status = resp.status;

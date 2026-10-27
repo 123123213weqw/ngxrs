@@ -1327,10 +1327,13 @@ fn eval_cond(cond: &IfCond, v: &RwVars<'_>) -> bool {
                 m
             }
         }
-        IfCond::FileTest(kind, path_expr) => {
-            let p = get_var(path_expr, v);
+        IfCond::FileTest(kind, path_expr, negated) => {
+            // The operand is a path with variables in it
+            // (`-f /srv/$arg_c`), not a variable name: `get_var` would look up
+            // the whole string as a name and always answer empty.
+            let p = expand_vars(path_expr, v);
             let path = std::path::Path::new(&p);
-            match kind {
+            let hit = match kind {
                 'f' => path.is_file(),
                 'd' => path.is_dir(),
                 'e' => path.exists(),
@@ -1341,7 +1344,8 @@ fn eval_cond(cond: &IfCond, v: &RwVars<'_>) -> bool {
                         .unwrap_or(false)
                 }
                 _ => false,
-            }
+            };
+            hit != *negated
         }
     }
 }
@@ -1369,7 +1373,22 @@ fn apply_rewrites(
         server,
         default_type,
         server_port,
+        &secure_link_seed(loc, req),
     )
+}
+
+/// The `$secure_link` / `$secure_link_expires` pair, ready to seed the rewrite
+/// variable map.
+///
+/// nginx resolves these through variable get_handlers, so the work happens on
+/// the first read -- which in practice is the `if ($secure_link = ...)` a
+/// config always has. Seeding before the rewrite steps is equivalent and also
+/// makes the values visible to `return`, `add_header` and the access log.
+fn secure_link_seed(loc: &LocCfg, req: &Request) -> Vec<(&'static str, String)> {
+    match crate::secure_link::evaluate(loc, req) {
+        Some((link, expires)) => vec![("secure_link", link), ("secure_link_expires", expires)],
+        None => Vec::new(),
+    }
 }
 
 /// Same, but with the three directive lists supplied explicitly (server-level
@@ -1386,6 +1405,7 @@ fn apply_rewrites_parts(
     server: &Server,
     default_type: &str,
     server_port: u16,
+    seed: &[(&str, String)],
 ) -> RewriteOutcome {
     let mut ignored_override = None;
     let mut ignored_seen = false;
@@ -1404,6 +1424,7 @@ fn apply_rewrites_parts(
         &mut ignored_override,
         &mut ignored_seen,
         &mut ignored_missing,
+        seed,
     )
     .0
 }
@@ -1428,6 +1449,11 @@ fn apply_rewrites_full(
     if_proxy_seen: &mut bool,
     // A matching `if` installed a proxy handler but left it without a target.
     proxy_override_missing: &mut bool,
+    // Variables already resolved for this request before the rewrite phase.
+    // `$secure_link` is nginx's clearest case: the module exposes it through a
+    // get_handler, so the first read -- the `if` that a config always has --
+    // computes it. Seeding reproduces that without a lazy callback.
+    seed: &[(&str, String)],
 ) -> (RewriteOutcome, std::collections::HashMap<String, String>) {
     let mut uri = path.to_string();
     let mut args = query.to_string();
@@ -1436,6 +1462,9 @@ fn apply_rewrites_full(
     // nginx runs `set` and `if` interleaved, in source order; a config that
     // re-assigns a variable between two `if`s depends on that order.
     let mut vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (name, value) in seed {
+        vars.insert((*name).to_string(), value.clone());
+    }
     let default_order: Vec<crate::config::Step>;
     let order: &[crate::config::Step] = if steps.is_empty() {
         default_order = sets
@@ -1517,7 +1546,7 @@ fn apply_rewrites_full(
         }
     }
     for rw in rewrites {
-        if let Some(out) = apply_one(rw, &mut uri, &mut args) {
+        if let Some(out) = apply_one(rw, &mut uri, &mut args, req, &vars, server_port) {
             return (out, vars);
         }
     }
@@ -1588,7 +1617,7 @@ fn run_if(
         return Some(RewriteOutcome::Respond(resp));
     }
     for rw in &ifb.rewrites {
-        if let Some(out) = apply_one(rw, uri, args) {
+        if let Some(out) = apply_one(rw, uri, args, req, vars, server_port) {
             return Some(out);
         }
     }
@@ -1600,6 +1629,9 @@ fn apply_one(
     rw: &crate::config::Rewrite,
     uri: &mut String,
     args: &mut String,
+    req: &Request,
+    vars: &std::collections::HashMap<String, String>,
+    server_port: u16,
 ) -> Option<RewriteOutcome> {
     if !rw.re.is_match(uri) {
         return None;
@@ -1618,10 +1650,16 @@ fn apply_one(
     // Capture values that land in the args part are escaped there
     // (`$1` containing `%` becomes `%25`, nginx's NGX_ESCAPE_ARGS); values in
     // the URI part keep their unescaped form.
-    let target = expand_captures(uri_tmpl, &caps);
+    // nginx compiles the replacement as a complex value, so `$1` and
+    // `$secure_link` are expanded in the same pass -- a rewrite that uses a
+    // named variable (`rewrite ^ /$secure_link break;`) is ordinary usage.
+    let expanded_uri = |tmpl: &str| {
+        expand_replacement(tmpl, &caps, req, uri, args, vars, server_port, false)
+    };
+    let target = expanded_uri(uri_tmpl);
     let new_args = match arg_tmpl {
         Some(t) if !t.is_empty() => {
-            let a = expand_captures_args(t, &caps);
+            let a = expand_replacement(t, &caps, req, uri, args, vars, server_port, true);
             if drop_args || args.is_empty() {
                 a
             } else {
@@ -1792,6 +1830,78 @@ fn expand_captures(replacement: &str, caps: &regex::Captures<'_>) -> String {
         i += 1;
     }
     out.push_str(&replacement[start..]);
+    out
+}
+
+/// Expand a `rewrite` replacement: `$1`..`$9` from the regex captures and
+/// `$name` from the rewrite-phase variable map, in one left-to-right pass, the
+/// way nginx's compiled complex value does it.
+///
+/// `escape_args` applies nginx's `NGX_ESCAPE_ARGS` to the *capture* text, which
+/// is what a substitution into the args part requires.
+#[allow(clippy::too_many_arguments)]
+fn expand_replacement(
+    tmpl: &str,
+    caps: &regex::Captures<'_>,
+    req: &Request,
+    path: &str,
+    query: &str,
+    vars: &std::collections::HashMap<String, String>,
+    server_port: u16,
+    escape_args: bool,
+) -> String {
+    let ctx = RwVars {
+        req,
+        path,
+        query,
+        vars,
+        server_port,
+    };
+    let mut out = String::with_capacity(tmpl.len());
+    let b = tmpl.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        out.push_str(&tmpl[start..i]);
+        let rest = &tmpl[i + 1..];
+        // `$1`..`$9` are captures; longer runs of digits are nginx's `$10`+,
+        // which only exist with named captures, so one digit is right here.
+        if rest.starts_with(|c: char| c.is_ascii_digit()) {
+            let n = (rest.as_bytes()[0] - b'0') as usize;
+            if let Some(m) = caps.get(n) {
+                if escape_args {
+                    out.push_str(&escape_arg_value(m.as_str()));
+                } else {
+                    out.push_str(m.as_str());
+                }
+            }
+            i += 2;
+            start = i;
+            continue;
+        }
+        let n = rest
+            .bytes()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == b'_')
+            .count();
+        if n == 0 {
+            out.push('$');
+            i += 1;
+        } else {
+            let name = rest[..n].trim_start_matches('$');
+            let value = match vars.get(name) {
+                Some(v) => v.clone(),
+                None => get_var(name, &ctx),
+            };
+            out.push_str(&value);
+            i += 1 + n;
+        }
+        start = i;
+    }
+    out.push_str(&tmpl[start..]);
     out
 }
 
@@ -2927,6 +3037,7 @@ pub fn resolve_target<'a>(
             server,
             &http.default_type,
             server_port,
+            &secure_link_seed(loc, req),
         ) {
             RewriteOutcome::Respond(r) => return Target::Done(r),
             RewriteOutcome::Continue(p, q) | RewriteOutcome::Relocate(p, q) => {
@@ -2979,8 +3090,15 @@ pub fn resolve_target<'a>(
             &mut proxy_override,
             &mut if_proxy_seen,
             &mut proxy_override_missing,
+            &secure_link_seed(cur_loc, req),
         );
         vars.extend(phase_vars);
+        // The location loop starts each pass with an empty map, so the secure
+        // link verdict has to be carried across: `return 200 x$secure_link` in
+        // a later `if` (and the access log) reads it from here.
+        for (name, value) in secure_link_seed(cur_loc, req) {
+            vars.entry(name.to_string()).or_insert(value);
+        }
         match outcome {
             RewriteOutcome::Respond(r) => return Target::Done(r),
             RewriteOutcome::Continue(p, q) => {
@@ -3212,7 +3330,7 @@ pub async fn resolve_response_local(
     // body off` is what the auth case uses), which is why `&[]` is passed.
     if loc.fastcgi_pass.is_some() {
         if let Some((resp, _had_length)) =
-            crate::fastcgi::fetch(req, path, query, loc, &[], peer_ip).await
+            crate::fastcgi::fetch(req, path, query, loc, http, &[], peer_ip).await
         {
             let mut resp = resp;
             return finalize_response(
@@ -4652,7 +4770,7 @@ async fn dispatch(
     // ---- FastCGI ----
     if loc.fastcgi_pass.is_some() {
         if let Some(o) =
-            crate::fastcgi::handle(conn, req, path, query, loc, server.server_tokens).await?
+            crate::fastcgi::handle(conn, req, path, query, loc, http, server.server_tokens).await?
         {
             return Ok(o);
         }

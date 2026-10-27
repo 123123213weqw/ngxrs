@@ -229,6 +229,24 @@ pub struct LocCfg {
     pub fastcgi_params: Vec<FastcgiParam>,
     pub fastcgi_index: Option<String>,
     pub fastcgi_split_path_info: Option<regex::Regex>,
+    /// `secure_link` (new style): a complex value holding `hash[,expires]`.
+    ///
+    /// The three `secure_link*` fields follow `ngx_http_secure_link_merge_conf`:
+    /// a scope that sets `secure_link_secret` forces the other two to nothing
+    /// (nginx rejects a config that sets both in one scope), and a scope that
+    /// sets either new-style directive stops inheriting the secret. The `*_set`
+    /// flags are how "set in this scope" is tracked; they are cleared for every
+    /// location block and consumed by `merge_secure_link`.
+    pub secure_link_set: bool,
+    pub secure_link_md5_set: bool,
+    pub secure_link_secret_set: bool,
+    pub secure_link: Option<String>,
+    /// `secure_link_md5`: the text whose MD5 the hash must equal.
+    pub secure_link_md5: Option<String>,
+    /// `secure_link_secret` (old style): the shared secret in the path.
+    pub secure_link_secret: Option<String>,
+    /// `fastcgi_catch_stderr`: a STDERR substring that turns the reply into 502.
+    pub fastcgi_catch_stderr: Vec<String>,
     pub fastcgi_connect_timeout: Duration,
     pub fastcgi_read_timeout: Duration,
     // ---- uwsgi / scgi ----
@@ -400,6 +418,13 @@ impl LocCfg {
             fastcgi_params: Vec::new(),
             fastcgi_index: None,
             fastcgi_split_path_info: None,
+            secure_link_set: false,
+            secure_link_md5_set: false,
+            secure_link_secret_set: false,
+            secure_link: None,
+            secure_link_md5: None,
+            secure_link_secret: None,
+            fastcgi_catch_stderr: Vec::new(),
             fastcgi_connect_timeout: Duration::from_secs(60),
             fastcgi_read_timeout: Duration::from_secs(60),
             uwsgi_pass: None,
@@ -481,8 +506,9 @@ pub enum IfCond {
     Equals(String, String, bool),
     /// `if ($var ~ regex)` / `~*` / `!~` / `!~*`
     Match(String, regex::Regex, bool),
-    /// `if (-f $request_filename)` etc.
-    FileTest(char, String),
+    /// `if (-f $request_filename)` etc. The `bool` is the `!` prefix, which
+    /// nginx spells as part of the operator (`!-f`), not as a separate token.
+    FileTest(char, String, bool),
 }
 
 #[derive(Debug, Clone)]
@@ -629,6 +655,20 @@ fn parse_if_cond(args: &[String]) -> Option<IfCond> {
     if toks.len() == 1 {
         return Some(IfCond::Truthy(toks[0].clone()));
     }
+    // File tests have no left operand: the grammar is `-f <path>` / `!-e <path>`.
+    // Reading them as `<var> <op> <rhs>` consumed the operator as the variable
+    // and the path as the operator, which is why every `-f` config failed to
+    // start before this.
+    if let Some(op) = toks.first().filter(|t| {
+        matches!(
+            t.as_str(),
+            "-f" | "-d" | "-e" | "-x" | "!-f" | "!-d" | "!-e" | "!-x"
+        )
+    }) {
+        let negated = op.starts_with('!');
+        let kind = op.chars().nth(if negated { 2 } else { 1 })?;
+        return Some(IfCond::FileTest(kind, toks[1..].join(" "), negated));
+    }
     let var = toks[0].clone();
     let op = toks[1].clone();
     let rhs = toks.get(2).cloned().unwrap_or_default();
@@ -642,7 +682,10 @@ fn parse_if_cond(args: &[String]) -> Option<IfCond> {
             let re = regex::Regex::new(&pattern).ok()?;
             Some(IfCond::Match(var, re, negate))
         }
-        "-f" | "-d" | "-e" | "-x" => Some(IfCond::FileTest(op.chars().nth(1)?, rhs)),
+        "-f" | "-d" | "-e" | "-x" => Some(IfCond::FileTest(op.chars().nth(1)?, rhs, false)),
+        "!-f" | "!-d" | "!-e" | "!-x" => {
+            Some(IfCond::FileTest(op.chars().nth(2)?, rhs, true))
+        }
         _ => None,
     }
 }
@@ -659,7 +702,13 @@ pub fn compile_rewrite(re_src: &str, replacement: &str, flag: RewriteFlag) -> Op
 
 #[derive(Debug, Clone)]
 pub struct FastcgiPass {
+    /// The literal address. Only meaningful when `dynamic` is false.
     pub addr: SocketAddr,
+    /// The configured value as written. Kept because `fastcgi_pass` accepts a
+    /// complex value (`fastcgi_pass $arg_b`) that nginx resolves per request,
+    /// against either an `upstream` name or `host:port`.
+    pub spec: String,
+    pub dynamic: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1484,6 +1533,24 @@ pub fn resolve_realip_from(s: &str) -> Result<Vec<(std::net::IpAddr, u8)>, Strin
         return Err(format!("host not found in \"{s}\""));
     }
     Ok(addrs)
+}
+
+/// `ngx_http_secure_link_merge_conf`: the two styles do not mix.
+///
+/// A scope that set `secure_link_secret` has already cleared the new-style
+/// fields (the caller does that), and a scope that set either new-style
+/// directive must stop inheriting the parent's secret -- otherwise a nested
+/// `location` with `secure_link`/`secure_link_md5` would be evaluated with the
+/// parent's `secure_link_secret`, which is the old style.
+fn merge_secure_link(cfg: &mut LocCfg) {
+    if cfg.secure_link_secret_set {
+        cfg.secure_link = None;
+        cfg.secure_link_md5 = None;
+        return;
+    }
+    if cfg.secure_link_set || cfg.secure_link_md5_set {
+        cfg.secure_link_secret = None;
+    }
 }
 
 pub fn parse_time(s: &str) -> Option<Duration> {
@@ -3136,14 +3203,50 @@ impl Builder {
                     .args
                     .first()
                     .ok_or_else(|| sem(&d.file, d.line, "fastcgi_pass requires an address"))?;
-                let addr = parse_listen(v).ok_or_else(|| {
-                    sem(
-                        &d.file,
-                        d.line,
-                        format!("invalid fastcgi_pass address \"{v}\""),
-                    )
-                })?;
-                cfg.fastcgi_pass = Some(FastcgiPass { addr });
+                // A value with a variable in it cannot be resolved here: nginx
+                // resolves it per request, against an `upstream` name or a
+                // literal `host:port`. Keeping the text is the only option.
+                if v.contains('$') {
+                    cfg.fastcgi_pass = Some(FastcgiPass {
+                        addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                        spec: v.clone(),
+                        dynamic: true,
+                    });
+                } else {
+                    let addr = parse_listen(v).ok_or_else(|| {
+                        sem(
+                            &d.file,
+                            d.line,
+                            format!("invalid fastcgi_pass address \"{v}\""),
+                        )
+                    })?;
+                    cfg.fastcgi_pass = Some(FastcgiPass {
+                        addr,
+                        spec: v.clone(),
+                        dynamic: false,
+                    });
+                }
+            }
+            "secure_link" => {
+                cfg.secure_link = d.args.first().cloned();
+                cfg.secure_link_set = true;
+            }
+            "secure_link_md5" => {
+                cfg.secure_link_md5 = d.args.first().cloned();
+                cfg.secure_link_md5_set = true;
+            }
+            "secure_link_secret" => {
+                cfg.secure_link_secret = d.args.first().cloned();
+                cfg.secure_link_secret_set = true;
+            }
+            "fastcgi_catch_stderr" => {
+                // nginx buffers STDERR and answers 502 when it contains one of
+                // these strings (`ngx_http_fastcgi_module`'s
+                // `fastcgi_catch_stderr`), which is how a PHP Fatal error is
+                // turned into a gateway error instead of a half page.
+                if let Some(v) = d.args.first() {
+                    cfg.fastcgi_catch_stderr.push(v.clone());
+                }
             }
             "fastcgi_param" => {
                 if d.args.len() < 2 {
@@ -3653,6 +3756,12 @@ impl Builder {
         // so the raw list must start empty here. Leaving the parent's entries in
         // place made a parent's `off` outrank a child's own rule.
         cfg.proxy_redirect_src = None;
+        // `secure_link*` inheritance (see the field docs). This scope's own
+        // flags arrive here untouched; the parent's were consumed by its own
+        // merge, so only this block's declarations matter.
+        cfg.secure_link_set = false;
+        cfg.secure_link_md5_set = false;
+        cfg.secure_link_secret_set = false;
         // `set_real_ip_from` follows nginx's array merge: a location with no
         // directive inherits the parent's list, one with any directive replaces
         // it entirely. Clearing the "already declared" flag is what makes the
@@ -3684,6 +3793,7 @@ impl Builder {
             }
         }
         resolve_proxy_redirects(&mut cfg, &loc_prefix);
+        merge_secure_link(&mut cfg);
         let mut nested = Vec::new();
         for child in block.iter().filter(|c| c.name == "location") {
             nested.push(self.parse_location(child, &cfg)?);

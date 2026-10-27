@@ -47,6 +47,17 @@ realip_hostname.t
 realip_remote_addr.t
 realip_remote_port.t
 
+# ---- rewrite / if ----
+# `if` operators: truthiness, `=`/`!=`, `~`/`~*`/`!~`/`!~*`, and the file
+# tests (`-f -d -e -x` and their `!` forms), whose operand is a path with
+# variables in it.
+rewrite_if.t
+
+# ---- secure_link ----
+# Both styles: `secure_link`+`secure_link_md5` (base64url MD5, optional
+# expiry) and the old `secure_link_secret` path form, including inheritance.
+secure_link.t
+
 # ---- sub_filter ----
 # Multiple patterns, longest match first, per-pattern `once`, variables in both
 # operands, and the filter running on proxied responses as well as local ones.
@@ -129,6 +140,9 @@ h2_proxy_max_temp_file_size.t
 h2_ssl_proxy_cache.t
 
 # ---- fastcgi / grpc ----
+# `fastcgi_pass` may be a complex value (a literal address, an `upstream` name,
+# or `$var`), and a `Location` header without `Status` is a 302.
+fastcgi.t
 fastcgi_body.t
 grpc_pass.t
 

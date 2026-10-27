@@ -13,9 +13,9 @@
 
 | 项 | 命令 | 当前结果 |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 89 文件，WORSE=0 TRUNC=0（nginx 1205 / ngxrs 1209 断言） |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 92 文件，WORSE=0 TRUNC=0（nginx 1271 / ngxrs 1275 断言） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
-| 单元测试 | `cargo test --release` | **PASS** — 133 passed |
+| 单元测试 | `cargo test --release` | **PASS** — 138 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
 
 ## 一之二、2026-10-27 轮：范围纠偏、realip 信任判定、auth_basic
@@ -177,9 +177,63 @@ nginx : ТЕКСТzast1ТЕКСТ      ngxrs(修前): ТЕКСТ模様ТЕКСТ
   nginx 三种配置全部返回 `xyz`）。要复现得实现按读边界推进的流式过滤器，收益是 1 条断言，
   代价是把一个更坏的实现写进热路径，故记为偏差。
 
+## 一之四、2026-10-27 第三轮：fastcgi 变量目标、secure_link、`if` 文件测试、rewrite 命名变量
+
+### 1. `fastcgi_pass` 接受复杂值（`fastcgi.t` 0/10 → 10/10）
+
+`fastcgi_pass` 此前只接受字面地址，`fastcgi_pass $arg_b;` 在 `-t` 阶段直接
+`invalid fastcgi_pass address "$arg_b"` 拒绝启动，整个文件 0 分。现在：
+
+- 配置里含 `$` 的值存为 `spec` + `dynamic`，请求期用 fastcgi 自己的变量视图展开；
+- 展开结果先按 `upstream` 名匹配（nginx 的 `ngx_http_upstream_init_request`），
+  再按 `host:port` 解析；两者都不是就 502 并写错误日志，而不是静默连错地方；
+- `$arg_*` 加进 fastcgi 的变量视图（`fastcgi_pass $arg_b` 与
+  `fastcgi_param X $arg_y` 都要它）；
+- `fastcgi_catch_stderr <pat>`：STDERR 命中即 502（`/catch` 用例）；
+- CGI 响应没有 `Status` 而有 `Location` 时是 302（`ngx_http_fastcgi_module` 第
+  2056 行的规则），此前一律当 200 发出去。
+
+### 2. `secure_link` 从零实现（`secure_link.t` 15/21 → 21/21）
+
+两种形态都按 `ngx_http_secure_link_module.c` 逐行核对：
+
+- **新式** `secure_link $arg_hash[,expires]` + `secure_link_md5 secret$uri$arg_expires`：
+  值先做 base64url 解码（padding 可省、超过 24 字符直接失败、长度必须是 16），
+  再和 MD5 比；`$secure_link` 给 `"1"` / `"0"`（过期）/ 空（未找到），
+  `$secure_link_expires` 给原样的 expires 文本。expires 用 nginx 的 `ngx_atotm`
+  语义：纯数字，`0` 或解析失败是「未找到」而不是「已过期」。
+- **老式** `secure_link_secret`：从 `$unparsed_uri`（含查询串）取
+  `/prefix/<32 hex>/<rest>`，校验 `md5(rest + secret)`，成功时 `$secure_link` = `rest`。
+- **继承规则**照 `ngx_http_secure_link_merge_conf`：某 scope 写了
+  `secure_link_secret` 就用老式并清空另外两个；某 scope 写了新式的任一指令就不再
+  继承父级的 secret。这条是 `inheritance` 用例失败的原因。
+
+MD5 从 `auth.rs` 的 apr1 里抽成 `src/md5.rs`（两个模块共用），带 RFC 1321 向量
+与分块输入一致性的单测。
+
+### 3. `if` 的文件测试从来没能用（`rewrite_if.t` 0/35 → 35/35）
+
+两个独立错误叠在一起：
+
+1. `parse_if_cond` 对 `-f` 也按「`<var> <op> <rhs>`」三段解析，于是把 `-f` 当变量、
+   把路径当运算符 —— 任何带 `-f` 的配置都 `unsupported if condition` 起不来。
+   文件测试没有左操作数，语法是 `-f <path>`；`!-f` 是**一个**运算符（nginx 的词法），
+   不是 `!` 加 `-f`。
+2. 操作数被当成变量名查表（`get_var`），而它是 `/srv/$arg_c` 这样的路径，查询必然
+   为空，于是一切文件测试恒为假。改为整体展开。
+
+### 4. `rewrite` 的替换只认 `$1..$9`
+
+`rewrite ^ /$secure_link break;` 是标准用法，但 `apply_one` 只展开捕获，
+命名变量原样留在 URI 里（`/$secure_link` → 404）。nginx 把替换编译成一个 complex
+value，捕获与命名变量在同一遍里替换。现在合并成一个展开器
+（`expand_replacement`），并保留 args 部分对捕获值做 `NGX_ESCAPE_ARGS`。
+
+声明清单 **89 → 92 文件**（新增 `fastcgi.t`、`secure_link.t`、`rewrite_if.t`）。
+
 ## 二、声明的测试清单
 
-清单在 `bench/declared.txt`，**89 个文件**，选取规则是机械的：
+清单在 `bench/declared.txt`，**92 个文件**，选取规则是机械的：
 
 1. 落在范围内（**参考构建 `-V` 能编出来的模块**：http core + proxy/cache/gzip/
    TLS/HTTP2/realip/auth_request/slice/sub/secure_link/dav/stub_status/gzip_static/

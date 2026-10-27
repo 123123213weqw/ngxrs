@@ -190,7 +190,7 @@ pub async fn resolve_any(
     let (rest, ssl) = split_scheme(&expanded);
     let (host, port) = split_host_port(rest, ssl)?;
     let r = http.resolver.as_ref()?;
-    let ip = crate::resolver::resolve(r, &host).await?;
+    let ip = crate::resolver::resolve(r, &host).await?.into_iter().next()?;
     Some(Target {
         addr: SocketAddr::new(ip, port),
         host: rest.to_string(),

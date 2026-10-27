@@ -13,9 +13,9 @@
 
 | 项 | 命令 | 当前结果 |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 100 文件，WORSE=0 TRUNC=0（nginx 1509 / ngxrs 1513 断言） |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 102 文件，WORSE=0 TRUNC=0（nginx 1622 / ngxrs 1627 断言） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
-| 单元测试 | `cargo test --release` | **PASS** — 147 passed |
+| 单元测试 | `cargo test --release` | **PASS** — 152 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
 
 ## 一之二、2026-10-27 轮：范围纠偏、realip 信任判定、auth_basic
@@ -292,9 +292,40 @@ value，捕获与命名变量在同一遍里替换。现在合并成一个展开
 这种混合家族，`ngx_proxy_protocol_write` 只能写 `PROXY UNKNOWN`，于是
 `$proxy_protocol_addr` 为空 —— `proxy_protocol_ipv6.t` 的两条断言正是这样。
 
+## 一之七、2026-10-27 第六轮：resolver（113 条断言）
+
+`http_resolver_aaaa.t` 25/74 → **74/74**，`http_resolver.t` 15/40 → **39/40**
+（那一条是 nginx 自己也失败的 `TODO`「zero ttl not cached」，我们反而通过）。
+
+原来的实现只发 A 查询、只收一个地址、不跟 CNAME。现在是 `ngx_resolver.c` 的状态机：
+
+- **A 与 AAAA 并发**，地址合并（A 在前）；
+- **任一错误响应即整名失败**。`n-e`（A 成功、AAAA SERVFAIL）必须是 502 而不是用 A 的地址，
+  这条靠「部分结果也要丢」才成立；
+- **空 NOERROR 响应不等于空结果**，但它决定了 CNAME 跟不跟：`z-c`（A 空、AAAA 是 CNAME）
+  要跟到底拿到 2 个地址，`c-z`（A 是 CNAME、AAAA 空）必须 502。差别只在「哪个响应最后到」，
+  nginx 用 `nan == 0` 的分支 + `rn->naddrs/naddrs6` 的 `-1` 哨兵表达，现在照抄；
+- **CNAME 只在两个响应都没有地址时跟**，且谁最后完成谁的名字生效（`c1-c2`：A 指向 alias4、
+  AAAA 指向 alias6，最终只解析 alias6）；
+- **缓存时长取最小 TTL**，但空响应不参与（否则 `many.example.net` 的 A 响应会把 3600 压成 0，
+  这正是「AAAA many cached」失败的原因）；`valid=` 覆盖 TTL；TTL 0 不缓存；
+- **服务器按「名字」轮转**（`r->last_connection++` 在节点创建时执行），所以
+  `resolver <坏> <好>` 第一次 502、第二次成功；
+- **重发**：每 `resend_timeout`(5s) 一次，直到 `resolver_timeout`，每次换服务器；
+- **TC 位置位时改用 TCP 重问同一台**（`tcp.example.net` 的桩就是这么写的）。
+
+### 顺带修掉的一个通用缺陷：上游连接失败不走 `error_page`
+
+这一轮之前，`proxy` 的连接/读取失败直接自己写 502/504，**完全绕过 `error_page`**。
+nginx 里这类失败走 `ngx_http_special_response_handler`，所以 `error_page 504 502 /50x` 对它们
+同样生效。改成返回 `Proxied::Intercept { status }`，让正常的 error_page 管線接手 ——
+resolver 的两个套件全靠这个把 `$upstream_addr` 暴露出来，因此这条不修，74 条断言里
+四十几条都过不去。这类缺陷之前没被发现，是因为既有用例里 `error_page` 都配在多后端场景，
+那时走的是另一条分支。
+
 ## 二、声明的测试清单
 
-清单在 `bench/declared.txt`，**100 个文件**，选取规则是机械的：
+清单在 `bench/declared.txt`，**102 个文件**，选取规则是机械的：
 
 1. 落在范围内（**参考构建 `-V` 能编出来的模块**：http core + proxy/cache/gzip/
    TLS/HTTP2/realip/auth_request/slice/sub/secure_link/dav/stub_status/gzip_static/

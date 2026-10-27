@@ -252,6 +252,13 @@ pub struct LocCfg {
     /// `min_delete_depth`: how many path segments a DELETE URI needs before it
     /// is allowed (nginx default 0 = no check).
     pub dav_min_delete_depth: u32,
+    /// `resolver <addr>`: consulted for hosts that only appear at request time.
+    /// nginx allows this in http, server and location, with the innermost
+    /// winning; each directive instance has its own cache.
+    pub resolver: Option<crate::resolver::Resolver>,
+    /// `resolver_timeout`: how long one name may take. Kept beside `resolver`
+    /// because the two directives may appear in either order.
+    pub resolver_timeout: Option<Duration>,
     /// `secure_link` (new style): a complex value holding `hash[,expires]`.
     ///
     /// The three `secure_link*` fields follow `ngx_http_secure_link_merge_conf`:
@@ -446,6 +453,8 @@ impl LocCfg {
             dav_access: 0o600,
             dav_create_full_put_path: false,
             dav_min_delete_depth: 0,
+            resolver: None,
+            resolver_timeout: None,
             secure_link_set: false,
             secure_link_md5_set: false,
             secure_link_secret_set: false,
@@ -1321,6 +1330,8 @@ pub struct Http {
     pub http2: bool,
     /// `resolver <addr>`: consulted for hosts that only appear at request time.
     pub resolver: Option<crate::resolver::Resolver>,
+    /// `resolver_timeout` at http scope: the fallback for locations.
+    pub resolver_timeout: Option<Duration>,
     /// `large_client_header_buffers <num> <size>` as (num, size).
     /// nginx defaults to `4 8k`.
     pub large_client_header_buffers: (usize, usize),
@@ -3283,6 +3294,27 @@ impl Builder {
                     });
                 }
             }
+            "resolver" => {
+                // nginx allows `resolver` in http, server and location; the
+                // instance is per directive, and its cache belongs to it.
+                cfg.resolver = crate::resolver::Resolver::parse(&d.args, std::path::Path::new(""));
+                if cfg.resolver.is_none() {
+                    return Err(sem(&d.file, d.line, "invalid resolver"));
+                }
+            }
+            "resolver_timeout" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "resolver_timeout requires a value"))?;
+                cfg.resolver_timeout = Some(parse_time(v).ok_or_else(|| {
+                    sem(
+                        &d.file,
+                        d.line,
+                        format!("invalid resolver_timeout value \"{v}\""),
+                    )
+                })?);
+            }
             "dav_methods" => {
                 cfg.dav_methods = 0;
                 for a in &d.args {
@@ -4810,6 +4842,7 @@ pub fn build(
         tcp_nopush: false,
         http2: false,
         resolver: None,
+        resolver_timeout: None,
         large_client_header_buffers: (4, 8192),
         tcp_nodelay: true,
         gzip: false,
@@ -5020,6 +5053,18 @@ pub fn build(
                 if http.resolver.is_none() {
                     return Err(sem(&d.file, d.line, "invalid resolver"));
                 }
+            }
+            "resolver_timeout" => {
+                let v = d.args.first().ok_or_else(|| {
+                    sem(&d.file, d.line, "resolver_timeout requires a value")
+                })?;
+                http.resolver_timeout = Some(parse_time(v).ok_or_else(|| {
+                    sem(
+                        &d.file,
+                        d.line,
+                        format!("invalid resolver_timeout value \"{v}\""),
+                    )
+                })?);
             }
             "ssl_certificate" => {
                 if let Some(v) = d.args.first() {

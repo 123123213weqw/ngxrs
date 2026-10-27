@@ -367,14 +367,14 @@ enum Chosen {
 /// needs `resolver` (nginx refuses to start without one in that case).
 async fn dynamic_addr(
     http: &Http,
+    loc: &LocCfg,
     authority: &str,
     https: bool,
     vars: &crate::http::ServerVars<'_>,
-    _h: &Http,
-) -> Option<std::net::SocketAddr> {
+) -> Option<Vec<std::net::SocketAddr>> {
     let authority = authority.split('/').next().unwrap_or(authority);
     if let Some(up) = http.upstreams.iter().find(|u| u.name == authority) {
-        return up.servers.first().map(|s| s.addr);
+        return up.servers.first().map(|s| vec![s.addr]);
     }
     let default_port = if https { 443 } else { 80 };
     let (host, port) = match authority.rsplit_once(':') {
@@ -384,12 +384,25 @@ async fn dynamic_addr(
         _ => (authority, default_port),
     };
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return Some(std::net::SocketAddr::new(ip, port));
+        return Some(vec![std::net::SocketAddr::new(ip, port)]);
     }
-    let resolver = http.resolver.as_ref()?;
+    // nginx allows `resolver` in http, server and location; the innermost one
+    // wins, and `resolver_timeout` applies to whichever is in force.
+    let resolver = loc.resolver.as_ref().or(http.resolver.as_ref())?;
+    let resolver = resolver.with_timeout(loc.resolver_timeout.or(http.resolver_timeout));
     let _ = vars;
-    let ip = crate::resolver::resolve(resolver, host).await?;
-    Some(std::net::SocketAddr::new(ip, port))
+    let ips = crate::resolver::resolve(&resolver, host).await?;
+    if ips.is_empty() {
+        return None;
+    }
+    // Every address the name resolved to becomes a peer, in order, so
+    // `proxy_next_upstream` walks them (`many.example.net` in the resolver
+    // tests expects both to appear in `$upstream_addr`).
+    Some(
+        ips.into_iter()
+            .map(|ip| std::net::SocketAddr::new(ip, port))
+            .collect(),
+    )
 }
 
 fn choose(
@@ -1040,7 +1053,7 @@ pub async fn handle(
     });
     let dyn_target = match dynamic.as_deref() {
         Some(expanded) if !expanded.is_empty() => {
-            match dynamic_addr(http, expanded, pp.https, vars, http).await {
+            match dynamic_addr(http, loc, expanded, pp.https, vars).await {
                 Some(a) => Some(a),
                 None => {
                     crate::log::error_log(
@@ -1061,7 +1074,13 @@ pub async fn handle(
         None => None,
     };
     let Some(candidates) = dyn_target
-        .map(|a| vec![Chosen::Direct(0, a)])
+        .map(|addrs| {
+            addrs
+                .into_iter()
+                .enumerate()
+                .map(|(i, a)| Chosen::Direct(i, a))
+                .collect()
+        })
         .or_else(|| choose(http, loc, &peer_ip, Some(vars)))
     else {
         // Peer selection found nothing live: nginx records the upstream group
@@ -1712,15 +1731,19 @@ pub async fn handle(
         Some(e) if e.kind() == io::ErrorKind::TimedOut => 504,
         _ => 502,
     };
-    if wanted_more && last_err.is_some() {
+    if last_err.is_some() && wanted_more {
         note_group_name(http, &pp);
-        return Ok(Some(written(
-            respond_error_upstream(conn, status, tokens, req.keepalive, loc, &pp).await?,
-        )));
     }
-    Ok(Some(written(
-        respond_error(conn, status, tokens, req.keepalive).await?,
-    )))
+    // A connection-level failure never reaches the client directly: nginx
+    // passes it through `ngx_http_special_response_handler`, so `error_page 502`
+    // / `error_page 504` apply. Nothing has been written at this point, which is
+    // what lets `Proxied::Intercept` hand the status to the normal pipeline --
+    // without this, `error_page 504 502 /50x` was silently ignored for every
+    // connect/read error and the resolver tests only ever saw a bare 502.
+    Ok(Some(Proxied::Intercept {
+        status,
+        headers: Vec::new(),
+    }))
 }
 
 /// `proxy_ssl_certificate` + `proxy_ssl_certificate_key`, when both are set.

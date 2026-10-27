@@ -572,6 +572,35 @@ add_header ETag foo always;           -> ETag: foo（不是两个）
 `bench/ntscan.sh` 的 `OUT=` 是普通赋值，我传 `OUT=...` 时被忽略并覆盖了上一次的扫描结果，
 基线因此丢失（从本地副本找回）。现在改为 `${OUT:-...}`，每次扫描可以写到独立目录。
 
+### 2026-10-27 第十四轮（未跑 nginx 对照，原因见下）
+
+**V100 主机（`wzu-server`，100.70.188.115）在本轮中途离线**，tailscale 显示该节点
+`offline`，从本机与备用跳板机（`v100-222`）都无法连通。因此本轮的 nginx A/B **没有跑**，
+`declared.sh` 的数字仍是上一轮的。
+
+已完成并在主机离线**之前**验证的：
+
+- `access_log_variables.t` 3/8 → **8/8**：`$request_length`（收到的 header 字节 + body，
+  与 `r->request_length` 同义）、`$bytes_sent`（整个响应含头）、`$msec`、
+  `$time_iso8601`、`$pipe`（本请求的字节是否已在上一请求处理期间缓冲）。`$request_time`
+  此前整个变量表里都没有。
+
+已写但**只在本机验证过编译与单测**的：
+
+- `open_log_file_cache max/inactive/min_uses/valid`，实现为写入线程里的句柄缓存。三条规则
+  都是 `access_log.t` 用「把目录改名」证明的：`valid` 内的句柄继续写 inode；不足
+  `min_uses` 次则每行开关文件、路径一消失就丢行；`max` 约束的是**条目数**，第四個路径会
+  淘汰 LRU 条目，该路径此后同样丢行。四条各有单元测试（会真的重命名目录），
+  `cargo test --release` 164 passed。
+- 写单测时发现一处必须改正的地方：运行期打开日志**不能创建父目录**。nginx 在加载配置时
+  打开所有日志（`ngx_conf_open_file`），请求期只重新打开路径。现在启动时
+  `preopen_access_logs` 做前半段（跳过含 `$` 的路径，nginx 也不会预创建它们），
+  `open_log` 只打开。
+
+**待办**：主机恢复后先跑 `bash bench/declared.sh` 与 `bench/all.sh` 确认这两轮改动没有
+回归，再跑 `TEST_LIST="access_log.t access_log_variables.t request_id.t"` 取得
+`access_log.t` 的实际分数（预期 21/21 后可入清单）。
+
 ## 二、声明的测试清单
 
 清单在 `bench/declared.txt`，**117 个文件**，选取规则是机械的：

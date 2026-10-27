@@ -298,7 +298,14 @@ pub struct Record {
 
 /// One entry of `open_log_file_cache`.
 struct Cached {
-    writer: Option<BufWriter<File>>,
+    /// The open handle, held only when the entry reached `min_uses`.
+    ///
+    /// Deliberately **not** a `BufWriter`: nginx writes access-log lines
+    /// unbuffered unless `buffer=` is configured, and buffering here loses lines
+    /// whenever an entry is evicted or its validity expires (which is exactly
+    /// what "cache - cached 1/2" in `access_log.t` measures -- the buffered copy
+    /// died with the evicted entry and the file came out short).
+    writer: Option<File>,
     created: Instant,
     last_used: Instant,
     /// How often this path has been logged, for `min_uses`.
@@ -320,11 +327,7 @@ impl Logger {
                             append_line(&mut files, &path, &line, cache);
                         }
                         Err(RecvTimeoutError::Timeout) => {
-                            for w in files.values_mut() {
-                                if let Some(b) = w.writer.as_mut() {
-                                    let _ = b.flush();
-                                }
-                            }
+
                             // `inactive`: an entry unused for that long is
                             // dropped, closing its handle.
                             files.retain(|_, e| e.last_used.elapsed() < e.inactive);
@@ -332,11 +335,7 @@ impl Logger {
                         Err(RecvTimeoutError::Disconnected) => break,
                     }
                 }
-                for w in files.values_mut() {
-                    if let Some(b) = w.writer.as_mut() {
-                        let _ = b.flush();
-                    }
-                }
+
             })?;
         Ok(Logger {
             tx: Some(tx),
@@ -398,7 +397,6 @@ fn append_line(
         if let Some(mut f) = open_log(path) {
             let _ = f.write_all(line.as_bytes());
             let _ = f.write_all(b"\n");
-            let _ = f.flush();
         }
         return;
     }
@@ -415,21 +413,24 @@ fn append_line(
         // Either the entry never kept a handle (`min_uses` not reached) or its
         // validity expired: reopen by path. A failure drops the line.
         e.writer = None;
-        if let Some(f) = open_log(path) {
-            let mut w = BufWriter::with_capacity(64 * 1024, f);
-            let _ = w.write_all(line.as_bytes());
-            let _ = w.write_all(b"\n");
+        if let Some(mut f) = open_log(path) {
+            let _ = f.write_all(line.as_bytes());
+            let _ = f.write_all(b"\n");
             if e.uses >= cache.min_uses {
-                e.writer = Some(w);
+                e.writer = Some(f);
                 e.created = now;
-            } else {
-                let _ = w.flush();
             }
         }
         return;
     }
 
     // First line for this path.
+    //
+    // A failed open is only remembered when `open_file_cache_errors` is on
+    // (`of.errors = clcf->open_file_cache_errors` in `ngx_http_log_module.c`,
+    // default off). Remembering it matters: a path that has just been renamed
+    // away would otherwise occupy a slot, evict a *live* entry under `max`, and
+    // that eviction is what made "cache - cached 1/2" come out one line short.
     let mut entry = Cached {
         writer: None,
         created: now,
@@ -437,15 +438,16 @@ fn append_line(
         uses: 1,
         inactive: cache.inactive,
     };
-    if let Some(f) = open_log(path) {
-        let mut w = BufWriter::with_capacity(64 * 1024, f);
-        let _ = w.write_all(line.as_bytes());
-        let _ = w.write_all(b"\n");
-        if entry.uses >= cache.min_uses {
-            entry.writer = Some(w);
-        } else {
-            let _ = w.flush();
+    match open_log(path) {
+        Some(mut f) => {
+            let _ = f.write_all(line.as_bytes());
+            let _ = f.write_all(b"\n");
+            if entry.uses >= cache.min_uses {
+                entry.writer = Some(f);
+            }
         }
+        None if !cache.errors => return,
+        None => {}
     }
     files.insert(path.to_path_buf(), entry);
 
@@ -458,11 +460,7 @@ fn append_line(
         else {
             break;
         };
-        if let Some(mut e) = files.remove(&oldest) {
-            if let Some(b) = e.writer.as_mut() {
-                let _ = b.flush();
-            }
-        }
+        files.remove(&oldest);
     }
 }
 
@@ -528,11 +526,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&moved);
         std::fs::rename(&d, &moved).unwrap();
         append_line(&mut files, &p, "three", cache(3, 1));
-        for e in files.values_mut() {
-            if let Some(w) = e.writer.as_mut() {
-                let _ = w.flush();
-            }
-        }
         assert_eq!(lines(&moved.join("a.log")), 3);
         // The old path was not recreated.
         assert!(!d.exists());

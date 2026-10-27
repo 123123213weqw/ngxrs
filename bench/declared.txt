@@ -79,6 +79,12 @@ stream_split_clients.t
 # `if=`, per-format `escape=`, dynamic log paths, and `-` for a not-found
 # variable in the default escape mode.
 request_id.t
+# The log writer end to end: `if=`, per-format `escape=`, dynamic log paths,
+# and `open_log_file_cache` (a handle cached within `valid` keeps writing to the
+# inode after the path is renamed away; `min_uses` and `max` decide which paths
+# get that treatment).
+access_log.t
+access_log_variables.t
 
 # ---- index ----
 # `index` as a complex value, its internal redirect (`$uri` changes), absolute

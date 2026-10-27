@@ -600,6 +600,7 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
                     0,
                     0,
                     false,
+                    crate::config::OpenFileCache::default(),
                     (&log_peer_ip, &log_peer_port),
                     &[],
                     None,
@@ -809,6 +810,7 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
             conn.last_head_len + req.body_len,
             conn.last_bytes_sent,
             pipelined,
+            loc.open_log_file_cache,
             (&remote_eff.0, &remote_eff.1),
             &sent,
             loc.access_logs.as_deref(),
@@ -6687,6 +6689,9 @@ fn log_access(
     // `$pipe`: `p` when this request was already buffered behind another on the
     // same connection, `.` otherwise.
     pipelined: bool,
+    // `open_log_file_cache` from this request's location, resolved at write
+    // time because directive order in the block must not matter.
+    file_cache: crate::config::OpenFileCache,
     // `$remote_addr` / `$remote_port` as `real_ip_*` left them; the raw socket
     // address is only the starting point.
     remote: (&str, &str),
@@ -6882,7 +6887,7 @@ fn log_access(
             }
             None => log.path.clone(),
         };
-        ctx.logger.access_cached(&path, line, log.cache);
+        ctx.logger.access_cached(&path, line, file_cache);
     }
 }
 

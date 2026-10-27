@@ -601,6 +601,39 @@ add_header ETag foo always;           -> ETag: foo（不是两个）
 回归，再跑 `TEST_LIST="access_log.t access_log_variables.t request_id.t"` 取得
 `access_log.t` 的实际分数（预期 21/21 后可入清单）。
 
+### 2026-10-27 第十五轮：搬迁到备用主机，并补上上一轮欠的 A/B
+
+上一轮 V100（`wzu-server`）离线后，本轮在**另一台 V100**（`v100-222`，88 核 / Ubuntu 22.04）
+上重建了完整对照环境：
+
+- nginx 1.28.0 从源码编译，configure 参数与参考二进制逐项一致（`-V` 已核对），
+  依赖用 `apt-get download` + `dpkg -x` 解到 `~/sysroot`（非 root）；
+- perl 侧 `IO::Socket::SSL` / `Net::SSLeay` / `FCGI` 均从 deb 取，`PERL5LIB` 指向 sysroot；
+- `~/nginx-tests` 用当前 master（与主机的 515 文件版本差 `http_headers.t` 一个文件，
+  其余声明清单里的 119 个文件都在）。
+
+**这台机器上的 declared 全量：119 文件 → WORSE=0 TRUNC=0，113 个逐断言一致、5 个更优。**
+
+### access_log 系列全部打平，`open_log_file_cache` 三个 bug 被 A/B 抓出来
+
+上一轮只做了单元测试、没有 nginx 对照的两处，本轮全部复现并修好：
+
+1. **缓存策略取的是解析时刻的值**。`access_log` 写在 `open_log_file_cache` 之前时拿到的是
+   默认值（`max=0`，等于关闭缓存）。nginx 的 `ngx_http_log_handler` 是**在写日志时**读
+   `clcf->open_file_cache`，所以指令顺序不该有影响。改为运行时从 location 取。
+2. **写缓冲在淘汰时丢行**。日志用 `BufWriter` 缓冲，条目被 LRU 淘汰时直接 drop，
+   缓冲区里的行随之消失 —— "cache - cached 1/2" 少一行正是这个。nginx 的 access_log
+   默认**不缓冲**（只有 `buffer=` 才缓冲），改为直写。
+3. **打开失败也建条目，反过来挤掉活着的句柄**。目录被改名后 `lru` 的重新打开失败，
+   我们仍为它建了条目，于是 `max=3` 下又淘汰了一个还有效的句柄。nginx 只在
+   `open_file_cache_errors` 打开时才记住失败（日志模块默认取该值，默认 off）。
+
+结果：`access_log.t` 19/21 → **21/21**、`access_log_variables.t` 8/8、`request_id.t` 14/14，
+三者均已入声明清单（119 文件）。
+
+教训直接写在这里：上一轮"四条单元测试通过"并不足以证明实现正确 —— 单元测试里我自己
+构造的调用顺序恰好避开了 bug 1，也没有覆盖"淘汰后再打开失败"这条路径。
+
 ## 二、声明的测试清单
 
 清单在 `bench/declared.txt`，**117 个文件**，选取规则是机械的：

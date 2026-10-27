@@ -1241,8 +1241,12 @@ pub struct AccessLog {
     pub if_cond: Option<String>,
     /// `escape=default|json|none`; `None` means "take the format's own mode".
     pub escape: Option<Escape>,
-    /// The `open_log_file_cache` in force where this `access_log` was declared.
-    pub cache: OpenFileCache,
+    /// Always `None`. The policy in force comes from the *current location's*
+    /// core conf at write time (`ngx_http_log_handler` reads
+    /// `clcf->open_file_cache`), so directive order inside a block cannot
+    /// matter -- and in `access_log.t` the `access_log` line comes before
+    /// `open_log_file_cache`.
+    pub cache: Option<OpenFileCache>,
 }
 
 /// `open_log_file_cache max=N [inactive=T] [min_uses=N] [valid=T]`.
@@ -1342,7 +1346,7 @@ pub fn parse_access_log(args: &[String], prefix: &std::path::Path) -> Option<Acc
         format,
         if_cond,
         escape,
-        cache: OpenFileCache::default(),
+        cache: None,
     })
 }
 
@@ -2711,7 +2715,6 @@ impl Builder {
                     let (text, esc) = resolve_format(&self.log_formats, &al.format);
                     al.format = text;
                     al.escape = al.escape.or(Some(esc));
-                    al.cache = cfg.open_log_file_cache;
                     logs.push(al);
                 }
             }
@@ -5279,7 +5282,7 @@ pub fn build(
             format: "combined".to_string(),
             if_cond: None,
             escape: Some(Escape::Default),
-            cache: OpenFileCache::default(),
+            cache: None,
         }],
         log_formats: LogFormats::default(),
     };

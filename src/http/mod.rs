@@ -3205,6 +3205,35 @@ pub async fn resolve_response_local(
         }
     }
 
+    // FastCGI without a socket: `auth_request` may point at a `fastcgi_pass`
+    // location, and nginx runs that subrequest through the ordinary content
+    // phase. The exchange itself has no connection in it, so the same code
+    // serves both paths. The subrequest carries no body (`fastcgi_pass_request_
+    // body off` is what the auth case uses), which is why `&[]` is passed.
+    if loc.fastcgi_pass.is_some() {
+        if let Some((resp, _had_length)) =
+            crate::fastcgi::fetch(req, path, query, loc, &[], peer_ip).await
+        {
+            let mut resp = resp;
+            return finalize_response(
+                req,
+                &mut resp,
+                path,
+                query,
+                server,
+                http,
+                peer_ip,
+                peer_port,
+                server_port,
+                captures,
+                &mut custom,
+                state,
+                local_addr,
+            )
+            .await;
+        }
+    }
+
     if loc.proxy_pass.is_some() {
         if let Some(resp) = crate::proxy::fetch(req, path, query, loc, http, peer_ip, &custom).await
         {

@@ -60,10 +60,10 @@ limit_conn_dry_run.t
 
 # ---- auth ----
 # `auth_basic` including `$apr1$` hashes and a variable in
-# `auth_basic_user_file`; `satisfy` combining auth_basic with auth_request.
-# `auth_request.t` is NOT here: a subrequest into a `fastcgi_pass` location
-# still answers 500 instead of the upstream status (see COMPAT.md).
+# `auth_basic_user_file`; `satisfy` combining auth_basic with auth_request;
+# `auth_request` into proxy, static, cache and FastCGI subrequests.
 auth_basic.t
+auth_request.t
 auth_request_satisfy.t
 auth_request_set.t
 

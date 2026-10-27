@@ -13,7 +13,7 @@
 
 | 项 | 命令 | 当前结果 |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 88 文件，WORSE=0 TRUNC=0（nginx 1183 / ngxrs 1187 断言） |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 89 文件，WORSE=0 TRUNC=0（nginx 1205 / ngxrs 1209 断言） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
 | 单元测试 | `cargo test --release` | **PASS** — 133 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
@@ -144,7 +144,31 @@ nginx : ТЕКСТzast1ТЕКСТ      ngxrs(修前): ТЕКСТ模様ТЕКСТ
 结果：`limit_req2.t` 11/16 → **16/16**，`limit_req_dry_run.t` 4/10 → **10/10**，
 `limit_conn_dry_run.t` 6/8 → **8/8**。
 
+### 4. `auth_request` 指向 FastCGI 上游（已修，`auth_request.t` 22/22）
+
+`fastcgi::handle` 把「和响应器交换」与「写客户端连接」写在一起，子请求没有连接可用，
+于是 `auth_request /auth-fastcgi` 只能拿到 500。现在拆成两半：
+
+- `fastcgi::fetch(req, path, query, loc, body, peer_ip) -> Option<(Response, bool)>`
+  做参数构造、连接、收发、解析，**不碰 socket**；
+- `fastcgi::handle` 只做 100-continue、取请求体、调 `fetch`、按 `had_length` 决定是否
+  chunked 后写出。
+
+缓冲路径（`resolve_response_local`）因此可以像 `proxy_pass`/`grpc_pass` 一样处理
+`fastcgi_pass`，`auth_request` 的子请求走同一条路。`auth_request.t` 19/22 → **22/22**，
+`auth_request_set.t` / `auth_request_satisfy.t` 保持 20/20、8/8。
+
+同一处修了 CGI 响应头解析：只认 `\r\n\r\n`，而 `fastcgi_cache.t` 的响应器只发 `\n`，
+于是整块 CGI 头被当成 body 发给了客户端。nginx 两种都接受（扫 `LF LF`），现在同样。
+
 ### 已知偏差（本轮新增，均有实测根因）
+
+- `fastcgi_pass` 不支持变量目标。`fastcgi.t` 用一个 `fastcgi_pass $arg_b;` 开跑，
+  我们在 `-t` 阶段就报 `invalid fastcgi_pass address "$arg_b"` 而根本起不来
+  （TRUNC 0/10）。要修得把 `ServerVars` 引进 fastcgi 处理器，属中等重构。
+- `fastcgi_cache` 未实现（`fastcgi_cache.t` 6/7，缺的那条要求第二个请求命中缓存）。
+
+
 
 - `sub_filter_buffering.t` "partial match" 1 条：上游声明 `Content-Length: 10` 却只发 3 字节
   就断开。nginx 在 `proxy_buffering off` 下流式转发，把末尾可能是匹配前缀的 `z` 挂住，
@@ -155,7 +179,7 @@ nginx : ТЕКСТzast1ТЕКСТ      ngxrs(修前): ТЕКСТ模様ТЕКСТ
 
 ## 二、声明的测试清单
 
-清单在 `bench/declared.txt`，**88 个文件**，选取规则是机械的：
+清单在 `bench/declared.txt`，**89 个文件**，选取规则是机械的：
 
 1. 落在范围内（**参考构建 `-V` 能编出来的模块**：http core + proxy/cache/gzip/
    TLS/HTTP2/realip/auth_request/slice/sub/secure_link/dav/stub_status/gzip_static/

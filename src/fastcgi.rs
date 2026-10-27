@@ -217,12 +217,18 @@ fn split_path(path: &str, loc: &LocCfg) -> (String, String) {
 }
 
 fn parse_cgi_response(buf: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>, bool) {
-    let split = memchr::memmem::find(buf, b"\r\n\r\n");
-    let (head, body) = match split {
-        Some(i) => (&buf[..i], buf[i + 4..].to_vec()),
+    // nginx accepts both line endings here (`ngx_http_fastcgi_process_header`
+    // scans for `LF LF` and tolerates the CRs), and responders in the wild use
+    // both: `fastcgi_cache.t`'s script prints `Location: ...\n` alone. Looking
+    // only for CRLFCRLF put the whole header block into the body.
+    let (head, body) = if let Some(i) = memchr::memmem::find(buf, b"\r\n\r\n") {
+        (&buf[..i], buf[i + 4..].to_vec())
+    } else if let Some(i) = memchr::memmem::find(buf, b"\n\n") {
+        (&buf[..i], buf[i + 2..].to_vec())
+    } else {
         // No header block: treat everything as body, like nginx does for a
         // responder that forgot the blank line.
-        None => (&buf[..0], buf.to_vec()),
+        (&buf[..0], buf.to_vec())
     };
 
     let mut status = 200u16;
@@ -264,29 +270,25 @@ fn parse_cgi_response(buf: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>, bool)
     (status, headers, body, had_length)
 }
 
-/// Returns `None` when this location does not use FastCGI.
-#[allow(clippy::too_many_arguments)]
-pub async fn handle(
-    conn: &mut Conn,
+/// One FastCGI exchange, with no socket involved.
+///
+/// `handle` writes the result to the client connection; the auth-subrequest
+/// path (`auth_request` into a `fastcgi_pass` location) needs the response
+/// object instead, which is why the exchange lives on its own. `None` means the
+/// location does not use FastCGI at all; an upstream failure is reported as the
+/// status nginx would answer (502/504) rather than as an `Err`.
+pub async fn fetch(
     req: &Request,
     path: &str,
     query: &str,
     loc: &LocCfg,
-    tokens: bool,
-) -> io::Result<Option<Outcome>> {
-    let Some(fcgi) = &loc.fastcgi_pass else {
-        return Ok(None);
-    };
+    body: &[u8],
+    peer_ip: &str,
+) -> Option<(Response, bool)> {
+    let fcgi = loc.fastcgi_pass.as_ref()?;
     let addr: SocketAddr = fcgi.addr;
 
-    // RFC 7231: never send 100 Continue to an HTTP/1.0 client.
-    if req.expect_continue && req.version_minor == 1 {
-        conn.send_100_continue().await?;
-    }
-
-    let body = crate::proxy::take_request_body(conn, req, 32 * 1024 * 1024).await?;
-
-    // ---- build the parameter list ----
+    // ---- build the parameter list
     let (script_name, path_info) = split_path(path, loc);
     let document_root = loc
         .alias
@@ -296,7 +298,7 @@ pub async fn handle(
 
     let vars = Vars {
         req,
-        peer_ip: &conn.peer.ip().to_string(),
+        peer_ip,
         server_port: 80,
         server_name: req.host.as_ref().map(|h| h.as_str()).unwrap_or(""),
         document_root: &document_root,
@@ -321,11 +323,11 @@ pub async fn handle(
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
                 eprintln!("ngxrs: [error] fastcgi connect {addr} failed: {e}");
-                return Ok(Some(respond(conn, 502, tokens, req.keepalive).await?));
+                return Some((error_response(502), true));
             }
             Err(_) => {
                 eprintln!("ngxrs: [error] fastcgi connect {addr} timed out");
-                return Ok(Some(respond(conn, 504, tokens, req.keepalive).await?));
+                return Some((error_response(504), true));
             }
         };
     let _ = stream.set_nodelay(true);
@@ -348,7 +350,7 @@ pub async fn handle(
 
     if let Err(e) = stream.write_all(&out).await {
         eprintln!("ngxrs: [error] fastcgi write failed: {e}");
-        return Ok(Some(respond(conn, 502, tokens, req.keepalive).await?));
+        return Some((error_response(502), true));
     }
 
     // ---- read the responder's STDOUT ----
@@ -363,11 +365,11 @@ pub async fn handle(
             Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => break,
             Ok(Err(e)) => {
                 eprintln!("ngxrs: [error] fastcgi read failed: {e}");
-                return Ok(Some(respond(conn, 502, tokens, req.keepalive).await?));
+                return Some((error_response(502), true));
             }
             Err(_) => {
                 crate::log::log_global(crate::log::Level::Error, "fastcgi read timed out");
-                return Ok(Some(respond(conn, 504, tokens, req.keepalive).await?));
+                return Some((error_response(504), true));
             }
         }
         let ty = hdr[1];
@@ -394,7 +396,7 @@ pub async fn handle(
         match ty {
             FCGI_STDOUT => {
                 if stdout.len() + content.len() > MAX_STDOUT {
-                    return Ok(Some(respond(conn, 502, tokens, req.keepalive).await?));
+                    return Some((error_response(502), true));
                 }
                 stdout.extend_from_slice(&content);
             }
@@ -417,27 +419,14 @@ pub async fn handle(
         raw.extend_from_slice(v.as_bytes());
         raw.extend_from_slice(b"\r\n");
     }
-
-    // nginx streams a CGI response with no Content-Length using chunked
-    // encoding; reproducing that keeps the wire format identical.
-    let body = if had_length {
+    // The payload goes out verbatim; `had_length` says whether the responder
+    // declared a length, which decides the framing at the write site.
+    if had_length {
         raw.extend_from_slice(b"Content-Length: ");
         raw.extend_from_slice(payload.len().to_string().as_bytes());
         raw.extend_from_slice(b"\r\n");
-        payload
-    } else {
-        raw.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
-        let mut chunked = Vec::with_capacity(payload.len() + 32);
-        if !payload.is_empty() {
-            chunked.extend_from_slice(format!("{:x}\r\n", payload.len()).as_bytes());
-            chunked.extend_from_slice(&payload);
-            chunked.extend_from_slice(b"\r\n");
-        }
-        chunked.extend_from_slice(b"0\r\n\r\n");
-        chunked
-    };
-
-    let resp = Response {
+    }
+    Some((Response {
         status,
         headers: Vec::new(),
         raw,
@@ -445,10 +434,80 @@ pub async fn handle(
         no_error_page: false,
         trailers: Vec::new(),
         expect_trailers: false,
+        headers_finalized: false,
+        body: Body::Bytes(payload),
+    }, had_length))
+}
 
+/// A FastCGI failure, as the status nginx answers for it.
+fn error_response(status: u16) -> Response {
+    let body = error_body(status, false);
+    let mut raw = Vec::with_capacity(96);
+    raw.extend_from_slice(b"Content-Type: text/html\r\nContent-Length: ");
+    raw.extend_from_slice(body.len().to_string().as_bytes());
+    raw.extend_from_slice(b"\r\n");
+    Response {
+        status,
+        headers: Vec::new(),
+        raw,
+        explicit_len: true,
+        no_error_page: false,
+        trailers: Vec::new(),
+        expect_trailers: false,
         headers_finalized: false,
         body: Body::Bytes(body),
+    }
+}
+
+/// Write a FastCGI response to the client. `None` when the location is not a
+/// FastCGI one.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle(
+    conn: &mut Conn,
+    req: &Request,
+    path: &str,
+    query: &str,
+    loc: &LocCfg,
+    tokens: bool,
+) -> io::Result<Option<Outcome>> {
+    if loc.fastcgi_pass.is_none() {
+        return Ok(None);
+    }
+
+    // RFC 7231: never send 100 Continue to an HTTP/1.0 client.
+    if req.expect_continue && req.version_minor == 1 {
+        conn.send_100_continue().await?;
+    }
+    let body = crate::proxy::take_request_body(conn, req, 32 * 1024 * 1024).await?;
+    let peer = conn.peer.ip().to_string();
+
+    let Some((resp, had_length)) = fetch(req, path, query, loc, &body, &peer).await else {
+        return Ok(None);
     };
+    let status = resp.status;
+    let mut resp = resp;
+    // nginx streams a CGI response with no Content-Length using chunked
+    // encoding; reproducing that keeps the wire format identical. `raw` already
+    // carries the Content-Length when the responder declared one.
+    if !had_length {
+        resp.raw
+            .extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+        let payload = match std::mem::replace(&mut resp.body, Body::Empty) {
+            Body::Bytes(b) => b,
+            other => {
+                resp.body = other;
+                Vec::new()
+            }
+        };
+        let mut chunked = Vec::with_capacity(payload.len() + 32);
+        if !payload.is_empty() {
+            chunked.extend_from_slice(format!("{:x}\r\n", payload.len()).as_bytes());
+            chunked.extend_from_slice(&payload);
+            chunked.extend_from_slice(b"\r\n");
+        }
+        chunked.extend_from_slice(b"0\r\n\r\n");
+        resp.body = Body::Bytes(chunked);
+    }
     let bytes = crate::http::write_response(
         conn,
         resp,

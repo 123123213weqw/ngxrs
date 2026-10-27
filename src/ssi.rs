@@ -154,13 +154,14 @@ fn escape_url(out: &mut String, s: &str) {
 
 /// HTML-entity encode: nginx's `ngx_http_ssi_entity` table.
 fn escape_entity(out: &mut String, s: &str) {
-    for &b in s.as_bytes() {
-        match b {
-            b'&' => out.push_str("&amp;"),
-            b'<' => out.push_str("&lt;"),
-            b'>' => out.push_str("&gt;"),
-            b'"' => out.push_str("&quot;"),
-            _ => out.push(b as char),
+    // Char-wise, so multi-byte text survives; the four entities are ASCII.
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
         }
     }
 }
@@ -241,6 +242,7 @@ fn eval_expr_inner(
         }
         let mut out = String::with_capacity(side.len());
         let b = side.as_bytes();
+        let mut start = 0usize;
         let mut i = 0usize;
         while i < b.len() {
             if b[i] == b'$' {
@@ -250,14 +252,18 @@ fn eval_expr_inner(
                     j += 1;
                 }
                 if j > st {
+                    // Literal runs are copied as slices: a byte-wise
+                    // `push(b as char)` re-encodes non-ASCII text as mojibake.
+                    out.push_str(&side[start..i]);
                     out.push_str(&look(&side[st..j]));
                     i = j;
+                    start = i;
                     continue;
                 }
             }
-            out.push(b[i] as char);
             i += 1;
         }
+        out.push_str(&side[start..]);
         out
     };
     let resolve = |side: &str, look: &dyn Fn(&str) -> String| -> String { expand(side, look) };
@@ -642,6 +648,7 @@ fn directive(
 fn expand_vars(s: &str, ctx: &Ctx, host: &mut dyn Host) -> String {
     let mut out = String::with_capacity(s.len());
     let b = s.as_bytes();
+    let mut lit = 0usize;
     let mut i = 0usize;
     while i < b.len() {
         if b[i] == b'$' && i + 1 < b.len() {
@@ -652,18 +659,19 @@ fn expand_vars(s: &str, ctx: &Ctx, host: &mut dyn Host) -> String {
             }
             if j > start {
                 let name = &s[start..j];
-                if let Some(v) = host.var(name, ctx) {
-                    out.push_str(&v);
-                } else {
-                    out.push_str(NONE);
+                out.push_str(&s[lit..i]);
+                match host.var(name, ctx) {
+                    Some(v) => out.push_str(&v),
+                    None => out.push_str(NONE),
                 }
                 i = j;
+                lit = i;
                 continue;
             }
         }
-        out.push(b[i] as char);
         i += 1;
     }
+    out.push_str(&s[lit..]);
     out
 }
 

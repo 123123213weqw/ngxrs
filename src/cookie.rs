@@ -115,19 +115,24 @@ fn expand_caps(
 ) -> String {
     let mut out = String::with_capacity(spec.len());
     let b = spec.as_bytes();
+    let mut start = 0usize;
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'$' && i + 1 < b.len() && b[i + 1].is_ascii_digit() {
+            // Literal runs are copied as slices: `push(b as char)` turns every
+            // non-ASCII byte into a Latin-1 code point (mojibake).
+            out.push_str(&spec[start..i]);
             let n = (b[i + 1] - b'0') as usize;
             if let Some(m) = caps.get(n) {
                 out.push_str(m.as_str());
             }
             i += 2;
+            start = i;
             continue;
         }
-        out.push(b[i] as char);
         i += 1;
     }
+    out.push_str(&spec[start..]);
     out
 }
 

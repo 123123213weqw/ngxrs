@@ -47,6 +47,17 @@ realip_hostname.t
 realip_remote_addr.t
 realip_remote_port.t
 
+# ---- sub_filter ----
+# Multiple patterns, longest match first, per-pattern `once`, variables in both
+# operands, and the filter running on proxied responses as well as local ones.
+sub_filter.t
+sub_filter_multi.t
+sub_filter_merge.t
+
+# ---- limit_req / limit_conn ----
+limit_req_dry_run.t
+limit_conn_dry_run.t
+
 # ---- auth ----
 # `auth_basic` including `$apr1$` hashes and a variable in
 # `auth_basic_user_file`; `satisfy` combining auth_basic with auth_request.

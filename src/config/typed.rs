@@ -106,6 +106,10 @@ pub struct LocCfg {
     pub sub_filter_once: bool,
     /// `sub_filter_types`: MIME types eligible for substitution.
     pub sub_filter_types: Vec<String>,
+    /// `sub_filter_buffering off`: emit output as it is produced, holding back
+    /// only the tail that could still become a match. With `on` (the default)
+    /// the whole body is collected first.
+    pub sub_filter_buffering: bool,
     /// `sub_filter_last_modified` (nginx default: off, which drops the header
     /// because the body no longer matches the file).
     pub sub_filter_last_modified: bool,
@@ -175,6 +179,11 @@ pub struct LocCfg {
     pub limit_req_log_level: crate::log::Level,
     /// `limit_conn_log_level`: severity of "limiting connections".
     pub limit_conn_log_level: crate::log::Level,
+    /// `limit_req_dry_run`: count and log the excess, but never delay or
+    /// reject. `$limit_req_status` then reports `*_DRY_RUN`.
+    pub limit_req_dry_run: bool,
+    /// `limit_conn_dry_run`, same idea for `limit_conn`.
+    pub limit_conn_dry_run: bool,
     /// Status returned when a limit is exceeded (`limit_req_status`).
     pub limit_req_status: u16,
     pub limit_conn_status: u16,
@@ -310,6 +319,8 @@ impl LocCfg {
             error_logs: Vec::new(),
             limit_req_log_level: crate::log::Level::Error,
             limit_conn_log_level: crate::log::Level::Error,
+            limit_req_dry_run: false,
+            limit_conn_dry_run: false,
             root,
             steps: Vec::new(),
             alias: None,
@@ -328,6 +339,7 @@ impl LocCfg {
             sub_filter_inherited: Vec::new(),
             sub_filter_once: true,
             sub_filter_types: vec!["text/html".to_string()],
+            sub_filter_buffering: true,
             sub_filter_last_modified: false,
             gzip: false,
             client_max_body_size: DEFAULT_CLIENT_MAX_BODY,
@@ -2462,6 +2474,18 @@ impl Builder {
             "sub_filter_types" => {
                 cfg.sub_filter_types = d.args.clone();
             }
+            "sub_filter_buffering" => {
+                let v = d.args.first().ok_or_else(|| {
+                    sem(&d.file, d.line, "sub_filter_buffering requires on|off")
+                })?;
+                cfg.sub_filter_buffering = parse_on_off(v).ok_or_else(|| {
+                    sem(
+                        &d.file,
+                        d.line,
+                        format!("invalid sub_filter_buffering value \"{v}\""),
+                    )
+                })?;
+            }
             "sub_filter_last_modified" => {
                 let v = d.args.first().ok_or_else(|| {
                     sem(&d.file, d.line, "sub_filter_last_modified requires on|off")
@@ -2826,7 +2850,12 @@ impl Builder {
                 }
             }
             "limit_req_dry_run" | "limit_conn_dry_run" => {
-                // Accepted; dry-run bookkeeping is not implemented.
+                let on = d.args.first().map(|v| v == "on").unwrap_or(false);
+                if d.name == "limit_req_dry_run" {
+                    cfg.limit_req_dry_run = on;
+                } else {
+                    cfg.limit_conn_dry_run = on;
+                }
             }
             "proxy_bind" => {
                 let v = d

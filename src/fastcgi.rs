@@ -104,8 +104,16 @@ fn expand(spec: &str, v: &Vars<'_>) -> String {
     let mut i = 0;
     while i < b.len() {
         if b[i] != b'$' {
-            out.push(b[i] as char);
-            i += 1;
+            // Copy the literal run as a slice. Pushing `b as char` maps each
+            // byte to a Latin-1 code point, so any non-ASCII text in a
+            // directive came out as mojibake (`\u{6a21}\u{6a23}` -> the same
+            // bytes re-encoded). `$` is ASCII, so both ends of the slice are
+            // char boundaries.
+            let end = memchr::memchr(b'$', &b[i..])
+                .map(|p| i + p)
+                .unwrap_or(b.len());
+            out.push_str(&spec[i..end]);
+            i = end;
             continue;
         }
         let rest = &spec[i + 1..];

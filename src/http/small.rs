@@ -56,6 +56,17 @@ pub struct SubFilters {
 
 impl SubFilters {
     /// Whether a response of this type is eligible (`sub_filter_types`).
+    ///
+    /// nginx installs the filter, and therefore changes the response headers,
+    /// as soon as the location has a pattern, the type matches and the body is
+    /// not known to be empty -- it does not wait for a pattern to actually
+    /// match (`ngx_http_sub_header_filter`).
+    pub fn eligible(&self, content_type: &str, body_len: usize) -> bool {
+        // nginx skips the filter when `content_length_n == 0`; a streamed body
+        // has length -1, which is not "empty".
+        !self.pairs.is_empty() && body_len != 0 && self.applies(content_type)
+    }
+
     fn applies(&self, content_type: &str) -> bool {
         let base = content_type.split(';').next().unwrap_or("").trim();
         self.types
@@ -63,53 +74,70 @@ impl SubFilters {
             .any(|t| t.eq_ignore_ascii_case(base) || t == "*")
     }
 
-    /// Apply every replacement to `body`.
+    /// Rewrite `body`.
     ///
-    /// nginx's filter is a chain of `ngx_http_sub_filter_ctx_t`, one per
-    /// matching entry, each of which replaces the *first* match when
-    /// `sub_filter_once` is on (the default) and every match otherwise.  The
-    /// chain runs in configuration order, so a later rule sees the text the
-    /// earlier one produced.
-    /// Matching is **caseless**, as in `ngx_http_sub_filter_module`: the module
-    /// compares `ngx_tolower` of each byte, so a `foo` pattern also rewrites
-    /// `FOO` (sub_filter.t asserts this).
+    /// nginx builds one list of patterns, **sorted longest first**, and at each
+    /// byte position takes the first pattern that matches (`ngx_http_sub_match`
+    /// walking `ctx->match`). Two consequences the tests pin down:
+    ///
+    ///   * the longest pattern wins where a shorter one also starts earlier --
+    ///     `sub_filter_multi.t`'s "partial match" makes `aaabb -> -` beat
+    ///     `aabb -> +`, so `aabbaaabbaabb` becomes `+-+`; running the patterns
+    ///     as independent passes produced `+a++`;
+    ///   * `sub_filter_once on` is per pattern, not per request: each pattern
+    ///     replaces its first occurrence and is then marked done, which is why
+    ///     `aabyyzaab` with `aab` and `yyz` becomes `+-aab`.
+    ///
+    /// Matching is caseless: nginx compares `ngx_tolower` of every byte, so a
+    /// `foo` pattern also rewrites `FOO` (sub_filter.t asserts this).
     pub fn apply(&self, body: &[u8], content_type: &str) -> Option<Vec<u8>> {
-        if self.pairs.is_empty() || !self.applies(content_type) {
+        if !self.eligible(content_type, body.len()) {
             return None;
         }
-        let mut out = body.to_vec();
+        // Longest first; equal lengths keep configuration order (`sort_by` is
+        // stable).
+        let mut pats: Vec<(&[u8], &[u8])> = self
+            .pairs
+            .iter()
+            .filter(|(from, _)| !from.is_empty())
+            .map(|(from, to)| (from.as_bytes(), to.as_bytes()))
+            .collect();
+        if pats.is_empty() {
+            return None;
+        }
+        pats.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        let mut done = vec![false; pats.len()];
+
+        let mut out = Vec::with_capacity(body.len());
         let mut changed = false;
-        for (from, to) in &self.pairs {
-            if from.is_empty() {
-                continue;
-            }
-            let from: Vec<u8> = from.bytes().map(|b| b.to_ascii_lowercase()).collect();
-            let to = to.as_bytes();
-            let mut next = Vec::with_capacity(out.len());
-            let mut i = 0;
-            let mut hit = false;
-            while i < out.len() {
-                let hit_here = out.len() - i >= from.len()
-                    && out[i..i + from.len()]
+        let mut i = 0usize;
+        while i < body.len() {
+            let mut hit: Option<usize> = None;
+            for (n, (from, _)) in pats.iter().enumerate() {
+                if self.once && done[n] {
+                    continue;
+                }
+                if body.len() - i >= from.len()
+                    && body[i..i + from.len()]
                         .iter()
                         .zip(from.iter())
-                        .all(|(a, b)| a.to_ascii_lowercase() == *b);
-                if hit_here {
-                    next.extend_from_slice(to);
-                    i += from.len();
-                    hit = true;
-                    if self.once {
-                        next.extend_from_slice(&out[i..]);
-                        i = out.len();
-                    }
-                } else {
-                    next.push(out[i]);
-                    i += 1;
+                        .all(|(a, b)| a.eq_ignore_ascii_case(b))
+                {
+                    hit = Some(n);
+                    break;
                 }
             }
-            if hit {
-                changed = true;
-                out = next;
+            match hit {
+                Some(n) => {
+                    out.extend_from_slice(pats[n].1);
+                    i += pats[n].0.len();
+                    done[n] = true;
+                    changed = true;
+                }
+                None => {
+                    out.push(body[i]);
+                    i += 1;
+                }
             }
         }
         if changed {
@@ -161,10 +189,62 @@ mod tests {
     }
 
     #[test]
-    fn rules_chain_in_configuration_order() {
+    fn replacement_output_is_not_rescanned() {
+        // Measured on nginx 1.28 with `sub_filter a b; sub_filter b c;`:
+        // "a" comes back as "b". The rules are alternatives considered per
+        // position, not a pipeline -- running them as chained passes (what this
+        // code used to do) gave "c".
         let f = sf(&[("a", "b"), ("b", "c")], false);
-        // The second rule sees the first rule's output, so `a` ends as `c`.
-        assert_eq!(f.apply(b"a", "text/html").unwrap(), b"c".to_vec());
+        assert_eq!(f.apply(b"a", "text/html").unwrap(), b"b".to_vec());
+    }
+
+    #[test]
+    fn longest_pattern_wins_at_a_position() {
+        // `sub_filter_multi.t` "partial match": `aaabb` must beat `aabb` even
+        // though `aabb` is configured first.
+        let f = sf(&[("aabb", "+"), ("aaabb", "-")], false);
+        for body in [&b"aabbaaabbaabb"[..], &b"aabbaaabaabb"[..]] {
+            let out = f.apply(body, "text/html").unwrap();
+            let s = String::from_utf8(out).unwrap();
+            assert!(s.contains('+'), "{s}");
+            assert_ne!(s, "+a++");
+        }
+        assert_eq!(
+            f.apply(b"aabbaaabbaabb", "text/html").unwrap(),
+            b"+-+".to_vec()
+        );
+    }
+
+    #[test]
+    fn once_is_per_pattern() {
+        // `sub_filter_once on` marks each pattern done after its first hit, so
+        // several patterns each fire once (nginx: "aabyyzaab" -> "+-aab",
+        // "yyzyyzaabaabyyz" -> "-yyz+aabyyz").
+        let f = sf(&[("aab", "+"), ("yyz", "-")], true);
+        assert_eq!(
+            f.apply(b"aabyyzaab", "text/html").unwrap(),
+            b"+-aab".to_vec()
+        );
+        assert_eq!(
+            f.apply(b"yyzyyzaabaabyyz", "text/html").unwrap(),
+            b"-yyz+aabyyz".to_vec()
+        );
+    }
+
+    #[test]
+    fn multibyte_patterns_are_matched_byte_exactly() {
+        // Patterns are UTF-8 byte strings; caseless folding is ASCII-only, so a
+        // non-ASCII pattern must survive untouched (it used to be mangled by a
+        // byte->char conversion in the config expander).
+        let f = SubFilters {
+            once: false,
+            types: vec!["*".to_string()],
+            pairs: vec![("模様".to_string(), "replaced".to_string())],
+        };
+        assert_eq!(
+            f.apply("ТЕКСТ模様ТЕКСТ".as_bytes(), "text/plain").unwrap(),
+            "ТЕКСТreplacedТЕКСТ".as_bytes().to_vec()
+        );
     }
 
     #[test]

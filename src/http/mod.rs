@@ -1705,30 +1705,39 @@ fn expand_captures_args(replacement: &str, caps: &regex::Captures<'_>) -> String
     // Re-expand value by value so only the substituted parts get escaped.
     let mut out = String::with_capacity(replacement.len());
     let b = replacement.as_bytes();
+    let mut start = 0usize;
     let mut i = 0usize;
     while i < b.len() {
         if b[i] == b'$' && i + 1 < b.len() && b[i + 1].is_ascii_digit() {
+            out.push_str(&replacement[start..i]);
             let n = b[i + 1] - b'0';
             if let Some(m) = caps.get(n as usize) {
                 out.push_str(&escape_arg_value(m.as_str()));
             }
             i += 2;
+            start = i;
             continue;
         }
-        out.push(b[i] as char);
         i += 1;
     }
+    out.push_str(&replacement[start..]);
     out
 }
 
 /// Expand `$var` references against the rewrite-phase variable set.
+///
+/// The literal runs are copied as `&str` slices, not byte by byte: pushing
+/// `b as char` maps each byte to a Latin-1 code point, so a non-ASCII literal
+/// (`return 200 "模様"`, a `sub_filter` pattern) was re-encoded as mojibake and
+/// could never match the UTF-8 body it was meant for. `$` and the characters of
+/// a variable name are ASCII, so every slice boundary is a char boundary.
 fn expand_vars(spec: &str, v: &RwVars<'_>) -> String {
     let mut out = String::with_capacity(spec.len());
     let b = spec.as_bytes();
-    let mut i = 0;
+    let mut start = 0usize;
+    let mut i = 0usize;
     while i < b.len() {
         if b[i] != b'$' {
-            out.push(b[i] as char);
             i += 1;
             continue;
         }
@@ -1737,14 +1746,17 @@ fn expand_vars(spec: &str, v: &RwVars<'_>) -> String {
             .bytes()
             .take_while(|c| c.is_ascii_alphanumeric() || *c == b'_')
             .count();
+        out.push_str(&spec[start..i]);
         if n == 0 {
             out.push('$');
             i += 1;
-            continue;
+        } else {
+            out.push_str(&get_var(&rest[..n], v));
+            i += 1 + n;
         }
-        out.push_str(&get_var(&rest[..n], v));
-        i += 1 + n;
+        start = i;
     }
+    out.push_str(&spec[start..]);
     out
 }
 
@@ -1764,19 +1776,22 @@ enum RewriteOutcome {
 fn expand_captures(replacement: &str, caps: &regex::Captures<'_>) -> String {
     let mut out = String::with_capacity(replacement.len());
     let b = replacement.as_bytes();
+    let mut start = 0usize;
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'$' && i + 1 < b.len() && b[i + 1].is_ascii_digit() {
+            out.push_str(&replacement[start..i]);
             let n = (b[i + 1] - b'0') as usize;
             if let Some(m) = caps.get(n) {
                 out.push_str(m.as_str());
             }
             i += 2;
+            start = i;
             continue;
         }
-        out.push(b[i] as char);
         i += 1;
     }
+    out.push_str(&replacement[start..]);
     out
 }
 
@@ -2353,8 +2368,16 @@ fn expand_upstream_vars(spec: &str, upstream: &[(String, String)]) -> String {
     let mut i = 0;
     while i < b.len() {
         if b[i] != b'$' {
-            out.push(b[i] as char);
-            i += 1;
+            // Copy the literal run as a slice. Pushing `b as char` maps each
+            // byte to a Latin-1 code point, so any non-ASCII text in a
+            // directive came out as mojibake (`\u{6a21}\u{6a23}` -> the same
+            // bytes re-encoded). `$` is ASCII, so both ends of the slice are
+            // char boundaries.
+            let end = memchr::memchr(b'$', &b[i..])
+                .map(|p| i + p)
+                .unwrap_or(b.len());
+            out.push_str(&spec[i..end]);
+            i = end;
             continue;
         }
         let rest = &spec[i + 1..];
@@ -2792,8 +2815,13 @@ impl<'a> ServerVars<'a> {
         let mut i = 0;
         while i < b.len() {
             if b[i] != b'$' {
-                out.push(b[i] as char);
-                i += 1;
+                // Literal runs are copied as slices; see `expand_vars` for why
+                // a byte-wise `push(b as char)` corrupts non-ASCII text.
+                let end = memchr::memchr(b'$', &b[i..])
+                    .map(|p| i + p)
+                    .unwrap_or(b.len());
+                out.push_str(&spec[i..end]);
+                i = end;
                 continue;
             }
             // ${name} or $name
@@ -3526,8 +3554,16 @@ fn limit_key(spec: &str, vars: &ServerVars<'_>) -> String {
     let mut i = 0;
     while i < b.len() {
         if b[i] != b'$' {
-            out.push(b[i] as char);
-            i += 1;
+            // Copy the literal run as a slice. Pushing `b as char` maps each
+            // byte to a Latin-1 code point, so any non-ASCII text in a
+            // directive came out as mojibake (`\u{6a21}\u{6a23}` -> the same
+            // bytes re-encoded). `$` is ASCII, so both ends of the slice are
+            // char boundaries.
+            let end = memchr::memchr(b'$', &b[i..])
+                .map(|p| i + p)
+                .unwrap_or(b.len());
+            out.push_str(&spec[i..end]);
+            i = end;
             continue;
         }
         let rest = &spec[i + 1..];
@@ -3560,40 +3596,75 @@ async fn check_limits(
     vars: &ServerVars<'_>,
     guards: &mut Vec<crate::limit::ConnGuard>,
     client_fd: Option<std::os::unix::io::RawFd>,
-) -> Option<Response> {
+) -> (Option<Response>, Vec<(&'static str, &'static str)>) {
+    // nginx's `$limit_req_status` / `$limit_conn_status`. Empty when no limit
+    // applied, which is why `add_header X-Status $limit_req_status` emits
+    // nothing for an unlimited location.
+    let mut statuses: Vec<(&'static str, &'static str)> = Vec::new();
     for lr in &loc.limit_reqs {
         let Some(zone) = http.limit_req_zones.iter().find(|z| z.name == lr.zone) else {
             continue;
         };
         let key = limit_key(&zone.key, vars);
+        // An empty key disables the limit for this request (`key.len == 0`
+        // is skipped in `ngx_http_limit_req_handler`). Without this the empty
+        // string becomes a shared bucket, so every request without the key --
+        // `limit_req2.t`'s `$arg_a` with no `a=` argument -- shares one bucket
+        // and the second one is rejected.
+        if key.is_empty() {
+            continue;
+        }
+        let dry = loc.limit_req_dry_run;
+        let log_at = |msg: &str| {
+            // nginx writes this once per configured `error_log` of the
+            // location, at `limit_req_log_level`. Two `error_log` directives
+            // pointing at the same file therefore produce two identical lines
+            // (error_log.t checks exactly that).
+            for spec in &loc.error_logs {
+                if let Some(sink) = crate::log::sink_cached(&spec.dest, spec.level) {
+                    crate::log::log_to(&[sink], loc.limit_req_log_level, msg);
+                }
+            }
+            if loc.error_logs.is_empty() {
+                crate::log::error_log(loc.limit_req_log_level.name(), msg);
+            }
+        };
         match zone.state.account(&key, lr.burst, lr.nodelay, lr.delay) {
             None => {
-                // nginx writes this once per configured `error_log` of the
-                // location, at `limit_req_log_level`. Two `error_log`
-                // directives pointing at the same file therefore produce two
-                // identical lines (error_log.t checks exactly that).
-                let msg = format!(
+                if dry {
+                    // `limit_req_dry_run on`: the excess is counted and logged,
+                    // the request goes through, and the variable says so.
+                    log_at(&format!(
+                        "limiting requests, dry run, excess: zone=\"{}\" key=\"{key}\"",
+                        lr.zone
+                    ));
+                    statuses.push(("limit_req_status", "REJECTED_DRY_RUN"));
+                    continue;
+                }
+                log_at(&format!(
                     "limiting requests, excess: zone=\"{}\" key=\"{key}\"",
                     lr.zone
-                );
-                for spec in &loc.error_logs {
-                    if let Some(sink) = crate::log::sink_cached(&spec.dest, spec.level) {
-                        crate::log::log_to(&[sink], loc.limit_req_log_level, &msg);
-                    }
-                }
-                if loc.error_logs.is_empty() {
-                    crate::log::error_log(loc.limit_req_log_level.name(), &msg);
-                }
-                return Some(error_response(loc.limit_req_status, true));
+                ));
+                statuses.push(("limit_req_status", "REJECTED"));
+                return (Some(error_response(loc.limit_req_status, true)), statuses);
             }
             Some(delay) if !delay.is_zero() => {
+                if dry {
+                    log_at(&format!(
+                        "delaying request, dry run, excess: zone=\"{}\" key=\"{key}\"",
+                        lr.zone
+                    ));
+                    statuses.push(("limit_req_status", "DELAYED_DRY_RUN"));
+                    continue;
+                }
+                statuses.push(("limit_req_status", "DELAYED"));
                 // nginx holds the request for the computed delay, without
                 // blocking its worker. Sleeping the thread here stalls every
                 // other connection multiplexed on that runtime thread; with a
                 // single worker it serialises the whole server.
                 tokio::time::sleep(delay.min(std::time::Duration::from_secs(10))).await;
             }
-            _ => {}
+            _ => statuses.push(("limit_req_status", "PASSED")),
         }
     }
 
@@ -3602,25 +3673,51 @@ async fn check_limits(
             continue;
         };
         let key = limit_key(&zone.key, vars);
-        match zone.state.acquire(&key, lc.limit, client_fd) {
-            Some(guard) => guards.push(guard),
-            None => {
-                let msg = format!("limiting connections by zone \"{}\"", lc.zone);
-                for spec in &loc.error_logs {
-                    if let Some(sink) = crate::log::sink_cached(&spec.dest, spec.level) {
-                        crate::log::log_to(&[sink], loc.limit_conn_log_level, &msg);
-                    }
+        // Same rule as `limit_req`: no key, no limit.
+        if key.is_empty() {
+            continue;
+        }
+        let too_many = match zone.state.acquire(&key, lc.limit, client_fd) {
+            Some(guard) => {
+                guards.push(guard);
+                false
+            }
+            None => true,
+        };
+        if !too_many {
+            statuses.push(("limit_conn_status", "PASSED"));
+            continue;
+        }
+        let msg = format!("limiting connections by zone \"{}\"", lc.zone);
+        if loc.limit_conn_dry_run {
+            // nginx: "limiting connections%s by zone ..." with `, dry run`
+            // substituted after the word "connections".
+            let dry = format!("limiting connections, dry run by zone \"{}\"", lc.zone);
+            for spec in &loc.error_logs {
+                if let Some(sink) = crate::log::sink_cached(&spec.dest, spec.level) {
+                    crate::log::log_to(&[sink], loc.limit_conn_log_level, &dry);
                 }
-                // The main-context log still sees it, as in nginx.
-                if loc.error_logs.is_empty() {
-                    crate::log::error_log(loc.limit_conn_log_level.name(), &msg);
-                }
-                return Some(error_response(loc.limit_conn_status, true));
+            }
+            if loc.error_logs.is_empty() {
+                crate::log::error_log(loc.limit_conn_log_level.name(), &dry);
+            }
+            statuses.push(("limit_conn_status", "REJECTED_DRY_RUN"));
+            continue;
+        }
+        for spec in &loc.error_logs {
+            if let Some(sink) = crate::log::sink_cached(&spec.dest, spec.level) {
+                crate::log::log_to(&[sink], loc.limit_conn_log_level, &msg);
             }
         }
+        // The main-context log still sees it, as in nginx.
+        if loc.error_logs.is_empty() {
+            crate::log::error_log(loc.limit_conn_log_level.name(), &msg);
+        }
+        statuses.push(("limit_conn_status", "REJECTED"));
+        return (Some(error_response(loc.limit_conn_status, true)), statuses);
     }
 
-    None
+    (None, statuses)
 }
 
 /// Apply `error_page`, `add_header` and `gzip` to a response the content phase
@@ -4595,7 +4692,43 @@ async fn dispatch(
             connection_time: state.elapsed_secs(),
             sent: &[],
         };
-        if let Some(reject) = check_limits(loc, http, &limit_vars, guards, conn.raw_fd()).await {
+        let (reject, limit_status) =
+            check_limits(loc, http, &limit_vars, guards, conn.raw_fd()).await;
+        for (name, value) in limit_status {
+            set_vars.insert(name.to_string(), value.to_string());
+        }
+        if let Some(mut reject) = reject {
+            // `add_header` is a header filter, so nginx emits its headers on
+            // the 503 the limit modules produce (`limit_req_dry_run.t` checks
+            // `X-Status: REJECTED` on that very response). This path writes
+            // before `finalize_response`, so apply them here.
+            let root = loc.root.to_string_lossy().to_string();
+            let header_vars = ServerVars {
+                req,
+                path,
+                query,
+                server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
+                server_port: listen_port,
+                peer_ip: client_ip,
+                peer_port,
+                scheme: "http",
+                document_root: &root,
+                upstream_cache_status: "",
+                custom: &set_vars,
+                connection_requests: state.requests,
+                connection_time: state.elapsed_secs(),
+                sent: &[],
+            };
+            crate::http::apply_add_headers_ctx(
+                &mut reject.raw,
+                &loc.headers,
+                reject.status,
+                "",
+                "",
+                &[],
+                Some(&header_vars),
+                "",
+            );
             let status = reject.status;
             let sent = split_head(&reject.raw);
             let bytes = write_response(
@@ -4637,8 +4770,16 @@ async fn dispatch(
     // buffered fetcher would mean maintaining a second, weaker copy of it.
     // Cached replies are still compressed, because `serve_cached` runs the gzip
     // filter; only a cache *miss* on such a location goes out uncompressed.
-    let wants_buffered =
-        loc.ssi || (loc.gzip && crate::gzip::accepts_gzip(req) && loc.proxy_cache.is_none());
+    // A body filter that needs the whole entity forces the buffered fetcher.
+    // Without this, `sub_filter` on a proxied location was silently skipped:
+    // the streaming path writes the upstream body straight to the socket.
+    // WebSocket upgrades stay on the streaming path (the filter has no
+    // meaning for a 101 tunnel).
+    let has_sub_filter = !loc.sub_filters.is_empty() || !loc.sub_filter_inherited.is_empty();
+    let upgrade = req.headers.get("upgrade").is_some();
+    let wants_buffered = loc.ssi
+        || (has_sub_filter && !upgrade)
+        || (loc.gzip && crate::gzip::accepts_gzip(req) && loc.proxy_cache.is_none());
     let mut ssi_proxied: Option<Response> = None;
     if loc.proxy_pass.is_some() && wants_buffered && req.method != Method::Head {
         ssi_proxied = crate::proxy::fetch(req, path, query, loc, http, client_ip, &set_vars).await;
@@ -5511,22 +5652,30 @@ fn apply_sub_filter(mut resp: Response, loc: &LocCfg, vars: &ServerVars<'_>) -> 
             buf
         }
     };
-    let Some(new_body) = filters.apply(&body, &ctype) else {
+    if !filters.eligible(&ctype, body.len()) {
         resp.body = Body::Bytes(body);
         return resp;
-    };
-    // The body no longer matches the file: nginx drops `Last-Modified` (unless
-    // `sub_filter_last_modified on`) and the strong ETag.
+    }
+    // The filter is installed, so its header effects apply even when no pattern
+    // matched (`ngx_http_sub_header_filter` runs before any body is seen):
+    // nginx clears `Content-Length` and `Accept-Ranges` for a main request and
+    // either drops both validators or -- with `sub_filter_last_modified on` --
+    // keeps `Last-Modified` and weakens the ETag, because the entity is no
+    // longer byte-identical to the origin's.
     if loc.sub_filter_last_modified {
-        // nginx keeps the validators but weakens the ETag: the entity is no
-        // longer byte-identical to the file, so a strong validator would lie.
         weaken_etag(&mut resp);
     } else {
         strip_header(&mut resp, "ETag");
         strip_header(&mut resp, "Last-Modified");
     }
+    strip_header(&mut resp, "Accept-Ranges");
+    // nginx clears the length and streams the reply, so its wire form is
+    // chunked. We have the whole body here and re-emit an exact Content-Length
+    // instead -- but the upstream's own copy must go, or the client sees the
+    // header twice.
+    strip_header(&mut resp, "Content-Length");
     resp.explicit_len = false;
-    resp.body = Body::Bytes(new_body);
+    resp.body = Body::Bytes(filters.apply(&body, &ctype).unwrap_or(body));
     resp
 }
 

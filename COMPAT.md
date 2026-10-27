@@ -13,9 +13,9 @@
 
 | 项 | 命令 | 当前结果 |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 83 文件，WORSE=0 TRUNC=0（nginx 1086 / ngxrs 1090 断言） |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 88 文件，WORSE=0 TRUNC=0（nginx 1183 / ngxrs 1187 断言） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
-| 单元测试 | `cargo test --release` | **PASS** — 130 passed |
+| 单元测试 | `cargo test --release` | **PASS** — 133 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
 
 ## 一之二、2026-10-27 轮：范围纠偏、realip 信任判定、auth_basic
@@ -85,9 +85,77 @@ nginx : X-IP: 127.0.0.1      ngxrs(修前): X-IP: 192.0.2.1
 - `slice.t` 23 条：`ngx_http_slice_module` 未实现。
 - `secure_link.t` 6 条、`limit_req2.t` 5 条、`sub_filter.t` 1 条 / `sub_filter_multi.t` 2 条：未实现或语义差异。
 
+## 一之三、2026-10-27 第二轮：sub_filter 语义、limit 空键与 dry run、配置文本编码
+
+### 1. 配置里所有非 ASCII 文本都被写成乱码（已修）
+
+`$var` 展开函数在拷贝字面量时逐字节 `push(b as char)`，把每个字节当成一个 Latin-1 码点，
+再按 UTF-8 编码输出。`模様`（`E6 A8 A1 E6 A7 98`）因此变成 `æ¨¡æ§˜`（`C3 A6 C2 A8 ...`）。
+
+后果不只是难看：`sub_filter 模様 替换` 里的模式在进程内是乱码，永远匹配不到真正的
+UTF-8 body。同机 A/B（`sub_filter 模様 zast1`，body 来自 `$arg_a`）：
+
+```
+nginx : ТЕКСТzast1ТЕКСТ      ngxrs(修前): ТЕКСТ模様ТЕКСТ（未替换）
+```
+
+修了 9 处展开器：`http/mod.rs` 的 `expand_vars` / `expand_captures` /
+`expand_captures_args` / `ServerVars::expand` / `limit_key`，以及 `ssi.rs`、`proxy.rs`（2 处）、
+`fastcgi.rs`、`uwsgi_scgi.rs`、`cache.rs`、`cookie.rs`。做法是把字面量整段按 `&str` 切片拷贝
+（`$` 是 ASCII，切片边界必然合法），比逐字节 push 还快。SSI 的 `escape_entity` 改为按字符遍历。
+
+顺带把 `ssi.t` 从 30/32 拉到 **32/32**。
+
+### 2. sub_filter 的匹配模型是错的（已修，2 个文件全平）
+
+原实现把多条规则当成独立流水线依次全局替换。nginx 不是这样：
+
+- **每个位置取最长匹配**（模式按长度降序排好，`ngx_http_sub_match` 取第一个命中的）。
+  `sub_filter_multi.t` 的 "partial match" 就是这一点：`aabb -> +` 与 `aaabb -> -` 处理
+  `aabbaaabbaabb`，nginx 给 `+-+`，流水线模型给 `+a++`。
+- **`sub_filter_once on` 是按模式计**，不是按请求计：每个模式各替换一次后置位。
+  `aabyyzaab`（`aab`/`yyz`）→ `+-aab`。
+- **替换结果不会被再次扫描**：`sub_filter a b; sub_filter b c;` 处理 `a` 得 `b`（实测 nginx）。
+  旧单测断言的是 `c`，那是错的，已按实测改正。
+
+同时补上：`sub_filter` 现在**也作用于代理响应**。此前 `wants_buffered` 只看 `ssi` 与 `gzip`，
+代理响应直接流式写 socket，`sub_filter` 完全没跑（`sub_filter.t` 的 `/lm` 用例即此）；
+现在有 `sub_filter` 的 location 走缓冲取回，WebSocket 升级仍走流式。
+另外按 nginx 的 header filter 语义，过滤器一装上就清 `Content-Length` / `Accept-Ranges`，
+并按 `sub_filter_last_modified` 决定「丢两个验证器」还是「留 Last-Modified + 弱化 ETag」。
+
+`sub_filter_buffering` 此前是未识别指令，现在会解析（nginx 默认 on，我们始终缓冲）。
+
+结果：`sub_filter.t` 31/32 → **32/32**，`sub_filter_multi.t` 42/44 → **44/44**。
+
+### 3. limit_req / limit_conn：空键与 dry run（已修，2 个新文件入清单）
+
+- **空键必须跳过**。nginx `ngx_http_limit_req_handler` 里 `key.len == 0` 直接 `continue`；
+  我们把空串当成共享桶，于是所有「没带这个参数」的请求挤在一个桶里互相拒绝。
+  `limit_req2.t` 的 5 条失败全部是这一个原因（`$arg_a` 缺省时被 `slow` 区限流）。
+- **`limit_req_dry_run` / `limit_conn_dry_run`** 此前只被「接受但忽略」。现在真的实现：
+  照常记账并写 `limiting requests, dry run, excess: ...` / `delaying request, dry run, ...`
+  （`limiting connections, dry run by zone ...`），但不延迟也不拒绝。
+- **`$limit_req_status` / `$limit_conn_status`** 新增（`PASSED` / `DELAYED` / `REJECTED` /
+  `DELAYED_DRY_RUN` / `REJECTED_DRY_RUN`），未配置限流时为空所以 `add_header` 不产出。
+- 限流产生的 503 现在会跑 `add_header`（nginx 的 header filter 对它的 503 同样生效；
+  `limit_req_dry_run.t` 就断言了那个响应上的 `X-Status: REJECTED`）。
+
+结果：`limit_req2.t` 11/16 → **16/16**，`limit_req_dry_run.t` 4/10 → **10/10**，
+`limit_conn_dry_run.t` 6/8 → **8/8**。
+
+### 已知偏差（本轮新增，均有实测根因）
+
+- `sub_filter_buffering.t` "partial match" 1 条：上游声明 `Content-Length: 10` 却只发 3 字节
+  就断开。nginx 在 `proxy_buffering off` 下流式转发，把末尾可能是匹配前缀的 `z` 挂住，
+  流被截断时直接丢弃，于是返回 `xy`；我们缓冲整段，保留 `xyz`。
+  这是「上游畸形响应 + 流式过滤器」的产物，不是可配置语义（同机实测：上游一次写全 3 字节时
+  nginx 三种配置全部返回 `xyz`）。要复现得实现按读边界推进的流式过滤器，收益是 1 条断言，
+  代价是把一个更坏的实现写进热路径，故记为偏差。
+
 ## 二、声明的测试清单
 
-清单在 `bench/declared.txt`，**83 个文件**，选取规则是机械的：
+清单在 `bench/declared.txt`，**88 个文件**，选取规则是机械的：
 
 1. 落在范围内（**参考构建 `-V` 能编出来的模块**：http core + proxy/cache/gzip/
    TLS/HTTP2/realip/auth_request/slice/sub/secure_link/dav/stub_status/gzip_static/

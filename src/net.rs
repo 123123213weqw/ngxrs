@@ -289,6 +289,7 @@ pub fn serve(cfg: Config) -> io::Result<()> {
             trusted_ca: sc.ssl_trusted_certificate.clone(),
             access_logs: sc.access_logs.clone(),
             logger: ctx.logger.clone(),
+            proxy_protocol: sc.proxy_protocol,
         });
     }
     let stream_cfg = Arc::new(stream_cfg);

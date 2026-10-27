@@ -350,6 +350,7 @@ fn synthesize_request(
         target.push_str(query);
     }
     Request {
+        proxy_protocol: None,
         method,
         raw_target: target,
         version_minor: 1,

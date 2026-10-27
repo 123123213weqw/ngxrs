@@ -163,6 +163,11 @@ pub struct Request {
     /// request (rather than threaded through every render helper) so `$scheme`
     /// and the `$ssl_*` family can be answered anywhere a `Request` is in scope.
     pub tls: Option<std::sync::Arc<crate::conn::TlsInfo>>,
+    /// The connection's parsed `listen ... proxy_protocol` header, copied here
+    /// so `$proxy_protocol_*` and `real_ip_header proxy_protocol` do not need
+    /// the connection. Like `tls`, it belongs to the connection but nginx
+    /// exposes it through the request's variables.
+    pub proxy_protocol: Option<std::sync::Arc<crate::proxyproto::Pp>>,
     /// When the request head finished parsing. Backs `$request_time`.
     pub started: std::time::Instant,
 }
@@ -533,6 +538,7 @@ impl Request {
             host,
             expect_continue,
             tls: None,
+            proxy_protocol: None,
             started: std::time::Instant::now(),
         })
     }

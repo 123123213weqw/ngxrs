@@ -53,6 +53,16 @@ realip_remote_port.t
 # variables in it.
 rewrite_if.t
 
+# ---- PROXY protocol ----
+# `listen ... proxy_protocol` (v1 text and v2 binary with TLVs),
+# `$proxy_protocol_*`, `real_ip_header proxy_protocol`, and `stream`'s
+# `proxy_protocol on`. `allow`/`deny` and the access log follow the rewritten
+# address because nginx's realip runs in POST_READ, before ACCESS.
+proxy_protocol.t
+proxy_protocol2.t
+proxy_protocol2_tlv.t
+proxy_protocol_ipv6.t
+
 # ---- dav ----
 # `dav_methods PUT DELETE MKCOL COPY MOVE`, `dav_access`,
 # `create_full_put_path`, `min_delete_depth`, and the `Depth`/`Overwrite`/

@@ -199,6 +199,7 @@ fn synthesize(req: &H3Request, authority: Option<&str>, path: &str, query: &str)
         target.push_str(query);
     }
     Request {
+        proxy_protocol: None,
         method,
         raw_target: target,
         version_minor: 1,

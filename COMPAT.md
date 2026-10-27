@@ -13,9 +13,9 @@
 
 | 项 | 命令 | 当前结果 |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 95 文件，WORSE=0 TRUNC=0（nginx 1393 / ngxrs 1397 断言） |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 99 文件，WORSE=0 TRUNC=0（nginx 1470 / ngxrs 1474 断言） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
-| 单元测试 | `cargo test --release` | **PASS** — 141 passed |
+| 单元测试 | `cargo test --release` | **PASS** — 147 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
 
 ## 一之二、2026-10-27 轮：范围纠偏、realip 信任判定、auth_basic
@@ -261,9 +261,40 @@ value，捕获与命名变量在同一遍里替换。现在合并成一个展开
 `user:` 就把 owner 位清零再按参数 OR 回去 —— 所以 `user:rw group:r all:r` 是 0644
 而不是 0744。
 
+## 一之六、2026-10-27 第五轮：PROXY protocol（77 条断言）
+
+`proxy_protocol.t` 26/26、`proxy_protocol2.t` 30/30、`proxy_protocol2_tlv.t` 16/16、
+`proxy_protocol_ipv6.t` 5/5。四种输入形态加一种输出：
+
+- **v1 文本**：`PROXY TCP4|TCP6 <src> <dst> <sport> <dport>\r\n`。
+  `PROXY UNKNOWN`（后面跟什么都不管）是合法的「无地址」答案，不是错误 ——
+  `$proxy_protocol_addr` 为空、端口为空，请求照常处理。
+- **v2 二进制**：12 字节签名 + 版本/命令 + 家族/传输 + 长度 + 地址 + TLV。
+  命令不是 PROXY、传输不是 STREAM、家族不是 INET/INET6 时**跳过整段头但保留连接**，
+  nginx 就是这么做的（`ngx_proxy_protocol_v2_read` 的 `return end`）。
+- **TLV**：`$proxy_protocol_tlv_<名字>`、`_0xNN`、以及 `ssl_` 前缀下的子 TLV
+  （`ssl_verify` 是前缀里的 4 字节整数，`ssl_cn` 等在子 TLV 表里）。
+- **输出侧**：`stream { proxy_protocol on; }` 写 v1 头。
+
+### 顺带补上两个真实的语义缺口
+
+1. **`allow`/`deny` 用重写后的地址**。nginx 的 realip 是 POST_READ 阶段，ACCESS 在它
+   之后；我们之前一直用连接地址判断。这条偏差从 realip 那轮就登记在案，现在有测试
+   驱动的修正：`proxy_protocol.t` 的 `/pp_4`、`/pp_6` 要求 403。
+2. **`access_log` 的 `$remote_addr`/`$remote_port` 也是重写后的值**。日志是在
+   `dispatch` 之外写的，所以加了一条 `&mut (String, String)` 把有效地址带出来；
+   之前日志里永远是 `127.0.0.1:0`。
+
+### 一处只有对照源码才发现的坑
+
+`stream ... proxy_protocol on` 写头时，**目标地址取客户端连到本机的那个地址**
+（`c->local_sockaddr`），不是上游 socket 的本地地址。取错会得到 `127.0.0.1 -> [::1]`
+这种混合家族，`ngx_proxy_protocol_write` 只能写 `PROXY UNKNOWN`，于是
+`$proxy_protocol_addr` 为空 —— `proxy_protocol_ipv6.t` 的两条断言正是这样。
+
 ## 二、声明的测试清单
 
-清单在 `bench/declared.txt`，**95 个文件**，选取规则是机械的：
+清单在 `bench/declared.txt`，**99 个文件**，选取规则是机械的：
 
 1. 落在范围内（**参考构建 `-V` 能编出来的模块**：http core + proxy/cache/gzip/
    TLS/HTTP2/realip/auth_request/slice/sub/secure_link/dav/stub_status/gzip_static/

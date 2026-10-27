@@ -296,6 +296,17 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
         .map(|a| a.ip().to_string())
         .unwrap_or_else(|| "127.0.0.1".to_string());
 
+    // `listen ... proxy_protocol`: the header sits in front of the first
+    // request, so it is consumed once -- before the loop, so the request
+    // timeout does not apply to it and the parser never sees it.
+    if group.proxy_protocol && conn.proxy_protocol.is_none() {
+        if let Err(e) = conn.read_proxy_protocol().await {
+            crate::log::error_log("error", &format!("PROXY protocol: {e}"));
+            let _ = send_error(&mut conn, 400, first_server.server_tokens, served == 0, false).await;
+            return;
+        }
+    }
+
     loop {
         #[cfg(feature = "alloc-count")]
         let mark0 = crate::alloccnt::mark(0);
@@ -351,6 +362,7 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
                 let synthetic = Request {
                     method: Method::Get,
                     raw_target: "/".to_string(),
+                    proxy_protocol: None,
                     version_minor: 0,
                     headers: crate::http::request::Headers::default(),
                     body_len: 0,
@@ -447,6 +459,7 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
                 // Attach the connection's TLS facts once per request so `$scheme`
                 // and `$ssl_*` can be answered from any `Request` in scope.
                 r.tls = tls_info.clone();
+                r.proxy_protocol = conn.proxy_protocol.clone();
                 r
             }
         };
@@ -551,6 +564,12 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
                 let _ = send_error(&mut conn, 400, tokens, false, false).await;
                 // nginx still writes an access-log line, with `$uri` empty.
                 let srv = http.server(group.default_server);
+                let (log_peer_ip, log_peer_port) = match &conn.proxy_protocol {
+                    Some(p) if !p.src_addr.is_empty() => {
+                        (p.src_addr.clone(), p.src_port.to_string())
+                    }
+                    _ => (conn.peer_ip_str(), conn.peer.port().to_string()),
+                };
                 log_access(
                     ctx,
                     group,
@@ -561,7 +580,7 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
                     400,
                     0,
                     std::time::Duration::ZERO,
-                    conn.peer,
+                    (&log_peer_ip, &log_peer_port),
                     &[],
                     None,
                 );
@@ -645,6 +664,7 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
         // is missing or unusable).
         let local_ip = &local_ip_owned;
         let prof_dispatch = crate::prof::start();
+        let mut remote_eff: (String, String) = (conn.peer_ip_str(), peer_port.to_string());
         let outcome = dispatch(
             &mut conn,
             &req,
@@ -660,6 +680,7 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
             peer_port,
             &client_ip,
             &mut guards_sink,
+            &mut remote_eff,
         )
         .await;
         crate::prof::record(1, prof_dispatch);
@@ -692,7 +713,7 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
             status,
             bytes,
             elapsed,
-            conn.peer,
+            (&remote_eff.0, &remote_eff.1),
             &sent,
             loc.access_logs.as_deref(),
         );
@@ -761,11 +782,14 @@ async fn access_phase(
     vars: &ServerVars<'_>,
     sets: &mut Vec<(String, String)>,
 ) -> Option<Response> {
-    // nginx reports `unix:` as the peer address for a unix socket, which does
-    // not parse as an IP; `peer_unix` is what `allow unix:` keys off.
-    let peer_addr: std::net::IpAddr = vars
-        .peer_ip
+    // nginx evaluates ACCESS *after* `real_ip_*` (the realip module is
+    // POST_READ), so `allow`/`deny` see the rewritten address. `vars` carries
+    // it under `remote_addr` once realip ran; the connection value is the
+    // fallback.
+    let effective = vars.get("remote_addr");
+    let peer_addr: std::net::IpAddr = effective
         .parse()
+        .or_else(|_| vars.peer_ip.parse())
         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     let peer_unix = vars.peer_ip == "unix:";
 
@@ -1911,6 +1935,32 @@ fn expand_replacement(
     out
 }
 
+/// `$proxy_protocol_addr` / `$proxy_protocol_server_addr`.
+fn pp_addr(req: &Request) -> String {
+    req.proxy_protocol
+        .as_ref()
+        .map(|p| p.src_addr.clone())
+        .unwrap_or_default()
+}
+
+fn pp_server_addr(req: &Request) -> String {
+    req.proxy_protocol
+        .as_ref()
+        .map(|p| p.dst_addr.clone())
+        .unwrap_or_default()
+}
+
+/// A PROXY port renders as the empty string when it is 0, which is what
+/// `ngx_http_variable_proxy_protocol_port` does and why `PROXY UNKNOWN` reads
+/// `X-PP: !`.
+fn pp_port(req: &Request, server: bool) -> String {
+    let Some(p) = req.proxy_protocol.as_ref() else {
+        return String::new();
+    };
+    let port = if server { p.dst_port } else { p.src_port };
+    crate::proxyproto::Pp::port_text(port)
+}
+
 /// Split rendered header lines back into (name, value) pairs.
 /// `$sent_http_*` is the only consumer of the sent-header list, and building it
 /// costs two `String`s per header line. With no access log configured that work
@@ -2745,6 +2795,20 @@ impl<'a> ServerVars<'a> {
                 }
             }
             "request_method" => self.req.method.as_str().to_string(),
+            _ if name.starts_with("proxy_protocol_tlv_") => {
+                // `$proxy_protocol_tlv_<name>` / `_0xNN` / `_ssl_<sub>`.
+                match self.req.proxy_protocol.as_ref() {
+                    Some(pp) => match pp.tlv(&name["proxy_protocol_tlv_".len()..]) {
+                        Ok(Some(v)) => String::from_utf8_lossy(&v).to_string(),
+                        // Absent and malformed both render empty here; nginx
+                        // answers 500 for the malformed case, which no test
+                        // exercises and which would need an error channel this
+                        // function does not have.
+                        _ => String::new(),
+                    },
+                    None => String::new(),
+                }
+            }
             // nginx exposes the body only once it has been read; over HTTP/1.1
             // our dispatcher streams it straight to the upstream, so this is
             // populated on HTTP/2 and HTTP/3, where it arrives before routing.
@@ -2818,6 +2882,13 @@ impl<'a> ServerVars<'a> {
             }
             "remote_addr" => self.peer_ip.to_string(),
             "remote_port" => self.peer_port.to_string(),
+            // `listen ... proxy_protocol` values. Absent (no header on this
+            // connection) is "not found", which is why these are empty and not
+            // the connection's address -- `proxy_protocol.t` asserts that.
+            "proxy_protocol_addr" => pp_addr(self.req),
+            "proxy_protocol_port" => pp_port(self.req, false),
+            "proxy_protocol_server_addr" => pp_server_addr(self.req),
+            "proxy_protocol_server_port" => pp_port(self.req, true),
             // nginx: without a rewrite these alias the connection values.
             "realip_remote_addr" => self
                 .custom
@@ -4347,6 +4418,7 @@ fn realip_effective(
     loc: &LocCfg,
     req: &Request,
     peer: Option<std::net::IpAddr>,
+    pp: Option<&crate::proxyproto::Pp>,
 ) -> Option<(std::net::IpAddr, u16)> {
     if loc.realip_from.is_empty() && !loc.realip_from_unix {
         return None;
@@ -4397,6 +4469,16 @@ fn realip_effective(
             return None;
         }
         Some(addr)
+    } else if loc.real_ip_header.eq_ignore_ascii_case("proxy_protocol") {
+        // `real_ip_header proxy_protocol`: the address comes from the header
+        // consumed at connection setup, not from an HTTP header. nginx resolves
+        // the value through `$proxy_protocol_addr`, so an empty one declines.
+        let pp = pp?;
+        if pp.src_addr.is_empty() {
+            return None;
+        }
+        let ip: std::net::IpAddr = pp.src_addr.parse().ok()?;
+        Some((ip, pp.src_port))
     } else {
         // Header names are stored lowercased; the directive keeps its case.
         let name = loc.real_ip_header.to_ascii_lowercase();
@@ -4421,6 +4503,10 @@ async fn dispatch(
     peer_port: u16,
     client_ip: &str,
     guards: &mut Vec<crate::limit::ConnGuard>,
+    // The client address as `real_ip_*` left it. The access log is written
+    // outside `dispatch`, and `$remote_addr` there must be the rewritten one
+    // (`proxy_protocol.t` asserts the client address in the log).
+    remote: &mut (String, String),
 ) -> io::Result<Outcome> {
     // Measurement endpoint for `NGXRS_PROF=1`: per-request thread-CPU time by
     // phase, so the cost of a path can be attributed instead of guessed.
@@ -4526,8 +4612,10 @@ async fn dispatch(
     // is passed as `None` and trusted only via `set_real_ip_from unix:`.
     let peer_str = conn.peer_ip_str();
     let peer_addr = peer_str.parse::<std::net::IpAddr>().ok();
+    let pp = conn.proxy_protocol.clone();
     if peer_addr.is_some() || peer_str == "unix:" {
-        if let Some((ip, port)) = realip_effective(loc, req, peer_addr) {
+        if let Some((ip, port)) = realip_effective(loc, req, peer_addr, pp.as_deref()) {
+            *remote = (ip.to_string(), port.to_string());
             set_vars.insert("remote_addr".to_string(), ip.to_string());
             set_vars.insert("remote_port".to_string(), port.to_string());
             set_vars.insert("realip_remote_addr".to_string(), peer_str.to_string());
@@ -6312,7 +6400,9 @@ fn log_access(
     status: u16,
     bytes: u64,
     _elapsed: Duration,
-    peer: std::net::SocketAddr,
+    // `$remote_addr` / `$remote_port` as `real_ip_*` left them; the raw socket
+    // address is only the starting point.
+    remote: (&str, &str),
     sent: &[(String, String)],
     loc_logs: Option<&[crate::config::AccessLog]>,
 ) {
@@ -6346,7 +6436,8 @@ fn log_access(
     let ua = req.headers.get("user-agent").unwrap_or("");
     let referer = req.headers.get("referer").unwrap_or("");
     let server_name = server.names.first().map(|s| s.as_str()).unwrap_or("");
-    let peer = peer.ip().to_string();
+    let peer = remote.0.to_string();
+    let peer_port = remote.1.to_string();
 
     // `$sent_http_*` values, resolved up front so the slice can borrow them.
     // Repeated headers are comma-joined, like nginx's `$sent_http_*`.
@@ -6377,7 +6468,7 @@ fn log_access(
 
     let mut vars: Vec<(&str, &str)> = vec![
         ("remote_addr", &peer),
-        ("remote_port", "0"),
+        ("remote_port", &peer_port),
         ("remote_user", "-"),
         ("time_local", ""),
         ("request", &request_line),

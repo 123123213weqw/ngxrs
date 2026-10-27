@@ -180,6 +180,10 @@ pub struct Conn {
     /// counted as reading / writing.
     reading: bool,
     writing: bool,
+    /// Parsed `listen ... proxy_protocol` header for this connection, if the
+    /// socket asked for one. `$proxy_protocol_*` and `real_ip_header
+    /// proxy_protocol` read it; nothing else does.
+    pub proxy_protocol: Option<std::sync::Arc<crate::proxyproto::Pp>>,
     /// `limit_rate` for the response in flight, in bytes per second (0 = off),
     /// and how many leading bytes escape throttling (`limit_rate_after`).
     pub limit_rate: u64,
@@ -257,6 +261,7 @@ impl Conn {
             out: Vec::with_capacity(512),
             reading: false,
             writing: false,
+            proxy_protocol: None,
             limit_rate: 0,
             limit_rate_after: 0,
             rate_bytes: 0,
@@ -402,6 +407,37 @@ impl Conn {
             self.start = 0;
             self.end = 0;
             self.buf.clear();
+        }
+    }
+
+    /// Read and consume a `listen ... proxy_protocol` header.
+    ///
+    /// nginx runs this once per connection, before the request head is parsed
+    /// (`ngx_proxy_protocol_read` in `ngx_http_wait_request_handler`), so the
+    /// header bytes are never seen by the HTTP parser.
+    pub async fn read_proxy_protocol(&mut self) -> io::Result<()> {
+        loop {
+            match crate::proxyproto::parse(self.buffered()) {
+                Ok(Some(parsed)) => {
+                    self.consume(parsed.consumed);
+                    self.proxy_protocol = Some(std::sync::Arc::new(parsed.pp));
+                    return Ok(());
+                }
+                Ok(None) => {
+                    if self.fill().await? == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "PROXY protocol header truncated",
+                        ));
+                    }
+                }
+                Err(()) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "broken PROXY protocol header",
+                    ));
+                }
+            }
         }
     }
 

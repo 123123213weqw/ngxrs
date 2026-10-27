@@ -39,6 +39,7 @@ python3 tests/parity.py         # 差分测试：同一请求分别打 nginx / n
 - **mail**：POP3 / IMAP / SMTP 三个协议完整实现（`auth_http`、`Auth-Method`/`Salt`、`*_auth` 按协议独立、`*_capabilities`、`starttls off|on|only` 与 `STLS`/`STARTTLS` 真实 TLS 升级、`listen ... ssl` 隐式 TLS、`smtp_greeting_delay`）
 - **日志**：`error_log` 八个级别（debug…emerg）在 main/http/server/location/stream/mail 各上下文，多目的地、`stderr`、`syslog:` 走 RFC 3164
 - **其它**：`gzip`、`add_header`/`add_trailer`（含 `$sent_http_*`、`$sent_trailer_*`）、`expires`、`access_log`、`allow`/`deny`/`limit_except`、`limit_req`/`limit_conn`、`map`、`geo`
+- **PROXY protocol**：`listen ... proxy_protocol`（v1 与 v2 二进制，含 TLV）、`$proxy_protocol_*`、`real_ip_header proxy_protocol`、`stream` 侧 `proxy_protocol on`
 - **realip**：`set_real_ip_from`（地址 / CIDR / 主机名 / `unix:`）、`real_ip_header`、`real_ip_recursive`。**peer 先受信才采信头**，`$remote_addr` 不可被任意客户端改写
 - **WebDAV**：`dav_methods PUT DELETE MKCOL COPY MOVE`、`dav_access`、`create_full_put_path`、`min_delete_depth`，以及 `Depth`/`Overwrite`/`Destination`
 - **auth**：`auth_basic`（`{PLAIN}`/`{SHA}`/`{SSHA}`/`crypt(3)`/`$apr1$`，`auth_basic_user_file` 支持变量）、`auth_request` + `auth_request_set`、`satisfy all|any`；`secure_link` 新式与老式两种签名
@@ -66,8 +67,8 @@ bash bench/fcgi.sh    # FastCGI / uwsgi / SCGI / stream TCP-UDP 14 项
 **绝对通过率没有意义**——nginx-tests master 依赖比 CPAN 更新的 `Test::Nginx`，很多用例对真 nginx 也是失败/阻塞。
 这两个脚本只报"nginx 过而 ngxrs 不过"的断言，那才是真缺陷。
 
-最近一次声明清单 A/B：**95 个文件，nginx 1393 / ngxrs 1397 条断言，0 条「nginx 过而我们不过」**，
-其中 91 个逐断言一致、4 个我们更多（`http_headers_multi.t`、`proxy_cache_range.t`、`proxy_if.t`、`proxy_noclose.t`）。
+最近一次声明清单 A/B：**99 个文件，nginx 1470 / ngxrs 1474 条断言，0 条「nginx 过而我们不过」**，
+其中 95 个逐断言一致、4 个我们更多（`http_headers_multi.t`、`proxy_cache_range.t`、`proxy_if.t`、`proxy_noclose.t`）。
 范围内仍不一致的文件、缺口与复现命令逐条列在 [COMPAT.md](COMPAT.md) 第三节。
 
 ## 性能

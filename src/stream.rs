@@ -47,6 +47,8 @@ pub struct StreamServer {
     pub access_logs: Vec<crate::config::AccessLog>,
     /// Shared writer for `access_log`.
     pub logger: std::sync::Arc<crate::log::Logger>,
+    /// `proxy_protocol on`: prefix the upstream connection with a PROXY header.
+    pub proxy_protocol: bool,
 }
 
 pub struct StreamConfig {
@@ -136,6 +138,11 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
+                // The address the *client* connected to, which is what the
+                // PROXY header advertises as the destination. Taking the
+                // upstream's local address instead produced a mixed-family
+                // pair (127.0.0.1 -> [::1]) and therefore `PROXY UNKNOWN`.
+                let client_local = client.local_addr().ok();
                 let _ = client.set_nodelay(true);
                 // nginx logs stream connections at `info`: the peer, the local
                 // address and the chosen upstream.
@@ -162,6 +169,7 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                 let proxy_ssl = server.proxy_ssl;
                 let reuse = server.proxy_ssl_session_reuse;
                 let sni = server.proxy_ssl_name.clone();
+                let write_pp = server.proxy_protocol;
                 let verify_mode = server.client_verify;
                 let client_ca = server.client_ca.clone();
                 let trusted_ca = server.trusted_ca.clone();
@@ -235,7 +243,20 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                                 }
                             }
                         }
-                        None => proxy_tcp(client, upstream, timeout, peer).await,
+                        None => {
+                            if write_pp {
+                                use tokio::io::AsyncWriteExt;
+                                let local = client_local
+                                    .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
+                                let mut upstream = upstream;
+                                let _ = upstream
+                                    .write_all(&crate::proxyproto::write(&peer, &local))
+                                    .await;
+                                proxy_tcp(client, upstream, timeout, peer).await
+                            } else {
+                                proxy_tcp(client, upstream, timeout, peer).await
+                            }
+                        }
                     }
                 });
             }

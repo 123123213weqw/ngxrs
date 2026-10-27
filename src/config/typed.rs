@@ -1204,6 +1204,9 @@ pub struct ListenGroup {
     pub ssl: bool,
     /// `listen ... quic`: this socket also serves HTTP/3 over UDP.
     pub quic: bool,
+    /// `listen ... proxy_protocol`: every connection on this socket starts with
+    /// a HAProxy PROXY header that has to be consumed before HTTP parsing.
+    pub proxy_protocol: bool,
 }
 
 #[derive(Debug)]
@@ -1444,6 +1447,12 @@ pub struct StreamServerCfg {
     pub ssl_trusted_certificate: Option<PathBuf>,
     /// `access_log` of this stream server; empty means none.
     pub access_logs: Vec<AccessLog>,
+    /// `proxy_protocol on`: prefix the upstream connection with a HAProxy
+    /// PROXY header carrying the client's address (`ngx_proxy_protocol_write`).
+    pub proxy_protocol: bool,
+    /// `listen ... proxy_protocol` in stream: consume such a header from the
+    /// client before proxying.
+    pub listen_proxy_protocol: bool,
 }
 
 impl Http {
@@ -3908,7 +3917,7 @@ impl Builder {
         http_http2: bool,
         http_header_field_limit: usize,
         http_header_bufs: usize,
-    ) -> Result<(Server, Vec<(ListenAddr, bool, bool, bool)>), ConfigError> {
+    ) -> Result<(Server, Vec<(ListenAddr, bool, bool, bool, bool)>), ConfigError> {
         let block = d
             .block
             .as_ref()
@@ -3930,7 +3939,7 @@ impl Builder {
         // (addr, is_default, ssl): TLS is decided per listen socket, not per
         // server — nginx lets one server block serve `listen 8081;` alongside
         // `listen 8082 ssl;`.
-        let mut listens: Vec<(ListenAddr, bool, bool, bool)> = Vec::new();
+        let mut listens: Vec<(ListenAddr, bool, bool, bool, bool)> = Vec::new();
         let mut keepalive = http_keepalive;
         let mut tokens = http_tokens;
         let mut access_log_off = false;
@@ -3982,7 +3991,8 @@ impl Builder {
                     if quic_now {
                         quic = true;
                     }
-                    listens.push((addr, is_default, listen_ssl, quic_now));
+                    let pp_now = child.args[1..].iter().any(|p| p == "proxy_protocol");
+                    listens.push((addr, is_default, listen_ssl, quic_now, pp_now));
                 }
                 "server_name" => {
                     names.extend(child.args.iter().cloned());
@@ -4185,6 +4195,7 @@ impl Builder {
                 ListenAddr::Tcp(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 80))),
                 false,
                 ssl,
+                false,
                 false,
             ));
         }
@@ -4446,6 +4457,8 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             ssl_client_certificate: stream_client_ca.clone(),
             ssl_trusted_certificate: stream_trusted.clone(),
             access_logs: stream_access_logs.clone(),
+            proxy_protocol: false,
+            listen_proxy_protocol: false,
         };
         let mut have_listen = false;
         for child in sd.block.as_ref().map(|x| x.as_slice()).unwrap_or(&[]) {
@@ -4467,10 +4480,19 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                     if child.args[1..].iter().any(|p| p == "ssl") {
                         cfg.ssl = true;
                     }
+                    if child.args[1..].iter().any(|p| p == "proxy_protocol") {
+                        cfg.listen_proxy_protocol = true;
+                    }
                     have_listen = true;
                 }
                 "proxy_pass" => {
                     cfg.proxy_pass = child.args.first().cloned();
+                }
+                "proxy_protocol" => {
+                    // `proxy_protocol on` prefixes the upstream with a PROXY
+                    // header; `off` (the default) leaves the byte stream alone.
+                    cfg.proxy_protocol =
+                        child.args.first().map(|v| v == "on").unwrap_or(false);
                 }
                 "proxy_timeout" => {
                     if let Some(v) = child.args.first() {
@@ -5209,7 +5231,7 @@ pub fn build(
     }
 
     let mut groups: BTreeMap<String, ListenGroup> = BTreeMap::new();
-    let mut listens_by_server: Vec<(usize, Vec<(ListenAddr, bool, bool, bool)>)> = Vec::new();
+    let mut listens_by_server: Vec<(usize, Vec<(ListenAddr, bool, bool, bool, bool)>)> = Vec::new();
 
     for (i, sd) in server_dirs.iter().enumerate() {
         let (server, listens) = b.parse_server(
@@ -5261,7 +5283,7 @@ pub fn build(
     let mut quic_groups: BTreeMap<String, ListenGroup> = BTreeMap::new();
 
     for (idx, listens) in listens_by_server {
-        for (addr, is_default, listen_ssl, listen_quic) in listens {
+        for (addr, is_default, listen_ssl, listen_quic, listen_pp) in listens {
             let table: &mut BTreeMap<String, ListenGroup> = if listen_quic {
                 &mut quic_groups
             } else {
@@ -5286,6 +5308,7 @@ pub fn build(
                 default_server: 0,
                 ssl: listen_ssl,
                 quic: listen_quic,
+                proxy_protocol: listen_pp,
             });
             if let ListenAddr::Tcp(a) = &addr {
                 if a.ip().is_unspecified() {

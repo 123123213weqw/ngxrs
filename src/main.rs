@@ -27,6 +27,7 @@ mod md5;
 mod net;
 mod prof;
 mod proxy;
+mod proxyproto;
 mod secure_link;
 mod referer;
 mod resolver;

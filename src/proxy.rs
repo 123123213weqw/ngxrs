@@ -2632,7 +2632,7 @@ async fn exchange(
                     raw.extend_from_slice(v.as_bytes());
                     raw.extend_from_slice(b"\r\n");
                 }
-                crate::http::apply_expires(&mut raw, loc, entry.status);
+                crate::http::apply_expires(&mut raw, loc, entry.status, Some(&vars.expand(loc.expires.as_deref().unwrap_or(""))));
                 apply_proxy_redirect(&mut raw, loc, vars);
                 crate::http::apply_add_headers_upstream(
                     &mut raw,
@@ -2929,7 +2929,7 @@ async fn exchange(
         let mut out_raw = raw;
         apply_cookie_rules(&mut out_raw, loc, vars);
         apply_proxy_redirect(&mut out_raw, loc, vars);
-        crate::http::apply_expires(&mut out_raw, loc, head.status);
+        crate::http::apply_expires(&mut out_raw, loc, head.status, Some(&vars.expand(loc.expires.as_deref().unwrap_or(""))));
         crate::http::apply_add_headers_upstream(
             &mut out_raw,
             &loc.headers,
@@ -3015,7 +3015,7 @@ async fn exchange(
 
     let mut raw = raw;
     apply_proxy_redirect(&mut raw, loc, vars);
-    crate::http::apply_expires(&mut raw, loc, head.status);
+    crate::http::apply_expires(&mut raw, loc, head.status, Some(&vars.expand(loc.expires.as_deref().unwrap_or(""))));
     let upstream_headers = crate::http::split_head(&raw);
     crate::http::apply_add_headers_ctx(
         &mut raw,
@@ -3640,7 +3640,7 @@ pub async fn fetch(
             Chosen::Upstream { addr, .. } => addr.to_string(),
         };
         apply_proxy_redirect(&mut raw, loc, &fetch_vars);
-        crate::http::apply_expires(&mut raw, loc, head.status);
+        crate::http::apply_expires(&mut raw, loc, head.status, None);
         // Applied here, where `$upstream_*` is in scope, and with the full
         // `ServerVars` set (`$request_body`, `$cookie_*`, `set` variables).
         // `headers_finalized` then stops `finalize_response` repeating it.

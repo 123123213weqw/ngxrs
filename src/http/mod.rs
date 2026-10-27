@@ -2135,95 +2135,130 @@ fn local_utc_offset(t: i64) -> i64 {
     }
 }
 
-pub fn apply_expires(raw: &mut Vec<u8>, loc: &LocCfg, status: u16) {
-    let Some(spec) = &loc.expires else { return };
-    // `expires` is installed by the same filter as `add_header`
-    // (`ngx_http_headers_filter_module`), so it is subject to the same status
-    // gate. nginx does not put Expires/Cache-Control on a 404; verified with
-    // bench/expires_diff.sh, which is the only check for this directive because
-    // nginx-tests has no expires test.
+pub fn apply_expires(raw: &mut Vec<u8>, loc: &LocCfg, status: u16, expanded: Option<&str>) {
+    let Some(raw_spec) = &loc.expires else { return };
+    // `expires` shares `add_header`'s filter, so it has the same status gate.
     if !add_header_applies(status, false) {
         return;
     }
-    let spec = spec.trim();
-    let (expires_value, cache_control): (String, Option<CacheControl>) = match spec {
-        "off" => (String::new(), None),
-        "epoch" => (
-            "Thu, 01 Jan 1970 00:00:01 GMT".to_string(),
-            Some(CacheControl::Fixed("no-cache")),
-        ),
-        "max" => (
-            "Thu, 31 Dec 2037 23:55:55 GMT".to_string(),
-            Some(CacheControl::Fixed("max-age=315360000")),
-        ),
-        other => {
-            // `modified <time>` anchors on Last-Modified (falling back to
-            // now); `@Hh[Mm[Ss]]` is a daily time — the next occurrence of
-            // that time of day.
-            let (modified, rest) = match other.strip_prefix("modified ") {
-                Some(r) => (true, r.trim()),
-                None => (false, other),
+    // `expires` is a complex value (`expires $arg_e`), expanded by the caller.
+    let spec = expanded.unwrap_or(raw_spec).trim();
+
+    // `ngx_http_parse_expires`: the epoch/max/off shortcuts are only recognised
+    // when the directive was NOT written as `modified ...`.
+    let mut modified = false;
+    let mut rest = spec;
+    if let Some(r) = spec.strip_prefix("modified") {
+        if r.is_empty() || r.starts_with(' ') {
+            modified = true;
+            rest = r.trim();
+        }
+    }
+
+    #[derive(PartialEq, Clone, Copy)]
+    enum Kind {
+        Epoch,
+        Max,
+        Daily,
+        Access,
+    }
+    let mut kind = Kind::Access;
+    let mut offset: i64 = 0;
+
+    if !modified {
+        match rest {
+            "epoch" => kind = Kind::Epoch,
+            "max" => kind = Kind::Max,
+            "off" => return,
+            _ => {}
+        }
+    }
+    if !matches!(kind, Kind::Epoch | Kind::Max) {
+        // A `+`/`-` prefix sign, then the time itself.
+        let (neg, body) = match rest.strip_prefix('-') {
+            Some(r) => (true, r),
+            None => (false, rest.strip_prefix('+').unwrap_or(rest)),
+        };
+        if let Some(daily) = body.strip_prefix('@') {
+            // A config-time `expires modified @...` is rejected while parsing;
+            // a variable that expands into one emits nothing.
+            if modified {
+                return;
+            }
+            let Some(d) = crate::config::parse_time(daily) else {
+                return;
             };
-            if let Some(daily) = rest.strip_prefix('@') {
+            kind = Kind::Daily;
+            offset = (d.as_secs() % 86_400) as i64;
+        } else {
+            // An empty or unparseable value emits nothing at all -- not even a
+            // zero-length Expires (`headers.t`, "expires var empty" / "bad").
+            let Some(d) = crate::config::parse_time(body) else {
+                return;
+            };
+            offset = if neg {
+                -(d.as_secs() as i64)
+            } else {
+                d.as_secs() as i64
+            };
+        }
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let (expires_value, cache_control): (String, CacheControl) = match kind {
+        Kind::Epoch => (
+            "Thu, 01 Jan 1970 00:00:01 GMT".to_string(),
+            CacheControl::Fixed("no-cache"),
+        ),
+        Kind::Max => (
+            "Thu, 31 Dec 2037 23:55:55 GMT".to_string(),
+            CacheControl::Fixed("max-age=315360000"),
+        ),
+        Kind::Daily | Kind::Access => {
+            let (at, max_age) = if kind == Kind::Daily {
                 // nginx reads the daily time in the server's *local* zone
                 // (`ngx_time_next_expiration` works on broken-down time).
-                let of_day = crate::config::parse_time(daily)
-                    .map(|d| (d.as_secs() % 86_400) as i64)
-                    .unwrap_or(0);
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
                 let local = now + local_utc_offset(now);
                 let today_start = local - local % 86_400;
-                let mut local_at = today_start + of_day;
+                let mut local_at = today_start + offset;
                 if local_at <= local {
                     local_at += 86_400;
                 }
                 let at = local_at - local_utc_offset(local_at);
-                let max_age = at - now;
-                (util::http_date(at), Some(CacheControl::MaxAge(max_age)))
+                (at, at - now)
+            } else if modified {
+                // Anchored on Last-Modified, falling back to "now" when the
+                // response has none (`last_modified_time == -1`).
+                let base = last_modified_of(raw).unwrap_or(now);
+                let at = base + offset;
+                (at, at - now)
             } else {
-                let (neg, body) = match rest.strip_prefix('-') {
-                    Some(rest) => (true, rest),
-                    None => (false, rest.strip_prefix('+').unwrap_or(rest)),
-                };
-                let d = crate::config::parse_time(body)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
-                let base = if modified {
-                    last_modified_of(raw).unwrap_or(now)
-                } else {
-                    now
-                };
-                let at = if neg { base - d } else { base + d };
-                // nginx: a moment at or before "now" turns the Cache-Control
-                // into `no-cache` (negative times land here too).
-                let cc = if at <= now {
-                    CacheControl::Fixed("no-cache")
-                } else {
-                    CacheControl::MaxAge(at - now)
-                };
-                (util::http_date(at), Some(cc))
-            }
+                (now + offset, offset)
+            };
+            let cc = if offset < 0 || max_age < 0 {
+                CacheControl::Fixed("no-cache")
+            } else {
+                CacheControl::MaxAge(max_age)
+            };
+            (util::http_date(at), cc)
         }
     };
+
     // nginx's expires *replaces* any Cache-Control the upstream produced —
     // in place: a proxied `Cache-Control` keeps its slot and the new value,
     // while a response without one gets both headers appended (Expires first,
     // then Cache-Control, as `ngx_http_headers_filter` orders them).
-    if cache_control.is_some() || !expires_value.is_empty() {
+    if !expires_value.is_empty() {
         let text = String::from_utf8_lossy(raw).to_string();
         let mut rebuilt = Vec::with_capacity(raw.len());
         let mut cc_placed = false;
         for line in text.split("\r\n") {
             let lower = line.to_ascii_lowercase();
             if lower.starts_with("cache-control:") {
-                if let (Some(cc), false) = (&cache_control, cc_placed) {
+                if let (cc, false) = (&cache_control, cc_placed) {
                     rebuilt.extend_from_slice(b"Cache-Control: ");
                     let v = match cc {
                         CacheControl::Fixed(v) => v.to_string(),
@@ -2235,7 +2270,7 @@ pub fn apply_expires(raw: &mut Vec<u8>, loc: &LocCfg, status: u16) {
                 }
                 continue;
             }
-            if cache_control.is_some() && lower.starts_with("expires:") {
+            if lower.starts_with("expires:") {
                 continue;
             }
             if line.is_empty() {
@@ -2245,49 +2280,21 @@ pub fn apply_expires(raw: &mut Vec<u8>, loc: &LocCfg, status: u16) {
             rebuilt.extend_from_slice(b"\r\n");
         }
         *raw = rebuilt;
-        if let Some(cc) = &cache_control {
-            // A response that had no Cache-Control gets both appended, the
-            // Expires header first (ngx_http_headers_filter's order); one
-            // that had it keeps the slot (handled above).
-            if !cc_placed && !expires_value.is_empty() {
-                raw.extend_from_slice(b"Expires: ");
-                raw.extend_from_slice(expires_value.as_bytes());
-                raw.extend_from_slice(b"\r\n");
-            }
-            if !cc_placed {
-                raw.extend_from_slice(b"Cache-Control: ");
-                let v = match cc {
-                    CacheControl::Fixed(v) => v.to_string(),
-                    CacheControl::MaxAge(n) => format!("max-age={n}"),
-                };
-                raw.extend_from_slice(v.as_bytes());
-                raw.extend_from_slice(b"\r\n");
-            } else if !expires_value.is_empty() {
-                raw.extend_from_slice(b"Expires: ");
-                raw.extend_from_slice(expires_value.as_bytes());
-                raw.extend_from_slice(b"\r\n");
-            }
-            return;
-        }
-    }
-
-    if !expires_value.is_empty() {
-        raw.extend_from_slice(b"Expires: ");
-        raw.extend_from_slice(expires_value.as_bytes());
-        raw.extend_from_slice(b"\r\n");
-    }
-    match cache_control {
-        Some(CacheControl::Fixed(v)) => {
+        // A response that had no Cache-Control gets both appended, Expires
+        // first (`ngx_http_headers_filter`'s order); one that had it keeps the
+        // slot, handled above.
+        if !cc_placed {
+            raw.extend_from_slice(b"Expires: ");
+            raw.extend_from_slice(expires_value.as_bytes());
+            raw.extend_from_slice(b"\r\n");
             raw.extend_from_slice(b"Cache-Control: ");
+            let v = match &cache_control {
+                CacheControl::Fixed(v) => v.to_string(),
+                CacheControl::MaxAge(n) => format!("max-age={n}"),
+            };
             raw.extend_from_slice(v.as_bytes());
             raw.extend_from_slice(b"\r\n");
         }
-        Some(CacheControl::MaxAge(n)) => {
-            raw.extend_from_slice(b"Cache-Control: max-age=");
-            raw.extend_from_slice(n.to_string().as_bytes());
-            raw.extend_from_slice(b"\r\n");
-        }
-        None => {}
     }
 }
 
@@ -2783,8 +2790,16 @@ pub fn apply_add_headers(
             sent: &sent,
         };
         let expanded = local.expand(value);
-        // nginx drops the header when the value expands to nothing.
         if expanded.is_empty() {
+            // `add_header` handles `ETag` and `Last-Modified` through
+            // `ngx_http_set_response_header`, whose empty value **clears** the
+            // header the handler had produced -- `headers.t` asserts this with
+            // `add_header ETag '' always`. Every other name is simply skipped
+            // (`ngx_http_add_header` drops a zero-length value).
+            if name.eq_ignore_ascii_case("etag") || name.eq_ignore_ascii_case("last-modified") {
+                drop_replaced_header(raw, name);
+                sent.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+            }
             continue;
         }
         drop_replaced_header(raw, name);
@@ -4365,7 +4380,25 @@ async fn finalize_response(
         http,
     );
 
-    apply_expires(&mut out.raw, cur_loc, out.status);
+    // `expires` may be a complex value (`expires $arg_e`), so it is expanded
+    // here where the request variables are in scope.
+    let expires_expanded = cur_loc.expires.as_ref().map(|spec| {
+        let ctx = RwVars {
+            req,
+            path: &cur_path,
+            query: &cur_query,
+            vars: custom,
+            server_port,
+            loc: Some(cur_loc),
+        };
+        expand_vars(spec, &ctx)
+    });
+    apply_expires(
+        &mut out.raw,
+        cur_loc,
+        out.status,
+        expires_expanded.as_deref(),
+    );
     // nginx's header filter turns *any* `Location` that starts with `/` into an
     // absolute URL when `absolute_redirect` is on -- including one an upstream
     // sent and `proxy_redirect` rewrote. Verified with `proxy_redirect.t`, whose

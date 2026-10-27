@@ -61,6 +61,12 @@ stream_map.t
 stream_set.t
 stream_split_clients.t
 
+# ---- headers ----
+# `add_header` with `always`, the special-header names (`ETag`/`Last-Modified`
+# are *set*, so an empty value clears them), and `expires` in every form
+# including a complex value (`expires $arg_e`).
+headers.t
+
 # ---- request body ----
 # `$request_body` / `$request_body_file` (the body has to be in memory before
 # dispatch, because the variable is read by `add_header` after the upstream

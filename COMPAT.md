@@ -13,7 +13,7 @@
 
 | 项 | 命令 | 当前结果 |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 108 文件，WORSE=0 TRUNC=0（nginx 1694 / ngxrs 1699 断言） |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 109 文件，WORSE=0 TRUNC=0（nginx 1724 / ngxrs 1729 断言） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
 | 单元测试 | `cargo test --release` | **PASS** — 156 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
@@ -431,9 +431,40 @@ nginx 的 `set` 在 rewrite 阶段执行、`return` 在 content 阶段，所以�
 要做得把连接与请求体的发送顺序拆开（先连、写头、再边读边写），并让 `Content-Length`
 在没有缓冲体时取自 `req.body_len`。这动的是热路径，本轮没做，记在这里。
 
+## 一之十一、2026-10-27 第十轮：`headers.t`（18/30 → 30/30）
+
+`expires` 此前是**按字面量匹配**的：`epoch`/`max`/`off`/`@time`/`modified` 直接比字符串，
+其余一律 `parse_time` 兜底成 0。于是 `expires $arg_e` 这种写法永远落到「0 秒」分支，
+输出一个等于现在的 `Expires` 加 `max-age=0`。现在按 `ngx_http_parse_expires` 重写：
+
+- 展开后的值先看是不是 `modified …`（**只有配置里写了 `modified` 才认**，
+  这时 `epoch`/`max`/`off` 三个快捷值**不**生效 —— `modified epoch` 会被当成
+  `ngx_parse_time("epoch")` 失败，于是什么都不发，正是 `headers.t` 的最后一条断言）；
+- `@HhMmSs` 是每日时间；`+`/`-` 前缀是偏移量；
+- **空值或无法解析 → 什么都不发**（不是发 `max-age=0`）；
+- `modified` 以 `Last-Modified` 为锚，响应没有它时退回「现在」；
+  `offset < 0` 或 `max_age < 0` → `Cache-Control: no-cache`。
+
+根因之一在共用代码里：`parse_time("")` 返回 `Some(0)` —— 空字符串被当成零时长。
+这会让任何「值为空」的指令悄悄变成 0，现在返回 `None`。
+
+另一个真缺陷是 **`add_header` 对 `ETag` / `Last-Modified` 的语义**。这两个名字在 nginx 里
+走 `ngx_http_set_response_header`（**替换**已有值），而不是 `ngx_http_add_header`（追加）。
+空值时尤其明显，实测（同机对照 nginx 1.28）：
+
+```
+(无 add_header)                       -> ETag: "6ae0a6e0-4"
+add_header ETag "" always;            -> 无 ETag（连静态处理器设的也被清掉）
+add_header Last-Modified "" always;   -> 无 Last-Modified
+add_header ETag foo always;           -> ETag: foo（不是两个）
+```
+
+之前我们对空值直接 `continue`，于是静态处理器的 `ETag` 留着，`headers.t` 的
+"good add_header always empty" 失败。现在空值对这两个名字是**删除**。
+
 ## 二、声明的测试清单
 
-清单在 `bench/declared.txt`，**108 个文件**，选取规则是机械的：
+清单在 `bench/declared.txt`，**109 个文件**，选取规则是机械的：
 
 1. 落在范围内（**参考构建 `-V` 能编出来的模块**：http core + proxy/cache/gzip/
    TLS/HTTP2/realip/auth_request/slice/sub/secure_link/dav/stub_status/gzip_static/

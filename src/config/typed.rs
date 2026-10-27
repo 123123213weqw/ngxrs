@@ -1629,6 +1629,13 @@ fn merge_secure_link(cfg: &mut LocCfg) {
 pub fn parse_time(s: &str) -> Option<Duration> {
     // nginx's time grammar sums unit tokens in any order: `1h30m`, `1d 12h`,
     // `500` (bare seconds). A bare number must end the value.
+    // An empty value is not zero: `ngx_parse_time` reports NGX_ERROR when there
+    // is not a single digit, which is what makes `expires ""` emit no headers at
+    // all (`headers.t`, "expires var empty"). Returning `Some(0)` here silently
+    // turned every missing value into a zero duration.
+    if s.is_empty() {
+        return None;
+    }
     let mut total_ms: u64 = 0;
     let mut rest = s;
     while !rest.is_empty() {

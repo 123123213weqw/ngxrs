@@ -13,7 +13,7 @@
 
 | 项 | 命令 | 当前结果 |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 126 文件，WORSE=0 TRUNC=0（nginx 1895 / ngxrs 1900，121 个逐断言一致、5 个更优；两台 V100 独立复跑数字一致） |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 128 文件，WORSE=0 TRUNC=0（nginx 1951 / ngxrs 1956，123 个逐断言一致、5 个更优） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
 | 单元测试 | `cargo test --release` | **PASS** — 156 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
@@ -725,9 +725,51 @@ nginx 1823 / ngxrs 1828 断言，114 个逐断言一致、5 个更优（`http_he
 新增 7 个单元测试覆盖这些行为（权重、max_conns 回落 backup 与回收、max_fails 禁用与
 恢复、单 peer 规则、least_conn 偏好、空/非空 hash key），总数 171。
 
+### 2026-10-28 第十八轮：upstream keepalive 连接池
+
+`proxy_keepalive.t` 15/51 → **51/51**，`proxy_chunked.t` 2/5 → **5/5**，两者入清单
+（126 → **128** 文件）。
+
+连接池本来就存在，但**只有带 `Content-Length` 的响应才归还连接**（`reuse` 里有
+`total_len.is_some()`）。带 chunked 编码的响应同样精确地定义了消息边界 —— `0` 尺寸行
+加上 trailer 之后的空行 —— nginx 也会归还。于是这个测试用 `X-Connection` 量到的
+「复用」几乎每一项都差一条连接：
+
+| 情形 | 之前 | 原因 |
+|---|---|---|
+| chunked 响应 | 从不归还 | `total_len` 为 `None` |
+| HEAD | 从不归还 | 在读体之前就 return，走不到归还那一步（我们发的是 HEAD，没有体要排空） |
+| 304 / 204 | 被当作有体 | `304len` 带 `Content-Length: 100`，那描述的是**客户端已持有的实体**，不是后面跟着的字节；读它会一直阻塞到 `proxy_read_timeout`，客户端什么都拿不到 |
+
+连接真的被复用之后，又暴露出三个 bug：
+
+1. **`dechunk` 见到 `0` 行就返回**，而收尾的 CRLF 可能还在路上（这个测试的 "complex"
+   后端在它之前 sleep 50ms）。那时归还连接，socket 里就留了一个字节，连接上下一次
+   响应解析错位 —— 表现为两个请求之后才出现的 "read timeout"，而测试后端一次只服务一条
+   连接，于是后面全部变成 "Connection refused"。新增 `chunked_body_end` 要求真正的
+   终止符，缓冲路径与流式路径都用它。
+2. **SSI `#include virtual=... set="x"` 根本没实现**，而服务子请求的缓冲 `fetch`
+   也**不使用连接池**：include 会另开一条连接，而后端还在读池里那条 —— nginx 的池是
+   按 peer 共享、子请求同样使用，于是对着「一次只服务一条连接」的后端直接死锁。
+   现在 `fetch` 与流式路径一样 checkout/checkin。
+3. `fetch` 也有同样的「chunked 永远读不完」问题：它一直读到 EOF，而 keep-alive 连接
+   上 EOF 不会到来。
+
+还有一条纯粹的协议规则：**nginx 从不给 HTTP/1.0 客户端发 chunked**。我们把上游的
+chunk 分帧原样转出，客户端看到 `a\r\n0123456789\r\n`，而 nginx 给的是纯数字。现在
+1.0 客户端拿到的是去分帧的体，用关闭连接来界定长度。
+
+**本轮推翻了一个旧结论**：`BUFFER_CHUNKED_UPSTREAM` 原本关着，注释说开启会让
+`proxy_cache_vary.t` 掉五条断言。在上面的解析与连接池修复之后，缓冲 chunked 响应在该
+文件上已是 SAME（53/54，与 nginx 一致），并修好了本文件的 "complex chunked"，所以现在
+它是开的。
+
+新增 4 个单元测试钉住终止符规则，其中一条特意对比「`dechunk` 认为 `0\r\n` 已完整、而
+消息其实还没结束」。
+
 ## 二、声明的测试清单
 
-清单在 `bench/declared.txt`，**126 个文件**，选取规则是机械的：
+清单在 `bench/declared.txt`，**128 个文件**，选取规则是机械的：
 
 1. 落在范围内（**参考构建 `-V` 能编出来的模块**：http core + proxy/cache/gzip/
    TLS/HTTP2/realip/auth_request/slice/sub/secure_link/dav/stub_status/gzip_static/

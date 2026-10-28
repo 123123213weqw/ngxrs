@@ -885,6 +885,7 @@ async fn accept_loop(
                                             group.default_server,
                                             &cfg.http,
                                             cfg.http.server(group.default_server).server_tokens,
+                                            group.addr.port(),
                                         )
                                         .await;
                                         return;
@@ -917,6 +918,7 @@ async fn accept_loop(
                                             group.default_server,
                                             &cfg.http,
                                             cfg.http.server(group.default_server).server_tokens,
+                                            group.addr.port(),
                                         )
                                         .await;
                                         return;
@@ -1215,6 +1217,7 @@ fn shared_worker_main(
                                         group.default_server,
                                         &cfg.http,
                                         cfg.http.server(group.default_server).server_tokens,
+                                        group.addr.port(),
                                     )
                                     .await;
                                     return;

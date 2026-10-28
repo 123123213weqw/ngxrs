@@ -24,6 +24,11 @@ pub async fn serve<S>(
     default_server: usize,
     http: &Http,
     tokens: bool,
+    // The port this listener accepted on. `Location` absolutisation needs it:
+    // nginx reports the port the client connected to, and hard-coding 443 made
+    // `absolute_redirect` emit `http://on:443/` for a cleartext listener on 8080
+    // (`h2_absolute_redirect.t`).
+    listen_port: u16,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -86,6 +91,11 @@ pub async fn serve<S>(
         // `:authority` follows the stricter absolute-form rules (port must be
         // digits), while a `Host` header is truncated at the first ':' like
         // `ngx_http_validate_host`.
+        // Selected before the host check: a bad host still needs a server for
+        // `error_page` to resolve against.
+        let server: &Server =
+            crate::http::select_server(http, server_idxs, default_server, authority.as_deref());
+
         let authority_from_header = request.uri().authority().is_none();
         let bad_host = duplicate_host
             || match authority.as_deref() {
@@ -99,27 +109,24 @@ pub async fn serve<S>(
                 }
             };
         if bad_host {
-            let mut b = H2Response::builder().status(StatusCode::BAD_REQUEST);
-            if let Some(h) = b.headers_mut() {
-                if let Ok(v) = http::header::HeaderValue::from_str(if tokens {
-                    "nginx/1.28.0"
-                } else {
-                    "nginx"
-                }) {
-                    h.insert(http::header::SERVER, v);
-                }
-            }
-            if let Ok(r) = b.body(()) {
-                if let Ok(mut send) = respond.send_response(r, true) {
-                    let _ = send.send_data(Bytes::new(), true);
-                }
-            }
+            // nginx's HTTP/2 path produces the 400 inside the request
+            // machinery, so `error_page 400 ...` applies to it. Answering here
+            // skipped that.
+            let synthetic = synthesize_request(&request, authority.as_deref(), "/", "");
+            let resp = crate::http::error_page_response(
+                &synthetic,
+                400,
+                server,
+                http,
+                "127.0.0.1",
+                0,
+                listen_port,
+                "127.0.0.1",
+            )
+            .await;
+            send_http2_response(&mut respond, resp, tokens, false).await;
             continue;
         }
-
-        let server: &Server =
-            crate::http::select_server(http, server_idxs, default_server, authority.as_deref());
-
         // `large_client_header_buffers` bounds header fields on HTTP/2 too:
         // nginx checks each decoded string against `buffers.size` and the whole
         // block against `size * num`. Exceeding either is a connection error
@@ -166,8 +173,31 @@ pub async fn serve<S>(
             }
         }
 
-        let path = request.uri().path().to_string();
+        // The request target must be resolved the same way as on HTTP/1:
+        // percent-decoded and path-normalised. `uri().path()` keeps `%20`
+        // escaped, so `/dir%20sp` did not match the `dir sp` on disk and the
+        // trailing-slash redirect -- the one `h2_absolute_redirect.t` measures
+        // with escaped names -- never fired.
         let query = request.uri().query().unwrap_or("").to_string();
+        let (path, _) = match crate::util::parse_target(request.uri().path()) {
+            Ok(v) => v,
+            Err(_) => {
+                let synthetic = synthesize_request(&request, authority.as_deref(), "/", "");
+                let resp = crate::http::error_page_response(
+                    &synthetic,
+                    400,
+                    server,
+                    http,
+                    "127.0.0.1",
+                    0,
+                    listen_port,
+                    "127.0.0.1",
+                )
+                .await;
+                send_http2_response(&mut respond, resp, tokens, false).await;
+                continue;
+            }
+        };
         let loc = server.locate(&path);
         let mut h1 = synthesize_request(&request, authority.as_deref(), &path, &query);
         let head_only = h1.method == Method::Head;
@@ -246,71 +276,87 @@ pub async fn serve<S>(
         }
         h1.buffered_body = Some(body);
 
-        let resp =
-            crate::http::resolve_response(&h1, &path, &query, server, loc, http, "127.0.0.1", 443)
-                .await;
+        let resp = crate::http::resolve_response(
+            &h1,
+            &path,
+            &query,
+            server,
+            loc,
+            http,
+            "127.0.0.1",
+            listen_port,
+        )
+        .await;
 
-        let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let mut builder = H2Response::builder().status(status);
-        {
-            let headers = builder.headers_mut().expect("fresh builder");
-            for line in split_header_lines(&resp.raw) {
-                if let Some((k, v)) = line.split_once(':') {
-                    if let (Ok(name), Ok(value)) = (
-                        http::header::HeaderName::from_bytes(k.trim().as_bytes()),
-                        http::header::HeaderValue::from_str(v.trim()),
-                    ) {
-                        headers.append(name, value);
-                    }
-                }
-            }
-            for (k, v) in &resp.headers {
+        send_http2_response(&mut respond, resp, tokens, head_only).await;
+    }
+}
+
+/// Render a `Response` as HTTP/2 HEADERS (+ DATA) frames.
+async fn send_http2_response(
+    respond: &mut h2::server::SendResponse<Bytes>,
+    resp: crate::http::Response,
+    tokens: bool,
+    head_only: bool,
+) {
+    let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut builder = H2Response::builder().status(status);
+    {
+        let headers = builder.headers_mut().expect("fresh builder");
+        for line in split_header_lines(&resp.raw) {
+            if let Some((k, v)) = line.split_once(':') {
                 if let (Ok(name), Ok(value)) = (
-                    http::header::HeaderName::from_bytes(k.as_bytes()),
-                    http::header::HeaderValue::from_str(v),
+                    http::header::HeaderName::from_bytes(k.trim().as_bytes()),
+                    http::header::HeaderValue::from_str(v.trim()),
                 ) {
                     headers.append(name, value);
                 }
             }
-            if !headers.contains_key(http::header::SERVER) {
-                headers.insert(
-                    http::header::SERVER,
-                    http::header::HeaderValue::from_static(if tokens {
-                        "nginx/1.28.0"
-                    } else {
-                        "nginx"
-                    }),
-                );
+        }
+        for (k, v) in &resp.headers {
+            if let (Ok(name), Ok(value)) = (
+                http::header::HeaderName::from_bytes(k.as_bytes()),
+                http::header::HeaderValue::from_str(v),
+            ) {
+                headers.append(name, value);
             }
         }
+        if !headers.contains_key(http::header::SERVER) {
+            headers.insert(
+                http::header::SERVER,
+                http::header::HeaderValue::from_static(if tokens {
+                    "nginx/1.28.0"
+                } else {
+                    "nginx"
+                }),
+            );
+        }
+    }
 
-        let body = match crate::http::body_bytes(resp.body).await {
-            Ok(b) => b,
-            Err(_) => Vec::new(),
-        };
-        let len = body.len();
-        if let Some(headers) = builder.headers_mut() {
-            if !headers.contains_key(http::header::CONTENT_LENGTH)
-                && resp.status != 204
-                && resp.status != 304
-            {
-                if let Ok(v) = http::header::HeaderValue::from_str(&len.to_string()) {
-                    headers.insert(http::header::CONTENT_LENGTH, v);
-                }
+    let body = match crate::http::body_bytes(resp.body).await {
+        Ok(b) => b,
+        Err(_) => Vec::new(),
+    };
+    let len = body.len();
+    if let Some(headers) = builder.headers_mut() {
+        if !headers.contains_key(http::header::CONTENT_LENGTH)
+            && resp.status != 204
+            && resp.status != 304
+        {
+            if let Ok(v) = http::header::HeaderValue::from_str(&len.to_string()) {
+                headers.insert(http::header::CONTENT_LENGTH, v);
             }
         }
+    }
 
-        let response = match builder.body(()) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let mut send = match respond.send_response(response, head_only || len == 0) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        if !head_only && len > 0 {
-            let _ = send.send_data(Bytes::from(body), true);
-        }
+    let Ok(response) = builder.body(()) else {
+        return;
+    };
+    let Ok(mut send) = respond.send_response(response, head_only || len == 0) else {
+        return;
+    };
+    if !head_only && len > 0 {
+        let _ = send.send_data(Bytes::from(body), true);
     }
 }
 

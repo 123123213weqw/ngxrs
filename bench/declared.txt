@@ -86,6 +86,11 @@ request_id.t
 access_log.t
 access_log_variables.t
 
+# ---- HTTP/2 header filter ----
+# `absolute_redirect` / `server_name_in_redirect` / `port_in_redirect` over h2,
+# percent-decoded `:path`, and `error_page` for an invalid `:authority`.
+h2_absolute_redirect.t
+
 # ---- upstream keepalive pool ----
 # The pool itself: buffered, unbuffered and in-memory (SSI subrequest) paths all
 # reuse it; a chunked reply is a message boundary like a Content-Length one; and

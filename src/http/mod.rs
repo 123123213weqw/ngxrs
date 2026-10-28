@@ -3485,6 +3485,46 @@ pub fn resolve_target<'a>(
     )
 }
 
+/// Run a bare error status through the normal pipeline, so `error_page` applies.
+///
+/// The HTTP/1 path gets this through `finalize_response` on a synthetic request;
+/// HTTP/2 answered an invalid `:authority` before routing and skipped
+/// `error_page` entirely, so a config that maps 400 to a page got a bare 400
+/// instead (`h2_absolute_redirect.t`, "invalid host - using local sockaddr").
+#[allow(clippy::too_many_arguments)]
+pub async fn error_page_response(
+    req: &Request,
+    status: u16,
+    server: &Server,
+    http: &Http,
+    peer_ip: &str,
+    peer_port: u16,
+    server_port: u16,
+    local_addr: &str,
+) -> Response {
+    let mut custom: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut resp = error_response(status, server.server_tokens);
+    finalize_response(
+        req,
+        &mut resp,
+        "/",
+        "",
+        server,
+        http,
+        peer_ip,
+        peer_port,
+        server_port,
+        &[],
+        &mut custom,
+        ConnState {
+            requests: 0,
+            started: std::time::Instant::now(),
+        },
+        local_addr,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn resolve_response_caps(
     req: &Request,
@@ -4495,6 +4535,12 @@ async fn finalize_response(
     // absolute URL when `absolute_redirect` is on -- including one an upstream
     // sent and `proxy_redirect` rewrote. Verified with `proxy_redirect.t`, whose
     // expectations are absolute.
+    // `Location` may still be an unrendered entry in `headers` (that is where
+    // `return 301 /x` and the directory redirect put it) or already rendered into
+    // `raw`. The socket path only ever fixed the former, in `write_redirect`, so
+    // an HTTP/2 client got a relative `Location` where nginx sends an absolute
+    // one (`h2_absolute_redirect.t`). Fix both here, once.
+    absolutize_location_field(&mut out, req, cur_loc, server_port, local_addr);
     absolutize_location(&mut out.raw, req, cur_loc, server_port, local_addr);
 
     if (!cur_loc.headers.is_empty() || !cur_loc.trailers.is_empty()) && !out.headers_finalized {
@@ -7229,6 +7275,29 @@ mod tests {
     fn log_expansion() {
         let vars = [("status", "200"), ("request_uri", "/x")];
         assert_eq!(expand_log("[$status] $request_uri", &vars, 0), "[200] /x");
+    }
+}
+
+/// Absolutise a relative `Location` that is still an unrendered header entry.
+///
+/// `ngx_http_header_filter` rewrites the value whatever its protocol, so a
+/// location that has not been rendered yet must be fixed up too; otherwise the
+/// HTTP/2 path -- which never goes through `write_redirect` -- sends it relative.
+fn absolutize_location_field(
+    resp: &mut Response,
+    req: &Request,
+    loc: &LocCfg,
+    listen_port: u16,
+    local_addr: &str,
+) {
+    if !loc.absolute_redirect {
+        return;
+    }
+    for (k, v) in resp.headers.iter_mut() {
+        if !k.eq_ignore_ascii_case("location") || !v.starts_with('/') {
+            continue;
+        }
+        *v = redirect_location(req, loc, v, listen_port, local_addr);
     }
 }
 

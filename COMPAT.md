@@ -3510,3 +3510,53 @@ proxy_download_rate 250，后端一次发 1000 字节
 ```bash
 TEST_LIST="stream_limit_rate.t" bash bench/nginxtests.sh   # 9/11，缺两条 time
 ```
+
+## 本轮（stream `resolver` + `proxy_next_upstream_tries`：可测量但未达一致）
+
+### 结果
+
+| 套件 | 修前 | 修后 | nginx |
+|---|---|---|---|
+| `stream_resolver.t` | TRUNC **0/10**（`unknown directive "proxy_next_upstream_tries"`） | **7/10** | 10/10 |
+| `stream_status_variable.t` | TRUNC **0/8**（`proxy_pass` 变量目标被拒） | **4/8** | 8/8 |
+
+无回归：`stream_proxy.t` 7/7、`stream_upstream.t` 8/8、`stream_ssl.t` 7/7 仍 SAME。
+
+### 已完成
+
+- `resolver` 在 `stream {}` 上下文解析，挂到每个 server。
+- `proxy_pass $var` 不再在配置期报错：含 `$` 的目标推迟到**每连接**展开
+  （`$server_port`、`map` 变量等），再用 resolver 解析。
+- `proxy_next_upstream_tries <n>`：0 表示不限，否则限制尝试次数。
+- `resolve_var_peer()` 实现 nginx 的两条硬规则：**无端口即报错**
+  （`no port in upstream "a.example.com"`），解析失败报
+  `nx.example.com could not be resolved`。
+
+### 未通过的原因（已定位一部分，未修完）
+
+`stream_resolver.t` 失败 3 条：`resolver`(8081)、`resolved tries`(8084)、
+`resolved tries zero`(8086)。通过的 2 条（`upstream no port` 8082、
+`name not found` 8083）断言的是**"收不到数据"**，所以如果变量展开为空，
+它们会**假通过** —— 这一点必须在修完后重新确认，不能当成已对。
+
+已确认 `maps` 确实挂到了 server 上（`net.rs` 里 `maps: stream_maps.clone()`，
+来源 `cfg.stream.maps`）。剩余怀疑两条：
+
+1. **只取了一个地址**：`resolve_var_peer` 用 `v.pop()` 取最后一个。8084 的
+   `$many` 返回 `127.0.0.2, 127.0.0.2, 127.0.0.1`，若取到 `127.0.0.2` 就连不上，
+   而 `tries 3` 的语义正是"逐个试"。`tries 0`（不限）同理。这解释了 8084/8086。
+2. **8081 仍无数据**：`a.example.com:8090` 单地址，理论应成功。可能是 resolver
+   首查耗时超过配置的 `proxy_connect_timeout 1s`（我把解析也套进了这个超时），
+   也可能是变量展开仍为空。
+
+`stream_status_variable.t` 失败 4 条（400/500/502/503 的状态记录），是 `$status`
+在变量目标与限流路径上的取值问题，本轮未查。
+
+**两个套件都不计入声明清单。**
+
+复现：
+
+```bash
+TEST_LIST="stream_resolver.t stream_status_variable.t" bash bench/nginxtests.sh
+# 7/10 与 4/8
+```

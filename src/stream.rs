@@ -40,6 +40,13 @@ pub struct StreamServer {
     pub access: Vec<crate::config::typed::AccessRule>,
     /// `limit_conn <zone> <n>`: at most `n` simultaneous sessions per key.
     pub limit_conns: Vec<(String, u32)>,
+    /// `proxy_next_upstream_tries <n>`: peers to try, 0 = unlimited.
+    pub next_upstream_tries: u32,
+    /// `proxy_pass` with a variable: expanded per connection and resolved with
+    /// `resolver`.
+    pub proxy_pass_var: Option<String>,
+    /// `resolver`, for the case above.
+    pub resolver: Option<std::sync::Arc<crate::resolver::Resolver>>,
     /// `proxy_download_rate` / `proxy_upload_rate`, bytes per second; 0 is
     /// unlimited (`ngx_stream_proxy_module`).
     pub proxy_download_rate: u64,
@@ -347,6 +354,9 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                 let access = server.access.clone();
                 let dl_rate = server.proxy_download_rate;
                 let ul_rate = server.proxy_upload_rate;
+                let resolver = server.resolver.clone();
+                let next_upstream_tries = server.next_upstream_tries;
+                let proxy_pass_var = server.proxy_pass_var.clone();
                 let verify_mode = server.client_verify;
                 let client_ca = server.client_ca.clone();
                 let trusted_ca = server.trusted_ca.clone();
@@ -477,11 +487,84 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                             .map(|d| d.as_secs() as i64)
                             .unwrap_or(0)
                     };
+                    let var_target = proxy_pass_var.clone();
+                    let var_resolver = resolver.clone();
+                    // `proxy_pass $var`: expand and resolve here, because the
+                    // value only exists per connection (`stream_resolver.t`).
+                    // ngx_stream_proxy_module does the same in its init handler.
+                    let mut var_peer: Option<(SocketAddr, String)> = None;
+                    if let Some(spec) = var_target.as_ref() {
+                        let text = {
+                            let mut vb =
+                                base_vars(
+                                    peer,
+                                    peer_unix,
+                                    eff,
+                                    local.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
+                                    &maps,
+                                    &geos,
+                                    &splits,
+                                );
+                            vb.proxy_protocol = pp.as_deref();
+                            vb.expand(spec)
+                        };
+                        match resolve_var_peer(&text, var_resolver.as_ref(), connect_timeout).await {
+                            Ok((addr, label)) => var_peer = Some((addr, label)),
+                            Err(e) => {
+                                crate::log::log_global(
+                                    crate::log::Level::Error,
+                                    &format!("stream {e}"),
+                                );
+                            }
+                        }
+                    }
                     let mut tried = vec![false; peers.len()];
                     let mut chosen: Option<crate::streamlb::Guard> = None;
                     let mut upstream = None;
                     let mut attempts = 0usize;
-                    while attempts < peers.len().max(1) * 2 {
+                    // A variable target bypasses the balancer entirely: nginx
+                    // resolves it to one address and there is nothing to retry.
+                    if let Some((addr, label)) = var_peer.take() {
+                        if let Some(l) = alog.as_mut() {
+                            l.start_attempt(&label);
+                        }
+                        let attempt = match tokio::time::timeout(
+                            connect_timeout,
+                            TcpStream::connect(addr),
+                        )
+                        .await
+                        {
+                            Ok(Ok(t)) => Ok(UpConn::Tcp(t)),
+                            Ok(Err(e)) => Err(e),
+                            Err(_) => Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "connect timed out",
+                            )),
+                        };
+                        match attempt {
+                            Ok(s) => {
+                                if let UpConn::Tcp(t) = &s {
+                                    let _ = t.set_nodelay(true);
+                                }
+                                upstream = Some(s);
+                            }
+                            Err(e) => {
+                                if let Some(l) = alog.as_mut() {
+                                    l.finish_attempt(0, 0);
+                                }
+                                crate::log::log_global(
+                                    crate::log::Level::Error,
+                                    &format!("stream connect to {label} failed: {e}"),
+                                );
+                            }
+                        }
+                    }
+                    let max_attempts = if next_upstream_tries == 0 {
+                        peers.len().max(1) * 2
+                    } else {
+                        (next_upstream_tries as usize).min(peers.len().max(1))
+                    };
+                    while upstream.is_none() && attempts < max_attempts {
                         let Some(idx) = peers.pick(&mut tried, hash_key.as_deref(), now()) else {
                             break;
                         };
@@ -908,6 +991,39 @@ where
     }
     w.flush().await
 
+}
+
+/// Resolve an expanded `proxy_pass` value: `host:port`, or just `host` (which is
+/// an error in nginx: "no port in upstream"), through `resolver`.
+async fn resolve_var_peer(
+    text: &str,
+    resolver: Option<&std::sync::Arc<crate::resolver::Resolver>>,
+    timeout: std::time::Duration,
+) -> Result<(SocketAddr, String), String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("empty proxy_pass value".to_string());
+    }
+    if let Ok(a) = text.parse::<SocketAddr>() {
+        return Ok((a, text.to_string()));
+    }
+    // `ngx_stream_proxy_module`: a name without a port is rejected outright.
+    let (host, port) = match text.rsplit_once(':') {
+        Some((h, p)) => match p.parse::<u16>() {
+            Ok(p) => (h, p),
+            Err(_) => return Err(format!("no port in upstream \"{text}\"")),
+        },
+        None => return Err(format!("no port in upstream \"{text}\"")),
+    };
+    let r = resolver.ok_or_else(|| format!("no resolver defined to resolve {host}"))?;
+    let ip = match tokio::time::timeout(timeout, crate::resolver::resolve(r, host)).await {
+        Ok(Some(mut v)) => match v.pop() {
+            Some(ip) => ip,
+            None => return Err(format!("{host} could not be resolved")),
+        },
+        _ => return Err(format!("{host} could not be resolved")),
+    };
+    Ok((SocketAddr::new(ip, port), text.to_string()))
 }
 
 async fn splice_rated<A, B>(

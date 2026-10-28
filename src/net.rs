@@ -267,6 +267,7 @@ pub fn serve(cfg: Config) -> io::Result<()> {
     let stream_geos = std::sync::Arc::new(cfg.stream.geos.clone());
     let stream_maps = std::sync::Arc::new(cfg.stream.maps.clone());
     let stream_splits = std::sync::Arc::new(cfg.stream.splits.clone());
+    let section_resolver = cfg.stream.resolver.clone();
     for sc in &cfg.stream.servers {
         // `proxy_pass` names either an `upstream {}` block or a plain
         // host:port. Both become a peer set: a direct address is simply a set
@@ -312,6 +313,15 @@ pub fn serve(cfg: Config) -> io::Result<()> {
                     crate::config::LbMethod::RoundRobin,
                     String::new(),
                 )
+            } else if pp.contains('$') {
+                // `proxy_pass $name;` is resolved per connection through the
+                // configured `resolver` (`ngx_stream_proxy_module`), so there is
+                // nothing to resolve here.
+                crate::streamlb::PeerSet::new(
+                    Vec::new(),
+                    crate::config::LbMethod::RoundRobin,
+                    String::new(),
+                )
             } else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -338,6 +348,13 @@ pub fn serve(cfg: Config) -> io::Result<()> {
             peers,
             proxy_timeout: sc.proxy_timeout,
             proxy_connect_timeout: sc.proxy_connect_timeout,
+            next_upstream_tries: sc.next_upstream_tries,
+            proxy_pass_var: if sc.proxy_pass.as_deref().is_some_and(|p| p.contains('$')) {
+                sc.proxy_pass.clone()
+            } else {
+                None
+            },
+            resolver: section_resolver.clone(),
             sinks: crate::config::typed::open_sinks(&sc.error_logs),
             tls: stream_tls(&sc),
             return_text: sc.return_text.clone(),

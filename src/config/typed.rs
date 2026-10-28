@@ -1802,6 +1802,9 @@ pub struct StreamSection {
     pub maps: Vec<crate::mapping::MapDef>,
     /// `split_clients` blocks in `stream {}` context.
     pub splits: Vec<crate::split::SplitClients>,
+    /// `resolver <addr>...`: consulted for `proxy_pass` targets that are not
+    /// literal addresses (`ngx_stream_resolver_module`).
+    pub resolver: Option<std::sync::Arc<crate::resolver::Resolver>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1820,6 +1823,10 @@ pub struct StreamServerCfg {
     pub proxy_download_rate: u64,
     /// `proxy_upload_rate <bytes/s>`: cap on what is written to the upstream.
     pub proxy_upload_rate: u64,
+    /// `proxy_next_upstream_tries <n>`: peers to try, 0 = unlimited.
+    pub next_upstream_tries: u32,
+    /// `proxy_pass` containing a variable: resolved per connection.
+    pub proxy_pass_var: Option<String>,
     /// `ssl_alpn <proto>...`: ALPN protocols to advertise (`ssl_alpn`).
     pub ssl_alpn: Vec<String>,
     /// `limit_conn <zone> <n>` for this server.
@@ -5201,6 +5208,11 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             "geo" => section.geos.push(parse_geo(d)?),
             "map" => section.maps.push(parse_map(d)?),
             "split_clients" => section.splits.push(parse_split_clients(d)?),
+            "resolver" => {
+                if let Some(r) = crate::resolver::Resolver::parse(&d.args, &b.prefix) {
+                    section.resolver = Some(std::sync::Arc::new(r));
+                }
+            }
             "proxy_download_rate" | "proxy_upload_rate" => {
                 if let Some(v) = d.args.first().and_then(|a| a.parse::<u64>().ok()) {
                     if d.name == "proxy_download_rate" {
@@ -5325,6 +5337,8 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             access: Vec::new(),
             limit_conns: Vec::new(),
             ssl_alpn: Vec::new(),
+            next_upstream_tries: 0,
+            proxy_pass_var: None,
             proxy_download_rate: stream_download_rate,
             proxy_upload_rate: stream_upload_rate,
             realip_from: stream_realip_from.clone(),
@@ -5406,6 +5420,11 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                         cfg.listen_proxy_protocol = true;
                     }
                     have_listen = true;
+                }
+                "proxy_next_upstream_tries" => {
+                    if let Some(v) = child.args.first().and_then(|a| a.parse::<u32>().ok()) {
+                        cfg.next_upstream_tries = v;
+                    }
                 }
                 "proxy_download_rate" | "proxy_upload_rate" => {
                     if let Some(v) = child.args.first().and_then(|a| a.parse::<u64>().ok()) {

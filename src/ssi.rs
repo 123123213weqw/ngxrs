@@ -607,8 +607,18 @@ fn directive(
             };
             let target = expand_vars(uri, ctx, host);
             let has_stub = param(&p, "stub").is_some();
+            // `set="name"` stores the subrequest output in that variable instead
+            // of emitting it (`<!--#include virtual="..." set="x" -->` followed by
+            // `<!--#echo var="x" -->` is `proxy_keepalive.t`'s "inmemory" case).
+            let set_into = param(&p, "set");
             match host.include(&target, has_stub) {
-                Some(b) => out.extend_from_slice(&b),
+                Some(b) => match set_into {
+                    Some(name) => {
+                        ctx.vars
+                            .insert(name.to_string(), String::from_utf8_lossy(&b).into_owned());
+                    }
+                    None => out.extend_from_slice(&b),
+                },
                 None => {
                     // A `stub` names a `#block` whose rendered body replaces
                     // the error text when the include fails.

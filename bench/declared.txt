@@ -86,6 +86,13 @@ request_id.t
 access_log.t
 access_log_variables.t
 
+# ---- upstream keepalive pool ----
+# The pool itself: buffered, unbuffered and in-memory (SSI subrequest) paths all
+# reuse it; a chunked reply is a message boundary like a Content-Length one; and
+# a client that cannot be sent chunked framing (HTTP/1.0) gets a dechunked body.
+proxy_keepalive.t
+proxy_chunked.t
+
 # ---- stream upstream balancers ----
 # `max_conns` (per-peer cap, two-pool primary/backup walk), `hash` (both the
 # folded Cache::Memcached expression and the consistent ring), `least_conn`

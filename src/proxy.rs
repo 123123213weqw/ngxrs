@@ -2790,16 +2790,32 @@ async fn exchange(
     }
 
     // ---- body ----
-    let total_len = if head.chunked {
+    //
+    // A response with no body never has one, whatever its headers say: `HEAD`
+    // (we asked the upstream for headers only), 204, 304 and 1xx. The `304` case
+    // is the trap -- `304len` in `proxy_keepalive.t` carries
+    // `Content-Length: 100`, which describes the *entity* the client already
+    // has, not bytes that follow. Reading it blocked until `proxy_read_timeout`
+    // and the client got nothing at all ("buffered 304").
+    let bodyless = req.method == Method::Head
+        || head.status == 204
+        || head.status == 304
+        || (100..200).contains(&head.status);
+    let total_len = if bodyless {
+        Some(0)
+    } else if head.chunked {
         None
     } else {
         head.content_length
     };
     let mut raw = head.raw;
+    // Synthesise a length only when a body is actually coming: adding
+    // `Content-Length: 0` to a 304 would be a lie about the entity.
     if let Some(len) = total_len {
-        if !raw
-            .windows(14)
-            .any(|w| w.eq_ignore_ascii_case(b"Content-Length"))
+        if !bodyless
+            && !raw
+                .windows(14)
+                .any(|w| w.eq_ignore_ascii_case(b"Content-Length"))
         {
             raw.extend_from_slice(b"Content-Length: ");
             raw.extend_from_slice(len.to_string().as_bytes());
@@ -2832,7 +2848,7 @@ async fn exchange(
     // nginx says MISS) and the mechanism is not understood yet. Shipping an
     // unexplained behaviour change for a net -4 is worse than the missing
     // assertion. See OPEN-ISSUES in COMPAT.md.
-    const BUFFER_CHUNKED_UPSTREAM: bool = false;
+    const BUFFER_CHUNKED_UPSTREAM: bool = true;
     let buffered_chunked = BUFFER_CHUNKED_UPSTREAM
         && loc.proxy_buffering
         && head.chunked
@@ -2841,9 +2857,12 @@ async fn exchange(
     if cacheable || wants_ranges || buffered_chunked {
         let mut payload = buf;
         match (head.chunked, total_len) {
-            // Chunked: read to the terminator, then decode.
+            // Chunked: read to the terminator, then decode. The terminator is
+            // the blank line *after* the `0` size line, which may arrive later
+            // than the `0` itself; stopping at the `0` left that byte in a socket
+            // that then went back to the pool ("buffered complex chunked 2").
             (true, _) => loop {
-                if dechunk(&payload).is_some() {
+                if chunked_body_end(&payload).is_some() {
                     break;
                 }
                 let mut chunk = vec![0u8; 64 * 1024];
@@ -3005,6 +3024,18 @@ async fn exchange(
         if req.method != Method::Head {
             conn.write_all(&payload).await?;
         }
+        // The body was read to its end (length, terminator or EOF), so the
+        // upstream connection is at a message boundary and can be reused --
+        // including after a buffered chunked reply, which is what
+        // "buffered chunked 2" / "buffered 0 chunk 2" measure.
+        let reuse = head.keepalive && !is_upgrade && loc.proxy_http_version == 1 && !req.chunked;
+        if reuse {
+            let cap = match pp.target {
+                crate::config::ProxyTarget::Upstream(i) => loc_upstream_cap(i, pp).unwrap_or(0),
+                _ => 0,
+            };
+            checkin(pool_key, up, cap);
+        }
         return Ok(written(Outcome {
             status,
             bytes: payload.len() as u64,
@@ -3039,13 +3070,27 @@ async fn exchange(
         raw = strip_length_headers(&mut raw);
         raw.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
     }
+    // A chunked upstream reply cannot stay chunked for an HTTP/1.0 client: the
+    // body is dechunked below and the close delimits it.
+    if head.chunked && req.version_minor != 1 {
+        raw = drop_header(&raw, "transfer-encoding");
+    }
     let sent_headers = crate::http::split_head(&raw);
     write_head(conn, head.status, &raw, req.keepalive, tokens).await?;
 
     let mut sent = 0u64;
     let mut pacer = Pacer::new(loc.proxy_limit_rate);
     if req.method == Method::Head {
-        // Converted HEAD: drain (and discard) the body we asked for.
+        // We sent HEAD upstream, so no body follows and nothing needs draining;
+        // the connection is at a message boundary and may go back to the pool.
+        let reuse = head.keepalive && !is_upgrade && loc.proxy_http_version == 1 && !req.chunked;
+        if reuse {
+            let cap = match pp.target {
+                crate::config::ProxyTarget::Upstream(i) => loc_upstream_cap(i, pp).unwrap_or(0),
+                _ => 0,
+            };
+            checkin(pool_key, up, cap);
+        }
         return Ok(written(Outcome {
             status: head.status,
             bytes: 0,
@@ -3053,8 +3098,27 @@ async fn exchange(
             sent: sent_headers,
         }));
     }
+    // A chunked upstream ends at a known boundary too, so its connection is
+    // just as reusable as a `Content-Length` one -- as long as the terminator
+    // was actually read.
+    let mut chunk_complete = false;
     if head.chunked {
-        sent = stream_chunked(conn, &mut up, buf, loc.proxy_read_timeout, &mut pacer).await?;
+        if req.version_minor == 1 {
+            let (n, complete) =
+                stream_chunked(conn, &mut up, buf, loc.proxy_read_timeout, &mut pacer).await?;
+            sent = n;
+            chunk_complete = complete;
+        } else {
+            // An HTTP/1.0 client cannot be sent chunked framing: nginx dechunks
+            // and delimits the body by closing the connection instead. Passing
+            // the upstream's chunks through gave the client `a\r\n0123456789\r\n`
+            // where nginx gives it the digits alone ("unbuffered complex
+            // chunked", `proxy_chunked.t`).
+            let (n, complete) =
+                stream_dechunked(conn, &mut up, buf, loc.proxy_read_timeout, &mut pacer).await?;
+            sent = n;
+            chunk_complete = complete;
+        }
         if loc.proxy_buffering {
             let _ = reason(200);
         }
@@ -3139,7 +3203,7 @@ async fn exchange(
 
     // ---- connection reuse ----
     let reuse = head.keepalive
-        && total_len.is_some()
+        && (bodyless || total_len.is_some() || chunk_complete)
         && !is_upgrade
         && loc.proxy_http_version == 1
         && !req.chunked;
@@ -3236,13 +3300,101 @@ impl Pacer {
     }
 }
 
+/// Stream a chunked upstream body **dechunked**, for clients that cannot be sent
+/// chunked framing (HTTP/1.0). Bytes are forwarded as they arrive; the caller
+/// closes the connection to mark the end.
+async fn stream_dechunked(
+    conn: &mut crate::conn::Conn,
+    up: &mut UpStream,
+    mut pending: Vec<u8>,
+    read_timeout: Duration,
+    pacer: &mut Pacer,
+) -> io::Result<(u64, bool)> {
+    let mut sent = 0u64;
+    loop {
+        let line_end = loop {
+            if let Some(i) = memchr::memchr(b'\n', &pending) {
+                break i;
+            }
+            let mut chunk = [0u8; 8192];
+            let n = match tokio::time::timeout(read_timeout, up.read(&mut chunk)).await {
+                Ok(Ok(0)) => return Ok((sent, false)),
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout")),
+            };
+            pending.extend_from_slice(&chunk[..n]);
+        };
+        let size = usize::from_str_radix(
+            String::from_utf8_lossy(&pending[..line_end])
+                .trim()
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim(),
+            16,
+        )
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad chunk"))?;
+        let need = line_end + 1 + size + 2;
+        while pending.len() < need {
+            let mut chunk = [0u8; 8192];
+            let n = match tokio::time::timeout(read_timeout, up.read(&mut chunk)).await {
+                Ok(Ok(0)) => return Ok((sent, false)),
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout")),
+            };
+            pending.extend_from_slice(&chunk[..n]);
+        }
+        if size == 0 {
+            // Trailers, then the blank line: wait for the real end so the
+            // connection is at a message boundary.
+            loop {
+                if chunked_message_end(&pending, line_end + 1).is_some() {
+                    return Ok((sent, true));
+                }
+                let mut chunk = [0u8; 8192];
+                let n = match tokio::time::timeout(read_timeout, up.read(&mut chunk)).await {
+                    Ok(Ok(0)) => return Ok((sent, false)),
+                    Ok(Ok(n)) => n,
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout")),
+                };
+                pending.extend_from_slice(&chunk[..n]);
+            }
+        }
+        let data = pending[line_end + 1..line_end + 1 + size].to_vec();
+        pacer.tick(size as u64).await;
+        conn.write_all(&data).await?;
+        sent += size as u64;
+        pending.drain(..need);
+    }
+}
+
+/// End of a chunked message: the offset just past the blank line that follows
+/// the `0` size line and any trailer block. `start` is the byte after the `0`
+/// line's CRLF.
+fn chunked_message_end(pending: &[u8], start: usize) -> Option<usize> {
+    let mut i = start;
+    loop {
+        let nl = pending.get(i..)?.iter().position(|&b| b == b'\n')? + i;
+        let line = &pending[i..nl];
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let next = nl + 1;
+        if line.is_empty() {
+            return Some(next);
+        }
+        i = next;
+    }
+}
+
 async fn stream_chunked(
     conn: &mut crate::conn::Conn,
     up: &mut UpStream,
     mut pending: Vec<u8>,
     read_timeout: Duration,
     pacer: &mut Pacer,
-) -> io::Result<u64> {
+) -> io::Result<(u64, bool)> {
     let mut sent = 0u64;
     loop {
         // ensure a full chunk-size line is buffered
@@ -3257,7 +3409,7 @@ async fn stream_chunked(
                 Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout")),
             };
             if n == 0 {
-                return Ok(sent);
+                return Ok((sent, false));
             }
             pending.extend_from_slice(&chunk[..n]);
         };
@@ -3278,18 +3430,37 @@ async fn stream_chunked(
                 Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout")),
             };
             if n == 0 {
-                return Ok(sent);
+                return Ok((sent, false));
             }
             pending.extend_from_slice(&chunk[..n]);
         }
 
         let header_len = line_end + 1;
         if size == 0 {
-            // trailers: pass through the terminating CRLF block
-            let end = need.min(pending.len());
-            conn.write_all(&pending[..end]).await?;
-            sent += end as u64;
-            return Ok(sent);
+            // The terminating `0` line is followed by an optional trailer block
+            // and then a blank line, and the upstream may pause before that blank
+            // line (`proxy_keepalive.t`'s "complex" case sleeps 50ms). Returning
+            // as soon as the `0` line arrived sent a truncated chunked body and a
+            // broken connection; wait for the real end of the message.
+            loop {
+                if let Some(end) = chunked_message_end(&pending, line_end + 1) {
+                    conn.write_all(&pending[..end]).await?;
+                    sent += end as u64;
+                    return Ok((sent, true));
+                }
+                let mut chunk = [0u8; 8192];
+                let n = match tokio::time::timeout(read_timeout, up.read(&mut chunk)).await {
+                    Ok(Ok(0)) => {
+                        conn.write_all(&pending).await?;
+                        sent += pending.len() as u64;
+                        return Ok((sent, false));
+                    }
+                    Ok(Ok(n)) => n,
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout")),
+                };
+                pending.extend_from_slice(&chunk[..n]);
+            }
         }
         pacer.tick(size).await;
         conn.write_all(&pending[..need]).await?;
@@ -3503,7 +3674,25 @@ pub async fn fetch(
     for cand in candidates {
         // The socket-free path buffers the whole reply, so `proxy_bind` (which
         // needs a TCP socket) only applies to TCP targets.
-        let mut up: UpStream = if let Chosen::Unix(path) = &cand {
+        //
+        // It shares the *same* keepalive pool as the streaming path. nginx's
+        // pool is per-peer and used by every request that reaches that peer,
+        // subrequests included, so an SSI `#include virtual=` goes out on the
+        // already-open upstream connection instead of dialling a second one.
+        // Without this, a backend that serves one connection at a time (the
+        // daemon in `proxy_keepalive.t`) blocks: it is still reading the pooled
+        // connection while the subrequest waits for it to accept a new one, and
+        // `inmemory` never gets a reply.
+        let mut key = pool_key_of(&cand);
+        let pooled = checkout(key).map(|(s, created, requests)| {
+            key.created = created;
+            key.requests = requests;
+            s
+        });
+        let mut reused = pooled.is_some();
+        let mut up: UpStream = if let Some(s) = pooled {
+            s
+        } else if let Chosen::Unix(path) = &cand {
             match connect_unix(path, loc.proxy_connect_timeout).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -3556,11 +3745,43 @@ pub async fn fetch(
             None,
             false,
         );
-        if up.write_all(&out).await.is_err() {
-            continue;
-        }
-        if !in_memory.is_empty() && up.write_all(in_memory).await.is_err() {
-            continue;
+        let write_failed = up.write_all(&out).await.is_err()
+            || (!in_memory.is_empty() && up.write_all(in_memory).await.is_err());
+        if write_failed {
+            // A pooled socket the peer has since closed fails on the first
+            // write; dial once more before giving up on this backend.
+            if reused {
+                reused = false;
+                let fresh = match &cand {
+                    Chosen::Unix(path) => connect_unix(path, loc.proxy_connect_timeout).await,
+                    _ => {
+                        let addr = match &cand {
+                            Chosen::Direct(_, a) => *a,
+                            Chosen::Upstream { addr, .. } => *addr,
+                            Chosen::Unix(_) => unreachable!(),
+                        };
+                        connect_bound(addr, None, loc.proxy_connect_timeout)
+                            .await
+                            .map(UpStream::Tcp)
+                    }
+                };
+                match fresh {
+                    Ok(mut s) => {
+                        if s.write_all(&out).await.is_err()
+                            || (!in_memory.is_empty() && s.write_all(in_memory).await.is_err())
+                        {
+                            continue;
+                        }
+                        up = s;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        continue;
+                    }
+                }
+            } else {
+                continue;
+            }
         }
 
         // Read until the head is complete, then to Content-Length or EOF.
@@ -3591,7 +3812,23 @@ pub async fn fetch(
                         if have as u64 >= len {
                             break;
                         }
-                    } else if !head.chunked {
+                    } else if head.chunked {
+                        // A chunked reply ends at its `0`-size line plus the
+                        // blank line after any trailers; keep-alive means the
+                        // socket stays open, so waiting for EOF never returns
+                        // (`inmemory chunked` came back empty).
+                        //
+                        // `dechunk` alone is not enough: it returns as soon as it
+                        // sees the `0` line, while the closing CRLF may still be
+                        // in flight (`proxy_keepalive.t`'s "complex" case sleeps
+                        // 50ms before it). Pooling then left that byte in the
+                        // socket and the next reply on the connection parsed off
+                        // by one, which showed up as "read timeout" two requests
+                        // later.
+                        if chunked_body_end(&buf[h..]).is_some() {
+                            break;
+                        }
+                    } else {
                         // No framing information: the upstream closes to signal
                         // the end, so keep reading until EOF.
                     }
@@ -3698,6 +3935,17 @@ pub async fn fetch(
             }
         }
 
+        // Hand the connection back so the next request -- including another
+        // subrequest -- reuses it, as nginx does. A close-delimited reply is
+        // kept because it was read to EOF, which is a message boundary too.
+        let reuse = head.keepalive && loc.proxy_http_version == 1 && !req.chunked;
+        if reuse {
+            let cap = match pp.target {
+                crate::config::ProxyTarget::Upstream(i) => loc_upstream_cap(i, &pp).unwrap_or(0),
+                _ => 0,
+            };
+            checkin(key, up, cap);
+        }
         return Some(Response {
             status: head.status,
             headers: Vec::new(),
@@ -3722,6 +3970,33 @@ pub async fn fetch(
         "text/html",
         crate::http::error_body(502, true),
     ))
+}
+
+/// Offset just past the final blank line of a chunked body, if the terminator
+/// has actually arrived. `dechunk` decodes as soon as it sees the `0` line, which
+/// is not enough to know the message ended.
+fn chunked_body_end(input: &[u8]) -> Option<usize> {
+    let mut i = 0usize;
+    loop {
+        let line_end = memchr::memmem::find(input.get(i..)?, b"\r\n")? + i;
+        let size = usize::from_str_radix(
+            std::str::from_utf8(&input[i..line_end])
+                .ok()?
+                .split(';')
+                .next()?
+                .trim(),
+            16,
+        )
+        .ok()?;
+        i = line_end + 2;
+        if size == 0 {
+            return chunked_message_end(input, i);
+        }
+        if i + size + 2 > input.len() {
+            return None;
+        }
+        i += size + 2;
+    }
 }
 
 /// Strip chunked framing.
@@ -4396,5 +4671,50 @@ fn authority_host(authority: &str) -> String {
         // (which contains colons) is left intact.
         Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => h.to_string(),
         _ => authority.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::{chunked_body_end, dechunk};
+
+    /// `dechunk` decodes as soon as it sees the `0` line, which is not the same
+    /// as the message having ended: the blank line that terminates it may still
+    /// be in flight. Pooling a connection at that point left one byte behind and
+    /// the next response on it parsed off by one.
+    #[test]
+    fn terminator_must_arrive_before_the_message_counts_as_complete() {
+        assert_eq!(chunked_body_end(b"0\r\n\r\n"), Some(5));
+        assert_eq!(chunked_body_end(b"0\r\n"), None, "closing CRLF still missing");
+        assert_eq!(
+            dechunk(b"0\r\n").is_some(),
+            true,
+            "dechunk alone is why this needed a separate check"
+        );
+    }
+
+    #[test]
+    fn terminator_with_trailers() {
+        // `0`, two trailer lines, then the blank line.
+        let body = b"0\r\nX-A: 1\r\nX-B: 2\r\n\r\n";
+        assert_eq!(chunked_body_end(body), Some(body.len()));
+        assert_eq!(chunked_body_end(&body[..body.len() - 1]), None);
+    }
+
+    #[test]
+    fn chunked_body_with_data() {
+        let body = b"a\r\n0123456789\r\n0\r\n\r\n";
+        assert_eq!(chunked_body_end(body), Some(body.len()));
+        // A truncated data chunk is not complete either.
+        assert_eq!(chunked_body_end(b"a\r\n0123"), None);
+        assert_eq!(dechunk(body).as_deref(), Some(&b"0123456789"[..]));
+    }
+
+    /// A zero-size chunk is a complete, empty body -- the `proxy_keepalive.t`
+    /// "0 chunk" case, which must still produce a body boundary.
+    #[test]
+    fn empty_chunked_body() {
+        assert_eq!(chunked_body_end(b"0\r\n\r\n"), Some(5));
+        assert_eq!(dechunk(b"0\r\n\r\n").as_deref(), Some(&b""[..]));
     }
 }

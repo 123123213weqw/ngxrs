@@ -1787,6 +1787,11 @@ pub struct Config {
 
 #[derive(Debug, Default)]
 pub struct StreamSection {
+    /// `stream { set_real_ip_from ...; }`: the networks every server inherits.
+    /// A unix peer has no address, so `unix:` is kept apart exactly as in http
+    /// (`ngx_stream_realip_module`).
+    pub stream_realip_from: Vec<(std::net::IpAddr, u8)>,
+    pub stream_realip_from_unix: bool,
     pub servers: Vec<StreamServerCfg>,
     pub upstreams: Vec<StreamUpstream>,
     /// `geo` blocks in `stream {}` context. They are a separate namespace from
@@ -1810,6 +1815,11 @@ pub struct StreamUpstream {
 
 #[derive(Debug, Clone)]
 pub struct StreamServerCfg {
+    /// `set_real_ip_from` networks for this server. The first directive in a
+    /// scope replaces the inherited list, `unix:` included.
+    pub realip_from: Vec<(std::net::IpAddr, u8)>,
+    pub realip_from_unix: bool,
+    pub realip_from_set: bool,
     pub listen: SocketAddr,
     /// `listen unix:/path`. `listen` holds a placeholder address in that case:
     /// a unix listener has no port, and nginx reports `$remote_addr` as `unix:`
@@ -5041,6 +5051,10 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
     let mut stream_proxy_ssl = false;
     // `stream { proxy_protocol on; }`: the default every server inherits.
     let mut stream_proxy_protocol: Option<bool> = None;
+    // `stream { set_real_ip_from ...; }` defaults, inherited by every server.
+    let mut stream_realip_from: Vec<(std::net::IpAddr, u8)> = Vec::new();
+    let mut stream_realip_unix = false;
+    let mut stream_realip_set = false;
     let mut stream_session_reuse = true;
     let mut stream_connect_timeout = std::time::Duration::from_secs(60);
     // nginx's stream default proxy_timeout is 10m.
@@ -5146,6 +5160,25 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                     method,
                     hash_key,
                 });
+            }
+            "set_real_ip_from" => {
+                // nginx allows it in both stream main and stream server context.
+                if !stream_realip_set {
+                    stream_realip_from.clear();
+                    stream_realip_unix = false;
+                    stream_realip_set = true;
+                }
+                let v = d.args.first().ok_or_else(|| {
+                    sem(&d.file, d.line, "set_real_ip_from requires an address")
+                })?;
+                if v == "unix:" {
+                    stream_realip_unix = true;
+                } else {
+                    match resolve_realip_from(v) {
+                        Ok(c) => stream_realip_from.extend(c),
+                        Err(e) => eprintln!("ngxrs: [warn] {e} in {}:{}", d.file.display(), d.line),
+                    }
+                }
             }
             "server" => server_dirs.push(d),
             "geo" => section.geos.push(parse_geo(d)?),
@@ -5263,6 +5296,9 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
         let mut per_server_proxy_timeout = false;
         let mut cfg = StreamServerCfg {
             listen: SocketAddr::from(([0, 0, 0, 0], 0)),
+            realip_from: stream_realip_from.clone(),
+            realip_from_unix: stream_realip_unix,
+            realip_from_set: stream_realip_set,
             udp: false,
             proxy_pass: None,
             error_logs: Vec::new(),
@@ -5290,7 +5326,18 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
         // the server. Sharing one `cfg.ssl` across every `listen` made a plain
         // `listen 8080` in a server that also had `listen 8443 ssl` try to
         // handshake TLS (`stream_ssl_variables.t`, "no ssl").
-        let mut listens: Vec<(SocketAddr, bool)> = Vec::new();
+        // `(unix path, address, ssl, proxy_protocol)`: every property belongs to
+        // the LISTENER, not the server. `stream_realip_hostname.t` and
+        // `stream_realip.t` both put `listen 8083 proxy_protocol` and
+        // `listen 8084` in one server, so a single flag made 8084 wait for a
+        // PROXY header it would never receive ("server off"), and a single
+        // `listen_unix` made every expanded copy bind the same unix socket.
+        let mut listens: Vec<(
+            Option<std::sync::Arc<std::path::PathBuf>>,
+            SocketAddr,
+            bool,
+            bool,
+        )> = Vec::new();
         for child in sd.block.as_ref().map(|x| x.as_slice()).unwrap_or(&[]) {
             match child.name.as_str() {
                 "listen" => {
@@ -5316,7 +5363,8 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                     cfg.listen_unix = unix.clone();
                     cfg.listen = addr;
                     let this_ssl = child.args[1..].iter().any(|p| p == "ssl");
-                    listens.push((addr, this_ssl));
+                    let this_pp = child.args[1..].iter().any(|p| p == "proxy_protocol");
+                    listens.push((unix.clone(), addr, this_ssl, this_pp));
                     if child.args[1..].iter().any(|p| p == "udp") {
                         cfg.udp = true;
                     }
@@ -5327,6 +5375,29 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                         cfg.listen_proxy_protocol = true;
                     }
                     have_listen = true;
+                }
+                "set_real_ip_from" => {
+                    // First directive in this scope replaces the inherited list.
+                    if !cfg.realip_from_set {
+                        cfg.realip_from.clear();
+                        cfg.realip_from_unix = false;
+                        cfg.realip_from_set = true;
+                    }
+                    if let Some(v) = child.args.first() {
+                        if v == "unix:" {
+                            cfg.realip_from_unix = true;
+                        } else {
+                            match resolve_realip_from(v) {
+                                Ok(c) => cfg.realip_from.extend(c),
+                                Err(e) => {
+                                    eprintln!(
+                                        "ngxrs: [warn] {e} in {}:{}",
+                                        child.file.display(), child.line
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
                 "proxy_pass" => {
                     cfg.proxy_pass = child.args.first().cloned();
@@ -5496,10 +5567,12 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
         if listens.is_empty() {
             section.servers.push(cfg);
         } else {
-            for (addr, this_ssl) in listens {
+            for (unix, addr, this_ssl, this_pp) in listens {
                 let mut c = cfg.clone();
+                c.listen_unix = unix;
                 c.listen = addr;
                 c.ssl = this_ssl;
+                c.listen_proxy_protocol = this_pp;
                 section.servers.push(c);
             }
         }

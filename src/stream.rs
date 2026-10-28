@@ -19,6 +19,11 @@ use tokio::sync::watch;
 #[derive(Clone)]
 pub struct StreamServer {
     pub listen: SocketAddr,
+    /// `set_real_ip_from`: trusted peers whose PROXY header rewrites
+    /// `$remote_addr` (`ngx_stream_realip_module`). `realip_from_unix` covers
+    /// `set_real_ip_from unix:`, which has no address to match.
+    pub realip_from: Vec<(std::net::IpAddr, u8)>,
+    pub realip_from_unix: bool,
     /// `listen unix:/path`: bind a unix socket instead of `listen`.
     pub listen_unix: Option<std::sync::Arc<std::path::PathBuf>>,
     pub udp: bool,
@@ -312,6 +317,8 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                 let splits = server.splits.clone();
                 let sets = server.sets.clone();
                 let listen_pp = server.listen_proxy_protocol;
+                let realip_from = server.realip_from.clone();
+                let realip_unix = server.realip_from_unix;
                 let verify_mode = server.client_verify;
                 let client_ca = server.client_ca.clone();
                 let trusted_ca = server.trusted_ca.clone();
@@ -334,11 +341,25 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                     } else {
                         None
                     };
+                    // `set_real_ip_from`: a trusted peer's PROXY header rewrites
+                    // `$remote_addr`/`$remote_port`, and `$realip_remote_*` then
+                    // keeps the original peer (`ngx_stream_realip_set_addr`
+                    // saves c->addr_text before overwriting it). An untrusted
+                    // peer leaves both pointing at the peer, which is why the
+                    // "no match" assertions expect the two to be equal.
+                    let eff = realip_addr(
+                        &pp,
+                        peer,
+                        peer_unix,
+                        &realip_from,
+                        realip_unix,
+                    );
                     // `return <text>` answers without touching an upstream.
                     if let Some(text) = return_text {
                         let local_addr = client_local.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
-                        let mut base =
-                            base_vars(peer, peer_unix, local_addr, &maps, &geos, &splits);
+                        let mut base = base_vars(
+                            peer, peer_unix, eff, local_addr, &maps, &geos, &splits,
+                        );
                         base.proxy_protocol = pp.as_deref();
                         // `set` values may reference earlier `set`s, so they are
                         // expanded one at a time into an accumulating map.
@@ -382,6 +403,7 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                             crate::streamvars::Vars {
                                 peer,
                                 peer_unix,
+                                eff,
                                 local: client_local.unwrap_or(peer),
                                 udp: false,
                                 maps: &maps,
@@ -480,6 +502,7 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                             crate::streamvars::Vars {
                                 peer,
                                 peer_unix,
+                                eff,
                                 local: client_local.unwrap_or(peer),
                                 udp: false,
                                 maps: &maps,
@@ -912,9 +935,43 @@ impl Drop for StreamAccessLog {
 }
 
 /// A `Vars` with no TLS facts yet: the handshake, when there is one, fills them.
+/// The address `$remote_addr` should report.
+///
+/// Mirrors `ngx_stream_realip_handler`: nothing happens unless the server
+/// configured `set_real_ip_from`, a PROXY header arrived, the peer is inside one
+/// of the trusted networks (or is a unix peer with `set_real_ip_from unix:`),
+/// and the header's source address parses. The port always comes from the
+/// header, so `$remote_port` follows it too.
+fn realip_addr(
+    pp: &Option<std::sync::Arc<crate::proxyproto::Pp>>,
+    peer: SocketAddr,
+    peer_unix: bool,
+    from: &[(std::net::IpAddr, u8)],
+    from_unix: bool,
+) -> Option<SocketAddr> {
+    let pp = pp.as_ref()?;
+    if from.is_empty() && !from_unix {
+        return None;
+    }
+    let trusted = if peer_unix {
+        from_unix
+    } else {
+        let ip = peer.ip();
+        from.iter().any(|(net, bits)| {
+            crate::http::cidr_contains_pub(*net, *bits, ip)
+        })
+    };
+    if !trusted {
+        return None;
+    }
+    let addr: std::net::IpAddr = pp.src_addr.trim().parse().ok()?;
+    Some(SocketAddr::new(addr, pp.src_port))
+}
+
 fn base_vars<'a>(
     peer: SocketAddr,
     peer_unix: bool,
+    eff: Option<SocketAddr>,
     local: SocketAddr,
     maps: &'a [crate::mapping::MapDef],
     geos: &'a [crate::geo::GeoDef],
@@ -923,6 +980,7 @@ fn base_vars<'a>(
     crate::streamvars::Vars {
         peer,
         peer_unix,
+        eff,
         local,
         udp: false,
         maps,

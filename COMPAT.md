@@ -3063,3 +3063,76 @@ RESP: b'addr=[unix:] port=[] geo=[none]'
 TEST_LIST="stream_geo_unix.t geo_unix.t stream_geo.t" bash bench/nginxtests.sh
 # 应 SAME 6/6、8/8、21/21
 ```
+
+## 本轮（stream `realip`：四个套件从"从未测量"到全部一致）
+
+| 套件 | 修前 | 修后 |
+|---|---|---|
+| `stream_realip.t` | TRUNC **0/10** | **10/10 一致** |
+| `stream_realip_hostname.t` | TRUNC **0/6** | **6/6 一致** |
+| `stream_ssl_realip.t` | TRUNC **0/8** | **8/8 一致** |
+| `proxy_protocol_unix.t` | TRUNC **0/7** | **7/7 一致** |
+
+合计 **31 条断言从"我方整份跳过"变成逐条一致**。声明清单 156 → **160**。
+`stream_map.t` 7/7 不变（它也用到多条 `listen`，正好被同一改动保护）。
+
+### 为什么之前是 0 条
+
+`-V` 没有广告 `--with-stream_realip_module`，而 `Test::Nginx` 用 `has('stream_realip')`
+判据跳过——**同类门控盲点第五次**（前四次：`http_v2`、FCGI Perl 模块、openssl 版本判据、
+`listen unix` 缺失导致的隐形）。跳过本身是诚实的：我们确实没实现 stream realip。
+
+### 实现
+
+按 `ngx_stream_realip_module` 的语义：
+
+- `set_real_ip_from` 在 `stream {}` 与 stream server 两级，每个作用域**第一条替换**继承的列表
+  （含 `unix:` 条目），值与 http 共用 `resolve_realip_from`（字面量/CIDR/主机名，
+  `localhost` 在配置期经 getaddrinfo 解析）。
+- 生效条件完全照源码：本 server 声明过 `set_real_ip_from`、收到了 PROXY 头、
+  **对端在受信网段内**（unix 对端看 `unix:` 条目）、头的源地址可解析。
+  满足则 `$remote_addr`/`$remote_port` 取头里的地址端口。
+- `$realip_remote_addr` / `$realip_remote_port` 是**原始对端**——只有 realip 生效时才与
+  `$remote_addr` 不同，这正是 "no match" 断言要求两者相等的原因。
+- `$binary_remote_addr` 同样跟随改写后的地址。
+
+### 顺带修掉：stream 的 listen 属性没有按 listener 区分
+
+`stream_realip.t` 的 "server off" 一直失败（第 2 条）：
+
+```nginx
+server {
+    listen 127.0.0.1:8083 proxy_protocol;
+    listen 127.0.0.1:8084;                 # 这一条不该等 PROXY 头
+    return $proxy_protocol_addr:$proxy_protocol_port;
+}
+```
+
+`listen_proxy_protocol` 是**server 级**单个 bool，于是 8084 也去读 PROXY 头，
+客户端不发就一直挂着。同一处还有第二个问题：`listen_unix` 也是单个字段，
+所以 `stream_realip_hostname.t` 里
+
+```nginx
+listen unix:<dir>/unix.sock proxy_protocol;
+listen 127.0.0.1:8080;
+listen 127.0.0.1:8082 proxy_protocol;
+```
+
+展开成三个 server 后**三个都去绑同一个 unix socket**，配置直接起不来
+（harness 报成 `no 127.0.0.1 on host`）。
+
+现在 listen 元组是 `(unix 路径, 地址, ssl, proxy_protocol)`，展开时逐条赋值。
+这与早前修 `ssl` 时踩的是同一类错误——把 listener 的属性存到了 server 上。
+
+### 仍未解决
+
+- `stream_realip` 与 `proxy_protocol off`（关掉 PROXY 时的 realip 行为）无断言覆盖。
+- `stream_geoip.t` / `stream_geoip2.t` 也 `has('stream_realip')`，但它们还需要
+  `--with-http_geoip_module` 一类能力，本机参考构建也没有，仍两边跳过。
+
+复现：
+
+```bash
+TEST_LIST="stream_realip.t stream_realip_hostname.t stream_ssl_realip.t proxy_protocol_unix.t" \
+  bash bench/nginxtests.sh     # 应 SAME 10/10、6/6、8/8、7/7
+```

@@ -326,3 +326,7 @@ proxy_unix.t
 stream_unix.t
 geo_unix.t
 stream_geo_unix.t
+stream_realip.t
+stream_realip_hostname.t
+stream_ssl_realip.t
+proxy_protocol_unix.t

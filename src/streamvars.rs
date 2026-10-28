@@ -43,6 +43,8 @@ pub struct Vars<'a> {
     /// what `stream_geo_unix.t` depends on -- geo cannot parse `unix:` and falls
     /// back to INADDR_NONE, so a `255.255.255.255` entry matches.
     pub peer_unix: bool,
+    /// `$remote_addr` after `set_real_ip_from` rewrote it, if it did.
+    pub eff: Option<SocketAddr>,
     pub local: SocketAddr,
     /// `proxy` addressed this server? nginx reports `PROXY` for a connection
     /// that carried a header, `TCP`/`UDP` otherwise.
@@ -70,23 +72,39 @@ impl Vars<'_> {
             return Some(v.clone());
         }
         Some(match name {
-            "remote_addr" => {
+            // After `set_real_ip_from` the address is the rewritten one whatever
+            // the peer family was (`ngx_stream_realip_set_addr` overwrites
+            // `c->addr_text` outright), so `eff` wins over the unix marker.
+            "remote_addr" => match self.eff {
+                Some(a) => a.ip().to_string(),
+                None if self.peer_unix => "unix:".to_string(),
+                None => self.peer.ip().to_string(),
+            },
+            // `ngx_stream_realip_remote_addr_variable`: the saved original when
+            // realip applied, otherwise the peer itself -- so the two agree
+            // whenever nothing was rewritten.
+            "realip_remote_addr" => {
                 if self.peer_unix {
                     "unix:".to_string()
                 } else {
                     self.peer.ip().to_string()
                 }
             }
-            "remote_port" => {
+            "realip_remote_port" => {
                 if self.peer_unix {
                     String::new()
                 } else {
                     self.peer.port().to_string()
                 }
             }
+            "remote_port" => match self.eff {
+                Some(a) => a.port().to_string(),
+                None if self.peer_unix => String::new(),
+                None => self.peer.port().to_string(),
+            },
             "server_addr" => self.local.ip().to_string(),
             "server_port" => self.local.port().to_string(),
-            "binary_remote_addr" => binary_addr(&self.peer),
+            "binary_remote_addr" => binary_addr(&self.eff.unwrap_or(self.peer)),
             // `$proxy_protocol_*`: absent without a header, like nginx.
             "proxy_protocol_addr" => self.proxy_protocol?.src_addr.clone(),
             "proxy_protocol_port" => {
@@ -266,6 +284,7 @@ mod tests {
     fn vars<'a>(maps: &'a [MapDef], geos: &'a [GeoDef]) -> Vars<'a> {
         Vars {
             peer_unix: false,
+            eff: None,
             peer: "127.0.0.1:5000".parse().unwrap(),
             local: "127.0.0.1:8080".parse().unwrap(),
             udp: false,

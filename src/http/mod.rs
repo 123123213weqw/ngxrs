@@ -4659,6 +4659,11 @@ pub async fn body_bytes(body: Body) -> io::Result<Vec<u8>> {
 #[allow(clippy::too_many_arguments)]
 // ---- realip (ngx_http_realip_module) --------------------------------------
 
+/// Exposed for the stream `realip` module, which matches the same way.
+pub fn cidr_contains_pub(net: std::net::IpAddr, bits: u8, ip: std::net::IpAddr) -> bool {
+    cidr_contains(net, bits, ip)
+}
+
 fn cidr_contains(net: std::net::IpAddr, bits: u8, ip: std::net::IpAddr) -> bool {
     match (net, ip) {
         (std::net::IpAddr::V4(n), std::net::IpAddr::V4(i)) => {

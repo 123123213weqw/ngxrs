@@ -1811,6 +1811,10 @@ pub struct StreamUpstream {
 #[derive(Debug, Clone)]
 pub struct StreamServerCfg {
     pub listen: SocketAddr,
+    /// `listen unix:/path`. `listen` holds a placeholder address in that case:
+    /// a unix listener has no port, and nginx reports `$remote_addr` as `unix:`
+    /// for sessions arriving on it (`stream_geo_unix.t`).
+    pub listen_unix: Option<std::sync::Arc<std::path::PathBuf>>,
     pub udp: bool,
     pub proxy_pass: Option<String>,
     pub proxy_timeout: Duration,
@@ -5279,6 +5283,7 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             access_logs: stream_access_logs.clone(),
             proxy_protocol: None,
             listen_proxy_protocol: false,
+            listen_unix: None,
         };
         let mut have_listen = false;
         // `(address, ssl)`: `listen ... ssl` is a property of the LISTENER, not of
@@ -5292,13 +5297,23 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                     let a = child.args.first().ok_or_else(|| {
                         sem(&child.file, child.line, "listen requires an address")
                     })?;
-                    let addr = parse_listen(a).ok_or_else(|| {
-                        sem(
-                            &child.file,
-                            child.line,
-                            format!("invalid listen address \"{a}\""),
-                        )
-                    })?;
+                    // `listen unix:/path` in a stream server: no address, and
+                    // `$remote_addr` becomes the literal `unix:` (`stream_geo_unix.t`).
+                    let unix = a
+                        .strip_prefix("unix:")
+                        .map(|p| std::sync::Arc::new(std::path::PathBuf::from(p)));
+                    let addr = if unix.is_some() {
+                        SocketAddr::from(([127, 0, 0, 1], 0))
+                    } else {
+                        parse_listen(a).ok_or_else(|| {
+                            sem(
+                                &child.file,
+                                child.line,
+                                format!("invalid listen address \"{a}\""),
+                            )
+                        })?
+                    };
+                    cfg.listen_unix = unix.clone();
                     cfg.listen = addr;
                     let this_ssl = child.args[1..].iter().any(|p| p == "ssl");
                     listens.push((addr, this_ssl));

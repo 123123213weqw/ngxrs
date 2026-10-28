@@ -3006,3 +3006,60 @@ default 分别是 `default`/`none`）。没有实现，因为 accept 循环目�
 ```bash
 TEST_LIST="geo_unix.t stream_geo_unix.t proxy_protocol_unix.t" bash bench/nginxtests.sh
 ```
+
+## 本轮（stream 的 `listen unix:` 与 unix 会话的 `$remote_addr`）
+
+`stream_geo_unix.t` 从 TRUNC 0/6 做到 **6/6 一致**。声明清单 155 → **156**。
+
+### 先用参考构建把语义测出来，而不是从用例反推
+
+我一开始从用例推"unix 对端地址应当是 255.255.255.255"，实际跑参考 nginx 发现不是：
+
+```
+RESP: b'addr=[unix:] port=[] geo=[none]'
+[info] *1 client unix: connected to unix:/tmp/probe_unix.sock
+```
+
+即 `$remote_addr` 是**字面量 `unix:`**、`$remote_port` **为空**，而 geo 仍得 `none`。
+读源码才明白为什么：
+
+- `ngx_stream_variable_remote_addr` 直接返回 `c->addr_text`；
+- `ngx_stream_geo_addr` 在 `ngx_parse_addr` 失败后落到 `INADDR_NONE`
+  （`stream/ngx_stream_geo_module.c:181/212` 用 `ngx_radix32tree_find(..., INADDR_NONE)`），
+  也就是 255.255.255.255，于是命中 `255.255.255.255 none;` 而落在
+  `0.0.0.0-255.255.255.254` 之外，`default none` 也成立。
+
+我们的 `geo.rs` 早就对解析失败回退到 `Ipv4Addr::BROADCAST`，与 nginx 一致；
+缺的是两件事，且第二件只有做过实测才会发现：
+
+1. **stream 的 `listen unix:` 根本不支持**，配置直接拒绝。
+2. **隐式 geo 绕过了 `$remote_addr`。** `geo $g { ... }`（不写源变量）走的是
+   `self.peer.ip()`，而显式 `geo $remote_addr $g` 走变量展开。改完第 1 点后，
+   显式的两条通过、隐式的两条失败——正是这个差一暴露了它。现在两者都经
+   `$remote_addr` 渲染。
+
+### 改动
+
+- `StreamServerCfg` / `stream::StreamServer` 增加 `listen_unix`；
+  `listen unix:/path` 在 stream server 里解析（地址留占位）。
+- 新增 `ClientIo::{Tcp,Unix}` 实现 `AsyncRead`/`AsyncWrite`，并承载
+  `set_nodelay`（仅 TCP）与 `local_addr`（unix 为 `None`）。
+  `serve_tcp` 的 accept 改为 `accept_stream()` 返回 `Accepted { client, peer,
+  peer_unix, local }`；`proxy_tcp` 与 `answer_stream_return` 改收 `ClientIo`。
+- `proxyproto::read_from` 改为对 `AsyncRead` 泛型（unix 监听 + `proxy_protocol`
+  现在也能编译通过，虽然无断言覆盖）。
+- `streamvars::Vars` 增加 `peer_unix`，`$remote_addr` → `unix:`，
+  `$remote_port` → 空。
+
+### 仍未解决
+
+- unix 监听 + `listen ... ssl` / `proxy_protocol` 的**行为**未测（只保证能编译）；
+  nginx 允许两者组合，我们没验证。
+- `debug_connection_unix.t` 两边都跳过，原因仍未查（上一轮已记录）。
+
+复现：
+
+```bash
+TEST_LIST="stream_geo_unix.t geo_unix.t stream_geo.t" bash bench/nginxtests.sh
+# 应 SAME 6/6、8/8、21/21
+```

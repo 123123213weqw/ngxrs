@@ -19,6 +19,8 @@ use tokio::sync::watch;
 #[derive(Clone)]
 pub struct StreamServer {
     pub listen: SocketAddr,
+    /// `listen unix:/path`: bind a unix socket instead of `listen`.
+    pub listen_unix: Option<std::sync::Arc<std::path::PathBuf>>,
     pub udp: bool,
     /// Peers and balancer for `proxy_pass`; empty when `return` is set.
     pub peers: std::sync::Arc<crate::streamlb::PeerSet>,
@@ -106,6 +108,127 @@ fn bind_udp(addr: SocketAddr) -> io::Result<UdpSocket> {
     UdpSocket::from_std(sock.into())
 }
 
+/// A stream client connection: TCP, or a unix socket (`stream_geo_unix.t`).
+/// The session body is shared, so only accept and the couple of socket-specific
+/// calls differ.
+enum ClientIo {
+    Tcp(TcpStream),
+    Unix(tokio::net::UnixStream),
+}
+
+impl ClientIo {
+    fn set_nodelay(&self) {
+        if let ClientIo::Tcp(s) = self {
+            let _ = s.set_nodelay(true);
+        }
+    }
+    fn local_addr(&self) -> Option<SocketAddr> {
+        match self {
+            ClientIo::Tcp(s) => s.local_addr().ok(),
+            // A unix socket has no address; nginx reports `unix:` for
+            // `$remote_addr` and nothing for `$remote_port`.
+            ClientIo::Unix(_) => None,
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for ClientIo {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ClientIo::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            ClientIo::Unix(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for ClientIo {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            ClientIo::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            ClientIo::Unix(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ClientIo::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
+            ClientIo::Unix(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ClientIo::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            ClientIo::Unix(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+enum Lsn {
+    Tcp(tokio::net::TcpListener),
+    Unix(tokio::net::UnixListener),
+}
+
+/// Bind a stream listener: `listen unix:/path` or a TCP address.
+fn bind_stream(server: &StreamServer) -> std::io::Result<Lsn> {
+    if let Some(path) = &server.listen_unix {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        // nginx unlinks a stale socket file before binding.
+        let _ = std::fs::remove_file(path.as_ref());
+        let l = std::os::unix::net::UnixListener::bind(path.as_ref())?;
+        l.set_nonblocking(true)?;
+        return Ok(Lsn::Unix(tokio::net::UnixListener::from_std(l)?));
+    }
+    Ok(Lsn::Tcp(bind_tcp(server.listen)?))
+}
+
+struct Accepted {
+    client: ClientIo,
+    peer: SocketAddr,
+    peer_unix: bool,
+    local: Option<SocketAddr>,
+}
+
+async fn accept_stream(l: &Lsn) -> std::io::Result<Accepted> {
+    match l {
+        Lsn::Tcp(listener) => {
+            let (s, peer) = listener.accept().await?;
+            let local = s.local_addr().ok();
+            Ok(Accepted {
+                client: ClientIo::Tcp(s),
+                peer,
+                peer_unix: false,
+                local,
+            })
+        }
+        Lsn::Unix(listener) => {
+            let (s, _addr) = listener.accept().await?;
+            // Placeholder peer: `$remote_addr` renders as `unix:` because
+            // `peer_unix` is set, so the value itself is never shown.
+            Ok(Accepted {
+                client: ClientIo::Unix(s),
+                peer: SocketAddr::from(([0, 0, 0, 0], 0)),
+                peer_unix: true,
+                local: None,
+            })
+        }
+    }
+}
+
 /// Run every stream listener until `shutdown` fires.
 pub async fn serve(cfg: Arc<StreamConfig>, mut shutdown: watch::Receiver<bool>) {
     let mut handles = Vec::new();
@@ -126,27 +249,31 @@ pub async fn serve(cfg: Arc<StreamConfig>, mut shutdown: watch::Receiver<bool>) 
 }
 
 async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
-    let listener = match bind_tcp(server.listen) {
+    let label = match &server.listen_unix {
+        Some(p) => format!("unix:{}", p.display()),
+        None => server.listen.to_string(),
+    };
+    let listener = match bind_stream(&server) {
         Ok(l) => l,
         Err(e) => {
             crate::log::log_global(
                 crate::log::Level::Emerg,
-                &format!("stream cannot bind {}: {e}", server.listen),
+                &format!("stream cannot bind {label}: {e}"),
             );
             return;
         }
     };
     crate::log::log_global(
         crate::log::Level::Notice,
-        &format!("stream listening on {} (tcp)", server.listen),
+        &format!("stream listening on {label} (tcp)"),
     );
 
     let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     loop {
         tokio::select! {
             _ = shutdown.changed() => return,
-            accepted = listener.accept() => {
-                let (client, peer) = match accepted {
+            accepted = accept_stream(&listener) => {
+                let Accepted { client, peer, peer_unix, local: acc_local } = match accepted {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
@@ -154,11 +281,11 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                 // PROXY header advertises as the destination. Taking the
                 // upstream's local address instead produced a mixed-family
                 // pair (127.0.0.1 -> [::1]) and therefore `PROXY UNKNOWN`.
-                let client_local = client.local_addr().ok();
-                let _ = client.set_nodelay(true);
+                let client_local = acc_local;
+                client.set_nodelay();
                 // nginx logs stream connections at `info`: the peer, the local
                 // address and the chosen upstream.
-                let local = client.local_addr().ok();
+                let local = client_local;
                 let n = crate::mail::next_conn_id();
                 if let Some(local) = local {
                     // Only *describe* the peer: picking here would take a
@@ -209,10 +336,9 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                     };
                     // `return <text>` answers without touching an upstream.
                     if let Some(text) = return_text {
-                        let local_addr = client
-                            .local_addr()
-                            .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
-                        let mut base = base_vars(peer, local_addr, &maps, &geos, &splits);
+                        let local_addr = client_local.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
+                        let mut base =
+                            base_vars(peer, peer_unix, local_addr, &maps, &geos, &splits);
                         base.proxy_protocol = pp.as_deref();
                         // `set` values may reference earlier `set`s, so they are
                         // expanded one at a time into an accumulating map.
@@ -255,6 +381,7 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                         Some(
                             crate::streamvars::Vars {
                                 peer,
+                                peer_unix,
                                 local: client_local.unwrap_or(peer),
                                 udp: false,
                                 maps: &maps,
@@ -352,6 +479,7 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                         let sni = sni.map(|raw| {
                             crate::streamvars::Vars {
                                 peer,
+                                peer_unix,
                                 local: client_local.unwrap_or(peer),
                                 udp: false,
                                 maps: &maps,
@@ -786,6 +914,7 @@ impl Drop for StreamAccessLog {
 /// A `Vars` with no TLS facts yet: the handshake, when there is one, fills them.
 fn base_vars<'a>(
     peer: SocketAddr,
+    peer_unix: bool,
     local: SocketAddr,
     maps: &'a [crate::mapping::MapDef],
     geos: &'a [crate::geo::GeoDef],
@@ -793,6 +922,7 @@ fn base_vars<'a>(
 ) -> crate::streamvars::Vars<'a> {
     crate::streamvars::Vars {
         peer,
+        peer_unix,
         local,
         udp: false,
         maps,
@@ -810,7 +940,7 @@ static NO_CUSTOM: std::sync::LazyLock<std::collections::HashMap<String, String>>
     std::sync::LazyLock::new(std::collections::HashMap::new);
 
 async fn answer_stream_return(
-    mut client: TcpStream,
+    mut client: ClientIo,
     tls: Option<std::sync::Arc<rustls::ServerConfig>>,
     text: &str,
     verify_mode: u8,
@@ -934,7 +1064,7 @@ fn client_cert_vars(
 }
 
 async fn proxy_tcp(
-    client: TcpStream,
+    client: ClientIo,
     upstream: UpConn,
     _idle: Duration,
     _peer: SocketAddr,

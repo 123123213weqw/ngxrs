@@ -327,6 +327,7 @@ pub fn serve(cfg: Config) -> io::Result<()> {
         };
         stream_cfg.servers.push(crate::stream::StreamServer {
             listen: sc.listen,
+            listen_unix: sc.listen_unix.clone(),
             udp: sc.udp,
             peers,
             proxy_timeout: sc.proxy_timeout,

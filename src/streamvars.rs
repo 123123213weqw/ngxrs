@@ -37,6 +37,12 @@ pub struct SslFacts {
 /// Everything a stream variable may read.
 pub struct Vars<'a> {
     pub peer: SocketAddr,
+    /// The client arrived over a unix socket. nginx renders `$remote_addr` as
+    /// the literal `unix:` and leaves `$remote_port` empty for those sessions
+    /// (verified against the reference build: `addr=[unix:] port=[]`), which is
+    /// what `stream_geo_unix.t` depends on -- geo cannot parse `unix:` and falls
+    /// back to INADDR_NONE, so a `255.255.255.255` entry matches.
+    pub peer_unix: bool,
     pub local: SocketAddr,
     /// `proxy` addressed this server? nginx reports `PROXY` for a connection
     /// that carried a header, `TCP`/`UDP` otherwise.
@@ -64,8 +70,20 @@ impl Vars<'_> {
             return Some(v.clone());
         }
         Some(match name {
-            "remote_addr" => self.peer.ip().to_string(),
-            "remote_port" => self.peer.port().to_string(),
+            "remote_addr" => {
+                if self.peer_unix {
+                    "unix:".to_string()
+                } else {
+                    self.peer.ip().to_string()
+                }
+            }
+            "remote_port" => {
+                if self.peer_unix {
+                    String::new()
+                } else {
+                    self.peer.port().to_string()
+                }
+            }
             "server_addr" => self.local.ip().to_string(),
             "server_port" => self.local.port().to_string(),
             "binary_remote_addr" => binary_addr(&self.peer),
@@ -139,9 +157,14 @@ impl Vars<'_> {
 
     fn eval_geo(&self, g: &GeoDef) -> String {
         // `geo` with no source reads `$remote_addr`; with one, that variable.
+        //
+        // The implicit case must go through the *same* rendering, not
+        // `peer.ip()`: for a unix session `$remote_addr` is the literal `unix:`,
+        // which geo cannot parse and therefore maps to INADDR_NONE -- the same
+        // value nginx uses for an AF_UNIX peer (`stream_geo_unix.t`, "geo unix").
         let addr = match &g.source {
             Some(src) => self.expand(src),
-            None => self.peer.ip().to_string(),
+            None => self.get("remote_addr").unwrap_or_default(),
         };
         g.lookup(&addr)
             .map(|v| v.to_string())
@@ -242,6 +265,7 @@ mod tests {
 
     fn vars<'a>(maps: &'a [MapDef], geos: &'a [GeoDef]) -> Vars<'a> {
         Vars {
+            peer_unix: false,
             peer: "127.0.0.1:5000".parse().unwrap(),
             local: "127.0.0.1:8080".parse().unwrap(),
             udp: false,

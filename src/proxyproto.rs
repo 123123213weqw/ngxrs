@@ -491,9 +491,10 @@ pub fn write(client: &std::net::SocketAddr, local: &std::net::SocketAddr) -> Vec
 /// the header in front of the handshake. Reading exactly what the header claims
 /// (never more) means the bytes that follow stay in the socket for the next
 /// layer, which is why this does not use a buffered reader.
-pub async fn read_from(
-    stream: &mut tokio::net::TcpStream,
-) -> std::io::Result<Pp> {
+pub async fn read_from<S>(stream: &mut S) -> std::io::Result<Pp>
+where
+    S: tokio::io::AsyncRead + Unpin + ?Sized,
+{
     use tokio::io::AsyncReadExt;
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     // Enough for the v2 fixed part, so the common case is one read.

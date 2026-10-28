@@ -3136,3 +3136,57 @@ listen 127.0.0.1:8082 proxy_protocol;
 TEST_LIST="stream_realip.t stream_realip_hostname.t stream_ssl_realip.t proxy_protocol_unix.t" \
   bash bench/nginxtests.sh     # 应 SAME 10/10、6/6、8/8、7/7
 ```
+
+## 本轮（`-V` 在撒谎：`dav` / `slice` / `secure_link` 早已实现，却声明为 `--without-`）
+
+**这是同类门控盲点的第六次，而且是最讽刺的一次**：不是"参考构建缺模块"，而是
+我们自己在 `-V` 里声明了三个已经实现的模块不存在。`Test::Nginx` 用
+`has('dav')` / `has('slice')` / `has('secure_link')` 判据跳过，于是这些套件
+从未运行过一次。
+
+修正后（`src/dav.rs`、`slice` 支持、`secure_link` 一直就在源码里）：
+
+| 套件 | 修前 | 修后 |
+|---|---|---|
+| `dav.t` | 从未运行 | **96/96 一致** |
+| `dav_chunked.t` | 从未运行 | **8/8 一致** |
+| `dav_utf8.t` | 从未运行 | **18/18 一致** |
+| `slice.t` | 从未运行 | **87/87 一致** |
+| `secure_link.t` | 从未运行 | **21/21 一致** |
+| `sub_filter_slice.t` | 从未运行 | **5/5**（nginx 3/5，**优于**参考） |
+
+合计 **230 条断言本来就全对**，只是从未被计数。
+
+### 改动
+
+`src/main.rs` 的 `-V` 输出：把 `--without-http_dav_module`、`--without-http_slice_module`、
+`--without-http_secure_link_module` 换成对应的 `--with-*`。
+
+改这段时踩了个小坑：`-V` 的内容是 Rust 字符串里带续行反斜杠的多行字面量，
+我第一次用 Python 替换时把 `\\` 的层数写错，编译能过但输出里多了一个字面反斜杠，
+`tr ' ' '\n'` 后才看出来。
+
+### 剩下的 `--without-` 现在是真的
+
+`gzip_static`、`userid`、`browser`、`mirror`、`mp4`、`flv`、`geoip`、`image_filter`、
+`xslt`、`perl`、`memcached`、`random_index`(有实现但参考构建无)、`empty_gif`(同)。
+逐个 grep 过：`userid` 在 `src/` 里只有 `-V` 那一处字符串，没有任何实现。
+
+需要它们的套件（`userid.t`、`userid_flags.t`、`gunzip*.t` 等）仍然两边跳过或
+仅我方跳过，如实记录为**未实现**，不算通过。
+
+### 教训
+
+`-V` 是测试集的**输入**，不是描述性输出。它和我方实现不一致时，测试会静默地
+不跑，而所有看板都会显示"没有变差"。这一轮之前我已经因为同类问题修正过四次
+（`http_v2`、FCGI Perl 模块、openssl 判据、`listen unix`），但每次都是"少广告了
+一个我真的没有的东西"或"漏了一个我有的"——这次是**多声明了三个我有的不存在**。
+以后改任何模块能力，`-V` 与实现必须同批检查。
+
+复现：
+
+```bash
+./target/release/ngxrs -V 2>&1 | tr ' ' '\n' | grep -E 'dav|slice|secure_link'
+TEST_LIST="dav.t dav_chunked.t dav_utf8.t slice.t secure_link.t sub_filter_slice.t" \
+  bash bench/nginxtests.sh     # 应全 SAME（sub_filter_slice 为 BETTER）
+```

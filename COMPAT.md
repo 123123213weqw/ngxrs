@@ -926,6 +926,31 @@ content-length` 与空 `:method` 那几条，发来的体长度与 `content-leng
 因此 `slice.t` **不进声明清单**：81/87 是真实提升，但该文件仍是 WORSE，我不会把一个
 失败的断言数藏进「已声明」里。
 
+### 2026-10-28 第二十四轮：切片泛化到 fastcgi，以及缓存目录布局
+
+`slice.t` **81/87 → 82/87**。仍未入清单。
+
+两件事：
+
+1. **切片循环由 proxy 与 fastcgi 共用**（`SliceMode`）。`fastcgi_param Range $slice_range`
+   之前在 fastcgi 自己的变量视图里解析不出来 —— 与 proxy 那边同一处缺口，于是 CGI 根本
+   收不到 Range。uwsgi/SCGI 明确返回「不支持」，而不是假装：它们没有可切片的缓冲 fetch，
+   静默忽略 `slice` 比诚实报错更糟。
+2. **`clear_variants` 无条件取变体索引锁**，于是每个普通（无 `Vary`）缓存条目旁边都留下一个
+   `.lock` 边车文件，任何 glob 缓存目录的东西都会看到两倍文件数。`slice.t` 的
+   "in named location - cache entries" 恰好数 8 个文件对应 8 个切片，把它抓了出来 ——
+   现在只有变体索引真实存在时才创建边车。该断言已通过。
+
+剩余 5 条全是 `fastcgi` + `slice`，且每条都读 `$upstream_cache_status`。没有
+`fastcgi_cache` 时该变量为空，`add_header X-Cache-Status` 被跳过，"MISS"/"HIT" 永远匹配不上
+—— 连 73/74 两条普通 fastcgi 用例也是因此失败，不是切片坏了。复用 `cache.rs` 做
+fastcgi 缓存可行，但需要指令集（`fastcgi_cache` / `fastcgi_cache_key` /
+`fastcgi_cache_valid`）、lookup/store 接线与状态传递到 `add_header`，那是独立一轮；
+只做「开切片时才缓存」的半成品我不想提交。
+
+proxy/cache/vary 均未回退：`proxy_cache.t` 17/17、`proxy_cache_vary.t` 53/54、
+`proxy_cache_valid.t` 14/14。
+
 ## 二、声明的测试清单
 
 清单在 `bench/declared.txt`，**132 个文件**，选取规则是机械的：

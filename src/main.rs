@@ -135,7 +135,7 @@ fn real_main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                          --without-http_flv_module --without-http_mp4_module \
                          --without-http_geoip_module --without-http_image_filter_module \
                          --without-http_xslt_module --without-http_perl_module \
-                                                  --without-http_gzip_static_module --without-http_userid_module \
+                                                  --with-http_gzip_static_module --without-http_userid_module \
                          --without-http_browser_module --without-http_mirror_module"
                     );
                 }

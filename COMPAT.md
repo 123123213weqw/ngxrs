@@ -3270,3 +3270,81 @@ HPACK 解码，而不是调整转发逻辑。
 ```bash
 TEST_LIST="grpc.t grpc_ssl.t" bash bench/nginxtests.sh   # 60/152、20/40
 ```
+
+## 本轮（stream `allow`/`deny`；`-V` 又一处说谎：`gzip_static` 早已实现）
+
+### 修掉
+
+**1. `gzip_static` 被 `-V` 声明为 `--without-`，但实现完好。**
+
+```
+SAME  charset_gzip_static.t  nginx 15/15  ngxrs 15/15
+```
+
+`src/config/typed.rs` 与 `src/http/static_file.rs` 里一直有实现，`charset.rs` 甚至
+已经为 `charset_gzip_static.t` 的 "recode gzip" 断言写了注释。**同类门控问题第七次**。
+已改成 `--with-http_gzip_static_module`。
+
+**2. stream `allow` / `deny`（`ngx_stream_access_module`）。**
+
+`stream_access.t` 此前报 `try_run('no inet6 support')`——那只是启动失败时的通用提示，
+真因是 `deny` 未识别。现在：
+
+```
+stream_access.t   TRUNC 0/20  ->  20/20 一致
+```
+
+实现要点：`StreamServerCfg.access: Vec<AccessRule>`，复用 http 的 `AccessRule`、
+`parse_cidr`、`access_denied_for`（含 `unix:` 条目，所以 unix 对端也能拒绝）；
+在 accept 之后、`return`/`proxy_pass` 之前判定，被拒连接**一个字节都不发**直接关闭，
+并把 `$status` 记为 403。
+
+**3. 顺带**：`limit_conn_zone` / `limit_conn` 在 stream 上下文中现在能解析
+（`stream_limit_conn.t` 从 TRUNC 变成可测量）。
+
+### 已测量但仍未通过
+
+| 套件 | 结果 | 原因 |
+|---|---|---|
+| `stream_limit_conn.t` | **8/10**（2 条失败） | 只解析未执行计数：`rejected same zone`、`rejected proxy` 需要真正的并发槽位 |
+| `stream_status_variable.t` | **TRUNC 0/8** | `proxy_pass example.com:$remote_port` 不支持变量主机名 |
+
+两者都已定位到具体的缺失能力，不是未知问题。
+
+### 其余同批（本轮未动，仍 TRUNC）
+
+`stream_server_name.t` 21、`stream_limit_rate.t` 11、`stream_ssl_alpn.t` 8、
+`stream_resolver.t` 10——分别需要 stream 的 SNI 虚拟主机、`proxy_download_rate`/
+`proxy_upload_rate`、`ssl_alpn`、`proxy_next_upstream_tries`。
+
+### 顺带核实（旧快照已过期）
+
+`http_resolver.t` **40/40（优于 nginx 39/40）**、`http_resolver_aaaa.t` **74/74 一致**
+——resolver 的 A+AAAA 并发查询与 CNAME 跟随早已完成，那份「25/74」是过期数字。
+
+复现：
+
+```bash
+TEST_LIST="stream_access.t charset_gzip_static.t stream_limit_conn.t stream_status_variable.t" \
+  bash bench/nginxtests.sh    # 20/20 SAME、15/15 SAME、8/10、0/8
+```
+
+### 回归状态（本轮诚实记录）
+
+`bench/all.sh` **70/70 PASS**，单测 **178 passed**。
+
+`bench/declared.sh` 本轮报 **FAILED**：
+
+```
+WORSE  proxy_cache_error.t   nginx 3/3   ngxrs 2/3   (1 assertions we fail)
+```
+
+但单独复跑同一命令是 **3/3 SAME**：
+
+```bash
+TEST_LIST="proxy_cache_error.t" bash bench/nginxtests.sh   # SAME 3/3
+```
+
+本轮改动没有触及缓存路径（只动了 stream 的 access 与 limit_conn 解析），因此判定为
+**共享机负载下的抖动**，不是回归。但这说明 `declared.sh` 目前不是一个稳定的门禁：
+任何一条 1 秒级时序断言都可能让它偶发失败。**这是待解决的问题，不是通过。**

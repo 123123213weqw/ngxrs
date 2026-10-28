@@ -1815,6 +1815,12 @@ pub struct StreamUpstream {
 
 #[derive(Debug, Clone)]
 pub struct StreamServerCfg {
+    /// `limit_conn <zone> <n>` for this server.
+    pub limit_conns: Vec<(String, u32)>, 
+    /// `allow` / `deny` in stream server context, first match wins
+    /// (`ngx_stream_access_module`). Evaluated before `return`; a denied
+    /// connection is closed without a byte.
+    pub access: Vec<AccessRule>,
     /// `set_real_ip_from` networks for this server. The first directive in a
     /// scope replaces the inherited list, `unix:` included.
     pub realip_from: Vec<(std::net::IpAddr, u8)>,
@@ -5296,6 +5302,8 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
         let mut per_server_proxy_timeout = false;
         let mut cfg = StreamServerCfg {
             listen: SocketAddr::from(([0, 0, 0, 0], 0)),
+            access: Vec::new(),
+            limit_conns: Vec::new(),
             realip_from: stream_realip_from.clone(),
             realip_from_unix: stream_realip_unix,
             realip_from_set: stream_realip_set,
@@ -5375,6 +5383,34 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                         cfg.listen_proxy_protocol = true;
                     }
                     have_listen = true;
+                }
+                "limit_conn" => {
+                    if let (Some(z), Some(n)) = (child.args.first(), child.args.get(1)) {
+                        if let Ok(n) = n.parse::<u32>() {
+                            cfg.limit_conns.push((z.clone(), n));
+                        }
+                    }
+                }
+                "allow" | "deny" => {
+                    let v = child.args.first().ok_or_else(|| {
+                        sem(&child.file, child.line, "allow/deny requires an address")
+                    })?;
+                    if v == "unix:" {
+                        cfg.access.push(AccessRule {
+                            deny: child.name == "deny",
+                            net: None,
+                            unix: true,
+                        });
+                    } else {
+                        let net = parse_cidr(v).ok_or_else(|| {
+                            sem(&child.file, child.line, format!("invalid address \"{v}\""))
+                        })?;
+                        cfg.access.push(AccessRule {
+                            deny: child.name == "deny",
+                            net,
+                            unix: false,
+                        });
+                    }
                 }
                 "set_real_ip_from" => {
                     // First directive in this scope replaces the inherited list.

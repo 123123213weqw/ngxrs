@@ -16,9 +16,30 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
 
 /// One `listen` in stream context, already resolved to its backend list.
+/// `limit_conn_zone` storage. nginx keeps zones in shared memory so every
+/// worker sees the same counters; one process means a plain map is equivalent.
+static ZONES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<crate::limit::ConnZone>>>,
+> = std::sync::OnceLock::new();
+
+/// Create (or reuse) the zone named `name` and register `key` against it.
+pub fn zone_for(name: &str, key: &str) -> std::sync::Arc<crate::limit::ConnZone> {
+    let m = ZONES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = key;
+    g.entry(name.to_string())
+        .or_insert_with(|| std::sync::Arc::new(crate::limit::ConnZone::new()))
+        .clone()
+}
+
 #[derive(Clone)]
 pub struct StreamServer {
     pub listen: SocketAddr,
+    /// `allow` / `deny`: a denied peer is closed before anything is sent
+    /// (`ngx_stream_access_module`, evaluated in the ACCESS phase).
+    pub access: Vec<crate::config::typed::AccessRule>,
+    /// `limit_conn <zone> <n>`: at most `n` simultaneous sessions per key.
+    pub limit_conns: Vec<(String, u32)>,
     /// `set_real_ip_from`: trusted peers whose PROXY header rewrites
     /// `$remote_addr` (`ngx_stream_realip_module`). `realip_from_unix` covers
     /// `set_real_ip_from unix:`, which has no address to match.
@@ -319,12 +340,36 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                 let listen_pp = server.listen_proxy_protocol;
                 let realip_from = server.realip_from.clone();
                 let realip_unix = server.realip_from_unix;
+                let access = server.access.clone();
                 let verify_mode = server.client_verify;
                 let client_ca = server.client_ca.clone();
                 let trusted_ca = server.trusted_ca.clone();
                 // One log line per connection, written when the task ends.
                 let mut alog = StreamAccessLog::new(&server, peer, "stream");
                 tokio::spawn(async move {
+                    // `ngx_stream_access_module` runs in the ACCESS phase, before
+                    // `return` or `proxy_pass`; a denied peer has its connection
+                    // closed with no bytes at all.
+                    if !access.is_empty() {
+                        let denied = if peer_unix {
+                            crate::config::typed::access_denied_for(
+                                &access,
+                                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                                true,
+                            )
+                        } else {
+                            crate::config::typed::access_denied_for(&access, peer.ip(), false)
+                        };
+                        if denied {
+                            // nginx answers nothing at all: the connection is
+                            // simply closed, and `$status` reports 403.
+                            if let Some(a) = alog.as_mut() {
+                                a.status = 403;
+                            }
+                            drop(alog);
+                            return;
+                        }
+                    }
                     // `listen ... proxy_protocol`: the header arrives before
                     // anything else, TLS included, and `$proxy_protocol_*`
                     // depends on it (`stream_proxy_protocol2_tlv.t`).

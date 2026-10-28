@@ -86,6 +86,15 @@ request_id.t
 access_log.t
 access_log_variables.t
 
+# ---- stream upstream balancers ----
+# `max_conns` (per-peer cap, two-pool primary/backup walk), `hash` (both the
+# folded Cache::Memcached expression and the consistent ring), `least_conn`
+# with its smooth-WRR tie-break, and `random two least_conn`.
+stream_upstream_max_conns.t
+stream_upstream_hash.t
+stream_upstream_least_conn.t
+stream_upstream_random.t
+
 # ---- charset filter ----
 # `charset` / `source_charset` / `charset_types` / `override_charset` /
 # `charset_map`, including the reverse direction of a declared map (one

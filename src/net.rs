@@ -268,23 +268,48 @@ pub fn serve(cfg: Config) -> io::Result<()> {
     let stream_maps = std::sync::Arc::new(cfg.stream.maps.clone());
     let stream_splits = std::sync::Arc::new(cfg.stream.splits.clone());
     for sc in &cfg.stream.servers {
-        let mut backends = Vec::new();
-        if let Some(pp) = &sc.proxy_pass {
+        // `proxy_pass` names either an `upstream {}` block or a plain
+        // host:port. Both become a peer set: a direct address is simply a set
+        // with one unlimited peer, so the proxy path is the same either way.
+        let peers = if let Some(pp) = &sc.proxy_pass {
             if let Some(up) = cfg.stream.upstreams.iter().find(|u| &u.name == pp) {
-                backends = up.backends.clone();
+                crate::streamlb::PeerSet::new(
+                    up.servers.clone(),
+                    up.method.clone(),
+                    up.hash_key.clone(),
+                )
             } else if let Some(addr) = parse_stream_addr(pp) {
-                backends.push(addr);
+                crate::streamlb::PeerSet::new(
+                    vec![crate::config::UpstreamServer {
+                        addr,
+                        weight: 1,
+                        backup: false,
+                        down: false,
+                        name: pp.clone(),
+                        max_fails: 1,
+                        fail_timeout: std::time::Duration::from_secs(10),
+                        max_conns: 0,
+                    }],
+                    crate::config::LbMethod::RoundRobin,
+                    String::new(),
+                )
             } else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("stream proxy_pass \"{pp}\" is neither an upstream nor host:port"),
                 ));
             }
-        }
+        } else {
+            crate::streamlb::PeerSet::new(
+                Vec::new(),
+                crate::config::LbMethod::RoundRobin,
+                String::new(),
+            )
+        };
         stream_cfg.servers.push(crate::stream::StreamServer {
             listen: sc.listen,
             udp: sc.udp,
-            backends,
+            peers,
             proxy_timeout: sc.proxy_timeout,
             proxy_connect_timeout: sc.proxy_connect_timeout,
             sinks: crate::config::typed::open_sinks(&sc.error_logs),

@@ -1195,6 +1195,11 @@ pub struct UpstreamServer {
     /// `fail_timeout=T` (nginx default 10s): how long a peer with
     /// `fails >= max_fails` stays out of rotation.
     pub fail_timeout: Duration,
+    /// `max_conns=N`: cap on simultaneous connections to this peer, 0 meaning
+    /// unlimited (nginx's default). Reached the cap, the peer is skipped for
+    /// this connection and the balancer moves on -- to a backup if there is one,
+    /// otherwise the connection is refused.
+    pub max_conns: u32,
 }
 
 /// One resolved `proxy_redirect` rule.
@@ -1719,7 +1724,10 @@ pub struct StreamSection {
 #[derive(Debug, Clone)]
 pub struct StreamUpstream {
     pub name: String,
-    pub backends: Vec<SocketAddr>,
+    pub servers: Vec<UpstreamServer>,
+    pub method: LbMethod,
+    /// `hash <key>` template, expanded per connection.
+    pub hash_key: String,
 }
 
 #[derive(Debug, Clone)]
@@ -2068,6 +2076,7 @@ fn parse_upstream(d: &Directive) -> Result<Upstream, ConfigError> {
                     name: addr_arg.clone(),
                     max_fails: 1,
                     fail_timeout: Duration::from_secs(10),
+                    max_conns: 0,
                 };
                 for p in &child.args[1..] {
                     if p == "backup" {
@@ -2082,6 +2091,8 @@ fn parse_upstream(d: &Directive) -> Result<Upstream, ConfigError> {
                         if let Some(t) = parse_time(ft) {
                             srv.fail_timeout = t;
                         }
+                    } else if let Some(mc) = p.strip_prefix("max_conns=") {
+                        srv.max_conns = mc.parse().unwrap_or(0);
                     }
                 }
                 up.servers.push(srv);
@@ -2125,7 +2136,7 @@ fn parse_upstream(d: &Directive) -> Result<Upstream, ConfigError> {
                     .unwrap_or(false);
                 up.method = LbMethod::Hash { key, consistent };
             }
-            "keepalive_requests" | "keepalive_timeout" | "zone" | "queue" | "resolver" => {}
+            "zone" | "queue" | "resolver" => {}
             other => {
                 return Err(sem(
                     &child.file,
@@ -2151,6 +2162,11 @@ fn parse_upstream(d: &Directive) -> Result<Upstream, ConfigError> {
 
 /// nginx's CRC-32 (the standard IEEE table, `ngx_crc32_table_init`): needed
 /// byte-for-byte because the hash balancer's peer mapping depends on it.
+/// One-shot CRC-32 (the zlib polynomial nginx uses for `hash` keys).
+pub fn crc32(data: &[u8]) -> u32 {
+    crc32_update(0, data)
+}
+
 pub fn crc32_update(crc: u32, data: &[u8]) -> u32 {
     fn table_entry(i: u32) -> u32 {
         let mut c = i;
@@ -2193,7 +2209,7 @@ fn chash_host_port(server: &str) -> (&str, &str) {
 /// Cache::Memcached::Fast-compatible points: per peer `weight * 160` entries,
 /// each `crc32(host \0 port prev_hash_le32)` chained through the previous
 /// point's hash, sorted and deduplicated by hash.
-fn build_chash_points(servers: &[UpstreamServer]) -> Vec<(u32, usize)> {
+pub fn build_chash_points(servers: &[UpstreamServer]) -> Vec<(u32, usize)> {
     let mut points: Vec<(u32, usize)> = Vec::new();
     for (i, s) in servers.iter().enumerate() {
         let (host, port) = chash_host_port(&s.name);
@@ -2235,6 +2251,7 @@ mod chash_tests {
             name: n.to_string(),
             max_fails: 1,
             fail_timeout: Duration::from_secs(10),
+            max_conns: 0,
         })
         .collect();
         let ring = build_chash_points(&servers);
@@ -4858,10 +4875,38 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                     .first()
                     .ok_or_else(|| sem(&d.file, d.line, "stream upstream requires a name"))?
                     .clone();
-                let mut backends = Vec::new();
+                // The same peer description the http balancer uses: weight,
+                // backup, down, max_fails/fail_timeout and now max_conns.
+                let mut servers: Vec<UpstreamServer> = Vec::new();
+                let mut method = LbMethod::RoundRobin;
+                let mut hash_key = String::new();
                 for child in d.block.as_ref().map(|x| x.as_slice()).unwrap_or(&[]) {
-                    if child.name != "server" {
-                        continue;
+                    match child.name.as_str() {
+                        "least_conn" => {
+                            method = LbMethod::LeastConn;
+                            continue;
+                        }
+                        "random" => {
+                            let two = child.args.first().map(|a| a == "two").unwrap_or(false);
+                            let least_conn = child.args.iter().any(|a| a == "least_conn");
+                            method = LbMethod::Random { two, least_conn };
+                            continue;
+                        }
+                        "hash" => {
+                            hash_key = child.args.first().cloned().unwrap_or_default();
+                            let consistent =
+                                child.args.get(1).map(|a| a == "consistent").unwrap_or(false);
+                            method = LbMethod::Hash {
+                                key: hash_key.clone(),
+                                consistent,
+                            };
+                            continue;
+                        }
+                        // Accepted, no data-path meaning for a raw TCP proxy.
+                        "keepalive" | "keepalive_timeout" | "keepalive_time"
+                        | "keepalive_requests" | "zone" | "queue" | "resolver" => continue,
+                        "server" => {}
+                        _ => continue,
                     }
                     let a = child.args.first().ok_or_else(|| {
                         sem(&child.file, child.line, "server requires an address")
@@ -4876,12 +4921,44 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                     if !a.contains(':') {
                         addr = SocketAddr::new(addr.ip(), 80);
                     }
-                    backends.push(addr);
+                    let mut srv = UpstreamServer {
+                        addr,
+                        weight: 1,
+                        backup: false,
+                        down: false,
+                        name: a.clone(),
+                        max_fails: 1,
+                        fail_timeout: Duration::from_secs(10),
+                        max_conns: 0,
+                    };
+                    for p in &child.args[1..] {
+                        if p == "backup" {
+                            srv.backup = true;
+                        } else if p == "down" {
+                            srv.down = true;
+                        } else if let Some(w) = p.strip_prefix("weight=") {
+                            srv.weight = w.parse().unwrap_or(1).max(1);
+                        } else if let Some(mf) = p.strip_prefix("max_fails=") {
+                            srv.max_fails = mf.parse().unwrap_or(1);
+                        } else if let Some(ft) = p.strip_prefix("fail_timeout=") {
+                            if let Some(t) = parse_time(ft) {
+                                srv.fail_timeout = t;
+                            }
+                        } else if let Some(mc) = p.strip_prefix("max_conns=") {
+                            srv.max_conns = mc.parse().unwrap_or(0);
+                        }
+                    }
+                    servers.push(srv);
                 }
-                if backends.is_empty() {
+                if servers.is_empty() {
                     return Err(sem(&d.file, d.line, "stream upstream has no servers"));
                 }
-                section.upstreams.push(StreamUpstream { name, backends });
+                section.upstreams.push(StreamUpstream {
+                    name,
+                    servers,
+                    method,
+                    hash_key,
+                });
             }
             "server" => server_dirs.push(d),
             "geo" => section.geos.push(parse_geo(d)?),

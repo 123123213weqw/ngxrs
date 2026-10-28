@@ -36,6 +36,7 @@ mod split;
 mod ssi;
 mod stats;
 mod stream;
+mod streamlb;
 mod streamvars;
 mod timing;
 mod tls;

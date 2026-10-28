@@ -20,8 +20,8 @@ use tokio::sync::watch;
 pub struct StreamServer {
     pub listen: SocketAddr,
     pub udp: bool,
-    /// Round-robin backend list; empty when `return` is set.
-    pub backends: Vec<SocketAddr>,
+    /// Peers and balancer for `proxy_pass`; empty when `return` is set.
+    pub peers: std::sync::Arc<crate::streamlb::PeerSet>,
     pub proxy_timeout: Duration,
     pub proxy_connect_timeout: Duration,
     /// `error_log` destinations of this stream server.
@@ -161,18 +161,16 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                 let local = client.local_addr().ok();
                 let n = crate::mail::next_conn_id();
                 if let Some(local) = local {
-                    let backends_now = server.backends.clone();
-                    let up = pick_backend(&backends_now, &counter)
-                        .map(|a| a.to_string())
-                        .unwrap_or_else(|| "-".to_string());
-                    let up = if up == "-" { "127.0.0.1:0".to_string() } else { up };
+                    // Only *describe* the peer: picking here would take a
+                    // `max_conns` slot that the real selection then cannot use.
+                    let up = server.peers.describe();
                     crate::log::log_to(
                         &server.sinks,
                         crate::log::Level::Info,
                         &format!("*{n} client {peer} connected to {local}, proxy to \"{up}\"", ),
                     );
                 }
-                let backends = server.backends.clone();
+                let peers = server.peers.clone();
                 let timeout = server.proxy_timeout;
                 let tls = server.tls.clone();
                 let connect_timeout = server.proxy_connect_timeout;
@@ -247,19 +245,72 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                         drop(alog);
                         return;
                     }
-                    let Some(upstream) = pick_backend(&backends, &counter) else {
+                    // `max_conns` and `backup` decide the candidate order; a
+                    // failed connect moves on to the next peer, which is what
+                    // nginx's default `proxy_next_upstream on` does while
+                    // nothing has been sent yet.
+                    let hash_key = if peers.hash_key.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            crate::streamvars::Vars {
+                                peer,
+                                local: client_local.unwrap_or(peer),
+                                udp: false,
+                                maps: &maps,
+                                geos: &geos,
+                                ssl: None,
+                                proxy_protocol: None,
+                                custom: &NO_CUSTOM,
+                                splits: &splits,
+                                connection: crate::stats::accepted(),
+                            }
+                            .expand(&peers.hash_key),
+                        )
+                    };
+                    // nginx's `pc->tries` starts at the primary count and each
+                    // attempt marks a peer tried, so the loop below is the
+                    // `max_fails`-aware equivalent of one `get_peer` per try.
+                    let now = || {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0)
+                    };
+                    let mut tried = vec![false; peers.len()];
+                    let mut chosen: Option<crate::streamlb::Guard> = None;
+                    let mut upstream = None;
+                    let mut attempts = 0usize;
+                    while attempts < peers.len().max(1) * 2 {
+                        let Some(idx) = peers.pick(&mut tried, hash_key.as_deref(), now()) else {
+                            break;
+                        };
+                        attempts += 1;
+                        match tokio::time::timeout(
+                            connect_timeout,
+                            TcpStream::connect(peers.addr(idx)),
+                        )
+                        .await
+                        {
+                            Ok(Ok(s)) => {
+                                let _ = s.set_nodelay(true);
+                                // `pick` already counted the connection; the
+                                // guard owns that slot from here on.
+                                chosen = Some(peers.guard(idx));
+                                upstream = Some(s);
+                                break;
+                            }
+                            // A refused or timed-out connect is `NGX_PEER_FAILED`:
+                            // it counts against `max_fails` and the next peer is
+                            // tried (`proxy_next_upstream on`).
+                            _ => peers.release(idx, false, now()),
+                        }
+                    }
+                    let (Some(upstream), Some(_guard)) = (upstream, chosen) else {
+                        // Every peer was at `max_conns`, refused or disabled:
+                        // nginx closes the client connection (`NGX_BUSY`).
                         return;
                     };
-                    let upstream = match tokio::time::timeout(
-                        connect_timeout,
-                        TcpStream::connect(upstream),
-                    )
-                    .await
-                    {
-                        Ok(Ok(s)) => s,
-                        _ => return,
-                    };
-                    let _ = upstream.set_nodelay(true);
                     // `proxy_ssl on`: speak TLS to the upstream, then splice.
                     if proxy_ssl {
                         // `proxy_ssl_name` is a complex value (`proxy_ssl_name
@@ -443,24 +494,42 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
     }
 }
 
-fn pick_backend(
-    backends: &[SocketAddr],
-    counter: &std::sync::atomic::AtomicUsize,
-) -> Option<SocketAddr> {
-    if backends.is_empty() {
-        return None;
-    }
-    let i = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % backends.len();
-    Some(backends[i])
-}
-
 /// Splice two arbitrary transports (used when either side speaks TLS).
+///
+/// `proxy_half_close` defaults to **off**, so the first EOF ends the whole
+/// session: nginx shuts both sides down as soon as one is done. Waiting for
+/// both directions to finish (`copy_bidirectional`) keeps the session -- and the
+/// upstream connection slot -- alive while the peer that already finished just
+/// sits there, which made `least_conn` see a tie where nginx sees a free peer
+/// (`stream_upstream_least_conn.t`) and held `max_conns` slots too long.
 async fn splice<A, B>(mut a: A, mut b: B)
 where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut ab = vec![0u8; 16 * 1024];
+    let mut ba = vec![0u8; 16 * 1024];
+    loop {
+        tokio::select! {
+            r = a.read(&mut ab) => match r {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if b.write_all(&ab[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            },
+            r = b.read(&mut ba) => match r {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if a.write_all(&ba[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            },
+        }
+    }
     let _ = a.shutdown().await;
     let _ = b.shutdown().await;
 }
@@ -690,17 +759,14 @@ fn client_cert_vars(
     (verify, pem)
 }
 
-async fn proxy_tcp(
-    mut client: TcpStream,
-    mut upstream: TcpStream,
-    _idle: Duration,
-    _peer: SocketAddr,
-) {
-    // `copy_bidirectional` already returns when either side closes; enforcing
-    // proxy_timeout with an outer timeout would also cut long-lived transfers.
-    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
-    let _ = client.shutdown().await;
-    let _ = upstream.shutdown().await;
+async fn proxy_tcp(client: TcpStream, upstream: TcpStream, _idle: Duration, _peer: SocketAddr) {
+    // The earlier comment here claimed `copy_bidirectional` returns as soon as
+    // one side closes. It does not: it waits for *both* directions, so a backend
+    // that answers and closes kept the session -- and the upstream connection
+    // slot -- alive until the client also went away. With `proxy_half_close`
+    // off (the default) nginx ends the session on the first EOF, which is what
+    // `splice` now does.
+    splice(client, upstream).await;
 }
 
 async fn serve_udp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
@@ -733,8 +799,22 @@ async fn serve_udp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let backend = match pick_backend(&server.backends, &counter) {
-                    Some(b) => b,
+                // UDP: one backend per client session, chosen once so the
+                // session keeps talking to the same peer.
+                let mut tried = vec![false; server.peers.len()];
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let backend = match server.peers.pick(&mut tried, None, now) {
+                    Some(i) => {
+                        // A UDP "connection" is a session, not a socket: the
+                        // slot is taken for the pick and released at once so a
+                        // long-lived session does not pin `max_conns`.
+                        let a = server.peers.addr(i);
+                        server.peers.release(i, true, now);
+                        a
+                    }
                     None => continue,
                 };
                 let up = if let Some(s) = sessions.get(&peer) {

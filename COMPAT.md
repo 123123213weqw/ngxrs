@@ -2547,3 +2547,42 @@ for i in 1 2 3 4 5; do TEST_LIST="proxy_cache_valid.t" bash bench/nginxtests.sh 
 修后 5/5 SAME；缓存族 14 个文件全部 SAME（`proxy_cache_range.t` 仍 BETTER，9 对 nginx 8），
 无回归。单测新增 3 条边界用例（`fresh_at_the_boundary_second`、`zero_ttl_is_immediately_stale`、
 `longer_ttl_boundary`），175 → 178。
+
+## 本轮（代理 chunked 响应被补 Content-Length，与 nginx 不符）
+
+复验 `bench/all.sh` 时 `features` 组 27/28，失败的是自建的 `proxy-chunked`：
+
+```
+nginx : Transfer-Encoding: chunked
+ngxrs : Content-Length: 16
+```
+
+体内容一致（`alpha-beta-gamma`），差别在**分帧**。原因是 `BUFFER_CHUNKED_UPSTREAM`
+被我上一轮设成了 `true`，注释给的理由是「`proxy_buffering on` 让 nginx 吸收 chunked
+响应并改发 Content-Length」。
+
+**这个理由是错的。** 同配置直接比对（16 字节 chunked 体）：
+
+| | 响应头 |
+|---|---|
+| nginx 1.28 | `Transfer-Encoding: chunked`（无 Content-Length） |
+| ngxrs（修前） | `Content-Length: 16` |
+
+`proxy_buffering on` 不会让 nginx 凭空造一个长度——头部在体结束前就发出去了。缓冲只在
+**必须知道完整体**时才需要：写入缓存，或从体中切 `Range`。
+
+已删除该常量，缓冲条件回到 `cacheable || wants_ranges`；相应的「dechunk 后丢掉
+Transfer-Encoding」改由 `head.chunked` 判断（走到那条路径就说明已经缓冲并解帧）。
+
+当时开启它的顾虑（`proxy_cache_vary.t` 会掉 5 条）在连接池修复之后已不成立——实测
+关闭后 `proxy_cache_vary.t` 仍是 53/54 SAME。
+
+结果：`proxy_chunked.t` 5/5 SAME、`proxy_chunked_extra.t` 3/3 SAME、
+`proxy_cache_vary.t` 53/54 SAME、`bench/all.sh` **70/70 PASS**。
+
+复现：
+
+```bash
+bash bench/feature.sh 2>&1 | grep -E 'DIFF|cases match'
+TEST_LIST="proxy_chunked.t proxy_chunked_extra.t proxy_cache_vary.t" bash bench/nginxtests.sh
+```

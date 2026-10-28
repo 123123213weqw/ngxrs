@@ -2913,22 +2913,15 @@ async fn exchange(
         && !is_upgrade
         && !cache.no_store
         && cache.min_uses_ok;
-    // `proxy_buffering on` (the default) makes nginx absorb a chunked upstream
-    // reply and re-send it with a Content-Length, so the client never sees the
-    // upstream's chunk framing (`proxy_chunked.t` checks the raw bytes).
+    // A chunked upstream reply is passed through with its chunk framing, which
+    // is what nginx does: `proxy_buffering on` does *not* make nginx invent a
+    // `Content-Length`. Measured directly (same config, 16-byte chunked body
+    // from a backend): nginx `Transfer-Encoding: chunked`, and an earlier
+    // version of this file answered `Content-Length: 16` instead.
     //
-    // OFF by default: enabling it fixes `proxy_chunked.t` #1 but costs five
-    // assertions in `proxy_cache_vary.t` (entries start reporting HIT where
-    // nginx says MISS) and the mechanism is not understood yet. Shipping an
-    // unexplained behaviour change for a net -4 is worse than the missing
-    // assertion. See OPEN-ISSUES in COMPAT.md.
-    const BUFFER_CHUNKED_UPSTREAM: bool = true;
-    let buffered_chunked = BUFFER_CHUNKED_UPSTREAM
-        && loc.proxy_buffering
-        && head.chunked
-        && !is_upgrade
-        && total_len.is_none();
-    if cacheable || wants_ranges || buffered_chunked {
+    // Buffering here is only required when the body must be known in full --
+    // to store it in the cache, or to slice a `Range` out of it.
+    if cacheable || wants_ranges {
         let mut payload = buf;
         match (head.chunked, total_len) {
             // Chunked: read to the terminator, then decode. The terminator is
@@ -3030,9 +3023,10 @@ async fn exchange(
             cache.status,
             upstream_addr,
         );
-        // We dechunked a buffered upstream reply, so the framing header must go
-        // and a Content-Length takes its place.
-        if buffered_chunked {
+        // Reaching here means the body was buffered in full, which for a
+        // chunked reply also means it was dechunked, so the upstream's framing
+        // header has to go and a `Content-Length` takes its place.
+        if head.chunked {
             out_raw = drop_header(&out_raw, "transfer-encoding");
         }
         // A close-delimited upstream response has no length; since we buffered

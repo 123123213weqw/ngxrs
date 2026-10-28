@@ -133,12 +133,21 @@ fn scgi_request(params: &[(String, String)], body: &[u8]) -> Vec<u8> {
 
 /// Split a CGI-style header block (same rules as the FastCGI module).
 fn parse_cgi(buf: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>, bool) {
-    let split = memchr::memmem::find(buf, b"\r\n\r\n");
-    let (head, body) = match split {
-        Some(i) => (&buf[..i], buf[i + 4..].to_vec()),
-        None => (&buf[..0], buf.to_vec()),
+    // Accept bare-LF line endings as well as CRLF. `ngx_http_scgi_process_header`
+    // tolerates both, and responders in the wild use both -- this suite's daemon
+    // prints its header block with plain `\n`, so looking only for CRLFCRLF put
+    // the whole block into the body (`scgi.t`, "scgi redirect": we answered 200
+    // with the headers as payload where nginx answers 302).
+    let (head, body) = if let Some(i) = memchr::memmem::find(buf, b"\r\n\r\n") {
+        (&buf[..i], buf[i + 4..].to_vec())
+    } else if let Some(i) = memchr::memmem::find(buf, b"\n\n") {
+        (&buf[..i], buf[i + 2..].to_vec())
+    } else {
+        (&buf[..0], buf.to_vec())
     };
     let mut status = 200u16;
+    let mut saw_status = false;
+    let mut saw_location = false;
     let mut headers = Vec::new();
     let mut had_length = false;
     for line in head.split(|b| *b == b'\n') {
@@ -154,12 +163,16 @@ fn parse_cgi(buf: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>, bool) {
             .trim()
             .to_string();
         if name.eq_ignore_ascii_case("status") {
+            saw_status = true;
             status = value
                 .split_whitespace()
                 .next()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(200);
             continue;
+        }
+        if name.eq_ignore_ascii_case("location") {
+            saw_location = true;
         }
         if name.eq_ignore_ascii_case("content-length") {
             had_length = true;
@@ -173,6 +186,13 @@ fn parse_cgi(buf: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>, bool) {
             continue;
         }
         headers.push((name, value));
+    }
+    // RFC 3875 §6.2.3: a CGI script that returns `Location` without `Status`
+    // asks the server to redirect, so the answer is 302. nginx implements this
+    // (`scgi.t`, "scgi redirect": the backend sends only `Location` and nginx
+    // answers `302 Moved Temporarily`).
+    if !saw_status && saw_location {
+        status = 302;
     }
     (status, headers, body, had_length)
 }
@@ -263,6 +283,34 @@ async fn run(
     }
     if kind == "scgi" && !all.iter().any(|(k, _)| k == "SCGI") {
         all.push(("SCGI".into(), "1".into()));
+    }
+    // The SCGI params block *is* the CGI environment, so every request header
+    // becomes `HTTP_<NAME>` (SCGI protocol spec). nginx does this in
+    // `ngx_http_scgi_create_request`; without it the backend sees only the
+    // variables the config named explicitly (`scgi.t`, "scgi with multiple
+    // X-Forwarded-For headers"). Repeated headers are joined the same way
+    // `$http_*` joins them: `, ` generally, `; ` for Cookie.
+    if kind == "scgi" {
+        let mut seen: Vec<&str> = Vec::new();
+        for (name, _) in req.headers.iter() {
+            if seen.contains(&name) {
+                continue;
+            }
+            seen.push(name);
+            // These have their own params (`CONTENT_LENGTH`; nginx does not add
+            // `HTTP_CONTENT_TYPE`/`HTTP_TRANSFER_ENCODING` either).
+            if matches!(name, "content-length" | "content-type" | "transfer-encoding") {
+                continue;
+            }
+            let mut key = String::with_capacity(name.len() + 5);
+            key.push_str("HTTP_");
+            for c in name.chars() {
+                key.push(if c == '-' { '_' } else { c.to_ascii_uppercase() });
+            }
+            if let Some(v) = req.headers.get_joined(name) {
+                all.push((key, v));
+            }
+        }
     }
 
     let packet = if kind == "uwsgi" {
@@ -442,6 +490,7 @@ pub async fn handle_uwsgi(
     loc: &crate::config::LocCfg,
     tokens: bool,
     vars: &crate::http::ServerVars<'_>,
+    http: &crate::config::Http,
 ) -> io::Result<Option<Outcome>> {
     let Some(pass) = &loc.uwsgi_pass else {
         return Ok(None);
@@ -463,13 +512,27 @@ pub async fn handle_uwsgi(
     } else {
         None
     };
+    // `uwsgi_pass $var` is resolved once the variables are known, exactly as
+    // `fastcgi_pass` does; the value may be an `upstream` name or `host:port`.
+    let addr = if pass.dynamic {
+        let target = vars.expand(&pass.spec);
+        match crate::fastcgi::resolve_dynamic(&target, http) {
+            Some(a) => a,
+            None => {
+                eprintln!("ngxrs: [error] uwsgi_pass \"{target}\" is not a resolvable address");
+                return Ok(Some(error_out(conn, 502, tokens, req.keepalive).await?));
+            }
+        }
+    } else {
+        pass.addr
+    };
     run(
         conn,
         req,
         path,
         query,
         loc,
-        pass.addr,
+        addr,
         "uwsgi",
         &loc.uwsgi_params,
         pass.connect_timeout,
@@ -487,9 +550,23 @@ pub async fn handle_scgi(
     query: &str,
     loc: &crate::config::LocCfg,
     tokens: bool,
+    vars: &crate::http::ServerVars<'_>,
+    http: &crate::config::Http,
 ) -> io::Result<Option<Outcome>> {
     let Some(pass) = &loc.scgi_pass else {
         return Ok(None);
+    };
+    let addr = if pass.dynamic {
+        let target = vars.expand(&pass.spec);
+        match crate::fastcgi::resolve_dynamic(&target, http) {
+            Some(a) => a,
+            None => {
+                eprintln!("ngxrs: [error] scgi_pass \"{target}\" is not a resolvable address");
+                return Ok(Some(error_out(conn, 502, tokens, req.keepalive).await?));
+            }
+        }
+    } else {
+        pass.addr
     };
     run(
         conn,
@@ -497,7 +574,7 @@ pub async fn handle_scgi(
         path,
         query,
         loc,
-        pass.addr,
+        addr,
         "scgi",
         &loc.scgi_params,
         pass.connect_timeout,

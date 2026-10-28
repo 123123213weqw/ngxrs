@@ -298,3 +298,4 @@ mail_pop3.t
 mail_smtp.t
 mail_smtp_greeting_delay.t
 mail_smtp_xclient.t
+scgi.t

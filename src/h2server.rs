@@ -318,6 +318,12 @@ async fn handle_stream(
             || loc.fastcgi_pass.is_some()
             || loc.uwsgi_pass.is_some()
             || loc.scgi_pass.is_some()
+            // `grpc_pass` is deliberately absent: it must *stream* the request
+            // body (see `COMPAT.md`), so it cannot wait here for the whole body
+            // the way the other upstream modules do. Reading it first deadlocks
+            // against the test backend, which only sends the body after it has
+            // seen our HEADERS. Measured: grpc.t 19 ok / 43 not ok before,
+            // 2 ok / 8 not ok with this line added.
             || (loc.dav_methods != 0)
             || crate::http::references_body_var(&loc.headers)
             || loc

@@ -2703,3 +2703,71 @@ TEST_LIST="grpc_next_upstream.t" bash bench/nginxtests.sh   # 应 SAME 11/11
 排查阶段还发现自己写的一处**多余改动**：`h2_roundtrip` 里曾为「body 非空」复制了一整段
 响应读取循环，理由是「发完 DATA 要立刻释放 SendStream」，而实测两种写法都能通过——
 真正起作用的只有 `end_of_stream`。那段重复代码已删除。
+
+## 本轮（SCGI：变量目标、`HTTP_*` 参数、LF 头块、CGI 302）
+
+`scgi.t` 此前**从未运行过**：`Test::Nginx` 需要 Perl 的 `SCGI` 模块，CPAN 镜像里没有，
+于是两边一起跳过，在扫描里显示为 `SKIP`。装上之后 `nginx 12/12`、`ngxrs 0/12`——
+又一个"隐身"的真实缺口。本轮做到 **12/12 与 nginx 完全一致**，并加入声明清单。
+
+同批 `fastcgi.t` 一直是 `TRUNC`（0/10），本轮 **10/10 一致**。
+
+### 四个独立缺陷
+
+**1. `scgi_pass` / `uwsgi_pass` 不接受变量目标。**
+配置直接拒绝：
+
+```
+ngxrs: .../nginx.conf:37: invalid scgi_pass "$arg_b"
+Can't start nginx
+```
+
+`fastcgi_pass` 早就支持（`spec` + `dynamic`），这两个没有。现在按同样方式补齐，
+运行时用 `expand` + `fastcgi::resolve_dynamic` 解析（该函数改为 `pub(crate)` 共用，
+而不是抄一份）。`fastcgi.t` 的 TRUNC 正是这一条——它也用 `fastcgi_pass $arg_b`，
+所以本轮之前的 `TRUNC` 归因（"变量目标未实现"）得到了验证。
+
+**2. SCGI 不传 `HTTP_*` 参数。**
+SCGI 的 params 块**就是** CGI 环境，所有请求头都要以 `HTTP_<NAME>` 出现
+（nginx 的 `ngx_http_scgi_create_request` 逐个 header 生成）。我们只发配置里点名的那几个，
+于是后端看不到 `X-Forwarded-For` / `Cookie` / `Foo`。现在按 `$http_*` 相同的规则合并重复头
+（一般用 `, `，Cookie 用 `; `），并跳过 `content-length` / `content-type` /
+`transfer-encoding`（它们有独立参数）。
+断言 8/9/10 一次全过。
+
+**3. SCGI 头块只认 CRLF。**
+`parse_cgi` 找 `\r\n\r\n`，而该套件的后端用纯 `\n`，于是**整个头块被当成 body**：
+
+```
+修前  HTTP/1.1 200 OK        Transfer-Encoding: chunked
+      body 开头是 "Location: http://localhost/redirect\nContent-Type: ..."
+修后  302 + Location，头在头里、body 只有 SEE-THIS
+```
+
+FastCGI 的解析器早就兼容两种行尾（它的注释里就写着这条），SCGI 的漏了。
+
+**4. CGI 的 `Location` 隐含 302（RFC 3875 §6.2.3）。**
+后端只给 `Location`、不给 `Status:` 时，nginx 回 **302 Moved Temporarily**，我们回 200。
+这条是我把用例拷贝一份、把断言换成 `diag()` 直接 dump 出 nginx 的原始响应才确认的：
+
+```
+# REDIR>>>HTTP/1.1 302 Moved Temporarily ... Location: http://localhost/redirect
+```
+
+规则已加在 `parse_cgi`：`Location` 出现且没有 `Status` → 302。
+**只加在 SCGI/uwsgi 上**：fastcgi 用另一个解析器，而我们没有 fastcgi 侧失败断言可以验证，
+不凭推测一起改。
+
+### 仍未解决
+
+- `uwsgi.t` 仍是 `SKIP`：`has_daemon('uwsgi')` 需要 `uwsgi` 二进制，两边都跳过，
+  与本项目实现无关。要在本机测量需先安装并启动它。
+- SCGI 侧的 `HTTP_*` 是否也该加 `uwsgi`：nginx 的 uwsgi 模块**不**自动传 header
+  （uwsgi 的参数由 `uwsgi_param` 显式给出），本轮保持原样。
+
+复现：
+
+```bash
+cpanm --local-lib=$HOME/perl5 SCGI      # 一次性
+TEST_LIST="scgi.t fastcgi.t" bash bench/nginxtests.sh   # 应 SAME 12/12 与 10/10
+```

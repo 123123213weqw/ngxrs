@@ -741,7 +741,7 @@ async fn fetch_uncached(
 /// nginx's `ngx_http_upstream_init_request` does the same thing: a URL whose
 /// host is an upstream name goes through that upstream, anything else is
 /// parsed as `host:port`.
-fn resolve_dynamic(target: &str, http: &Http) -> Option<SocketAddr> {
+pub(crate) fn resolve_dynamic(target: &str, http: &Http) -> Option<SocketAddr> {
     let target = target.trim();
     if let Some(rest) = target.strip_prefix("unix:") {
         // A unix target is not a SocketAddr; the caller cannot express it, so

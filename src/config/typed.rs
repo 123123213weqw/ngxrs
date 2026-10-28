@@ -853,7 +853,13 @@ pub struct FastcgiPass {
 
 #[derive(Debug, Clone)]
 pub struct UwsgiPass {
+    /// The literal address. Only meaningful when `dynamic` is false.
     pub addr: SocketAddr,
+    /// As written. Kept because `uwsgi_pass` accepts a complex value
+    /// (`uwsgi_pass $arg_b`) that nginx resolves per request, against either an
+    /// `upstream` name or `host:port` -- same as `fastcgi_pass`.
+    pub spec: String,
+    pub dynamic: bool,
     /// `uwsgi_pass suwsgi://` -- the connection is TLS.
     pub tls: bool,
     pub connect_timeout: Duration,
@@ -862,7 +868,11 @@ pub struct UwsgiPass {
 
 #[derive(Debug, Clone)]
 pub struct ScgiPass {
+    /// The literal address. Only meaningful when `dynamic` is false.
     pub addr: SocketAddr,
+    /// As written; see `UwsgiPass::spec`.
+    pub spec: String,
+    pub dynamic: bool,
     pub connect_timeout: Duration,
     pub read_timeout: Duration,
 }
@@ -4014,10 +4024,19 @@ impl Builder {
                 // takes the rest as the address, then wraps the connection.
                 let tls = v.starts_with("suwsgi://");
                 let bare = v.strip_prefix("suwsgi://").unwrap_or(v);
-                let addr = parse_listen(bare)
-                    .ok_or_else(|| sem(&d.file, d.line, format!("invalid uwsgi_pass '{v}'")))?;
+                // A variable target is resolved per request (`uwsgi.t` uses
+                // `uwsgi_pass $arg_b`); only a literal is parsed here.
+                let dynamic = bare.contains('$');
+                let addr = if dynamic {
+                    SocketAddr::from(([127, 0, 0, 1], 0))
+                } else {
+                    parse_listen(bare)
+                        .ok_or_else(|| sem(&d.file, d.line, format!("invalid uwsgi_pass '{v}'")))? 
+                };
                 cfg.uwsgi_pass = Some(UwsgiPass {
                     addr,
+                    spec: bare.to_string(),
+                    dynamic,
                     tls,
                     connect_timeout: Duration::from_secs(60),
                     read_timeout: Duration::from_secs(60),
@@ -4053,10 +4072,17 @@ impl Builder {
                     .args
                     .first()
                     .ok_or_else(|| sem(&d.file, d.line, "scgi_pass requires an address"))?;
-                let addr = parse_listen(v)
-                    .ok_or_else(|| sem(&d.file, d.line, format!("invalid scgi_pass \"{v}\"")))?;
+                let dynamic = v.contains('$');
+                let addr = if dynamic {
+                    SocketAddr::from(([127, 0, 0, 1], 0))
+                } else {
+                    parse_listen(v)
+                        .ok_or_else(|| sem(&d.file, d.line, format!("invalid scgi_pass \"{v}\"")))?
+                };
                 cfg.scgi_pass = Some(ScgiPass {
                     addr,
+                    spec: v.to_string(),
+                    dynamic,
                     connect_timeout: Duration::from_secs(60),
                     read_timeout: Duration::from_secs(60),
                 });

@@ -5318,6 +5318,7 @@ async fn dispatch(
             loc,
             server.server_tokens,
             &uwsgi_vars,
+            http,
         )
         .await?
         {
@@ -5325,9 +5326,34 @@ async fn dispatch(
         }
     }
     if loc.scgi_pass.is_some() {
-        if let Some(o) =
-            crate::uwsgi_scgi::handle_scgi(conn, req, path, query, loc, server.server_tokens)
-                .await?
+        // `scgi_pass $var` needs the same variable view the other upstreams get.
+        let scgi_vars = crate::http::ServerVars {
+            req,
+            path,
+            query,
+            server_name: server.names.first().map(|s| s.as_str()).unwrap_or(""),
+            server_port: listen_port,
+            peer_ip: client_ip,
+            peer_port,
+            scheme: "http",
+            document_root: loc.root.to_str().unwrap_or(""),
+            upstream_cache_status: "",
+            custom: &set_vars,
+            connection_requests: state.requests,
+            connection_time: 0,
+            sent: &[],
+        };
+        if let Some(o) = crate::uwsgi_scgi::handle_scgi(
+            conn,
+            req,
+            path,
+            query,
+            loc,
+            server.server_tokens,
+            &scgi_vars,
+            http,
+        )
+        .await?
         {
             return Ok(o);
         }

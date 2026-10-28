@@ -13,7 +13,7 @@
 
 | 项 | 命令 | 当前结果 |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 134 文件，WORSE=0 TRUNC=0（nginx 2122 / ngxrs 2127，129 个逐断言一致、5 个更优） |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 135 文件，WORSE=0 TRUNC=0（nginx 2142 / ngxrs 2147，130 个逐断言一致、5 个更优） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
 | 单元测试 | `cargo test --release` | **PASS** — 175 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
@@ -987,9 +987,46 @@ slice 最后 5 条断言都读 `$upstream_cache_status`，没有它不可能通�
 二进制对照过，也是 14/17。那个缺口是仍未实现的 `fastcgi_request_buffering` 指令，该文件
 不在声明清单里。
 
+### 2026-10-28 第二十六轮：`proxy_request_buffering off`
+
+`proxy_request_buffering.t` 18/20 → **20/20**，入清单（134 → **135** 文件）。
+`fastcgi_request_buffering.t` 14/17 → 16/17，**未入清单**（原因见末尾）。
+
+这个指令此前**完全没有解析**：`proxy_request_buffering` 与
+`fastcgi_request_buffering` 躺在「接受但不生效」那一支，请求不缓冲的 location 拿到的是
+缓冲行为，而且没有任何提示。
+
+指令真正改变的是：**上游连接在读取客户端 body 之前就建立**。这正是测试里 `accept()` 检查
+的东西。此前 `handle` 先 `take_request_body` 再拨号，后端的 `accept()` 要等客户端把十个
+字节全部发出才能返回 —— 两条 preread 断言直接超时。
+
+四处必须同时对上，每一处都是上一条修好后由下一条断言暴露的：
+
+1. `build_upstream_head` 发的是 `Content-Length: 0`（它只看到空的缓冲体），而 body 在之后
+   才流式送出。上游于是等一个「头里说不存在」的 body。
+2. 按固定长度转发（`take_body(want)`）会一直等到凑满；nginx 是**读到多少转多少**。
+   `Conn::take_available` 返回当前已缓冲的部分。这才让 "preread - body part" 在客户端只
+   写了五个字节后就看到 `01234`。
+3. 随请求头一起到达的那部分 body 必须与头**在同一次写出**中发出 —— 后端在 `accept()`
+   之后只做一次 `sysread`，期望两样都在。所以这段前缀在写出前被折进头部缓冲区。
+4. `$request_body` 必须在非缓冲路径之后仍然可读：nginx 无论缓冲与否都会填
+   `r->request_body`，而 `fastcgi_request_buffering.t` 通过 `error_page` 目标读它。现在流式
+   送出的字节会按 `client_body_buffer_size` 上限保留在 `Request::streamed_body`
+   （`Arc<Mutex<..>>`，因为 request 是共享的），该变量回退到它。
+
+chunked body 在两个模块上都仍然缓冲：不缓冲转发意味着边收边重新分帧。我试过 fastcgi 那一半，
+它把 `fastcgi_request_buffering_chunked.t` 从 17/21 拉到 **12/21**，所以**回退了**，
+而不是把一个半成品留在树里 —— 注释里写明了这一点和原因。
+
+**`fastcgi_request_buffering.t` 停在 16/17，不进声明清单。** 剩下那条是 "body in error
+page"，它**与缓冲无关**：`fastcgi::handle` 直接把响应写连接，所以
+`error_page` / `fastcgi_intercept_errors` 对 fastcgi 上游状态**从不执行** —— nginx 交给
+`/404` 的地方我们回 404。这与 proxy 在学会返回 `Proxied::Intercept` 之前是同一处结构缺口，
+给 fastcgi 补上是一件独立的事。
+
 ## 二、声明的测试清单
 
-清单在 `bench/declared.txt`，**134 个文件**，选取规则是机械的：
+清单在 `bench/declared.txt`，**135 个文件**，选取规则是机械的：
 
 1. 落在范围内（**参考构建 `-V` 能编出来的模块**：http core + proxy/cache/gzip/
    TLS/HTTP2/realip/auth_request/slice/sub/secure_link/dav/stub_status/gzip_static/

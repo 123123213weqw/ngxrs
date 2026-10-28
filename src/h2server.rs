@@ -62,12 +62,87 @@ pub async fn serve<S>(
         }
     };
 
-    while let Some(accepted) = conn.accept().await {
-        let (request, mut respond) = match accepted {
+    // Streams are handled concurrently, not one at a time.
+    //
+    // This is not a style choice: the `h2::server::Connection` is the only thing
+    // that reads the socket, and it makes progress only while it is being
+    // polled. Awaiting a request body inside the accept loop therefore stalled
+    // the connection whenever the body had not fully arrived -- the next DATA
+    // frame was never read, and a body larger than the stream window never even
+    // got its WINDOW_UPDATE. `h2_request_body.t`'s multi-frame, big-body and
+    // "discarded body" cases all hung on exactly that.
+    //
+    // So `accept()` keeps being polled here and each stream runs as a local
+    // future. `futures` is not a dependency, hence the small poll set below.
+    let mut pending: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>> =
+        Vec::new();
+    loop {
+        let accepted = tokio::select! {
+            a = conn.accept() => a,
+            _ = poll_all(&mut pending), if !pending.is_empty() => continue,
+        };
+        let Some(accepted) = accepted else {
+            break;
+        };
+        let (request, respond) = match accepted {
             Ok(v) => v,
             Err(_) => break,
         };
+        pending.push(Box::pin(handle_stream(
+            request,
+            respond,
+            server_idxs,
+            default_server,
+            http,
+            tokens,
+            listen_port,
+        )));
+    }
+    // Drain whatever is still in flight before the connection goes away.
+    while !pending.is_empty() {
+        poll_all(&mut pending).await;
+    }
+}
 
+/// Poll every future in `pending` once, dropping the ones that finished.
+///
+/// Returns as soon as at least one completed, so the caller's `select!` can make
+/// progress without needing a separate wakeup protocol.
+async fn poll_all<'a>(
+    pending: &mut Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>>,
+) {
+    std::future::poll_fn(|cx| {
+        use std::task::Poll;
+        let mut finished = false;
+        let mut i = 0;
+        while i < pending.len() {
+            if pending[i].as_mut().poll(cx).is_ready() {
+                pending.swap_remove(i);
+                finished = true;
+            } else {
+                i += 1;
+            }
+        }
+        if finished {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_stream(
+    request: H2Request<h2::RecvStream>,
+    mut respond: h2::server::SendResponse<Bytes>,
+    server_idxs: &[usize],
+    default_server: usize,
+    http: &Http,
+    tokens: bool,
+    listen_port: u16,
+) {
+    {
         // The effective host is `:authority` when present, otherwise the
         // `Host` header — nginx's `$host` accepts either over HTTP/2.
         let mut host_headers = request.headers().get_all("host").iter();
@@ -125,7 +200,7 @@ pub async fn serve<S>(
             )
             .await;
             send_http2_response(&mut respond, resp, tokens, false).await;
-            continue;
+            return;
         }
         // `large_client_header_buffers` bounds header fields on HTTP/2 too:
         // nginx checks each decoded string against `buffers.size` and the whole
@@ -169,7 +244,7 @@ pub async fn serve<S>(
                         let _ = send.send_data(Bytes::new(), true);
                     }
                 }
-                continue;
+                return;
             }
         }
 
@@ -195,7 +270,7 @@ pub async fn serve<S>(
                 )
                 .await;
                 send_http2_response(&mut respond, resp, tokens, false).await;
-                continue;
+                return;
             }
         };
         let loc = server.locate(&path);
@@ -224,25 +299,120 @@ pub async fn serve<S>(
         let mut recv = request.into_body();
         let mut body: Vec<u8> = Vec::new();
         let mut too_large = false;
-        loop {
-            match recv.data().await {
-                Some(Ok(chunk)) => {
-                    let n = chunk.len();
-                    if max_body != u64::MAX && (body.len() + n) as u64 > max_body {
-                        too_large = true;
-                        let _ = recv.flow_control().release_capacity(n);
+        // Flow control is released in blocks, not per DATA frame.
+        //
+        // nginx credits the window in large steps, and `h2_request_body.t`
+        // asserts a single WINDOW_UPDATE with `wdelta >= 65536` for an 80 KB
+        // body. Releasing every 16 KB frame produced a 16 KB delta.
+        const WINDOW_STEP: usize = 65536;
+        let mut unreleased: usize = 0;
+        // Whether anything is going to look at the body. A request nothing needs
+        // the body for is answered without waiting for END_STREAM, and the
+        // stream is then reset -- which is what nginx does, and what
+        // "request body discarded - zero RST_STREAM" measures.
+        let wants_body = loc.proxy_pass.is_some()
+            || loc.fastcgi_pass.is_some()
+            || loc.uwsgi_pass.is_some()
+            || loc.scgi_pass.is_some()
+            || (loc.dav_methods != 0)
+            || crate::http::references_body_var(&loc.headers)
+            || loc
+                .ret
+                .as_ref()
+                .map(|(_, t)| t.contains("$request_body"))
+                .unwrap_or(false)
+            // Deliberately *not* `!loc.error_pages.is_empty()`: an error page
+            // existing somewhere in the config does not mean this request's body
+            // is needed, and treating it as such made every stream wait for an
+            // END_STREAM that "request body discarded" never sends.
+            ;
+        let mut ended = false;
+        // A request whose stream already ended has no body to discard, and
+        // resetting it after the response is a protocol error the client sees as
+        // a failed stream (`h2_request_body.t`, "request body with padding -
+        // next"). Only an *unfinished* stream gets the reset.
+        let ended_on_headers = recv.is_end_stream();
+        let mut discarded = false;
+        let mut saw_data = false;
+        if wants_body {
+            loop {
+                match recv.data().await {
+                    Some(Ok(chunk)) => {
+                        saw_data = true;
+                        let n = chunk.len();
+                        if max_body != u64::MAX && (body.len() + n) as u64 > max_body {
+                            too_large = true;
+                            let _ = recv.flow_control().release_capacity(n);
+                            break;
+                        }
+                        body.extend_from_slice(&chunk);
+                        unreleased += n;
+                        if unreleased >= WINDOW_STEP
+                            && recv.flow_control().release_capacity(unreleased).is_err()
+                        {
+                            break;
+                        } else if unreleased >= WINDOW_STEP {
+                            unreleased = 0;
+                        }
+                        if declared_len.is_some_and(|l| body.len() as u64 >= l) {
+                            ended = true;
+                            break;
+                        }
+                        // The peer may have set END_STREAM on the DATA frame while
+                        // declaring a longer `content-length` (a malformed request
+                        // nginx answers 400). `data()` will not report the end in
+                        // that case -- the length and the flag disagree -- so check
+                        // the flag itself instead of waiting forever.
+                        if recv.is_end_stream() {
+                            ended = true;
+                            break;
+                        }
+                    }
+                    Some(Err(_)) => {
+                        ended = true;
                         break;
                     }
-                    body.extend_from_slice(&chunk);
-                    if recv.flow_control().release_capacity(n).is_err() {
-                        break;
-                    }
-                    if declared_len.is_some_and(|l| body.len() as u64 >= l) {
+                    None => {
+                        ended = true;
                         break;
                     }
                 }
-                Some(Err(_)) | None => break,
             }
+            if unreleased > 0 {
+                let _ = recv.flow_control().release_capacity(unreleased);
+            }
+            // nginx compares what arrived against the declared length and
+            // answers 400 on any mismatch ("request body less/more than
+            // content-length").
+            if !too_large {
+                if let Some(l) = declared_len {
+                    if body.len() as u64 != l {
+                        let mut resp = crate::http::error_page_response(
+                            &h1,
+                            400,
+                            server,
+                            http,
+                            "127.0.0.1",
+                            0,
+                            listen_port,
+                            "127.0.0.1",
+                        )
+                        .await;
+                        crate::http::absolutize_location_field(
+                            &mut resp,
+                            &h1,
+                            loc,
+                            listen_port,
+                            "127.0.0.1",
+                        );
+                        send_http2_response(&mut respond, resp, tokens, false).await;
+                        return;
+                    }
+                }
+            }
+            let _ = ended;
+        } else {
+            discarded = !ended_on_headers;
         }
 
         if too_large {
@@ -263,7 +433,7 @@ pub async fn serve<S>(
                     send.send_data(Bytes::new(), true).ok();
                 }
             }
-            continue;
+            return;
         }
         // `client_body_in_file_only`, or a body larger than
         // `client_body_buffer_size`, spills to a temp file: `$request_body`
@@ -274,7 +444,13 @@ pub async fn serve<S>(
         if crate::http::body_needs_file(loc, body.len()) {
             h1.request_body_file = crate::http::write_body_file(http, &body);
         }
-        h1.buffered_body = Some(body);
+        // Only present when the request actually carries one: `buffered_body`
+        // being `Some` makes the upstream head emit `Content-Length: 0`, and
+        // nginx sends no such header for a request without a body
+        // (`h2_request_body.t`, "request without body - content length").
+        if saw_data || !body.is_empty() || declared_len.is_some() {
+            h1.buffered_body = Some(body);
+        }
 
         let resp = crate::http::resolve_response(
             &h1,
@@ -289,6 +465,12 @@ pub async fn serve<S>(
         .await;
 
         send_http2_response(&mut respond, resp, tokens, head_only).await;
+        if discarded {
+            // Nothing consumed the body, so tell the client to stop sending it.
+            // nginx resets with NO_ERROR (code 0) *after* the response, which is
+            // what "request body discarded - zero RST_STREAM" checks.
+            respond.send_reset(h2::Reason::NO_ERROR);
+        }
     }
 }
 

@@ -59,7 +59,7 @@ pub fn write_body_file(http: &Http, body: &[u8]) -> Option<std::path::PathBuf> {
 static NEXT_BODY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Does any `add_header` value reference `$request_body` (or its file)?
-fn references_body_var(headers: &[(String, String)]) -> bool {
+pub fn references_body_var(headers: &[(String, String)]) -> bool {
     headers
         .iter()
         .any(|(_, v)| v.contains("$request_body"))
@@ -7283,7 +7283,7 @@ mod tests {
 /// `ngx_http_header_filter` rewrites the value whatever its protocol, so a
 /// location that has not been rendered yet must be fixed up too; otherwise the
 /// HTTP/2 path -- which never goes through `write_redirect` -- sends it relative.
-fn absolutize_location_field(
+pub fn absolutize_location_field(
     resp: &mut Response,
     req: &Request,
     loc: &LocCfg,

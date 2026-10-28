@@ -848,6 +848,39 @@ where
     splice_rated(a, b, 0, 0).await
 }
 
+/// nginx puts `proxy_*_rate` on the **write** side: reads stay unthrottled and
+/// only the bytes handed to the peer are paced (`c->write_rate`). Throttling the
+/// reads instead breaks sessions, because a client that half-closes after
+/// sending makes `read` return 0 and the loop exits with the response still
+/// buffered -- measured as "download - data" receiving 1 of 1011 bytes.
+async fn write_paced<W>(w: &mut W, mut buf: &[u8], rate: &mut Rate) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    while !buf.is_empty() {
+        let want = match rate.allowance() {
+            None => buf.len(),
+            Some(0) => {
+                let wait = std::time::Duration::from_micros(1_000_000 / rate.rate.max(1));
+                tokio::time::sleep(wait.min(std::time::Duration::from_millis(20))).await;
+                continue;
+            }
+            Some(n) => (n as usize).min(buf.len()),
+        };
+        let n = w.write(&buf[..want]).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "stream write returned 0",
+            ));
+        }
+        rate.sent += n as u64;
+        buf = &buf[n..];
+    }
+    w.flush().await
+}
+
 async fn splice_rated<A, B>(
     mut a: A,
     mut b: B,
@@ -858,7 +891,7 @@ where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
     let mut up = Rate::new(upload_rate);
     let mut down = Rate::new(download_rate);
     let mut ab = vec![0u8; 16 * 1024];
@@ -868,45 +901,23 @@ where
     let mut sent = 0u64;
     let mut received = 0u64;
     loop {
-        // A zero allowance means the budget for this instant is used up; sleep
-        // for the time one byte needs and re-check.
-        let up_n = match up.allowance() {
-            None => ab.len(),
-            Some(0) => {
-                let wait = std::time::Duration::from_micros(1_000_000 / up.rate.max(1));
-                tokio::time::sleep(wait.min(std::time::Duration::from_millis(50))).await;
-                continue;
-            }
-            Some(n) => (n as usize).min(ab.len()),
-        };
-        let down_n = match down.allowance() {
-            None => ba.len(),
-            Some(0) => {
-                let wait = std::time::Duration::from_micros(1_000_000 / down.rate.max(1));
-                tokio::time::sleep(wait.min(std::time::Duration::from_millis(50))).await;
-                continue;
-            }
-            Some(n) => (n as usize).min(ba.len()),
-        };
         tokio::select! {
-            r = a.read(&mut ab[..up_n]) => match r {
+            r = a.read(&mut ab) => match r {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if b.write_all(&ab[..n]).await.is_err() {
+                    if write_paced(&mut b, &ab[..n], &mut up).await.is_err() {
                         break;
                     }
                     sent += n as u64;
-                    up.sent += n as u64;
                 }
             },
-            r = b.read(&mut ba[..down_n]) => match r {
+            r = b.read(&mut ba) => match r {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if a.write_all(&ba[..n]).await.is_err() {
+                    if write_paced(&mut a, &ba[..n], &mut down).await.is_err() {
                         break;
                     }
                     received += n as u64;
-                    down.sent += n as u64;
                 }
             },
         }
@@ -914,6 +925,7 @@ where
     let _ = a.shutdown().await;
     let _ = b.shutdown().await;
     (sent, received)
+
 }
 
 /// Splice a TLS-terminated client to a plaintext upstream.
@@ -1262,7 +1274,10 @@ async fn proxy_tcp(
     // slot -- alive until the client also went away. With `proxy_half_close`
     // off (the default) nginx ends the session on the first EOF, which is what
     // `splice` now does.
-    splice(client, upstream).await
+    // Rates must reach the paced splice; passing them in and then
+    // calling the unlimited `splice` is exactly the bug that left
+    // `proxy_download_rate` silently inert.
+    splice_rated(client, upstream, upload, download).await
 }
 
 async fn serve_udp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {

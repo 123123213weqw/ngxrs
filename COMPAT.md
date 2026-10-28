@@ -13,7 +13,7 @@
 
 | 项 | 命令 | 当前结果 |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 125 文件，WORSE=0 TRUNC=0（nginx 1887 / ngxrs 1892，120 个逐断言一致、5 个更优） |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 126 文件，WORSE=0 TRUNC=0（nginx 1895 / ngxrs 1900，121 个逐断言一致、5 个更优；两台 V100 独立复跑数字一致） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
 | 单元测试 | `cargo test --release` | **PASS** — 156 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
@@ -715,17 +715,19 @@ nginx 1823 / ngxrs 1828 断言，114 个逐断言一致、5 个更优（`http_he
 测试挂起两条连接（其中一条指向会 sleep 的后端），期望接下来十条全部走另一个 peer，
 而我们看到两个 peer 的 `conns` 卡在 1/1，结果是 5/5。
 
-**仍未对齐**：`stream_upstream.t` 的 "per-upstream variables" —— stream access_log 里的
-`$upstream_addr`、`$upstream_bytes_sent`、`$upstream_bytes_received`，格式是按尝试
-逗号分隔的列表（`127.0.0.1:8086, 127.0.0.1:8084!0, 1!0, 4`）。这需要把尝试链传进
-stream 日志器，所以该文件保持 7/8、**不进**声明清单，而不是靠口径绕过。
+**后续**：同一轮里把 "per-upstream variables" 也做完了。`stream_upstream.t` 最终 7/8 → **8/8**
+并入清单（126 文件）。那一项要求 stream access_log 的 `$upstream_addr`、
+`$upstream_bytes_sent`、`$upstream_bytes_received` 是**按尝试逗号分隔的列表**
+（`127.0.0.1:8086, 127.0.0.1:8084!0, 1!0, 4`）：先被拒的 peer、再应答的 peer，字节计数
+同形。这不是「填个变量」——`splice` 现在返回 `(sent, received)`，每次连接尝试追加一条
+`StreamAttempt`，失败的那次保持 0。
 
 新增 7 个单元测试覆盖这些行为（权重、max_conns 回落 backup 与回收、max_fails 禁用与
 恢复、单 peer 规则、least_conn 偏好、空/非空 hash key），总数 171。
 
 ## 二、声明的测试清单
 
-清单在 `bench/declared.txt`，**125 个文件**，选取规则是机械的：
+清单在 `bench/declared.txt`，**126 个文件**，选取规则是机械的：
 
 1. 落在范围内（**参考构建 `-V` 能编出来的模块**：http core + proxy/cache/gzip/
    TLS/HTTP2/realip/auth_request/slice/sub/secure_link/dav/stub_status/gzip_static/

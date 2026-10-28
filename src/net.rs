@@ -485,6 +485,15 @@ pub fn serve(cfg: Config) -> io::Result<()> {
     if let Some(pid_path) = &pid_path {
         let _ = std::fs::remove_file(pid_path);
     }
+    // nginx unlinks the socket file of a `listen unix:` socket when it closes
+    // it, so a stopped server leaves no stale path behind (`geo_unix.t`,
+    // "unix socket removed"). Without this the file stays and the next `bind`
+    // silently replaces it only because `unix_bind` unlinks first.
+    for group in &cfg.http.groups {
+        if let Some(path) = &group.unix {
+            let _ = std::fs::remove_file(path.as_ref());
+        }
+    }
     Ok(())
 }
 

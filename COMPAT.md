@@ -2965,3 +2965,44 @@ earlyoom -r 60 -m 5 -s 10 --prefer python|node|java|qemu|rustc|cargo|cc1plus ...
 ```bash
 TEST_LIST="proxy_unix.t stream_unix.t" bash bench/nginxtests.sh   # 应 SAME 7/7 与 4/4
 ```
+
+## 本轮（unix 监听 socket 的清理；三个新暴露的缺口）
+
+### 修掉的：停服后 unix socket 文件残留
+
+`geo_unix.t` 的最后一条断言是 `$t->stop()` 之后 socket 文件必须不存在
+（`is(-e $testdir.'/unix.sock', undef, 'unix socket removed')`）。nginx 关闭监听时
+会 unlink，我们没做，文件留在原地。
+
+现在 shutdown 时按配置遍历 `http` 的 unix 监听组逐个 `remove_file`。
+`geo_unix.t` **7/8 → 8/8 一致**，已加入声明清单（155 个文件）。
+
+这个缺陷在 `unix_bind()` 里被掩盖了——它 bind 前也 unlink 一次，所以重新启动看不出问题，
+只有"停服后文件应消失"这类断言才会暴露。
+
+### 新暴露、本轮未修的三个缺口
+
+按"两边都跳过 / 配置起不来"这两类线索排查 `*unix*.t`，发现四个从未测量过的套件：
+
+| 套件 | nginx | ngxrs | 原因 |
+|---|---|---|---|
+| `geo_unix.t` | 8/8 | **已修到 8/8** | 见上 |
+| `stream_geo_unix.t` | 6/6 | **0/6 TRUNC** | `stream { server { listen unix:/path; } }` 不认 |
+| `proxy_protocol_unix.t` | 7/7 | **跳过** | `-V` 未广告 `stream_realip`，我方整份跳过 |
+| `debug_connection_unix.t` | — | 跳过 | 两边都跳过，原因未查 |
+
+`proxy_protocol_unix.t` 是**同类门控盲点第四次**（前三次：`http_v2`、FCGI Perl 模块、
+openssl 版本判据）。判据是 `has('stream_realip')`，我们确实没有实现 stream 的 realip，
+所以跳过是"诚实的"——但它意味着这 7 条断言从未被测量过，不能算通过。
+
+`stream_geo_unix.t` 需要 stream 的 unix 监听。它要求的语义已经用用例算清：
+unix 对端的地址按 **255.255.255.255** 处理——只有这样才能让四处 geo 查询同时得到
+`none`（`255.255.255.255 → none` 命中，区间 `0.0.0.0-255.255.255.254 → test` 不命中，
+default 分别是 `default`/`none`）。没有实现，因为 accept 循环目前绑定在 `TcpStream` 上，
+要改成对 client 泛型；本轮把这份改动留到单独一轮，不做收尾期的大重构。
+
+复现：
+
+```bash
+TEST_LIST="geo_unix.t stream_geo_unix.t proxy_protocol_unix.t" bash bench/nginxtests.sh
+```

@@ -324,3 +324,4 @@ stub_status.t
 fastcgi_unix.t
 proxy_unix.t
 stream_unix.t
+geo_unix.t

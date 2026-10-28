@@ -13,7 +13,7 @@
 
 | 项 | 命令 | 当前结果 |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 121 文件，WORSE=0 TRUNC=0（nginx 1847 / ngxrs 1852，116 个逐断言一致、5 个更优） |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 125 文件，WORSE=0 TRUNC=0（nginx 1887 / ngxrs 1892，120 个逐断言一致、5 个更优） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
 | 单元测试 | `cargo test --release` | **PASS** — 156 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
@@ -670,9 +670,62 @@ nginx 1823 / ngxrs 1828 断言，114 个逐断言一致、5 个更优（`http_he
 顺带修掉一处重复的 `charset` 匹配分支：一个只设置 autoindex 宽度标志的旧分支排在前面，
 把新分支挡住了 —— `charset` 被解析后又被丢弃。
 
+### 2026-10-27 第十七轮：stream 负载均衡
+
+四个此前 WORSE 的文件现在与 nginx 持平（同机、同次运行、同一参考二进制）：
+
+| 文件 | 之前 | 现在 |
+|---|---|---|
+| `stream_upstream_max_conns.t` | 3/16 | **16/16** |
+| `stream_upstream_hash.t` | 4/6 | **6/6** |
+| `stream_upstream_least_conn.t` | 3/4 | **4/4** |
+| `stream_upstream_random.t` | 11/14 | **14/14** |
+| `stream_upstream.t` | 3/8 | 7/8（剩 1 条，见下） |
+
+**方法上的说明**：这次是先在同一台主机上编译「上一提交」的二进制，背靠背跑同一组
+`TEST_LIST` 取基线，再跑本轮的构建。跨主机的数字不可比 —— 繁忙的内部 V100 上两个二进制
+都会掉好几分，拿那种数字做判断会得出相反结论。
+
+改动要点：
+
+1. **`max_conns` 在 stream 里完全不存在**。字段没解析，peer 列表只是一个
+   `Vec<SocketAddr>` 配按下标的轮转。现在 stream upstream 复用 http 的 `UpstreamServer`
+   （weight/backup/down/max_fails/fail_timeout/max_conns）并带自己的 `LbMethod`。
+2. **选择必须是有状态的**。nginx 的轮询是平滑加权轮询
+   （`current_weight`/`effective_weight`），不是简单轮转；`weight=2` 要拿到三分之二的
+   连接。这就是 "weight" 那条断言。
+3. **`hash` 是折叠后的 Cache::Memcached 表达式**：
+   `((crc32([REHASH] KEY) >> 16) & 0x7fff)` 累加后对总权重取模。只对 key 做一次
+   不折叠的 crc32 会选到**不同**的 peer。`consistent` 走排序后的环与单次
+   `crc32_long` 查找。另外 hash 的**空 key** 必须回落到真正会轮转的 round-robin ——
+   第一版只把计数器加一，结果四条连接全压在一个 peer 上。
+4. **`max_fails`/`fail_timeout` 需要每 peer 的 `fails`/`checked`**，且失败的连接要计入：
+   连接被拒是 `NGX_PEER_FAILED`，要抬 `fails` 并把 `effective_weight` 减去
+   `weight / max_fails`。
+5. **读了两遍源码才确认的一条**：只有**一个** peer 的池子直接取它，并**完全忽略
+   `max_fails`**（`ngx_stream_upstream_get_round_robin_peer` 的 `peers->single` 分支），
+   只检查 `down` 与 `max_conns`。在这里也检查 max_fails，会让「单主 + backup」的组在
+   主 peer 恢复后仍被钉在 backup 上整整一个 fail_timeout —— "recovery" 期望的是主 peer
+   30/30。
+
+还有一个直到连接计数变得重要才暴露的缺陷：`proxy_tcp` 用 `copy_bidirectional`，注释写着
+「任一侧关闭即返回」，实际要等**两侧**都结束。应答后立即关闭的后端会让会话 —— 连同它的
+`max_conns` 槽位与 `conns` 计数 —— 一直挂到客户端也断开。nginx 在
+`proxy_half_close off`（默认）下，第一个 EOF 就结束会话。这正是 "least_conn" 那条：
+测试挂起两条连接（其中一条指向会 sleep 的后端），期望接下来十条全部走另一个 peer，
+而我们看到两个 peer 的 `conns` 卡在 1/1，结果是 5/5。
+
+**仍未对齐**：`stream_upstream.t` 的 "per-upstream variables" —— stream access_log 里的
+`$upstream_addr`、`$upstream_bytes_sent`、`$upstream_bytes_received`，格式是按尝试
+逗号分隔的列表（`127.0.0.1:8086, 127.0.0.1:8084!0, 1!0, 4`）。这需要把尝试链传进
+stream 日志器，所以该文件保持 7/8、**不进**声明清单，而不是靠口径绕过。
+
+新增 7 个单元测试覆盖这些行为（权重、max_conns 回落 backup 与回收、max_fails 禁用与
+恢复、单 peer 规则、least_conn 偏好、空/非空 hash key），总数 171。
+
 ## 二、声明的测试清单
 
-清单在 `bench/declared.txt`，**121 个文件**，选取规则是机械的：
+清单在 `bench/declared.txt`，**125 个文件**，选取规则是机械的：
 
 1. 落在范围内（**参考构建 `-V` 能编出来的模块**：http core + proxy/cache/gzip/
    TLS/HTTP2/realip/auth_request/slice/sub/secure_link/dav/stub_status/gzip_static/

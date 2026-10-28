@@ -45,6 +45,10 @@ outcomes() {
 worse_total=0; same=0; better=0; skipped=0; compared=0
 better_total=0
 worse_files=0
+# Files where the reference served and we produced no assertion at all. These
+# used to land in `same`: the worse-count is built from failing assertion ids,
+# and a run that never started has none, so it looked identical to a pass.
+unrun_files=0; unrun_lost=0
 : > "$OUT/summary.txt"
 
 for t in $files; do
@@ -60,6 +64,13 @@ for t in $files; do
   # Skip files neither server can run (missing modules in the reference too).
   if [ "$r_ok" -eq 0 ] && [ "$r_bad" -eq 0 ]; then
     skipped=$((skipped + 1))
+    continue
+  fi
+  if [ "$o_ok" -eq 0 ] && [ "$o_bad" -eq 0 ]; then
+    unrun_files=$((unrun_files + 1))
+    unrun_lost=$((unrun_lost + r_ok))
+    printf 'UNRUN  %-28s nginx %3s/%-3s  ngxrs never ran\n' \
+      "$t" "$r_ok" "$((r_ok + r_bad))" | tee -a "$OUT/summary.txt"
     continue
   fi
   compared=$((compared + 1))
@@ -90,6 +101,7 @@ for t in $files; do
 done
 
 echo
-printf 'files compared=%d same=%d better=%d worse=%d  (skipped=%d)\n' \
-  "$compared" "$same" "$better_total" "$worse_files" "$skipped"
+printf 'files compared=%d same=%d better=%d worse=%d  (skipped=%d unrun=%d)\n' \
+  "$compared" "$same" "$better_total" "$worse_files" "$skipped" "$unrun_files"
 printf 'total assertions where ngxrs loses: %d\n' "$worse_total"
+printf 'assertions the reference passed in files we never ran: %d\n' "$unrun_lost"

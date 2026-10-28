@@ -528,6 +528,7 @@ fn stream_tls(sc: &crate::config::typed::StreamServerCfg) -> Option<Arc<rustls::
         sc.ssl_verify_client,
         sc.ssl_client_certificate.as_deref(),
         sc.ssl_trusted_certificate.as_deref(),
+        &sc.ssl_alpn,
     ) {
         Ok(c) => Some(c),
         Err(e) => {

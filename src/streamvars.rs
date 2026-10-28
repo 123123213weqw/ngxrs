@@ -30,6 +30,9 @@ pub struct SslFacts {
     /// `TLSv1.3`, `TLSv1.2`, ... (nginx's spelling, not rustls's).
     pub protocol: String,
     pub server_name: String,
+    /// `$ssl_alpn_protocol`: the negotiated ALPN protocol, empty when the
+    /// client offered none.
+    pub alpn: String,
     pub client_verify: String,
     pub client_cert: String,
 }
@@ -139,6 +142,7 @@ impl Vars<'_> {
             "ssl_cipher" => self.ssl?.cipher.clone(),
             "ssl_protocol" => self.ssl?.protocol.clone(),
             "ssl_server_name" => self.ssl?.server_name.clone(),
+            "ssl_alpn_protocol" => self.ssl?.alpn.clone(),
             "ssl_client_verify" => self.ssl?.client_verify.clone(),
             "ssl_client_cert" => self.ssl?.client_cert.clone(),
             _ => {

@@ -1063,6 +1063,7 @@ pub fn build_stream_config(
     verify: u8,
     client_ca: Option<&Path>,
     trusted: Option<&Path>,
+    alpn: &[String],
 ) -> io::Result<Arc<ServerConfig>> {
     let key_id = load_cert_with(key, cert, passwords)?;
     let resolver = Arc::new(SniResolver {
@@ -1112,7 +1113,11 @@ pub fn build_stream_config(
                 .with_cert_resolver(resolver)
         }
     };
-    cfg.alpn_protocols = Vec::new();
+    // `ssl_alpn first second`: advertise in the configured order. rustls fails
+    // the handshake with no_application_protocol when the client offers nothing
+    // that overlaps, which is what nginx does too (the client sees no reply and
+    // `$status` logs 500).
+    cfg.alpn_protocols = alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
     Ok(Arc::new(cfg))
 }
 

@@ -1122,6 +1122,10 @@ fn ssl_facts(
             .unwrap_or_default(),
         protocol,
         server_name: conn.server_name().unwrap_or("").to_string(),
+        alpn: conn
+            .alpn_protocol()
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .unwrap_or_default(),
         client_verify,
         client_cert,
     }

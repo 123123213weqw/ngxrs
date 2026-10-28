@@ -1815,6 +1815,8 @@ pub struct StreamUpstream {
 
 #[derive(Debug, Clone)]
 pub struct StreamServerCfg {
+    /// `ssl_alpn <proto>...`: ALPN protocols to advertise (`ssl_alpn`).
+    pub ssl_alpn: Vec<String>,
     /// `limit_conn <zone> <n>` for this server.
     pub limit_conns: Vec<(String, u32)>, 
     /// `allow` / `deny` in stream server context, first match wins
@@ -5304,6 +5306,7 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             listen: SocketAddr::from(([0, 0, 0, 0], 0)),
             access: Vec::new(),
             limit_conns: Vec::new(),
+            ssl_alpn: Vec::new(),
             realip_from: stream_realip_from.clone(),
             realip_from_unix: stream_realip_unix,
             realip_from_set: stream_realip_set,
@@ -5383,6 +5386,10 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                         cfg.listen_proxy_protocol = true;
                     }
                     have_listen = true;
+                }
+                "ssl_alpn" => {
+                    // `ssl_alpn first second;` -- order is the preference order.
+                    cfg.ssl_alpn = child.args.clone();
                 }
                 "limit_conn" => {
                     if let (Some(z), Some(n)) = (child.args.first(), child.args.get(1)) {

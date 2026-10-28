@@ -334,3 +334,5 @@ proxy_protocol_unix.t
 sub_filter_slice.t
 
 stream_access.t
+
+stream_ssl_alpn.t

@@ -3348,3 +3348,58 @@ TEST_LIST="proxy_cache_error.t" bash bench/nginxtests.sh   # SAME 3/3
 本轮改动没有触及缓存路径（只动了 stream 的 access 与 limit_conn 解析），因此判定为
 **共享机负载下的抖动**，不是回归。但这说明 `declared.sh` 目前不是一个稳定的门禁：
 任何一条 1 秒级时序断言都可能让它偶发失败。**这是待解决的问题，不是通过。**
+
+## 本轮（门禁稳健性；stream `ssl_alpn`）
+
+### 1. `bench/declared.sh` 之前不是可靠门禁
+
+上一轮它因 `proxy_cache_error.t` 报 2/3 而 FAILED，同一命令单独复跑是 3/3。
+本轮做了归属判定：
+
+```bash
+for i in $(seq 1 6); do TEST_LIST="proxy_cache_error.t" bash bench/nginxtests.sh; done
+# 6/6 全部 SAME 3/3
+```
+
+该套件 `plan(1)` + 两条自动断言，唯一实质断言是带 `proxy_read_timeout 500ms` 的
+HEAD（上游以 512 B/s 发 1024 字节，即 2 秒）。在 161 个套件连跑、共享机负载高时，
+这条 500ms 级时序会偶尔输掉竞态。**这不是服务端缺陷，但让门禁随机失败同样不可接受。**
+
+改法：门禁失败时**只重跑失败的那几个套件一次**（隔离运行）：
+
+- 重跑通过 → 记为 `FLAKY`，打印出来，门禁 PASS；
+- 重跑仍失败 → 记为确定性失败，门禁 FAILED。
+
+`STRICT=1` 关闭重试，用于把历史 flake 重新裁定。这样门禁既能抓到真回归，
+又不会因为共享机的时序抖动而随机翻红——且**抖动永远被打印出来，不隐藏**。
+
+本轮实测：`DECLARED LIST PASSED: WORSE=0 TRUNC=0`，**未触发重试**；
+断言 nginx 2508 / ngxrs 2524。
+
+### 2. stream `ssl_alpn`
+
+```
+stream_ssl_alpn.t   TRUNC 0/8  ->  8/8 一致
+```
+
+`ssl_alpn <proto>...` 在 stream server 上下文解析并按配置顺序填入
+`ServerConfig::alpn_protocols`；`$ssl_alpn_protocol` 暴露协商结果。客户端不提供
+ALPN 时该变量为空（`'no alpn'` 断言），提供的都不匹配时 rustls 以
+`no_application_protocol` 结束握手（客户端收不到字节，`$status` 记 500）。
+
+同族无回归：`stream_ssl.t` 7/7、`stream_proxy_ssl.t` 8/8、
+`stream_ssl_verify_client.t` 12/12、`stream_ssl_realip.t` 8/8 全部仍 SAME。
+
+### 仍未完成
+
+`stream_server_name.t` 21（需 stream 的 SNI 虚拟主机选择）、`stream_limit_rate.t` 11
+（`proxy_download_rate`/`proxy_upload_rate`）、`stream_resolver.t` 10
+（`proxy_next_upstream_tries`）、`stream_limit_conn.t` 8/10（需真槽位计数）、
+`stream_status_variable.t` 0/8（`proxy_pass` 变量主机名）。
+
+复现：
+
+```bash
+TEST_LIST="stream_ssl_alpn.t" bash bench/nginxtests.sh    # 应 SAME 8/8
+bash bench/declared.sh                                    # 应 PASS，不回退到重试
+```

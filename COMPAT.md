@@ -2651,3 +2651,55 @@ curl --http2-prior-knowledge /444 -> 444   ← 修前
 ```bash
 TEST_LIST="grpc_next_upstream.t" bash bench/nginxtests.sh   # 应 SAME 11/11
 ```
+
+## 本轮（`grpc_pass` 从不转发请求体）
+
+手工 A/B 复现（前面 `grpc_pass`，后面 nginx `http2 on` 记录 `$request` 与 `$content_length`）：
+
+```
+修前： POST /x  -> 请求体被丢弃，且客户端一直等到超时（rc=28）
+修后： POST 5 字节  -> 后端收到 POST /x, CL=[5]，代理在 0.1s 内返回 200
+       POST 40 字节 -> 同上
+       GET         -> 行为不变
+```
+
+### 两个各自独立的原因，缺一不可
+
+**1. `grpc_pass` 没被算进 `proxy_target`，请求体在 `dispatch` 之前就被 drain 了。**
+`handle_conn` 对「上游模块自己读体」的 location 会跳过 drain，条件是
+`loc.proxy_pass | fastcgi_pass | uwsgi_pass | scgi_pass | dav_put | body_vars`——
+**gRPC 不在其中**。于是 body 先被丢掉，模块再读时得到 `body truncated`。
+埋点证据：
+
+```
+[gdbg] dispatch-grpc: body_len=5 chunked=false buffered=None
+[gdbg] take_request_body err=body truncated
+```
+
+**2. `h2_roundtrip` 一直用 `end_of_stream=true` 发 HEADERS。**
+即使体还在，`send_request(request, true)` 已经把流半关，后续 DATA 会被拒绝。
+现在按 `body.is_empty()` 决定，非空时发一帧 DATA 并置 END_STREAM。
+后端看到的 `HEADERS flags` 因此从 5 变成 4，与 nginx 一致。
+
+### `grpc_ssl.t` 仍是 13/40——差的是流式，不是转发
+
+修完后该套件断言数**没有变化**。原因是它要求**请求体边到边发**：用例在客户端还没
+送出 body 时就期待后端先收到 `HEADERS`（flags=4，无 END_STREAM），随后才是 DATA。
+我们是「先读完整个体，再连上游」，天然发不出那个序列。这与
+`proxy_request_buffering off` 是同一族问题——该功能在 HTTP 代理上已经实现
+（连接先行、随后流式送体），gRPC 侧尚未接。
+
+结论按实测记录：**请求体转发已修好并手工验证；`grpc_ssl.t` 的提升需要 gRPC 的
+流式转发，本轮未做。**
+
+### 两个假线索，都是我自己的测试脚本问题
+
+- `cat > conf <<CONF`（未加引号）会被 shell 展开 `$content_length` / `$request_body`，
+  于是配置里是空串，看起来像「变量不生效」。改用 `<<'CONF'` 后 `/ret` 与 `add_header`
+  两条路径都正确输出 `CL=[5]`，说明变量本来就是对的。
+- 一次 `sed` 改端口时把前端监听端口也改了，curl 打到不存在的端口（rc=7），
+  差点被当成实现缺陷。
+
+排查阶段还发现自己写的一处**多余改动**：`h2_roundtrip` 里曾为「body 非空」复制了一整段
+响应读取循环，理由是「发完 DATA 要立刻释放 SendStream」，而实测两种写法都能通过——
+真正起作用的只有 `end_of_stream`。那段重复代码已删除。

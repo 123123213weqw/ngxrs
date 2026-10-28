@@ -279,6 +279,7 @@ async fn fetch_one(
     path: &str,
     query: &str,
     target: &Target,
+    body: &[u8],
 ) -> Result<Response, FailKind> {
     // Build first: a value HTTP/2 cannot carry is `invalid_header`, not a
     // connection problem.
@@ -305,11 +306,11 @@ async fn fetch_one(
             Err(_) => return Err(FailKind::Connect),
         };
         match connector.connect(name, tcp).await {
-            Ok(tls) => h2_roundtrip(tls, request).await,
+            Ok(tls) => h2_roundtrip(tls, request, body).await,
             Err(_) => return Err(FailKind::Connect),
         }
     } else {
-        h2_roundtrip(tcp, request).await
+        h2_roundtrip(tcp, request, body).await
     };
     match got {
         Some((status, headers, body)) => Ok(translate(status, headers, body)),
@@ -477,6 +478,7 @@ pub async fn fetch(
     query: &str,
     peer_ip: &str,
     vars: Option<&crate::http::ServerVars<'_>>,
+    body: &[u8],
 ) -> Option<Response> {
     use crate::config::next_upstream as nu;
     let spec = loc.grpc_pass.as_deref()?;
@@ -541,7 +543,7 @@ pub async fn fetch(
         // and a peer may be left; `pick_next` answers the latter.
         let more = retry_enabled;
 
-        match fetch_one(req, path, query, &cand.target).await {
+        match fetch_one(req, path, query, &cand.target, body).await {
             Ok(resp) => {
                 crate::timing::set_status(slot, resp.status);
                 if let Some((u, i)) = cand.peer {
@@ -576,6 +578,7 @@ pub async fn fetch(
 async fn h2_roundtrip<S>(
     io: S,
     request: H2Request<()>,
+    body: &[u8],
 ) -> Option<(StatusCode, http::HeaderMap, Vec<u8>)>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -583,13 +586,23 @@ where
     let (mut client, conn) = h2::client::handshake(io).await.ok()?;
     let mut conn = Box::pin(conn);
     // Drive the connection while awaiting the response.
-    // `end_of_stream = true` already closes our half of the stream; sending an
-    // extra DATA frame would be rejected (the stream is no longer writable).
-    let (resp, send) = client.send_request(request, true).ok()?;
+    //
+    // The request body goes out as one DATA frame. `send_request`'s
+    // `end_of_stream` argument must therefore be false whenever a body follows:
+    // with it true the stream is already half-closed and the DATA is rejected,
+    // which is how every gRPC request body used to be dropped
+    // ("request - DATA" in `grpc_ssl.t`).
+    let (resp, mut send) = client.send_request(request, body.is_empty()).ok()?;
+    if !body.is_empty() {
+        send.send_data(Bytes::copy_from_slice(body), true).ok()?;
+    }
     let response = tokio::select! {
         r = resp => r.ok()?,
         _ = &mut conn => return None,
     };
+    // The `SendStream` is released only after the response arrived; both
+    // dropping it early and keeping it forever were tried here and neither
+    // matters -- what mattered was `end_of_stream`.
     drop(send);
     let (parts, mut body) = response.into_parts();
     let mut out = Vec::new();

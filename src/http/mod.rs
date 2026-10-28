@@ -672,6 +672,11 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
             || loc.fastcgi_pass.is_some()
             || loc.uwsgi_pass.is_some()
             || loc.scgi_pass.is_some()
+            // `grpc_pass` reads the body itself, exactly like the other upstream
+            // modules. Leaving it out of this set made the drain below consume
+            // the body first, so the gRPC module saw `body truncated` and sent
+            // no DATA at all (`grpc_ssl.t`, "request - DATA").
+            || loc.grpc_pass.is_some()
             || dav_put
             || body_vars;
         // Read it here rather than in the upstream module, so both the module and
@@ -3668,8 +3673,11 @@ pub async fn resolve_response_local(
             connection_time: 0,
             sent: &[],
         };
+        // A gRPC client's body reaches us as buffered DATA frames; forward it.
+        let grpc_body: &[u8] = req.buffered_body.as_deref().unwrap_or(&[]);
         if let Some(resp) =
-            crate::grpc::fetch(http, loc, req, path, query, peer_ip, Some(&grpc_vars)).await
+            crate::grpc::fetch(http, loc, req, path, query, peer_ip, Some(&grpc_vars), grpc_body)
+                .await
         {
             let mut resp = resp;
             return finalize_response(
@@ -5206,8 +5214,30 @@ async fn dispatch(
             connection_time: 0,
             sent: &[],
         };
-        if let Some(resp) =
-            crate::grpc::fetch(http, loc, req, path, query, client_ip, Some(&grpc_vars)).await
+        // `grpc_pass` must forward the request body. On the HTTP/1 client path
+        // it is still on the socket, so read it here -- the socket-free
+        // resolver can only see what was buffered for it.
+        let grpc_body = match crate::proxy::take_request_body(
+            conn,
+            req,
+            http.client_max_body_size as usize,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(_) => Vec::new(),
+        };
+        if let Some(resp) = crate::grpc::fetch(
+            http,
+            loc,
+            req,
+            path,
+            query,
+            client_ip,
+            Some(&grpc_vars),
+            &grpc_body,
+        )
+        .await
         {
             let mut resp = resp;
             let mut set_vars_mut = set_vars.clone();

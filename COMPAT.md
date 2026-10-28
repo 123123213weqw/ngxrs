@@ -2495,3 +2495,55 @@ A/B 23 文件 382/382 全部一致，`bench/all.sh` 70/70，单测 122/122。
   之后评估 ACCESS 阶段）；官方用例未覆盖，后续把 access_guard 的 peer_ip 一并
   切到变量。
 - `set_real_ip_from <hostname>`（realip_hostname.t）需要运行时解析，未实现。
+
+## 本轮（缓存过期判定的秒边界差一，`proxy_cache_valid.t` 抖动）
+
+对声明清单做一次**全新**的 A/B 复验（135 文件）时，`proxy_cache_valid.t` 报
+`ngxrs 13/14`（nginx 14/14），失败断言是 `error cached from max-age`
+（nginx ticket #1382 那条）。单跑 5 次又全部 14/14 —— 这是抖动，不是稳定答错。
+
+### 它不是负载噪声，是差一
+
+`Cached::is_fresh` 当时写的是：
+
+```rust
+now - self.stored_at < self.valid_for as i64
+```
+
+nginx 存的是**绝对** `valid_sec = now + ttl`，只在 `valid_sec < now` 时才判过期；
+所以 TTL 用尽的那一秒内仍然是 HIT。我们用的是相对量加严格小于，等于**早一秒过期**。
+
+用可控探针确认（`proxy_cache_valid 200 1s`，请求精确落在第 x+1 秒内，
+此时 `now == valid_sec`）：
+
+| 时刻 | nginx | ngxrs（修前） |
+|---|---|---|
+| x+0.05 | MISS | MISS |
+| x+0.90 | HIT | HIT |
+| **x+1.50（now == valid_sec）** | **HIT** | **EXPIRED** |
+| x+2.50 | EXPIRED | EXPIRED |
+
+因为判定依赖「存储落在哪一秒的哪个位置」，任何 1s TTL 的用例都会随机失败——
+`max-age=1`、`proxy_cache_valid ... 1s` 全在此列。这解释了该套件历史上
+「整批跑 10/14、单跑 12/14」的漂移，此前被我记成「共享机负载噪声」，**那个归因是错的**。
+
+### 修法
+
+```rust
+if self.valid_for == 0 { return false; }   // X-Accel-Expires: @<过去> 仍要立即过期
+now - self.stored_at <= self.valid_for as i64
+```
+
+`valid_for == 0` 必须保留：`cache::ttl` 对 `@N` 的过去时间返回 `Duration::ZERO`，
+nginx 对它是立刻 EXPIRED（`valid_sec` 在过去）。只改正向 TTL 的比较。
+这与同文件里 `may_serve_stale` 已经采用的 `>=` 方向一致。
+
+复现：
+
+```bash
+for i in 1 2 3 4 5; do TEST_LIST="proxy_cache_valid.t" bash bench/nginxtests.sh | grep -E '^SAME|^WORSE'; done
+```
+
+修后 5/5 SAME；缓存族 14 个文件全部 SAME（`proxy_cache_range.t` 仍 BETTER，9 对 nginx 8），
+无回归。单测新增 3 条边界用例（`fresh_at_the_boundary_second`、`zero_ttl_is_immediately_stale`、
+`longer_ttl_boundary`），175 → 178。

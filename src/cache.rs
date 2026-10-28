@@ -46,7 +46,16 @@ impl Cached {
     pub fn is_fresh(&self, now: i64) -> bool {
         // `valid_for == 0` means "stored but already stale" (an `@N`
         // X-Accel-Expires in the past), which nginx reports as EXPIRED.
-        now - self.stored_at < self.valid_for as i64
+        if self.valid_for == 0 {
+            return false;
+        }
+        // nginx keeps an absolute `valid_sec` and only expires on
+        // `valid_sec < now`, so the second in which a short TTL elapses is still
+        // a hit. `now - stored_at < valid_for` expired one second early, which
+        // made any 1s TTL depend on where inside the second the store landed --
+        // measured with a controlled probe (`proxy_cache_valid 200 1s`,
+        // request at `now == valid_sec`): nginx HIT, we EXPIRED.
+        now - self.stored_at <= self.valid_for as i64
     }
 }
 
@@ -687,4 +696,50 @@ pub fn load_variant(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(stored_at: i64, valid_for: u64) -> Cached {
+        Cached {
+            status: 200,
+            error: None,
+            headers: Vec::new(),
+            body: Vec::new(),
+            stored_at,
+            valid_for,
+        }
+    }
+
+    /// nginx keeps an absolute `valid_sec` and expires only on `valid_sec < now`,
+    /// so a 1s TTL is still a hit during the whole second that elapses it.
+    /// Verified against nginx with a controlled probe: with
+    /// `proxy_cache_valid 200 1s`, a request landing at `now == valid_sec` is a
+    /// HIT for nginx. Comparing `now - stored_at < valid_for` expired one second
+    /// early and made the result depend on where in the second the store fell.
+    #[test]
+    fn fresh_at_the_boundary_second() {
+        let e = entry(1_000, 1);
+        assert!(e.is_fresh(1_000), "same second must be fresh");
+        assert!(e.is_fresh(1_001), "now == valid_sec must still be fresh");
+        assert!(!e.is_fresh(1_002), "past valid_sec must be expired");
+    }
+
+    #[test]
+    fn zero_ttl_is_immediately_stale() {
+        // `X-Accel-Expires: @<past>` yields Duration::ZERO; nginx stores it and
+        // reports EXPIRED straight away.
+        let e = entry(1_000, 0);
+        assert!(!e.is_fresh(1_000));
+        assert!(!e.is_fresh(1_001));
+    }
+
+    #[test]
+    fn longer_ttl_boundary() {
+        let e = entry(1_000, 60);
+        assert!(e.is_fresh(1_060));
+        assert!(!e.is_fresh(1_061));
+    }
 }

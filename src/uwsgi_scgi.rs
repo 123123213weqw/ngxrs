@@ -284,33 +284,20 @@ async fn run(
     if kind == "scgi" && !all.iter().any(|(k, _)| k == "SCGI") {
         all.push(("SCGI".into(), "1".into()));
     }
-    // The SCGI params block *is* the CGI environment, so every request header
-    // becomes `HTTP_<NAME>` (SCGI protocol spec). nginx does this in
-    // `ngx_http_scgi_create_request`; without it the backend sees only the
-    // variables the config named explicitly (`scgi.t`, "scgi with multiple
-    // X-Forwarded-For headers"). Repeated headers are joined the same way
-    // `$http_*` joins them: `, ` generally, `; ` for Cookie.
-    if kind == "scgi" {
-        let mut seen: Vec<&str> = Vec::new();
-        for (name, _) in req.headers.iter() {
-            if seen.contains(&name) {
-                continue;
-            }
-            seen.push(name);
-            // These have their own params (`CONTENT_LENGTH`; nginx does not add
-            // `HTTP_CONTENT_TYPE`/`HTTP_TRANSFER_ENCODING` either).
-            if matches!(name, "content-length" | "content-type" | "transfer-encoding") {
-                continue;
-            }
-            let mut key = String::with_capacity(name.len() + 5);
-            key.push_str("HTTP_");
-            for c in name.chars() {
-                key.push(if c == '-' { '_' } else { c.to_ascii_uppercase() });
-            }
-            if let Some(v) = req.headers.get_joined(name) {
-                all.push((key, v));
-            }
-        }
+    // Every request header becomes `HTTP_<NAME>` unless the configuration named
+    // that header as a param. This is `ngx_http_uwsgi_module.c` /
+    // `ngx_http_scgi_module.c`: both build an `ignored[]` set out of the
+    // configured param names (lowercased, `-` folded to `_`) and then emit the
+    // rest, so `scgi_param CONTENT_LENGTH ...` suppresses `HTTP_CONTENT_LENGTH`
+    // while `scgi_param HTTP_X_BLAH ...` does not (its key is `http_x_blah`,
+    // which never equals a header key).
+    //
+    // Repeated headers join with `"; "` for Cookie and `", "` otherwise, and the
+    // name is uppercased with `-` -> `_`. Note uwsgi gets the same treatment:
+    // `uwsgi.t` asserts `X-Forwarded-For`, `X-Cookie` and `X-Foo` reach the
+    // application as `HTTP_*`, which is what nginx does.
+    for (name, value) in header_params(req, params) {
+        all.push((name, value));
     }
 
     let packet = if kind == "uwsgi" {
@@ -480,6 +467,45 @@ async fn error_out(
         close: false,
         sent: Vec::new(),
     })
+}
+
+/// Request headers as `HTTP_*` params, minus any the configuration already
+/// declares (see the comment at the call site).
+fn header_params(
+    req: &Request,
+    configured: &[crate::config::FastcgiParam],
+) -> Vec<(String, String)> {
+    // Param names are compared the way nginx compares them: lowercase, with `-`
+    // folded to `_`.
+    let folded = |s: &str| -> String {
+        s.chars()
+            .map(|c| if c == '-' { '_' } else { c.to_ascii_lowercase() })
+            .collect()
+    };
+    let skip: Vec<String> = configured.iter().map(|p| folded(&p.name)).collect();
+    let mut seen: Vec<&str> = Vec::new();
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (name, _) in req.headers.iter() {
+        if seen.contains(&name) {
+            continue;
+        }
+        seen.push(name);
+        if skip.iter().any(|s| s == &folded(name)) {
+            continue;
+        }
+        let mut key = String::with_capacity(name.len() + 5);
+        key.push_str("HTTP_");
+        for c in name.chars() {
+            key.push(match c {
+                '-' => '_',
+                c => c.to_ascii_uppercase(),
+            });
+        }
+        if let Some(v) = req.headers.get_joined(name) {
+            out.push((key, v));
+        }
+    }
+    out
 }
 
 pub async fn handle_uwsgi(

@@ -2771,3 +2771,65 @@ FastCGI 的解析器早就兼容两种行尾（它的注释里就写着这条）
 cpanm --local-lib=$HOME/perl5 SCGI      # 一次性
 TEST_LIST="scgi.t fastcgi.t" bash bench/nginxtests.sh   # 应 SAME 12/12 与 10/10
 ```
+
+## 本轮（uwsgi：`HTTP_*` 参数，并修正上一轮对 nginx 的错误判断）
+
+`uwsgi.t` 也一直是 `SKIP`：`has_daemon('uwsgi')` 需要 `uwsgi` 二进制。`pip3 install --user uwsgi`
+装上后立刻暴露 **nginx 10/10、ngxrs 7/10**——又一个隐身套件，本轮做到 **10/10 一致**。
+
+### 上一轮的判断是错的，这里更正
+
+上一轮我在 `COMPAT.md` 里写了：
+
+> SCGI 侧的 `HTTP_*` 是否也该加 `uwsgi`：nginx 的 uwsgi 模块**不**自动传 header
+> （uwsgi 的参数由 `uwsgi_param` 显式给出），本轮保持原样。
+
+**这是错的。** nginx 的 uwsgi 模块与 SCGI 一样把每个请求头变成 `HTTP_*`。
+证据来自 `ngx_http_uwsgi_module.c` 的 `ngx_http_uwsgi_create_request`：
+
+```c
+if (uwcf->upstream.pass_request_headers) {          /* 默认 on */
+    for (每个请求头) {
+        if (该头在 ignored[] 里) goto next_value;    /* 被 uwsgi_param 点名了 */
+        key_len = sizeof("HTTP_") - 1 + header[i].key.len;
+        b->last = ngx_cpymem(b->last, "HTTP_", sizeof("HTTP_") - 1);
+        for (n = 0; n < header[i].key.len; n++) {
+            ch = header[i].key.data[n];
+            if (ch >= 'a' && ch <= 'z') { ch &= ~0x20; }   /* 大写 */
+            else if (ch == '-') { ch = '_'; }              /* - -> _ */
+            *b->last++ = ch;
+        }
+        ... 重复头用 sep + ' ' 连接；Cookie 用 ';'，其余用 ',' ...
+```
+
+`ignored[]` 的构造方式也看清了：只有**配置里声明的 param 名**（小写、`-`→`_`）会命中。
+所以 `scgi_param CONTENT_LENGTH ...` 能压掉 `HTTP_CONTENT_LENGTH`，而
+`scgi_param HTTP_X_BLAH ...` **不能**压掉 `X-Blah`（键是 `http_x_blah`，永远不等于 `x_blah`）。
+
+我原来的实现里硬编码跳过 `content-length` / `content-type` / `transfer-encoding`，
+这个规则没有源码依据。现在两个模块共用一个 `header_params()`，规则就是上面那条。
+
+### 效果
+
+| 套件 | 修前 | 修后 |
+|---|---|---|
+| `uwsgi.t` | SKIP（两边都没跑）→ 装上后 7/10 | **10/10 一致** |
+| `scgi.t` | 12/12 | 12/12（改用共用规则后仍一致） |
+| `fastcgi.t` | 10/10 | 10/10 |
+
+### 仍未解决（本轮未验证，不当作通过）
+
+- **uwsgi 的 `CONTENT_LENGTH`**：我的实现在 `all` 里内置推入 `CONTENT_LENGTH`，
+  而 `ngx_http_uwsgi_module.c` 源码里没有这两个字符串（SCGI 有，见其 662/809 行的
+  `%ui:CONTENT_LENGTH%Z%V%Z`）。也就是说 nginx 的 uwsgi 只靠 `uwsgi_param CONTENT_LENGTH`
+  来设置它。**没有断言覆盖这一条**，我不凭推测删掉内置值（那会动到自己的 uwsgi 用例），
+  记为未验证差异。
+- **SCGI 侧 `HTTP_CONTENT_LENGTH` 是否与内置 `CONTENT_LENGTH` 并存**：按新规则现在两者都会发，
+  与 nginx 一致；但同样没有断言覆盖带 body 的 SCGI 请求，未实测。
+
+复现：
+
+```bash
+pip3 install --user uwsgi      # 一次性
+TEST_LIST="uwsgi.t scgi.t fastcgi.t" bash bench/nginxtests.sh   # 应 SAME 10/10、12/12、10/10
+```

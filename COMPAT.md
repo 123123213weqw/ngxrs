@@ -823,6 +823,43 @@ h1 不受影响）；端口从 `group.addr.port()` 传入；`parse_target` 负�
 `--with-http_v3_module`，跑出来的只是我方数字，**不能**当作一致性证据 —— 所以既没有
 实现也没有声明，如实记在这里。
 
+### 2026-10-28 第二十一轮：HTTP/2 的流并发（以及 h2 crate 的一条结构限制）
+
+`h2_request_body.t` 40/51 → **48/51**，**未入清单**（原因见末尾）。
+
+**根因是一个架构问题**：接受循环一次只处理一个流，读完整个请求体才回到
+`conn.accept()`。而 `h2::server::Connection` 是唯一读取 socket 的东西，只有被轮询时才
+前进 —— 在循环里 `await` 请求体，就把连接本身停住了。凡是需要「超出已缓冲字节」的用例
+全部挂起：
+
+| 用例 | 表现 |
+|---|---|
+| 请求体分多个 DATA 帧到达 | 第二帧永远读不到 |
+| 超过流窗口的大请求体 | 对端在等我们的 WINDOW_UPDATE，而我们没在驱动连接 |
+| 打开流但不发 END_STREAM、且请求不需要体 | 本该立即应答再复位，实际一直等 |
+
+现在流作为并发本地 future 运行，`accept()` 持续被轮询。`futures` 不是依赖，所以
+`poll_all` 是约 20 行的 poll 集合 —— 只有「连接」和「各流」两类东西要等，够用。
+
+同一文件量到的另外四点，现在都与 nginx 一致：
+
+  * 流控按 **64 KB 块**归还，而不是每个 DATA 帧一次：对端看到的是一条
+    `wdelta >= 65536` 的 WINDOW_UPDATE，而不是一串 16 KB 的；
+  * 只有真的会用到请求体时才收集（proxy/fastcgi/uwsgi/scgi/dav/`$request_body`）。
+    不需要且未结束的体，应答之后用 `NO_ERROR` 复位 —— 但**仅在流确实未结束时**；第一版
+    把已结束的流也复位了，直接打破了 "request body with padding - next"；
+  * 请求没有体、也没有声明长度时，不再向上游发 `Content-Length: 0`；
+  * 只要收到过 DATA 帧（哪怕是空的）就把体落盘（`$request_body_file`），这是
+    "request body - empty size" 需要的。
+
+**剩下 3 条做不到，不能归因于本项目的代码**：`request body less/more than
+content-length` 与空 `:method` 那几条，发来的体长度与 `content-length` 矛盾。`h2` crate
+在 `recv_data` 里自己比较两者并抛 `PROTOCOL_ERROR` 复位流 —— payload **根本不会**交给
+我们的 `RecvStream`，于是 `data()` 永不返回，没有任何东西可以应答。nginx 自己拥有 HTTP/2
+帧层，所以它能比较 `r->headers_in.content_length_n` 与实际收到的字节并回 400。这与已在
+本文件记录过的 HPACK / 帧级条目同类：结构性限制，不是待办的 bug。因此该文件停在
+48/51、**不进声明清单**。
+
 ## 二、声明的测试清单
 
 清单在 `bench/declared.txt`，**130 个文件**，选取规则是机械的：

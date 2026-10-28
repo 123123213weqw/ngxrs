@@ -816,7 +816,14 @@ impl tokio::io::AsyncWrite for UpConn {
 struct Rate {
     rate: u64,
     sent: u64,
-    started: std::time::Instant,
+    /// Started lazily, on this direction's first byte.
+    ///
+    /// It must not be the session start: with `proxy_upload_rate 1000` the
+    /// upload phase takes a second before the upstream replies, and that idle
+    /// second would hand the download direction a full second of credit. The
+    /// suite catches exactly this -- 1011 bytes at `proxy_download_rate 250`
+    /// then took 3.04 s instead of 4.04 s, and `download - time` wants >= 4.
+    started: Option<std::time::Instant>,
 }
 
 impl Rate {
@@ -824,17 +831,18 @@ impl Rate {
         Rate {
             rate,
             sent: 0,
-            started: std::time::Instant::now(),
+            started: None,
         }
     }
 
     /// How many bytes may be in flight right now, and how long to wait when the
     /// answer is zero. `None` means unlimited.
-    fn allowance(&self) -> Option<u64> {
+    fn allowance(&mut self) -> Option<u64> {
         if self.rate == 0 {
             return None;
         }
-        let elapsed = self.started.elapsed().as_micros() as u64;
+        let started = *self.started.get_or_insert_with(std::time::Instant::now);
+        let elapsed = started.elapsed().as_micros() as u64;
         let allowed = self.rate.saturating_mul(elapsed) / 1_000_000;
         Some(allowed.saturating_sub(self.sent))
     }
@@ -853,20 +861,40 @@ where
 /// reads instead breaks sessions, because a client that half-closes after
 /// sending makes `read` return 0 and the loop exits with the response still
 /// buffered -- measured as "download - data" receiving 1 of 1011 bytes.
+/// Wait long enough that the budget covers the whole buffer, then write it in
+/// one go.
+///
+/// Dribbling a byte at a time is wrong even though the average rate is the same:
+/// a peer that does a single `read` only ever sees the first byte, and a test
+/// backend built that way answers '1' instead of the 1000 bytes it was sent
+/// (`stream_limit_rate.t`, "exact limit"). Delaying *before* the write and then
+/// handing over the whole buffer keeps both properties -- the peer receives
+/// complete records and the transfer still averages `rate` bytes per second.
+///
+/// A wait longer than five seconds is not worth blocking on, so the buffer is
+/// then split and the excess is carried by later iterations; that keeps a large
+/// transfer flowing at the configured rate instead of stalling for minutes.
 async fn write_paced<W>(w: &mut W, mut buf: &[u8], rate: &mut Rate) -> std::io::Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
     use tokio::io::AsyncWriteExt;
+    const MAX_WAIT_US: u64 = 5_000_000;
+
     while !buf.is_empty() {
         let want = match rate.allowance() {
             None => buf.len(),
-            Some(0) => {
-                let wait = std::time::Duration::from_micros(1_000_000 / rate.rate.max(1));
-                tokio::time::sleep(wait.min(std::time::Duration::from_millis(20))).await;
-                continue;
+            Some(n) if n as usize >= buf.len() => buf.len(),
+            Some(n) => {
+                let need = buf.len() as u64 - n;
+                let wait_us = need.saturating_mul(1_000_000) / rate.rate.max(1);
+                if wait_us <= MAX_WAIT_US {
+                    tokio::time::sleep(std::time::Duration::from_micros(wait_us)).await;
+                    continue;
+                }
+                // Too long to wait for the whole thing: send one second's worth.
+                (rate.rate.max(1) as usize).min(buf.len())
             }
-            Some(n) => (n as usize).min(buf.len()),
         };
         let n = w.write(&buf[..want]).await?;
         if n == 0 {
@@ -879,6 +907,7 @@ where
         buf = &buf[n..];
     }
     w.flush().await
+
 }
 
 async fn splice_rated<A, B>(

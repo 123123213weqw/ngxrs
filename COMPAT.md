@@ -3448,16 +3448,43 @@ passing 的 9 条包含全部**数据**断言（`exact limit`、`unlimited`、`l
 现在 `write_paced()` 在写侧按配额分块并 sleep，`splice_rated` 不再切片读。
 本地用与用例相同的载荷（1011 字节含时间戳）验证：`bytes=1011 body_ok=True`。
 
-### 仍未解决：服务器上数据仍被截断
+### 第三轮：已解决 —— `stream_limit_rate.t` 11/11 一致
 
-同一份二进制在服务器上跑 `stream_limit_rate.t` 仍是 **9/11**，
-`exact limit` 与 `download - data` 失败（数据被截断）。
-本地同样的 1011 字节单次写后端能拿全，所以差异来自用例后端**分块发送**
-（每个 1 秒间隔），这段交互我没能在本轮定位。
+真正的模型找到了，而且是我前两轮都没猜对的：**先等到预算够整个缓冲区，
+再一次性写出去**。
 
-**因此仍不计入声明清单。** 下一步排查入口：给 `write_paced` 加计数日志，
-确认是 `write` 返回 0 触发了 `WriteZero` 提前 break，还是 `b.read` EOF 早于
-配额耗尽。
+前两轮的两个错误方向：
+
+- 逐字节写（"涓流"）：平均值对了，但对端如果只做**一次 `read`**，它只看到第一个
+  字节。`stream_limit_rate.t` 的后端正是
+
+  ```perl
+  $client->sysread(my $buffer, 65536) or return 1;
+  $buffer .= " " . time() if $client->sockport() eq port(8080);
+  $client->syswrite($buffer);
+  ```
+
+  一次读、一次写，所以涓流会让它回 `'1'` 而不是 1000 字节，
+  `exact limit` 与 `download - data` 因此失败。
+- 加一秒"突发信用"：`exact limit` 修好了，但 `download - time` 变成约 3.04 秒
+  （1011 字节、rate 250，扣掉 1 秒突发），低于断言要求的 4 秒。
+
+正确做法（`write_paced`）：预算不足时**先 sleep 到足够为止**，然后整个缓冲区一次写入。
+等待超过 5 秒则退化为"一次写一秒的量"，避免大传输被长时间挂住。
+
+这一版同时满足两个看似矛盾的要求：对端收到的是完整记录，而平均速率恰好是 `rate`。
+
+| 端口 | 配置 | 断言 | 结果 |
+|---|---|---|---|
+| 8081 | up 1000 / down 1011 | `exact limit`（1000 字节完整） | 通过 |
+| 8082 | 不限速 | `unlimited`（含 extra） | 通过 |
+| 8085 | down 250 | `download - time >= 4` + `download - data` | 通过 |
+| 8086 | up 250 | `upload - time >= 4` + `upload - data` | 通过 |
+
+`stream_limit_rate.t` **TRUNC 0/11 → 11/11 一致**，已加入声明清单（164 文件）。
+
+顺带记录：该套件里 `limited`、`download - one byte`、`upload - one byte` 三条
+被 `skip 'unsafe on VM'` 跳过（未设 `TEST_NGINX_UNSAFE`），所以实际只跑 8 条断言。
 
 ### 上一轮的旧记录（保留以便对照）
 

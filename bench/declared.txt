@@ -336,3 +336,5 @@ sub_filter_slice.t
 stream_access.t
 
 stream_ssl_alpn.t
+
+stream_limit_rate.t

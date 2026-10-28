@@ -231,6 +231,7 @@ pub fn maybe_compress(req: &Request, resp: Response, loc: &LocCfg, http: &Http) 
             no_error_page: resp.no_error_page,
             trailers: resp.trailers,
             expect_trailers: resp.expect_trailers,
+            server_tokens: None,
             headers_finalized: resp.headers_finalized,
             body,
         };
@@ -258,6 +259,7 @@ pub fn maybe_compress(req: &Request, resp: Response, loc: &LocCfg, http: &Http) 
         no_error_page: resp.no_error_page,
         trailers: resp.trailers,
         expect_trailers: req.version_minor >= 1 || resp.expect_trailers,
+        server_tokens: None,
         headers_finalized: resp.headers_finalized,
         body: Body::Bytes(payload),
     }

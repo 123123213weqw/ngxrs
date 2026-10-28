@@ -486,6 +486,7 @@ pub async fn fetch(
         no_error_page: false,
         trailers: Vec::new(),
         expect_trailers: false,
+        server_tokens: None,
         headers_finalized: false,
         body: Body::Bytes(payload),
     }, had_length))
@@ -547,6 +548,7 @@ fn error_response(status: u16) -> Response {
         no_error_page: false,
         trailers: Vec::new(),
         expect_trailers: false,
+        server_tokens: None,
         headers_finalized: false,
         body: Body::Bytes(body),
     }
@@ -637,6 +639,7 @@ async fn respond(
         no_error_page: false,
         trailers: Vec::new(),
         expect_trailers: false,
+        server_tokens: None,
 
         headers_finalized: false,
         body: Body::Bytes(body),

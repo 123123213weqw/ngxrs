@@ -194,6 +194,10 @@ pub struct LocCfg {
     pub limit_conns: Vec<LimitConn>,
     /// `error_log` directives that apply to this location, in order.
     pub error_logs: Vec<LogSpec>,
+    /// `server_tokens on|off|build` at location scope. `None` inherits, which is
+    /// what nginx's `clcf` merge does -- a location-level `off` affects only that
+    /// location (`h2_server_tokens.t` sets it inside `/off`).
+    pub server_tokens: Option<bool>,
     /// `gzip_static on|off|always`: serve a sibling `.gz` when the client
     /// accepts gzip (`ngx_http_gzip_static_module`).
     pub gzip_static: bool,
@@ -397,6 +401,7 @@ impl LocCfg {
             access_logs: None,
             charset_utf8: false,
             error_logs: Vec::new(),
+            server_tokens: None,
             gzip_static: false,
             charset: CharsetSpec::default(),
             source_charset: CharsetSpec::default(),
@@ -3608,6 +3613,19 @@ impl Builder {
                     });
                 }
             }
+            "server_tokens" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "server_tokens requires a value"))?;
+                cfg.server_tokens = Some(match v.as_str() {
+                    "off" => false,
+                    // `build` also names the build in the version string; the
+                    // build name is empty here, so it behaves like `on`.
+                    "on" | "build" => true,
+                    _ => return Err(sem(&d.file, d.line, "invalid server_tokens")),
+                });
+            }
             "gzip_static" => {
                 let v = d
                     .args
@@ -4270,7 +4288,7 @@ impl Builder {
                 // Accepted, not yet honoured.
             }
             "limit_rate" | "limit_rate_after" | "sendfile" | "tcp_nopush" | "tcp_nodelay"
-            | "server_tokens" | "default_type" | "merge_slashes"
+            | "default_type" | "merge_slashes"
             | "open_file_cache" | "etag" | "msie_padding" => {
                 // Accepted at this scope but not yet plumbed through: handled at
                 // http/server level where relevant, otherwise silently accepted.

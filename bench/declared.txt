@@ -94,6 +94,10 @@ h2_absolute_redirect.t
 # (split into CONTINUATION when the block exceeds the frame size). Also pins that
 # the hop-by-hop headers HTTP/2 forbids are not forwarded.
 h2_trailers.t
+# Location-scope `server_tokens`, in the `Server` line and the builtin error
+# body, over both protocols.
+h2_server_tokens.t
+server_tokens.t
 
 # ---- upstream keepalive pool ----
 # The pool itself: buffered, unbuffered and in-memory (SSI subrequest) paths all

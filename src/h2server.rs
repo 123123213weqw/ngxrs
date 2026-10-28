@@ -482,6 +482,8 @@ async fn send_http2_response(
     head_only: bool,
 ) {
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    // A location-level `server_tokens` overrides the server's for this stream.
+    let tokens = resp.server_tokens.unwrap_or(tokens);
     let mut builder = H2Response::builder().status(status);
     {
         let headers = builder.headers_mut().expect("fresh builder");

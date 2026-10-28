@@ -1402,6 +1402,7 @@ pub async fn handle(
                         no_error_page: false,
                         trailers: Vec::new(),
                         expect_trailers: false,
+                        server_tokens: None,
 
                         headers_finalized: false,
                         body: Body::Bytes(entry.body),
@@ -2425,6 +2426,7 @@ async fn serve_cached(
         no_error_page: false,
         trailers: Vec::new(),
         expect_trailers: false,
+        server_tokens: None,
 
         headers_finalized: false,
         body: crate::http::Body::Bytes(body),
@@ -2672,6 +2674,7 @@ async fn exchange(
                     no_error_page: false,
                     trailers: Vec::new(),
                     expect_trailers: false,
+                    server_tokens: None,
 
                     headers_finalized: false,
                     body: crate::http::Body::Bytes(body),
@@ -2995,6 +2998,7 @@ async fn exchange(
                     no_error_page: false,
                     trailers: list,
                     expect_trailers: true,
+                    server_tokens: None,
 
                     headers_finalized: false,
                     body: if req.method == Method::Head {
@@ -3954,6 +3958,7 @@ pub async fn fetch(
             no_error_page: false,
             trailers: Vec::new(),
             expect_trailers: false,
+            server_tokens: None,
             headers_finalized: true,
             body: Body::Bytes(body),
         });
@@ -4083,6 +4088,7 @@ fn cached_response(entry: crate::cache::Cached, loc: &LocCfg, status: &str) -> R
         no_error_page: false,
         trailers: Vec::new(),
         expect_trailers: false,
+        server_tokens: None,
         headers_finalized: true,
         body: Body::Bytes(entry.body),
     }

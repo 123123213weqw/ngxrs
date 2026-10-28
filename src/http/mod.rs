@@ -91,6 +91,10 @@ pub struct Response {
     /// every value expands to empty (`ngx_http_headers_filter` sets
     /// `r->expect_trailers` before the values are known).
     pub expect_trailers: bool,
+    /// `server_tokens` chosen by the matched location, when it set one. The
+    /// emitters otherwise only know the server-level flag, so this overrides it
+    /// for the `Server` line and the builtin error body.
+    pub server_tokens: Option<bool>,
     /// `add_header` / `add_trailer` have already been applied to `raw`.
     ///
     /// The socket-free path (HTTP/2, HTTP/3, SSI, auth subrequests) renders the
@@ -118,6 +122,7 @@ impl Response {
             no_error_page: false,
             trailers: Vec::new(),
             expect_trailers: false,
+            server_tokens: None,
 
             headers_finalized: false,
             body: Body::Empty,
@@ -133,6 +138,7 @@ impl Response {
             no_error_page: false,
             trailers: Vec::new(),
             expect_trailers: false,
+            server_tokens: None,
 
             headers_finalized: false,
             body: Body::Bytes(body),
@@ -149,6 +155,7 @@ impl Response {
             no_error_page: false,
             trailers: Vec::new(),
             expect_trailers: false,
+            server_tokens: None,
 
             headers_finalized: false,
             body,
@@ -4540,6 +4547,15 @@ async fn finalize_response(
     // `raw`. The socket path only ever fixed the former, in `write_redirect`, so
     // an HTTP/2 client got a relative `Location` where nginx sends an absolute
     // one (`h2_absolute_redirect.t`). Fix both here, once.
+    // `server_tokens off` at location scope rewrites the signature in both the
+    // header and the builtin error body. Doing it here covers HTTP/1 and HTTP/2
+    // with one rule, since h2 renders whatever this produced.
+    if let Some(tokens) = cur_loc.server_tokens {
+        // The emitters write the `Server` line themselves and only know the
+        // server-level flag, so record the location's choice on the response.
+        out.server_tokens = Some(tokens);
+        apply_server_tokens(&mut out, tokens);
+    }
     absolutize_location_field(&mut out, req, cur_loc, server_port, local_addr);
     absolutize_location(&mut out.raw, req, cur_loc, server_port, local_addr);
 
@@ -5757,6 +5773,7 @@ async fn write_redirect(
         no_error_page: false,
         trailers: Vec::new(),
         expect_trailers: false,
+        server_tokens: None,
 
         headers_finalized: false,
         body: Body::Bytes(body),
@@ -5879,6 +5896,7 @@ pub async fn send_error(
         explicit_len: true,
         trailers: Vec::new(),
         expect_trailers: false,
+        server_tokens: None,
 
         headers_finalized: false,
         body: Body::Bytes(body),
@@ -5974,9 +5992,12 @@ async fn write_response_inner(
         no_error_page: _,
         trailers,
         expect_trailers,
+        server_tokens: resp_tokens,
         headers_finalized: _,
         body,
     } = resp;
+    // A location-level `server_tokens` overrides the server's for this reply.
+    let tokens = resp_tokens.unwrap_or(tokens);
 
     // nginx's `return 444`: close the connection without sending anything.
     // Surfaced as an error so the connection loop drops the socket, exactly
@@ -7275,6 +7296,52 @@ mod tests {
     fn log_expansion() {
         let vars = [("status", "200"), ("request_uri", "/x")];
         assert_eq!(expand_log("[$status] $request_uri", &vars, 0), "[200] /x");
+    }
+}
+
+/// Rewrite the `Server` signature and the builtin error page's signature line.
+fn apply_server_tokens(resp: &mut Response, tokens: bool) {
+    let want: &[u8] = if tokens {
+        b"nginx/1.28.0"
+    } else {
+        b"nginx"
+    };
+    let other: &[u8] = if tokens {
+        b"nginx"
+    } else {
+        b"nginx/1.28.0"
+    };
+    // Header, whether pre-rendered or still dynamic.
+    for (k, v) in resp.headers.iter_mut() {
+        if k.eq_ignore_ascii_case("server") && *v == String::from_utf8_lossy(other) {
+            *v = String::from_utf8_lossy(want).into_owned();
+        }
+    }
+    if resp.raw.windows(8).any(|w| w.eq_ignore_ascii_case(b"Server: ")) {
+        let text = String::from_utf8_lossy(&resp.raw).into_owned();
+        let from = format!("Server: {}", String::from_utf8_lossy(other));
+        let to = format!("Server: {}", String::from_utf8_lossy(want));
+        if text.contains(&from) {
+            resp.raw = text.replacen(&from, &to, 1).into_bytes();
+        }
+    }
+    // The builtin error body repeats the signature after the `<hr>`.
+    if let Body::Bytes(b) = &resp.body {
+        if let Ok(text) = std::str::from_utf8(b) {
+            let from = format!("<center>{}</center>", String::from_utf8_lossy(other));
+            let to = format!("<center>{}</center>", String::from_utf8_lossy(want));
+            if text.contains(&from) {
+                resp.body = Body::Bytes(text.replacen(&from, &to, 1).into_bytes());
+                let len = match &resp.body {
+                    Body::Bytes(b) => b.len(),
+                    _ => 0,
+                };
+                strip_header(resp, "Content-Length");
+                resp.headers
+                    .push(("Content-Length".to_string(), len.to_string()));
+                resp.explicit_len = false;
+            }
+        }
     }
 }
 

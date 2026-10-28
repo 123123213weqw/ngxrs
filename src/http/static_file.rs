@@ -510,6 +510,7 @@ fn serve_entry(
         explicit_len: true,
         trailers: Vec::new(),
         expect_trailers: false,
+        server_tokens: None,
 
         headers_finalized: false,
         body: match multipart {

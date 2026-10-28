@@ -1,0 +1,508 @@
+# sendfile=on conns=128 threads=8 dur=10s repeat=3
+# nginx :19180   ngxrs :19181
+# commit unknown
+# command: CONNS=128 REPEAT=3 SENDFILE=on bash bench/abba_raw.sh
+===== nginx 1k.txt =====
+Running 10s test @ http://127.0.0.1:19180/1k.txt
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   256.53us  110.02us   2.64ms   65.13%
+    Req/Sec    54.15k     8.53k   78.06k    68.33%
+  Latency Distribution
+     50%  252.00us
+     75%  328.00us
+     90%  402.00us
+     99%  542.00us
+  4318673 requests in 10.10s, 5.08GB read
+Requests/sec: 427599.77
+Transfer/sec:    515.45MB
+===== ngxrs 1k.txt =====
+Running 10s test @ http://127.0.0.1:19181/1k.txt
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   226.82us  110.46us   4.49ms   77.86%
+    Req/Sec    50.56k     5.44k   64.42k    66.88%
+  Latency Distribution
+     50%  223.00us
+     75%  289.00us
+     90%  341.00us
+     99%  577.00us
+  4024265 requests in 10.03s, 4.74GB read
+Requests/sec: 401078.64
+Transfer/sec:    483.48MB
+===== ngxrs 1k.txt =====
+Running 10s test @ http://127.0.0.1:19181/1k.txt
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   243.14us  129.34us   6.87ms   81.59%
+    Req/Sec    49.35k     5.57k   68.78k    62.89%
+  Latency Distribution
+     50%  240.00us
+     75%  300.00us
+     90%  373.00us
+     99%  646.00us
+  3942585 requests in 10.10s, 4.64GB read
+Requests/sec: 390367.43
+Transfer/sec:    470.57MB
+===== nginx 1k.txt =====
+Running 10s test @ http://127.0.0.1:19180/1k.txt
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   257.96us  113.39us   3.08ms   67.05%
+    Req/Sec    55.38k     9.60k   77.45k    60.38%
+  Latency Distribution
+     50%  262.00us
+     75%  327.00us
+     90%  397.00us
+     99%  545.00us
+  4405722 requests in 10.03s, 5.19GB read
+Requests/sec: 439128.13
+Transfer/sec:    529.34MB
+===== nginx 1k.txt =====
+Running 10s test @ http://127.0.0.1:19180/1k.txt
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   270.08us  137.34us   3.52ms   65.80%
+    Req/Sec    52.63k     8.93k   78.89k    73.66%
+  Latency Distribution
+     50%  260.00us
+     75%  358.00us
+     90%  446.00us
+     99%  638.00us
+  4192265 requests in 10.10s, 4.94GB read
+Requests/sec: 415085.61
+Transfer/sec:    500.36MB
+===== ngxrs 1k.txt =====
+Running 10s test @ http://127.0.0.1:19181/1k.txt
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   252.15us  128.97us   8.56ms   78.73%
+    Req/Sec    48.98k     6.17k   68.73k    69.08%
+  Latency Distribution
+     50%  241.00us
+     75%  309.00us
+     90%  380.00us
+     99%  710.00us
+  3907764 requests in 10.10s, 4.60GB read
+Requests/sec: 386940.35
+Transfer/sec:    466.44MB
+===== ngxrs 1k.txt =====
+Running 10s test @ http://127.0.0.1:19181/1k.txt
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   220.20us  112.17us   9.43ms   81.71%
+    Req/Sec    51.90k     5.39k   67.77k    70.73%
+  Latency Distribution
+     50%  217.00us
+     75%  280.00us
+     90%  329.00us
+     99%  548.00us
+  4145693 requests in 10.10s, 4.88GB read
+Requests/sec: 410479.41
+Transfer/sec:    494.81MB
+===== nginx 1k.txt =====
+Running 10s test @ http://127.0.0.1:19180/1k.txt
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   265.60us  173.46us  10.07ms   87.69%
+    Req/Sec    54.99k     9.84k   77.62k    65.09%
+  Latency Distribution
+     50%  266.00us
+     75%  341.00us
+     90%  396.00us
+     99%  584.00us
+  4386813 requests in 10.10s, 5.16GB read
+Requests/sec: 434377.92
+Transfer/sec:    523.62MB
+===== nginx 1k.txt =====
+Running 10s test @ http://127.0.0.1:19180/1k.txt
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   224.62us  140.85us   3.04ms   70.50%
+    Req/Sec    57.49k     5.92k   73.87k    67.79%
+  Latency Distribution
+     50%  174.00us
+     75%  317.00us
+     90%  450.00us
+     99%  582.00us
+  4581084 requests in 10.10s, 5.39GB read
+Requests/sec: 453605.55
+Transfer/sec:    546.80MB
+===== ngxrs 1k.txt =====
+Running 10s test @ http://127.0.0.1:19181/1k.txt
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   225.35us  113.99us   5.20ms   78.67%
+    Req/Sec    50.26k     6.61k   71.20k    61.00%
+  Latency Distribution
+     50%  212.00us
+     75%  286.00us
+     90%  349.00us
+     99%  554.00us
+  3999822 requests in 10.04s, 4.71GB read
+Requests/sec: 398506.81
+Transfer/sec:    480.38MB
+===== ngxrs 1k.txt =====
+Running 10s test @ http://127.0.0.1:19181/1k.txt
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   237.98us  126.72us  10.09ms   81.75%
+    Req/Sec    50.94k     5.44k   69.61k    67.46%
+  Latency Distribution
+     50%  236.00us
+     75%  290.00us
+     90%  358.00us
+     99%  705.00us
+  4064377 requests in 10.10s, 4.78GB read
+Requests/sec: 402430.14
+Transfer/sec:    485.11MB
+===== nginx 1k.txt =====
+Running 10s test @ http://127.0.0.1:19180/1k.txt
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   263.56us  112.33us   2.66ms   64.17%
+    Req/Sec    54.10k     8.19k   77.54k    59.55%
+  Latency Distribution
+     50%  273.00us
+     75%  340.00us
+     90%  397.00us
+     99%  532.00us
+  4309946 requests in 10.10s, 5.07GB read
+Requests/sec: 426750.35
+Transfer/sec:    514.42MB
+===== nginx 64k.bin =====
+Running 10s test @ http://127.0.0.1:19180/64k.bin
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     4.19ms    9.44ms  44.22ms   87.57%
+    Req/Sec    23.79k     3.77k   32.02k    58.00%
+  Latency Distribution
+     50%  466.00us
+     75%  733.00us
+     90%   19.09ms
+     99%   39.28ms
+  1893266 requests in 10.03s, 116.01GB read
+Requests/sec: 188774.89
+Transfer/sec:     11.57GB
+===== ngxrs 64k.bin =====
+Running 10s test @ http://127.0.0.1:19181/64k.bin
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   384.65us  134.05us   3.36ms   71.10%
+    Req/Sec    24.98k     1.33k   29.49k    72.62%
+  Latency Distribution
+     50%  336.00us
+     75%  470.00us
+     90%  602.00us
+     99%  726.00us
+  1987969 requests in 10.03s, 121.81GB read
+Requests/sec: 198112.62
+Transfer/sec:     12.14GB
+===== ngxrs 64k.bin =====
+Running 10s test @ http://127.0.0.1:19181/64k.bin
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   391.30us  140.58us   4.56ms   71.44%
+    Req/Sec    24.68k     1.53k   29.05k    70.00%
+  Latency Distribution
+     50%  340.00us
+     75%  484.00us
+     90%  615.00us
+     99%  749.00us
+  1964876 requests in 10.03s, 120.40GB read
+Requests/sec: 195947.90
+Transfer/sec:     12.01GB
+===== nginx 64k.bin =====
+Running 10s test @ http://127.0.0.1:19180/64k.bin
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     4.23ms    9.49ms  43.20ms   87.49%
+    Req/Sec    23.73k     3.79k   31.85k    57.27%
+  Latency Distribution
+     50%  474.00us
+     75%  735.00us
+     90%   19.31ms
+     99%   39.37ms
+  1899983 requests in 10.10s, 116.42GB read
+Requests/sec: 188123.78
+Transfer/sec:     11.53GB
+===== nginx 64k.bin =====
+Running 10s test @ http://127.0.0.1:19180/64k.bin
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     4.37ms    9.69ms  43.03ms   86.98%
+    Req/Sec    25.38k     4.24k   32.06k    52.06%
+  Latency Distribution
+     50%  376.00us
+     75%  680.00us
+     90%   20.40ms
+     99%   39.35ms
+  2023224 requests in 10.10s, 123.97GB read
+Requests/sec: 200325.54
+Transfer/sec:     12.28GB
+===== ngxrs 64k.bin =====
+Running 10s test @ http://127.0.0.1:19181/64k.bin
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   405.86us  156.10us   3.59ms   73.92%
+    Req/Sec    23.87k     0.92k   28.43k    79.05%
+  Latency Distribution
+     50%  345.00us
+     75%  515.00us
+     90%  649.00us
+     99%  789.00us
+  1904420 requests in 10.10s, 116.69GB read
+Requests/sec: 188557.54
+Transfer/sec:     11.55GB
+===== ngxrs 64k.bin =====
+Running 10s test @ http://127.0.0.1:19181/64k.bin
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   406.65us  172.35us   7.06ms   78.13%
+    Req/Sec    23.98k     1.72k   28.87k    86.77%
+  Latency Distribution
+     50%  342.00us
+     75%  518.00us
+     90%  645.00us
+     99%  821.00us
+  1911148 requests in 10.10s, 117.10GB read
+Requests/sec: 189235.52
+Transfer/sec:     11.60GB
+===== nginx 64k.bin =====
+Running 10s test @ http://127.0.0.1:19180/64k.bin
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     4.54ms    9.91ms  42.83ms   86.55%
+    Req/Sec    26.62k     3.02k   30.93k    74.03%
+  Latency Distribution
+     50%  350.00us
+     75%  614.00us
+     90%   21.41ms
+     99%   39.51ms
+  2121229 requests in 10.10s, 129.98GB read
+Requests/sec: 210020.70
+Transfer/sec:     12.87GB
+===== nginx 64k.bin =====
+Running 10s test @ http://127.0.0.1:19180/64k.bin
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     4.45ms    9.79ms  42.89ms   86.77%
+    Req/Sec    26.10k     3.36k   32.01k    68.54%
+  Latency Distribution
+     50%  369.00us
+     75%  596.00us
+     90%   20.88ms
+     99%   39.42ms
+  2079982 requests in 10.10s, 127.45GB read
+Requests/sec: 205950.94
+Transfer/sec:     12.62GB
+===== ngxrs 64k.bin =====
+Running 10s test @ http://127.0.0.1:19181/64k.bin
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   405.50us  163.06us   3.79ms   77.72%
+    Req/Sec    23.72k     1.04k   29.43k    79.15%
+  Latency Distribution
+     50%  348.00us
+     75%  476.00us
+     90%  644.00us
+     99%  834.00us
+  1890310 requests in 10.10s, 115.83GB read
+Requests/sec: 187174.03
+Transfer/sec:     11.47GB
+===== ngxrs 64k.bin =====
+Running 10s test @ http://127.0.0.1:19181/64k.bin
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   384.09us  131.73us   4.37ms   71.36%
+    Req/Sec    24.86k     1.33k   29.14k    70.66%
+  Latency Distribution
+     50%  338.00us
+     75%  459.00us
+     90%  600.00us
+     99%  722.00us
+  1981469 requests in 10.10s, 121.41GB read
+Requests/sec: 196192.66
+Transfer/sec:     12.02GB
+===== nginx 64k.bin =====
+Running 10s test @ http://127.0.0.1:19180/64k.bin
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     4.21ms    9.48ms  43.12ms   87.47%
+    Req/Sec    23.91k     3.69k   31.47k    54.81%
+  Latency Distribution
+     50%  426.00us
+     75%  693.00us
+     90%   19.31ms
+     99%   39.29ms
+  1905302 requests in 10.10s, 116.75GB read
+Requests/sec: 188649.76
+Transfer/sec:     11.56GB
+===== nginx 1m.bin =====
+Running 10s test @ http://127.0.0.1:19180/1m.bin
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.45ms    1.12ms  14.78ms   73.20%
+    Req/Sec     4.21k   238.64     4.53k    75.00%
+  Latency Distribution
+     50%    2.04ms
+     75%    3.24ms
+     90%    4.03ms
+     99%    5.71ms
+  336373 requests in 10.08s, 328.57GB read
+Requests/sec:  33380.40
+Transfer/sec:     32.61GB
+===== ngxrs 1m.bin =====
+Running 10s test @ http://127.0.0.1:19181/1m.bin
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.43ms  806.50us  13.08ms   74.37%
+    Req/Sec     3.79k   201.32     4.29k    75.88%
+  Latency Distribution
+     50%    2.24ms
+     75%    2.71ms
+     90%    3.74ms
+     99%    4.70ms
+  303308 requests in 10.09s, 296.27GB read
+Requests/sec:  30059.84
+Transfer/sec:     29.36GB
+===== ngxrs 1m.bin =====
+Running 10s test @ http://127.0.0.1:19181/1m.bin
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.40ms  776.96us  13.14ms   74.57%
+    Req/Sec     3.81k   175.74     4.27k    70.00%
+  Latency Distribution
+     50%    2.23ms
+     75%    2.67ms
+     90%    3.69ms
+     99%    4.57ms
+  304934 requests in 10.10s, 297.86GB read
+Requests/sec:  30196.36
+Transfer/sec:     29.50GB
+===== nginx 1m.bin =====
+Running 10s test @ http://127.0.0.1:19180/1m.bin
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.62ms    1.24ms  43.26ms   72.58%
+    Req/Sec     4.16k   230.69     4.45k    90.00%
+  Latency Distribution
+     50%    2.26ms
+     75%    3.45ms
+     90%    4.34ms
+     99%    6.02ms
+  331980 requests in 10.08s, 324.28GB read
+Requests/sec:  32943.57
+Transfer/sec:     32.18GB
+===== nginx 1m.bin =====
+Running 10s test @ http://127.0.0.1:19180/1m.bin
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.65ms    1.23ms  43.84ms   72.55%
+    Req/Sec     4.13k   218.57     4.42k    87.25%
+  Latency Distribution
+     50%    2.29ms
+     75%    3.48ms
+     90%    4.30ms
+     99%    6.01ms
+  329591 requests in 10.06s, 321.95GB read
+Requests/sec:  32748.07
+Transfer/sec:     31.99GB
+===== ngxrs 1m.bin =====
+Running 10s test @ http://127.0.0.1:19181/1m.bin
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.41ms  800.66us  11.89ms   74.96%
+    Req/Sec     3.81k   215.65     4.31k    81.12%
+  Latency Distribution
+     50%    2.22ms
+     75%    2.68ms
+     90%    3.70ms
+     99%    4.60ms
+  304749 requests in 10.10s, 297.68GB read
+Requests/sec:  30174.72
+Transfer/sec:     29.47GB
+===== ngxrs 1m.bin =====
+Running 10s test @ http://127.0.0.1:19181/1m.bin
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.40ms  785.99us  11.92ms   73.86%
+    Req/Sec     3.83k   179.21     4.23k    71.75%
+  Latency Distribution
+     50%    2.22ms
+     75%    2.69ms
+     90%    3.69ms
+     99%    4.57ms
+  306381 requests in 10.08s, 299.27GB read
+Requests/sec:  30387.09
+Transfer/sec:     29.68GB
+===== nginx 1m.bin =====
+Running 10s test @ http://127.0.0.1:19180/1m.bin
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.74ms    1.24ms  18.47ms   69.35%
+    Req/Sec     4.08k   254.72     4.43k    87.38%
+  Latency Distribution
+     50%    2.44ms
+     75%    3.56ms
+     90%    4.42ms
+     99%    6.09ms
+  325803 requests in 10.06s, 318.25GB read
+Requests/sec:  32396.75
+Transfer/sec:     31.65GB
+===== nginx 1m.bin =====
+Running 10s test @ http://127.0.0.1:19180/1m.bin
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.62ms    1.14ms  15.13ms   66.78%
+    Req/Sec     4.15k   232.41     4.49k    81.62%
+  Latency Distribution
+     50%    2.33ms
+     75%    3.48ms
+     90%    4.15ms
+     99%    5.69ms
+  331269 requests in 10.07s, 323.59GB read
+Requests/sec:  32901.69
+Transfer/sec:     32.14GB
+===== ngxrs 1m.bin =====
+Running 10s test @ http://127.0.0.1:19181/1m.bin
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.44ms  829.73us  23.40ms   74.62%
+    Req/Sec     3.77k   218.40     4.26k    74.31%
+  Latency Distribution
+     50%    2.26ms
+     75%    2.74ms
+     90%    3.77ms
+     99%    4.71ms
+  301374 requests in 10.10s, 294.38GB read
+Requests/sec:  29845.03
+Transfer/sec:     29.15GB
+===== ngxrs 1m.bin =====
+Running 10s test @ http://127.0.0.1:19181/1m.bin
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.42ms  784.29us  13.61ms   74.26%
+    Req/Sec     3.78k   164.01     4.17k    70.09%
+  Latency Distribution
+     50%    2.24ms
+     75%    2.71ms
+     90%    3.70ms
+     99%    4.59ms
+  302382 requests in 10.10s, 295.37GB read
+Requests/sec:  29942.60
+Transfer/sec:     29.25GB
+===== nginx 1m.bin =====
+Running 10s test @ http://127.0.0.1:19180/1m.bin
+  8 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.74ms    1.28ms  19.31ms   71.45%
+    Req/Sec     4.08k   336.19     4.43k    92.62%
+  Latency Distribution
+     50%    2.45ms
+     75%    3.60ms
+     90%    4.32ms
+     99%    6.34ms
+  325680 requests in 10.06s, 318.13GB read
+Requests/sec:  32370.29
+Transfer/sec:     31.62GB

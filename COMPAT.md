@@ -3233,10 +3233,31 @@ resp err Error { kind: GoAway(b"", PROTOCOL_ERROR, Library) }
 - `select!` 抢跑（把连接驱动放进独立 task、响应分支 `biased` 优先，错误照旧）
 - 连接提前结束（那是同一错误的另一种表现）
 
-下一步的怀疑方向：HEADERS 与 DATA 之间插入了一次 `.await` 后，本 crate 对
-`send_request` 的 `end_of_stream=false` + 延后 DATA 的组合有额外校验（缓冲模式下
-两者在同一轮内发出，`grpc_pass.t` 7/7 因此正常）。要确认需要能抓到 h2 crate
-内部错误的原因字符串，本机没有可用的 tracing 出口。
+### 已定位边界：转发逻辑本身正确，失败只在特定后端
+
+用一个能区分「我们的帧序」与「对方的帧/HPACK 选择」的实验：
+
+```bash
+# 上游是 nginx 自己的 h2c 服务（正常实现）
+$HOME/nginx-baseline/sbin/nginx -c /tmp/gx/up.conf -p /tmp/gx &
+./target/release/ngxrs -c /tmp/gx/px.conf -p /tmp/gx &     # grpc_pass grpc://127.0.0.1:29381
+
+curl --http2-prior-knowledge -X POST --data-binary Hello http://127.0.0.1:29380/
+# => code=200 ver=2, body=UPSTREAM-OK
+```
+
+**同一段 `stream_once` 对 nginx 的 h2 上游返回 200 且 body 正确**，因此
+HEADERS/DATA 的发送时序、`end_of_stream` 判定、响应读取都没有问题。
+
+而对着 `grpc.t` 的 Perl 后端（`Test::Nginx::HTTP2`，`pure => 1`，
+响应头用 `mode => 0/1/2` + `huff => 1` 等非常规 HPACK 表示）时，
+本机 h2 crate 自己发 GOAWAY(PROTOCOL_ERROR)。
+
+结论：这是**HPACK 表示层**的差异，与 `h2_headers.t` 那批属于同一类结构性限制
+（见本文件「结构性缺口」一节：HPACK 由 `h2` crate 决定）。要消除它必须自己实现
+HPACK 解码，而不是调整转发逻辑。
+
+因此 `grpc.t` / `grpc_ssl.t` 仍记为落后，数字保持 60/152 与 20/40。
 
 ### 为什么保留
 

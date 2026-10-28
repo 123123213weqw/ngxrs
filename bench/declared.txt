@@ -90,6 +90,10 @@ access_log_variables.t
 # `absolute_redirect` / `server_name_in_redirect` / `port_in_redirect` over h2,
 # percent-decoded `:path`, and `error_page` for an invalid `:authority`.
 h2_absolute_redirect.t
+# `add_trailer` over h2: HEADERS, DATA without END_STREAM, then a trailer HEADERS
+# (split into CONTINUATION when the block exceeds the frame size). Also pins that
+# the hop-by-hop headers HTTP/2 forbids are not forwarded.
+h2_trailers.t
 
 # ---- upstream keepalive pool ----
 # The pool itself: buffered, unbuffered and in-memory (SSI subrequest) paths all

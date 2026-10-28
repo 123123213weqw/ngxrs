@@ -797,6 +797,32 @@ h1 不受影响）；端口从 `group.addr.port()` 传入；`parse_target` 负�
    `add_header ... $ssl_client_s_dn always` 没有发出。这本身是较小的 bug，但只修它只能把
    2/11 变成约 7/11，而半个文件不能进声明清单。
 
+### 2026-10-28 第二十轮：HTTP/2 trailers，以及一条工具自检
+
+`h2_trailers.t` 10/24 → **24/24**，入清单（129 → **130** 文件）。
+
+`add_trailer` 在 h1 上是「chunked 尾块」，在 h2 上是**第二个 HEADERS 帧**：流必须
+先发完 DATA 而不置 END_STREAM，再发 trailer HEADERS。此前 h2 路径根本没有看
+`resp.trailers`，DATA 直接带 END_STREAM，于是帧序列只有 2 帧而 nginx 是 3 帧。
+
+顺带一条 h2 的协议约束：`Transfer-Encoding`、`Connection`、`Keep-Alive`、
+`Proxy-Connection`、`Upgrade` 在 HTTP/2 里是禁止的（RFC 9113 §8.2.2），而 h1 路径
+为了 `add_trailer` 会插入 `Transfer-Encoding: chunked`。现在这两条路径共用一个
+`is_connection_specific` 过滤器。
+
+**工具自检**（本轮新增，因为上一轮我自己踩了两次）：`bench/declared.sh` 现在会
+
+1. 打印**解析后的** `declared.txt` 绝对路径；
+2. 逐条核对清单里的文件名在 `$TESTS_DIR` 中确实存在，缺失即非零退出。
+
+起因是两次「绿了的假象」：`rsync -az bench/declared.txt host:~/ngxrs/` 会把文件落在
+`~/ngxrs/declared.txt` 而不是 `bench/` 下，于是回归跑的是**上一次的清单**却仍打印 PASS
+（两次分别少跑了 1 个和 1 个文件）。这类错配必须是硬失败，不能靠人盯。
+
+**未做**：`h3server` 同样不发 trailers。`h3_trailers.t` 存在，但参考 nginx 没有编译
+`--with-http_v3_module`，跑出来的只是我方数字，**不能**当作一致性证据 —— 所以既没有
+实现也没有声明，如实记在这里。
+
 ## 二、声明的测试清单
 
 清单在 `bench/declared.txt`，**129 个文件**，选取规则是机械的：

@@ -305,6 +305,12 @@ async fn send_http2_response(
         let headers = builder.headers_mut().expect("fresh builder");
         for line in split_header_lines(&resp.raw) {
             if let Some((k, v)) = line.split_once(':') {
+                // `Transfer-Encoding` and the rest of the hop-by-hop set are
+                // forbidden in HTTP/2, and the h1 path adds
+                // `Transfer-Encoding: chunked` whenever `add_trailer` applies.
+                if is_connection_specific(k.trim()) {
+                    continue;
+                }
                 if let (Ok(name), Ok(value)) = (
                     http::header::HeaderName::from_bytes(k.trim().as_bytes()),
                     http::header::HeaderValue::from_str(v.trim()),
@@ -314,6 +320,9 @@ async fn send_http2_response(
             }
         }
         for (k, v) in &resp.headers {
+            if is_connection_specific(k) {
+                continue;
+            }
             if let (Ok(name), Ok(value)) = (
                 http::header::HeaderName::from_bytes(k.as_bytes()),
                 http::header::HeaderValue::from_str(v),
@@ -349,15 +358,49 @@ async fn send_http2_response(
         }
     }
 
+    // `add_trailer` reaches HTTP/2 as a second HEADERS frame after the DATA, so
+    // the response must not end the stream up front (`h2_trailers.t` counts the
+    // frames: HEADERS, DATA without END_STREAM, then the trailer HEADERS).
+    let has_trailers = !resp.trailers.is_empty();
     let Ok(response) = builder.body(()) else {
         return;
     };
-    let Ok(mut send) = respond.send_response(response, head_only || len == 0) else {
+    let Ok(mut send) = respond.send_response(response, !has_trailers && (head_only || len == 0))
+    else {
         return;
     };
-    if !head_only && len > 0 {
-        let _ = send.send_data(Bytes::from(body), true);
+    if head_only {
+        return;
     }
+    if len > 0 && !has_trailers {
+        let _ = send.send_data(Bytes::from(body), true);
+        return;
+    }
+    if len > 0 {
+        let _ = send.send_data(Bytes::from(body), false);
+    }
+    if has_trailers {
+        let mut trailers = http::HeaderMap::new();
+        for (k, v) in &resp.trailers {
+            if let (Ok(name), Ok(value)) = (
+                http::header::HeaderName::from_bytes(k.as_bytes()),
+                http::header::HeaderValue::from_str(v),
+            ) {
+                trailers.append(name, value);
+            }
+        }
+        let _ = send.send_trailers(trailers);
+    }
+}
+
+/// Headers HTTP/2 forbids (`RFC 9113` 8.2.2): HTTP/2 has its own framing, so the
+/// hop-by-hop set must not be forwarded.
+fn is_connection_specific(name: &str) -> bool {
+    name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("keep-alive")
+        || name.eq_ignore_ascii_case("proxy-connection")
+        || name.eq_ignore_ascii_case("upgrade")
 }
 
 fn split_header_lines(raw: &[u8]) -> Vec<String> {

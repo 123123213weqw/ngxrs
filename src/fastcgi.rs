@@ -520,17 +520,20 @@ async fn fetch_uncached(
 
     // `fastcgi_pass $var` is resolved here, once the variables are known. The
     // value may be an `upstream` name or a literal `host:port`.
-    let addr: SocketAddr = if fcgi.dynamic {
-        let target = expand(&fcgi.spec, &vars);
-        match resolve_dynamic(&target, http) {
-            Some(a) => a,
+    // The target is either a TCP address or a unix socket path.
+    let target: DynTarget = if fcgi.dynamic {
+        let value = expand(&fcgi.spec, &vars);
+        match resolve_dyn(&value, http) {
+            Some(t) => t,
             None => {
-                eprintln!("ngxrs: [error] fastcgi_pass \"{target}\" is not a resolvable address");
+                eprintln!("ngxrs: [error] fastcgi_pass \"{value}\" is not a resolvable address");
                 return Some((error_response(502), true));
             }
         }
+    } else if let Some(path) = &fcgi.unix {
+        DynTarget::Unix(path.as_ref().clone())
     } else {
-        fcgi.addr
+        DynTarget::Tcp(fcgi.addr)
     };
 
     let mut params: Vec<(String, String)> = Vec::with_capacity(loc.fastcgi_params.len() + 8);
@@ -541,19 +544,49 @@ async fn fetch_uncached(
     }
 
     // ---- send it ----
-    let mut stream =
-        match tokio::time::timeout(loc.fastcgi_connect_timeout, TcpStream::connect(addr)).await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                eprintln!("ngxrs: [error] fastcgi connect {addr} failed: {e}");
-                return Some((error_response(502), true));
+    let mut stream = match &target {
+        DynTarget::Tcp(addr) => {
+            match tokio::time::timeout(loc.fastcgi_connect_timeout, TcpStream::connect(*addr)).await
+            {
+                Ok(Ok(s)) => {
+                    let _ = s.set_nodelay(true);
+                    FcgiConn::Tcp(s)
+                }
+                Ok(Err(e)) => {
+                    eprintln!("ngxrs: [error] fastcgi connect {addr} failed: {e}");
+                    return Some((error_response(502), true));
+                }
+                Err(_) => {
+                    eprintln!("ngxrs: [error] fastcgi connect {addr} timed out");
+                    return Some((error_response(504), true));
+                }
             }
-            Err(_) => {
-                eprintln!("ngxrs: [error] fastcgi connect {addr} timed out");
-                return Some((error_response(504), true));
+        }
+        DynTarget::Unix(path) => {
+            match tokio::time::timeout(
+                loc.fastcgi_connect_timeout,
+                tokio::net::UnixStream::connect(path),
+            )
+            .await
+            {
+                Ok(Ok(s)) => FcgiConn::Unix(s),
+                Ok(Err(e)) => {
+                    eprintln!(
+                        "ngxrs: [error] fastcgi connect unix:{} failed: {e}",
+                        path.display()
+                    );
+                    return Some((error_response(502), true));
+                }
+                Err(_) => {
+                    eprintln!(
+                        "ngxrs: [error] fastcgi connect unix:{} timed out",
+                        path.display()
+                    );
+                    return Some((error_response(504), true));
+                }
             }
-        };
-    let _ = stream.set_nodelay(true);
+        }
+    };
 
     let req_id: u16 = 1;
     let mut out = Vec::with_capacity(4096);
@@ -735,12 +768,20 @@ async fn fetch_uncached(
     }, had_length))
 }
 
-/// Resolve a per-request `fastcgi_pass` value: an `upstream` name, or
-/// `host:port`, or `unix:/path`.
-///
-/// nginx's `ngx_http_upstream_init_request` does the same thing: a URL whose
-/// host is an upstream name goes through that upstream, anything else is
-/// parsed as `host:port`.
+/// Where a `*_pass` value points. A unix socket has no `SocketAddr`, so the two
+/// cases cannot share a type (`fastcgi_unix.t` passes `unix:<path>`).
+pub(crate) enum DynTarget {
+    Tcp(SocketAddr),
+    Unix(std::path::PathBuf),
+}
+
+pub(crate) fn resolve_dyn(target: &str, http: &Http) -> Option<DynTarget> {
+    if let Some(path) = target.trim().strip_prefix("unix:") {
+        return Some(DynTarget::Unix(std::path::PathBuf::from(path)));
+    }
+    resolve_dynamic(target.trim(), http).map(DynTarget::Tcp)
+}
+
 pub(crate) fn resolve_dynamic(target: &str, http: &Http) -> Option<SocketAddr> {
     let target = target.trim();
     if let Some(rest) = target.strip_prefix("unix:") {
@@ -801,6 +842,56 @@ fn error_response(status: u16) -> Response {
 /// Write a FastCGI response to the client. `None` when the location is not a
 /// FastCGI one.
 #[allow(clippy::too_many_arguments)]
+/// The upstream side of a FastCGI exchange: a TCP socket, or a unix one.
+enum FcgiConn {
+    Tcp(TcpStream),
+    Unix(tokio::net::UnixStream),
+}
+
+impl tokio::io::AsyncRead for FcgiConn {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            FcgiConn::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            FcgiConn::Unix(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for FcgiConn {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        match self.get_mut() {
+            FcgiConn::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            FcgiConn::Unix(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            FcgiConn::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
+            FcgiConn::Unix(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            FcgiConn::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            FcgiConn::Unix(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
 pub async fn handle(
     conn: &mut Conn,
     req: &Request,

@@ -849,6 +849,9 @@ pub struct FastcgiPass {
     /// against either an `upstream` name or `host:port`.
     pub spec: String,
     pub dynamic: bool,
+    /// `fastcgi_pass unix:/path`: the address above is a placeholder and the
+    /// connection is made over this socket (`fastcgi_unix.t`).
+    pub unix: Option<std::sync::Arc<std::path::PathBuf>>,
 }
 
 #[derive(Debug, Clone)]
@@ -3664,19 +3667,31 @@ impl Builder {
                         addr: SocketAddr::from(([127, 0, 0, 1], 0)),
                         spec: v.clone(),
                         dynamic: true,
+                        unix: None,
                     });
                 } else {
-                    let addr = parse_listen(v).ok_or_else(|| {
-                        sem(
-                            &d.file,
-                            d.line,
-                            format!("invalid fastcgi_pass address \"{v}\""),
-                        )
-                    })?;
+                    // `fastcgi_pass unix:/path` names a unix socket, which is
+                    // not a `SocketAddr`; keep the path and leave a placeholder
+                    // address behind.
+                    let unix = v.strip_prefix("unix:").map(|p| {
+                        std::sync::Arc::new(std::path::PathBuf::from(p))
+                    });
+                    let addr = if unix.is_some() {
+                        SocketAddr::from(([127, 0, 0, 1], 0))
+                    } else {
+                        parse_listen(v).ok_or_else(|| {
+                            sem(
+                                &d.file,
+                                d.line,
+                                format!("invalid fastcgi_pass address \"{v}\""),
+                            )
+                        })?
+                    };
                     cfg.fastcgi_pass = Some(FastcgiPass {
                         addr,
                         spec: v.clone(),
                         dynamic: false,
+                        unix,
                     });
                 }
             }

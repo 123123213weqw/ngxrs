@@ -2833,3 +2833,82 @@ if (uwcf->upstream.pass_request_headers) {          /* 默认 on */
 pip3 install --user uwsgi      # 一次性
 TEST_LIST="uwsgi.t scgi.t fastcgi.t" bash bench/nginxtests.sh   # 应 SAME 10/10、12/12、10/10
 ```
+
+## 本轮（声明清单从 137 修到 152；`fastcgi_pass unix:`；三个新发现的缺口）
+
+### 1. 声明清单少算了 14 个已达标的套件
+
+`bench/declared.txt` 是验收依据，但它来自更早的一次扫描，之后**从未随修好的套件更新**。
+把前几轮报告过"完全一致"的名字逐个核对，发现 `access.t`、`autoindex.t`、`error_log.t`、
+`empty_gif.t`、`http_method.t`、`rewrite.t`、`charset.t`、`stub_status.t`、`split_clients.t`、
+`referer.t`、`limit_req.t`、`limit_req_delay.t`、`limit_conn.t`、`ssi.t` 全都不在清单里。
+
+本轮用 `bench/nginxtests.sh` 重新测量后才加入，没有凭旧报告直接写进去：
+
+```
+SAME   access.t        14/14     SAME   error_log.t         27/27
+SAME   autoindex.t     18/18     SAME   http_method.t        4/6
+SAME   charset.t        9/9      SAME   rewrite.t           25/25
+SAME   empty_gif.t      6/6      SAME   stub_status.t       36/36
+SAME   split_clients.t  3/3      SAME   referer.t           56/56
+SAME   limit_req.t      8/8      SAME   limit_req_delay.t    6/6
+SAME   limit_conn.t    10/10     SAME   ssi.t               32/32
+```
+
+（`ssi_if.t` 是 BETTER：41 条 vs nginx 的 32，也一并加入——声明清单只要求 `WORSE=0`。）
+
+清单 **137 → 151**，本轮又加入 `fastcgi_unix.t`，现为 **152**。
+
+**过程记录**：第一次追加时我用脚本做了 `sorted(set(...))`，把文件里的分节注释头也一起重排，
+135 个名字被摊成 269 行碎片。`git checkout` 回滚后改为纯追加 + 精确去重，
+`git diff` 只有新增的 22 行。
+
+### 2. `fastcgi_pass unix:/path`
+
+`fastcgi_unix.t` 此前是 `TRUNC 0/8`：配置直接拒绝
+
+```
+ngxrs: nginx.conf:30: invalid fastcgi_pass address "unix:/tmp/.../unix.sock"
+```
+
+`parse_listen` 只认 `SocketAddr`。修改：
+
+- `FastcgiPass` 增加 `unix: Option<Arc<PathBuf>>`，`unix:` 前缀的值存路径、地址留占位；
+- `resolve_dyn()` 返回 `DynTarget::{Tcp,Unix}`，供 `fastcgi_pass $arg_b` 在请求时解析
+  （该用例的 `/var` location 就是变量形式）；
+- 连接处改为本地枚举 `FcgiConn::{Tcp,Unix}` 实现 `AsyncRead/AsyncWrite`，
+  `set_nodelay` 只在 TCP 分支调用。
+
+`fastcgi_unix.t` **0/8 → 8/8 一致**，`fastcgi.t` 仍 10/10。
+
+### 3. 三个新发现的未测缺口（都不在声明清单里，如实计入）
+
+`IO::Socket::UNIX` 其实一直装着（我先前按名字猜它缺失）。于是三个套件第一次真正跑起来：
+
+| 套件 | nginx | ngxrs | 原因 |
+|---|---|---|---|
+| `fastcgi_unix.t` | 8/8 | **已修到 8/8** | 见上 |
+| `proxy_unix.t` | 7/7 | **0/7 TRUNC** | `upstream { server unix:/path; }` 不认 |
+| `stream_unix.t` | 4/4 | **0/4 TRUNC** | 同上，且 `stream` 的 `proxy_pass unix:` 也不认 |
+
+两个未修的报错都是 `invalid server address "unix:/tmp/.../unix.sock"`。
+`UpstreamServer.addr` 是 `SocketAddr`，要支持 unix 得给它加一个可选路径字段，
+并让 `proxy::connect_bound` 的返回类型从 `TcpStream` 变成 `UpStream`——**会波及
+proxy/grpc/uwsgi/fastcgi/stream 五处连接点**。本轮刻意没做：在收尾阶段动连接层的
+返回类型，正是此前 `rewrite` 顺序 bug 的成因。下一轮单独做。
+
+### 4. 与参考构建有关、无法 A/B 的套件（不是我们的缺陷）
+
+- `gunzip.t` / `gunzip_ssi.t` / `gunzip_static.t` / `charset_gzip_static.t` 等 7 个：
+  参考 nginx 编译时没有 `--with-http_gunzip_module`，两边同时跳过。
+- `control_api*.t`（3 个）：`control_api` 是 nginx 1.29 的模块，参考构建是 1.28。
+- `addition*.t`：参考构建没有 `--with-http_addition_module`。
+
+这些要真正测量，需要重编参考 nginx 并实现对应模块。本轮未做，也不把它们算作通过。
+
+复现：
+
+```bash
+TEST_LIST="fastcgi_unix.t fastcgi.t" bash bench/nginxtests.sh   # 应 SAME 8/8 与 10/10
+TEST_LIST="proxy_unix.t stream_unix.t" bash bench/nginxtests.sh # 目前 TRUNC，见上文
+```

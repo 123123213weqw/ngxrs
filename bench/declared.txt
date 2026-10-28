@@ -300,3 +300,25 @@ mail_smtp_greeting_delay.t
 mail_smtp_xclient.t
 scgi.t
 uwsgi.t
+
+# ---- suites that already matched but were never listed ----
+# Found by checking every suite reported identical in earlier rounds against
+# this file: the list had been built from an older scan and never updated, so
+# the acceptance evidence covered 137 files where 151 actually match. Each name
+# below was re-measured with `bench/nginxtests.sh` in this round before being
+# added (`ssi_if.t` is BETTER: 41 assertions vs nginx's 32).
+access.t
+autoindex.t
+empty_gif.t
+error_log.t
+http_method.t
+limit_conn.t
+limit_req.t
+limit_req_delay.t
+referer.t
+rewrite.t
+split_clients.t
+ssi.t
+ssi_if.t
+stub_status.t
+fastcgi_unix.t

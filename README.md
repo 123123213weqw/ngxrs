@@ -68,8 +68,8 @@ bash bench/fcgi.sh    # FastCGI / uwsgi / SCGI / stream TCP-UDP 14 项
 **绝对通过率没有意义**——nginx-tests master 依赖比 CPAN 更新的 `Test::Nginx`，很多用例对真 nginx 也是失败/阻塞。
 这两个脚本只报"nginx 过而 ngxrs 不过"的断言，那才是真缺陷。
 
-最近一次声明清单 A/B：**132 个文件，0 条「nginx 过而我们不过」**，
-其中 127 个逐断言一致、5 个我们更多（nginx 2028 / ngxrs 2033 断言）（`http_headers_multi.t`、`proxy_cache_range.t`、`proxy_if.t`、`proxy_noclose.t`）。
+最近一次声明清单 A/B：**134 个文件，0 条「nginx 过而我们不过」**，
+其中 129 个逐断言一致、5 个我们更多（nginx 2122 / ngxrs 2127 断言）（`http_headers_multi.t`、`proxy_cache_range.t`、`proxy_if.t`、`proxy_noclose.t`）。
 范围内仍不一致的文件、缺口与复现命令逐条列在 [COMPAT.md](COMPAT.md) 第三节。
 
 ## 性能

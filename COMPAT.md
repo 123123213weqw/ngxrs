@@ -13,9 +13,9 @@
 
 | 项 | 命令 | 当前结果 |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 132 文件，WORSE=0 TRUNC=0（nginx 2028 / ngxrs 2033，127 个逐断言一致、5 个更优） |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 134 文件，WORSE=0 TRUNC=0（nginx 2122 / ngxrs 2127，129 个逐断言一致、5 个更优） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
-| 单元测试 | `cargo test --release` | **PASS** — 156 passed |
+| 单元测试 | `cargo test --release` | **PASS** — 175 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
 
 ## 一之二、2026-10-27 轮：范围纠偏、realip 信任判定、auth_basic
@@ -951,9 +951,45 @@ fastcgi 缓存可行，但需要指令集（`fastcgi_cache` / `fastcgi_cache_key
 proxy/cache/vary 均未回退：`proxy_cache.t` 17/17、`proxy_cache_vary.t` 53/54、
 `proxy_cache_valid.t` 14/14。
 
+### 2026-10-28 第二十五轮：`fastcgi_cache`（同时关闭 `slice.t`）
+
+`slice.t` **82/87 → 87/87**、`fastcgi_cache.t` 6/7 → **7/7**，两者入清单
+（132 → **134** 文件）。
+
+`fastcgi_cache` 此前完全不存在：`fastcgi_cache` / `fastcgi_cache_key` /
+`fastcgi_cache_valid` 躺在「接受但不生效」那一支，`fastcgi_cache_path` 根本没解析。
+slice 最后 5 条断言都读 `$upstream_cache_status`，没有它不可能通过。
+
+本轮做的：
+
+- **`*_cache_path` 合并成一个解析器**：两个模块的参数逐个相同，注册进同一张 zone 表，
+  而且一个 zone 被两者共用是合法配置。
+- **`LocCfg` 有自己的 `fastcgi_cache*` 字段**。nginx 把它们放在 fastcgi 的 location conf
+  上（`ngx_http_fastcgi_loc_conf_t.cache`），不是 proxy 的，所以同一个 location 可以缓存
+  其中一个上游模块而不缓存另一个，有效期也可以不同。`cache::ttl` 因此拆开，有效期来源变成
+  参数而不是写死 `proxy_cache_valid`。
+- **`fastcgi::fetch` 做 lookup / 命中即不联系应答方 / 未命中则存储**。`$slice_range` 也进
+  `fastcgi_cache_key` —— 漏掉它会让所有片共用一条缓存，症状是切片循环要
+  `bytes=2-3`、却拿到缓存的 `bytes=0-1` 响应（`unexpected range 0-1, want 2-1`）。
+
+**顺带挖出两个早于本轮的架构缺陷**：
+
+1. `fastcgi::handle` 把响应直接写连接、**从不经过 `finalize_response`**，所以 HTTP/1 上
+   **fastcgi 响应从来不会应用 `add_header`**。改在上游变量可见的位置应用（proxy 模块本来
+   就是这么做的）才对。仅这一条就值好几条断言：没有它，缓存就算完全正确也什么都显示不出来。
+2. 命中路径在应用那个头部块**之前**就提前返回，于是缓存命中的响应没有 `X-Cache-Status`。
+   两条路径现在共用一个出口。
+
+另外：`fastcgi::handle` 需要**单独**教它切片。我第一版只让无 socket 的路径（HTTP/2、
+子请求）会切片，而 `slice.t` 跑在 HTTP/1 上 —— 在 `handle` 走同一条路之前断言一直是红的。
+
+**不是回归**：`fastcgi_request_buffering.t` 是 14/17，我在同一台主机上用上一提交编译的
+二进制对照过，也是 14/17。那个缺口是仍未实现的 `fastcgi_request_buffering` 指令，该文件
+不在声明清单里。
+
 ## 二、声明的测试清单
 
-清单在 `bench/declared.txt`，**132 个文件**，选取规则是机械的：
+清单在 `bench/declared.txt`，**134 个文件**，选取规则是机械的：
 
 1. 落在范围内（**参考构建 `-V` 能编出来的模块**：http core + proxy/cache/gzip/
    TLS/HTTP2/realip/auth_request/slice/sub/secure_link/dav/stub_status/gzip_static/

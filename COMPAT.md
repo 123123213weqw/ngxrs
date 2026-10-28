@@ -13,7 +13,7 @@
 
 | 项 | 命令 | 当前结果 |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 129 文件，WORSE=0 TRUNC=0（nginx 1976 / ngxrs 1981，124 个逐断言一致、5 个更优） |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 130 文件，WORSE=0 TRUNC=0（nginx 2000 / ngxrs 2005，125 个逐断言一致、5 个更优） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
 | 单元测试 | `cargo test --release` | **PASS** — 156 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
@@ -825,7 +825,7 @@ h1 不受影响）；端口从 `group.addr.port()` 传入；`parse_target` 负�
 
 ## 二、声明的测试清单
 
-清单在 `bench/declared.txt`，**129 个文件**，选取规则是机械的：
+清单在 `bench/declared.txt`，**130 个文件**，选取规则是机械的：
 
 1. 落在范围内（**参考构建 `-V` 能编出来的模块**：http core + proxy/cache/gzip/
    TLS/HTTP2/realip/auth_request/slice/sub/secure_link/dav/stub_status/gzip_static/

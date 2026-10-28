@@ -3681,9 +3681,26 @@ pub async fn resolve_response_local(
     // serves both paths. The subrequest carries no body (`fastcgi_pass_request_
     // body off` is what the auth case uses), which is why `&[]` is passed.
     if loc.fastcgi_pass.is_some() {
-        if let Some((resp, _had_length)) =
-            crate::fastcgi::fetch(req, path, query, loc, http, &[], peer_ip).await
-        {
+        // A `slice`d fastcgi location goes through the same slice loop as proxy:
+        // the CGI is asked for one `Range` at a time and the pieces assembled.
+        let fcgi_resp = match loc.slice {
+            None => crate::fastcgi::fetch(req, path, query, loc, http, &[], peer_ip, "").await,
+            Some(n) => {
+                crate::proxy::fetch_sliced_for(
+                    crate::proxy::SliceMode::Fastcgi,
+                    req,
+                    path,
+                    query,
+                    loc,
+                    http,
+                    peer_ip,
+                    n,
+                )
+                .await
+                .map(|r| (r, true))
+            }
+        };
+        if let Some((resp, _had_length)) = fcgi_resp {
             let mut resp = resp;
             return finalize_response(
                 req,

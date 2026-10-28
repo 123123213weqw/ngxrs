@@ -566,6 +566,14 @@ pub fn store_variant(zone: &CacheZone, base: &str, sig: &str, entry: &Cached) ->
 /// all previously cached representations, as in `proxy_cache_vary.t`).
 pub fn clear_variants(zone: &CacheZone, base: &str) {
     let path = vary_index_path(zone, base);
+    // Nothing to clear when no variant index was ever written. Taking the lock
+    // unconditionally used to leave a `.lock` sidecar beside every ordinary
+    // entry, which doubled the file count in the cache directory -- visible to
+    // anything that globs it, e.g. `slice.t`'s
+    // "in named location - cache entries".
+    if !path.exists() {
+        return;
+    }
     let _ = with_index_lock(&path, || {
         if let Ok(text) = fs::read_to_string(&path) {
             for sig in text.lines().filter(|l| !l.is_empty()) {

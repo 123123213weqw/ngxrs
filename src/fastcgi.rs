@@ -97,6 +97,9 @@ struct Vars<'a> {
     request_uri: &'a str,
     args: &'a str,
     scheme: &'a str,
+    /// `$slice_range`: the `Range` for the current slice, forwarded by
+    /// `fastcgi_param Range $slice_range` (`ngx_http_slice_filter_module`).
+    slice_range: &'a str,
 }
 
 fn expand(spec: &str, v: &Vars<'_>) -> String {
@@ -139,6 +142,7 @@ fn expand(spec: &str, v: &Vars<'_>) -> String {
             "server_name" => Some(v.server_name),
             "server_port" => None, // formatted below
             "remote_addr" => Some(v.peer_ip),
+            "slice_range" => Some(v.slice_range),
             "remote_port" => None,
             "server_protocol" => Some(if v.req.version_minor == 1 {
                 "HTTP/1.1"
@@ -306,6 +310,7 @@ pub async fn fetch(
     http: &Http,
     body: &[u8],
     peer_ip: &str,
+    slice_range: &str,
 ) -> Option<(Response, bool)> {
     let fcgi = loc.fastcgi_pass.as_ref()?;
 
@@ -329,6 +334,7 @@ pub async fn fetch(
         request_uri: &req.raw_target,
         args: query,
         scheme: "http",
+        slice_range,
     };
 
     // `fastcgi_pass $var` is resolved here, once the variables are known. The
@@ -577,7 +583,8 @@ pub async fn handle(
     let body = crate::proxy::take_request_body(conn, req, 32 * 1024 * 1024).await?;
     let peer = conn.peer.ip().to_string();
 
-    let Some((resp, had_length)) = fetch(req, path, query, loc, http, &body, &peer).await else {
+    let Some((resp, had_length)) = fetch(req, path, query, loc, http, &body, &peer, "").await
+    else {
         return Ok(None);
     };
     let status = resp.status;

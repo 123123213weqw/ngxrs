@@ -3583,8 +3583,35 @@ pub async fn fetch(
 ) -> Option<Response> {
     match loc.slice {
         None => fetch_plain(req, path, query, loc, http, peer_ip, custom, "").await,
-        Some(size) => fetch_sliced(req, path, query, loc, http, peer_ip, custom, size).await,
+        Some(size) => {
+            fetch_sliced(req, path, query, loc, http, peer_ip, custom, size, SliceMode::Proxy).await
+        }
     }
+}
+
+/// Slice loop for a non-proxy upstream module.
+pub async fn fetch_sliced_for(
+    mode: SliceMode,
+    req: &Request,
+    path: &str,
+    query: &str,
+    loc: &LocCfg,
+    http: &Http,
+    peer_ip: &str,
+    size: u64,
+) -> Option<Response> {
+    let empty = std::collections::HashMap::new();
+    fetch_sliced(req, path, query, loc, http, peer_ip, &empty, size, mode).await
+}
+
+/// Which upstream module a slice loop drives. The loop itself is identical; only
+/// the per-piece fetch differs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SliceMode {
+    Proxy,
+    Fastcgi,
+    Uwsgi,
+    Scgi,
 }
 
 /// `ngx_http_slice_filter_module`: fetch the entity in fixed-size pieces.
@@ -3611,6 +3638,7 @@ async fn fetch_sliced(
     peer_ip: &str,
     custom: &std::collections::HashMap<String, String>,
     size: u64,
+    mode: SliceMode,
 ) -> Option<Response> {
     // `ngx_http_slice_get_start`: `If-Range` and multi-range requests start at 0.
     let mut pos = size * (slice_get_start(req) / size);
@@ -3632,7 +3660,20 @@ async fn fetch_sliced(
         let range = format!("bytes={pos}-{}", pos + size - 1);
         let mut sc = custom.clone();
         sc.insert("slice_range".to_string(), range.clone());
-        let mut resp = fetch_plain(req, path, query, loc, http, peer_ip, &sc, &range).await?;
+        let mut resp = match mode {
+            SliceMode::Proxy => {
+                fetch_plain(req, path, query, loc, http, peer_ip, &sc, &range).await?
+            }
+            SliceMode::Fastcgi => {
+                crate::fastcgi::fetch(req, path, query, loc, http, &[], peer_ip, &range)
+                    .await?
+                    .0
+            }
+            // uwsgi/SCGI have no buffered fetch yet (they write straight to the
+            // connection), so a sliced location over them is not supported and
+            // says so rather than silently ignoring `slice`.
+            SliceMode::Uwsgi | SliceMode::Scgi => return None,
+        };
         let h = crate::http::split_head(&resp.raw);
         let get = |n: &str| {
             h.iter()

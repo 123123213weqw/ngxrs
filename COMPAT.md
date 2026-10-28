@@ -11,12 +11,24 @@
 绝对通过率没有意义——nginx-tests 里的套件会因为 Test::Nginx 版本、`-V` 特性门控、
 参考构建的编译选项而在两边一起失败，那种失败不构成我们的缺陷。
 
-| 项 | 命令 | 当前结果 |
+| 项 | 命令 | 当前结果（2026-10-28 复验） |
 |---|---|---|
 | 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 135 文件，WORSE=0 TRUNC=0（nginx 2142 / ngxrs 2147，130 个逐断言一致、5 个更优） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
-| 单元测试 | `cargo test --release` | **PASS** — 175 passed |
-| 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
+| 单元测试 | `cargo test --release` | **PASS** — 178 passed |
+| 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 判据由 **64 KB p99** 满足：默认 39.35 ms → 749 µs，对照组（nginx `sendfile off`）1.16 ms → 747 µs。64 KB 吞吐只算持平（1.002 / 1.025），1 KB 落后（0.861–0.932）。原始输出见 `bench/results/raw-20261028-1603{42}.txt` 与 `raw-20261028-161005.txt` |
+
+**关于「所有已知偏差」的口径。** 声明清单是按机械规则从全量扫描里选出的
+**当前已达标**子集（规则见 `bench/declared.txt` 头部注释：在参考构建能力范围内、
+两边都产断言、无一条 nginx 过而我们不过、我方未截断）。清单之外的一切都是
+已知偏差，其逐文件数字由 `bash bench/ntscan.sh` 生成。
+
+`## 三、已知偏差（全量扫描，逐项带复现）` 那张表是 **2026-10-27 的快照**，
+之后又完成了十余轮修复（PROXY protocol、dav、resolver、disable_symlinks、
+请求体、headers、index、stream geo/map、h2 头过滤器、trailers、TLS 证书变量、
+chunked 分帧等），因此它**高于**当前真实欠账，应视为下界而不是现状。
+每次改动后重跑 `ntscan.sh` 可刷新；本轮因耗时未重跑，如实记录而不引用旧数字
+当作现状。
 
 ## 一之二、2026-10-27 轮：范围纠偏、realip 信任判定、auth_basic
 

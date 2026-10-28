@@ -361,6 +361,11 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                 let verify_mode = server.client_verify;
                 let client_ca = server.client_ca.clone();
                 let trusted_ca = server.trusted_ca.clone();
+                // A per-connection copy of the shutdown signal. Without it the
+                // task is simply cancelled when the worker stops, so a session
+                // parked in `read_from` never observes EOF and keeps the default
+                // `$status`; nginx closes the socket there and logs 400.
+                let mut conn_sd = shutdown.clone();
                 // One log line per connection, written when the task ends.
                 let mut alog = StreamAccessLog::new(&server, peer, "stream");
                 tokio::spawn(async move {
@@ -429,7 +434,15 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                     // depends on it (`stream_proxy_protocol2_tlv.t`).
                     let mut client = client;
                     let pp = if listen_pp {
-                        match crate::proxyproto::read_from(&mut client).await {
+                        let pp_read = tokio::select! {
+                            biased;
+                            _ = conn_sd.changed() => Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "shutdown while reading PROXY header",
+                            )),
+                            r = crate::proxyproto::read_from(&mut client) => r,
+                        };
+                        match pp_read {
                             Ok(p) => Some(std::sync::Arc::new(p)),
                             Err(_) => {
                                 // `ngx_stream_proxy_protocol`: a malformed header

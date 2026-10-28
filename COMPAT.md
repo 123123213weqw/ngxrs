@@ -3664,3 +3664,34 @@ EOF，`$status` 保持默认 200。nginx 在同一时刻是把连接关掉，读
 ```bash
 TEST_LIST="stream_status_variable.t" bash bench/nginxtests.sh    # 7/8，缺 400
 ```
+
+### 最终：`stream_status_variable.t` 8/8，且 `stream_limit_conn.t` 10/10
+
+上一轮只剩下 400 一条。根因是**停机时序**，本轮修掉：
+
+```perl
+my $s = stream('127.0.0.1:' . port(8085));   # 连接 1，占住 limit_conn 槽位
+stream('127.0.0.1:' . port(8085))->read();   # 连接 2，被 503 拒掉
+$s->io('PROXY INVALID');
+```
+
+连接 1 的上游会话阻塞在 8086 的 `read_from`（8086 在等一个 8085 不会发的 PROXY 头）。
+`$t->stop()` 时，我们原先直接**取消任务**，`read_from` 从未见到 EOF，`$status` 停在默认
+200；nginx 此刻关闭连接，读操作返回 EOF，于是记 400。
+
+改法：给每个连接克隆一个 shutdown receiver，`read_from` 与停机信号竞速，停机时按
+「头被截断」处理（`UnexpectedEof`），走既有的 400 分支。
+
+本地先验证：`-s stop` 期间挂起的连接，日志由 `200` 变为 `400`。
+
+**顺带**：`stream_limit_conn.t` 从上一轮的 8/10 变成 **10/10**——`limit_conn` 的槽位
+实现在这一轮被完整覆盖到（上轮只加了 acquire，未验证到全部断言）。
+
+两个套件都已加入声明清单（167 文件）。
+
+复现：
+
+```bash
+TEST_LIST="stream_status_variable.t stream_limit_conn.t" bash bench/nginxtests.sh
+# 均 SAME
+```

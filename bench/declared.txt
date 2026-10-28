@@ -340,3 +340,6 @@ stream_ssl_alpn.t
 stream_limit_rate.t
 
 stream_resolver.t
+
+stream_status_variable.t
+stream_limit_conn.t

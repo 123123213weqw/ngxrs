@@ -1413,6 +1413,7 @@ pub async fn handle(
                         trailers: Vec::new(),
                         expect_trailers: false,
                         server_tokens: None,
+                        cache_status: None,
 
                         headers_finalized: false,
                         body: Body::Bytes(entry.body),
@@ -2439,6 +2440,7 @@ async fn serve_cached(
         trailers: Vec::new(),
         expect_trailers: false,
         server_tokens: None,
+        cache_status: None,
 
         headers_finalized: false,
         body: crate::http::Body::Bytes(body),
@@ -2688,6 +2690,7 @@ async fn exchange(
                     trailers: Vec::new(),
                     expect_trailers: false,
                     server_tokens: None,
+                    cache_status: None,
 
                     headers_finalized: false,
                     body: crate::http::Body::Bytes(body),
@@ -3012,6 +3015,7 @@ async fn exchange(
                     trailers: list,
                     expect_trailers: true,
                     server_tokens: None,
+                    cache_status: None,
 
                     headers_finalized: false,
                     body: if req.method == Method::Head {
@@ -3697,7 +3701,9 @@ async fn fetch_sliced(
         match (&etag, &this_etag) {
             (None, _) => etag = this_etag.clone(),
             (Some(a), Some(b)) if a == b => {}
-            _ => return Some(Response::empty(444)),
+            _ => {
+                return Some(Response::empty(444));
+            }
         }
 
         // `Content-Range: bytes <first>-<last>/<complete>`; `*` is refused.
@@ -3840,6 +3846,7 @@ async fn fetch_sliced(
         trailers: Vec::new(),
         expect_trailers: false,
         server_tokens: None,
+        cache_status: None,
         // `add_header` already ran for the first slice, with that slice's
         // `$upstream_cache_status` -- which is the value nginx reports.
         headers_finalized: true,
@@ -4321,6 +4328,7 @@ async fn fetch_plain(
             trailers: Vec::new(),
             expect_trailers: false,
             server_tokens: None,
+            cache_status: None,
             headers_finalized: true,
             body: Body::Bytes(body),
         });
@@ -4464,6 +4472,7 @@ fn cached_response(entry: crate::cache::Cached, loc: &LocCfg, status: &str) -> R
         trailers: Vec::new(),
         expect_trailers: false,
         server_tokens: None,
+        cache_status: None,
         headers_finalized: true,
         body: Body::Bytes(entry.body),
     }
@@ -5106,4 +5115,5 @@ mod chunk_tests {
         assert_eq!(dechunk(b"0\r\n\r\n").as_deref(), Some(&b""[..]));
     }
 }
+
 

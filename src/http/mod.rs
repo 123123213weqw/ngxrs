@@ -91,6 +91,10 @@ pub struct Response {
     /// every value expands to empty (`ngx_http_headers_filter` sets
     /// `r->expect_trailers` before the values are known).
     pub expect_trailers: bool,
+    /// `$upstream_cache_status` for this reply. The proxy path applies
+    /// `add_header` itself with the value in hand; the fastcgi path lets
+    /// `finalize_response` do it, so the value has to travel on the response.
+    pub cache_status: Option<String>,
     /// `server_tokens` chosen by the matched location, when it set one. The
     /// emitters otherwise only know the server-level flag, so this overrides it
     /// for the `Server` line and the builtin error body.
@@ -123,6 +127,7 @@ impl Response {
             trailers: Vec::new(),
             expect_trailers: false,
             server_tokens: None,
+            cache_status: None,
 
             headers_finalized: false,
             body: Body::Empty,
@@ -139,6 +144,7 @@ impl Response {
             trailers: Vec::new(),
             expect_trailers: false,
             server_tokens: None,
+            cache_status: None,
 
             headers_finalized: false,
             body: Body::Bytes(body),
@@ -156,6 +162,7 @@ impl Response {
             trailers: Vec::new(),
             expect_trailers: false,
             server_tokens: None,
+            cache_status: None,
 
             headers_finalized: false,
             body,
@@ -4590,7 +4597,7 @@ async fn finalize_response(
             peer_port,
             scheme: "http",
             document_root: &root_str,
-            upstream_cache_status: "",
+            upstream_cache_status: out.cache_status.as_deref().unwrap_or(""),
             custom,
             connection_requests: state.requests,
             connection_time: state.elapsed_secs(),
@@ -5794,6 +5801,7 @@ async fn write_redirect(
         trailers: Vec::new(),
         expect_trailers: false,
         server_tokens: None,
+        cache_status: None,
 
         headers_finalized: false,
         body: Body::Bytes(body),
@@ -5917,6 +5925,7 @@ pub async fn send_error(
         trailers: Vec::new(),
         expect_trailers: false,
         server_tokens: None,
+        cache_status: None,
 
         headers_finalized: false,
         body: Body::Bytes(body),
@@ -6013,6 +6022,7 @@ async fn write_response_inner(
         trailers,
         expect_trailers,
         server_tokens: resp_tokens,
+        cache_status: _,
         headers_finalized: _,
         body,
     } = resp;

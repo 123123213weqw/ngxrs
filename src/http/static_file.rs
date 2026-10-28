@@ -511,6 +511,7 @@ fn serve_entry(
         trailers: Vec::new(),
         expect_trailers: false,
         server_tokens: None,
+        cache_status: None,
 
         headers_finalized: false,
         body: match multipart {

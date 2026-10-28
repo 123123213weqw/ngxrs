@@ -312,6 +312,167 @@ pub async fn fetch(
     peer_ip: &str,
     slice_range: &str,
 ) -> Option<(Response, bool)> {
+    // `fastcgi_cache`: a hit is served without contacting the responder at all,
+    // and a miss stores what came back against `fastcgi_cache_key`.
+    let zone = loc
+        .fastcgi_cache
+        .as_deref()
+        .and_then(|name| http.cache_zones.iter().find(|z| z.name == name));
+    let key = zone.map(|_| fastcgi_cache_key(loc, req, slice_range));
+    let mut cache_status = "MISS";
+    // A hit is served without contacting the responder. It is *not* returned
+    // immediately: `add_header` still has to run for it, and skipping that is
+    // why a cached reply had no `X-Cache-Status` at all
+    // (`slice.t`, "fastcgi cached").
+    let mut hit: Option<(Response, bool)> = None;
+    if let (Some(z), Some(k)) = (zone, key.as_deref()) {
+        if let Some((entry, _sig)) = crate::cache::lookup(z, k, |_| String::new()) {
+            if entry.is_fresh(crate::cache::now()) && entry.error.is_none() {
+                let had_len = entry
+                    .headers
+                    .iter()
+                    .any(|(h, _)| h.eq_ignore_ascii_case("content-length"));
+                hit = Some((cached_to_response(&entry, "HIT"), had_len));
+                cache_status = "HIT";
+            }
+        }
+    }
+    let mut out = match hit {
+        Some(v) => v,
+        None => fetch_uncached(req, path, query, loc, http, body, peer_ip, slice_range).await?,
+    };
+    // `handle` writes the response straight to the connection -- it does not go
+    // through `finalize_response` -- so `add_header` has to be applied here, the
+    // way the proxy module does it.
+    {
+        let resp_headers = crate::http::split_head(&out.0.raw);
+        crate::http::apply_add_headers_full(
+            &mut out.0.raw,
+            &loc.headers,
+            out.0.status,
+            cache_status,
+            "",
+            &resp_headers,
+        );
+        out.0.headers_finalized = true;
+        out.0.cache_status = Some(cache_status.to_string());
+    }
+    if cache_status == "HIT" {
+        return Some(out);
+    }
+
+    if let (Some(z), Some(k)) = (zone, key.as_deref()) {
+        let resp = &out.0;
+        let headers = crate::http::split_head(&resp.raw);
+        // A 206 slice is stored like any other response: `slice.t` expects each
+        // slice to be its own entry, keyed by `$slice_range`.
+        if let Some(ttl) = crate::cache::ttl_fastcgi(loc, resp.status, &headers) {
+            let stored: Vec<(String, String)> = headers
+                .iter()
+                .filter(|(h, _)| {
+                    !h.eq_ignore_ascii_case("connection")
+                        && !h.eq_ignore_ascii_case("keep-alive")
+                        && !h.eq_ignore_ascii_case("transfer-encoding")
+                })
+                .cloned()
+                .collect();
+            let body_bytes = match &resp.body {
+                Body::Bytes(b) => b.clone(),
+                _ => Vec::new(),
+            };
+            let entry = crate::cache::Cached {
+                status: resp.status,
+                error: None,
+                headers: stored,
+                body: body_bytes,
+                stored_at: crate::cache::now(),
+                valid_for: ttl.as_secs(),
+            };
+            let _ = crate::cache::store(z, k, &entry);
+        }
+        // `$upstream_cache_status` is read by `add_header` during
+        // finalisation, so it has to travel on the response.
+        let mut resp = out.0;
+        mark_cache_status(&mut resp, cache_status);
+        return Some((resp, out.1));
+    }
+    Some(out)
+}
+
+/// The key `fastcgi_cache_key` expands to; `$request_uri` when unset, matching
+/// nginx's default for the module.
+fn fastcgi_cache_key(loc: &LocCfg, req: &Request, slice_range: &str) -> String {
+    match loc.fastcgi_cache_key.as_deref() {
+        None => req.raw_target.clone(),
+        Some(spec) => {
+            let (uri, args) = match req.raw_target.split_once('?') {
+                Some((u, a)) => (u, a),
+                None => (req.raw_target.as_str(), ""),
+            };
+            crate::cache::expand_key(
+                spec,
+                "http",
+                "",
+                req.host.as_ref().map(|h| h.as_str()).unwrap_or(""),
+                &req.raw_target,
+                uri,
+                args,
+                "",
+                req.method.as_str(),
+                slice_range,
+            )
+        }
+    }
+}
+
+/// Rebuild a `Response` from a stored entry.
+fn cached_to_response(entry: &crate::cache::Cached, status: &str) -> Response {
+    let mut raw = Vec::with_capacity(entry.body.len() + 256);
+    for (k, v) in &entry.headers {
+        raw.extend_from_slice(k.as_bytes());
+        raw.extend_from_slice(b": ");
+        raw.extend_from_slice(v.as_bytes());
+        raw.extend_from_slice(b"\r\n");
+    }
+    if !entry
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+    {
+        raw.extend_from_slice(b"Content-Length: ");
+        raw.extend_from_slice(entry.body.len().to_string().as_bytes());
+        raw.extend_from_slice(b"\r\n");
+    }
+    Response {
+        status: entry.status,
+        headers: Vec::new(),
+        raw,
+        explicit_len: true,
+        no_error_page: false,
+        trailers: Vec::new(),
+        expect_trailers: false,
+        server_tokens: None,
+        cache_status: Some(status.to_string()),
+        headers_finalized: false,
+        body: Body::Bytes(entry.body.clone()),
+    }
+}
+
+/// Record the cache status for `$upstream_cache_status`.
+fn mark_cache_status(resp: &mut Response, status: &str) {
+    resp.cache_status = Some(status.to_string());
+}
+
+async fn fetch_uncached(
+    req: &Request,
+    path: &str,
+    query: &str,
+    loc: &LocCfg,
+    http: &Http,
+    body: &[u8],
+    peer_ip: &str,
+    slice_range: &str,
+) -> Option<(Response, bool)> {
     let fcgi = loc.fastcgi_pass.as_ref()?;
 
     // ---- build the parameter list
@@ -493,6 +654,7 @@ pub async fn fetch(
         trailers: Vec::new(),
         expect_trailers: false,
         server_tokens: None,
+        cache_status: None,
         headers_finalized: false,
         body: Body::Bytes(payload),
     }, had_length))
@@ -555,6 +717,7 @@ fn error_response(status: u16) -> Response {
         trailers: Vec::new(),
         expect_trailers: false,
         server_tokens: None,
+        cache_status: None,
         headers_finalized: false,
         body: Body::Bytes(body),
     }
@@ -583,8 +746,26 @@ pub async fn handle(
     let body = crate::proxy::take_request_body(conn, req, 32 * 1024 * 1024).await?;
     let peer = conn.peer.ip().to_string();
 
-    let Some((resp, had_length)) = fetch(req, path, query, loc, http, &body, &peer, "").await
-    else {
+    // `slice` needs the whole entity assembled before anything is written, so a
+    // sliced location takes the buffered route even on HTTP/1. nginx's slice
+    // module is a filter: it drives subrequests and rewrites the response, which
+    // is exactly buffering.
+    let fetched = match loc.slice {
+        None => fetch(req, path, query, loc, http, &body, &peer, "").await,
+        Some(n) => crate::proxy::fetch_sliced_for(
+            crate::proxy::SliceMode::Fastcgi,
+            req,
+            path,
+            query,
+            loc,
+            http,
+            &peer,
+            n,
+        )
+        .await
+        .map(|r| (r, true)),
+    };
+    let Some((resp, had_length)) = fetched else {
         return Ok(None);
     };
     let status = resp.status;
@@ -647,6 +828,7 @@ async fn respond(
         trailers: Vec::new(),
         expect_trailers: false,
         server_tokens: None,
+        cache_status: None,
 
         headers_finalized: false,
         body: Body::Bytes(body),

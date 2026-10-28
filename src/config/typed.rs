@@ -273,6 +273,12 @@ pub struct LocCfg {
     // ---- fastcgi ----
     pub fastcgi_pass: Option<FastcgiPass>,
     pub fastcgi_params: Vec<FastcgiParam>,
+    /// `fastcgi_cache <zone>` and its companions. nginx keeps these on their own
+    /// location conf (`ngx_http_fastcgi_loc_conf_t.cache`), independent of
+    /// `proxy_cache`, so a location can cache one upstream module and not another.
+    pub fastcgi_cache: Option<String>,
+    pub fastcgi_cache_key: Option<String>,
+    pub fastcgi_cache_valid: Vec<(Vec<u16>, Duration)>,
     pub fastcgi_index: Option<String>,
     pub fastcgi_split_path_info: Option<regex::Regex>,
     /// `dav_methods`: bitmask of the WebDAV methods this location serves
@@ -496,6 +502,9 @@ impl LocCfg {
             proxy_hide_headers: Vec::new(),
             fastcgi_pass: None,
             fastcgi_params: Vec::new(),
+            fastcgi_cache: None,
+            fastcgi_cache_key: None,
+            fastcgi_cache_valid: Vec::new(),
             fastcgi_index: None,
             fastcgi_split_path_info: None,
             dav_methods: 0,
@@ -3880,6 +3889,33 @@ impl Builder {
                     value: d.args[1..].join(" "),
                 });
             }
+            "fastcgi_cache" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "fastcgi_cache requires a zone"))?;
+                cfg.fastcgi_cache = if v == "off" { None } else { Some(v.clone()) };
+            }
+            "fastcgi_cache_key" => {
+                cfg.fastcgi_cache_key = d.args.first().cloned();
+            }
+            "fastcgi_cache_valid" => {
+                // `fastcgi_cache_valid [code ...] time`; a bare time means 200.
+                let mut args = d.args.clone();
+                let Some(time) = args.pop() else {
+                    return Err(sem(&d.file, d.line, "fastcgi_cache_valid requires a time"));
+                };
+                let dur = parse_time(&time)
+                    .ok_or_else(|| sem(&d.file, d.line, format!("invalid time \"{time}\"")))?;
+                let codes: Vec<u16> = if args.is_empty() {
+                    vec![200]
+                } else {
+                    args.iter()
+                        .filter_map(|c| c.parse::<u16>().ok())
+                        .collect()
+                };
+                cfg.fastcgi_cache_valid.push((codes, dur));
+            }
             "fastcgi_index" => {
                 cfg.fastcgi_index = d.args.first().cloned();
             }
@@ -4051,9 +4087,7 @@ impl Builder {
             | "fastcgi_keep_conn"
             | "fastcgi_store"
             | "fastcgi_store_access"
-            | "fastcgi_cache"
-            | "fastcgi_cache_key"
-            | "fastcgi_cache_valid"
+            | "fastcgi_cache_no_cache"
             | "fastcgi_ignore_headers"
             | "fastcgi_hide_header" => {
                 // Accepted, not yet honoured.
@@ -5798,48 +5832,11 @@ pub fn build(
                 upstream_index.insert(up.name.clone(), http.upstreams.len());
                 http.upstreams.push(up);
             }
-            "proxy_cache_path" => {
-                // proxy_cache_path <path> [levels=..] [keys_zone=name:size]
-                //                   [max_size=..] [inactive=..];
-                let path_arg = d
-                    .args
-                    .first()
-                    .ok_or_else(|| sem(&d.file, d.line, "proxy_cache_path requires a path"))?;
-                let mut zone = CacheZone {
-                    lock: std::sync::Arc::new(std::sync::Mutex::new(
-                        std::collections::HashMap::new(),
-                    )),
-                    uses: std::sync::Arc::new(std::sync::Mutex::new(
-                        std::collections::HashMap::new(),
-                    )),
-                    name: String::new(),
-                    path: resolve_path(prefix, path_arg),
-                    max_size: 1024 * 1024 * 1024,
-                    inactive: Duration::from_secs(600),
-                    levels: None,
-                };
-                for a in &d.args[1..] {
-                    if let Some(v) = a.strip_prefix("keys_zone=") {
-                        zone.name = v.split(':').next().unwrap_or(v).to_string();
-                    } else if let Some(v) = a.strip_prefix("max_size=") {
-                        if let Some(n) = parse_size(v) {
-                            zone.max_size = n;
-                        }
-                    } else if let Some(v) = a.strip_prefix("inactive=") {
-                        if let Some(t) = parse_time(v) {
-                            zone.inactive = t;
-                        }
-                    } else if let Some(v) = a.strip_prefix("levels=") {
-                        zone.levels = Some(v.to_string());
-                    }
-                }
-                if zone.name.is_empty() {
-                    return Err(sem(
-                        &d.file,
-                        d.line,
-                        "proxy_cache_path requires keys_zone=name:size",
-                    ));
-                }
+            // `proxy_cache_path` and `fastcgi_cache_path` take exactly the same
+            // arguments and register into the same zone table: nginx's zones are
+            // keyed by name, and one zone may be shared by both modules.
+            "proxy_cache_path" | "fastcgi_cache_path" => {
+                let zone = parse_cache_zone(d, prefix)?;
                 http.cache_zones.push(zone);
             }
             "location"
@@ -6429,4 +6426,46 @@ fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, ()> {
         i += 2;
     }
     Ok(out)
+}
+
+/// `*_cache_path <path> [levels=..] [keys_zone=name:size] [max_size=..]
+/// [inactive=..]`. Shared by the proxy and fastcgi variants, which are
+/// argument-for-argument identical.
+fn parse_cache_zone(d: &Directive, prefix: &Path) -> Result<CacheZone, ConfigError> {
+    let path_arg = d
+        .args
+        .first()
+        .ok_or_else(|| sem(&d.file, d.line, format!("{} requires a path", d.name)))?;
+    let mut zone = CacheZone {
+        lock: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        uses: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        name: String::new(),
+        path: resolve_path(prefix, path_arg),
+        max_size: 1024 * 1024 * 1024,
+        inactive: Duration::from_secs(600),
+        levels: None,
+    };
+    for a in &d.args[1..] {
+        if let Some(v) = a.strip_prefix("keys_zone=") {
+            zone.name = v.split(':').next().unwrap_or(v).to_string();
+        } else if let Some(v) = a.strip_prefix("max_size=") {
+            if let Some(n) = parse_size(v) {
+                zone.max_size = n;
+            }
+        } else if let Some(v) = a.strip_prefix("inactive=") {
+            if let Some(t) = parse_time(v) {
+                zone.inactive = t;
+            }
+        } else if let Some(v) = a.strip_prefix("levels=") {
+            zone.levels = Some(v.to_string());
+        }
+    }
+    if zone.name.is_empty() {
+        return Err(sem(
+            &d.file,
+            d.line,
+            format!("{} requires keys_zone=name:size", d.name),
+        ));
+    }
+    Ok(zone)
 }

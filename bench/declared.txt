@@ -99,6 +99,12 @@ h2_trailers.t
 h2_server_tokens.t
 server_tokens.t
 
+# ---- slice filter / fastcgi cache ----
+# `slice` (fixed-size ranged subrequests over proxy and fastcgi, assembled into
+# one response, each slice its own cache entry) and `fastcgi_cache`.
+slice.t
+fastcgi_cache.t
+
 # ---- upstream keepalive pool ----
 # The pool itself: buffered, unbuffered and in-memory (SSI subrequest) paths all
 # reuse it; a chunked reply is a message boundary like a Content-Length one; and

@@ -170,6 +170,16 @@ pub fn validity(loc: &LocCfg, status: u16) -> Option<Duration> {
     None
 }
 
+/// `fastcgi_cache_valid`, the fastcgi counterpart of [`validity`].
+pub fn fastcgi_validity(loc: &LocCfg, status: u16) -> Option<Duration> {
+    for (codes, dur) in &loc.fastcgi_cache_valid {
+        if codes.iter().any(|c| *c == status) {
+            return Some(*dur);
+        }
+    }
+    None
+}
+
 /// `Cache-Control: stale-while-revalidate=N` (nginx's `updating_sec`).
 pub fn stale_while_revalidate(headers: &[(String, String)]) -> u64 {
     headers
@@ -211,6 +221,25 @@ pub fn ttl(
     status: u16,
     headers: &[(String, String)],
     ignore: Ignore,
+) -> Option<Duration> {
+    ttl_with(|| validity(loc, status), ignore, headers)
+}
+
+/// Same, for `fastcgi_cache_valid`, which is a separate list on its own location
+/// conf (`ngx_http_fastcgi_loc_conf_t.cache` vs `..._proxy_...`) -- a location
+/// may cache one module and not the other, with different validities.
+pub fn ttl_fastcgi(
+    loc: &LocCfg,
+    status: u16,
+    headers: &[(String, String)],
+) -> Option<Duration> {
+    ttl_with(|| fastcgi_validity(loc, status), Ignore::default(), headers)
+}
+
+fn ttl_with(
+    validity_of: impl FnOnce() -> Option<Duration>,
+    ignore: Ignore,
+    headers: &[(String, String)],
 ) -> Option<Duration> {
     // All occurrences of one header, trimmed, in order.
     let all = |name: &str| -> Vec<String> {
@@ -302,8 +331,8 @@ pub fn ttl(
         }
     }
 
-    // ---- 4. proxy_cache_valid ----
-    validity(loc, status)
+    // ---- 4. *_cache_valid ----
+    validity_of()
 }
 
 pub fn load(zone: &CacheZone, key: &str) -> Option<Cached> {

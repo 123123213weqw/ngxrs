@@ -368,6 +368,7 @@ async fn run(
         trailers: Vec::new(),
         expect_trailers: false,
         server_tokens: None,
+        cache_status: None,
 
         headers_finalized: false,
         body: Body::Bytes(framed),
@@ -419,6 +420,7 @@ async fn error_out(
         trailers: Vec::new(),
         expect_trailers: false,
         server_tokens: None,
+        cache_status: None,
 
         headers_finalized: false,
         body: Body::Bytes(body),

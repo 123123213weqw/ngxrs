@@ -3608,3 +3608,59 @@ TEST_LIST="stream_resolver.t stream_status_variable.t" bash bench/nginxtests.sh
 TEST_LIST="stream_resolver.t stream_status_variable.t" bash bench/nginxtests.sh
 # 10/10 与 4/8
 ```
+
+## 本轮（stream `$status` 与 `limit_conn`）
+
+### 结果
+
+| 套件 | 修前 | 修后 | nginx |
+|---|---|---|---|
+| `stream_status_variable.t` | **4/8** | **7/8** | 8/8 |
+
+无回归：`stream_error_log.t` 36/36、`stream_access.t` 20/20、`stream_proxy.t` 7/7。
+
+### 修掉的四处
+
+用 `TEST_NGINX_LEAVE=1` 保留测试目录、直接读日志内容定位——修前六个日志**全是
+`200`**，说明失败路径根本没更新 `$status`：
+
+| 场景 | 期望 | 修前 | 修后 |
+|---|---|---|---|
+| PROXY 头非法（8086） | 400 | 200 | 400 ✱ |
+| 变量目标无 resolver（8084） | 500 | 200 | **500** |
+| 连接被拒（8082，`proxy_connect_timeout 0`） | 502 | 200 | **502** |
+| `limit_conn` 超限（8085） | 503 | 200 | **503** |
+
+✱ 单独探针能得 400，但套件内仍是 200，见下。
+
+另外 **`limit_conn` 之前只解析、从未执行**：`StreamServerCfg.limit_conns` 一路传到
+`StreamServer`，却没有任何代码去 acquire 槽位。现在按 `$binary_remote_addr` 取 key、
+在 access 控制之后、连接上游之前 acquire，槽位随会话存活，超限以 503 结束。
+
+`500` 那个还踩了一个我自己挖的坑：设置 500 后**没有 return**，继续走到空 peer 集合，
+被新加的 `502` 覆盖了。日志里表现为 `500.log` 内容是 `502`。
+
+### 未解决：`400` 仍差一条
+
+套件内 `400.log` 是单行 `200`。单独复现同一条链路（8085 `limit_conn` + `proxy_pass`
+→ 8086 `proxy_protocol`）得到的是 `400`，所以不是解析问题，而是**停机时序**：
+
+```perl
+my $s = stream('127.0.0.1:' . port(8085));   # 连接 1，占住 limit_conn 槽位
+stream('127.0.0.1:' . port(8085))->read();   # 连接 2，被 503 拒掉，read 立刻返回
+$s->io('PROXY INVALID');
+```
+
+连接 1 的上游会话一直阻塞在 `read_from`（8086 在等 PROXY 头，而 8085 不发）。
+`$t->stop()` 时我们的优雅停机会在 30 秒后**取消任务**，于是 8086 的会话从未收到
+EOF，`$status` 保持默认 200。nginx 在同一时刻是把连接关掉，读操作返回 EOF，
+才走到 400。
+
+修法是把停机信号接进 `read_from` 的等待里（或在停机时主动关闭 client socket 而非
+取消任务）。这属于连接生命周期改造，本轮时间不足，**如实记为未解决，不计入清单**。
+
+复现：
+
+```bash
+TEST_LIST="stream_status_variable.t" bash bench/nginxtests.sh    # 7/8，缺 400
+```

@@ -356,6 +356,7 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                 let ul_rate = server.proxy_upload_rate;
                 let resolver = server.resolver.clone();
                 let next_upstream_tries = server.next_upstream_tries;
+                let limit_conns = server.limit_conns.clone();
                 let proxy_pass_var = server.proxy_pass_var.clone();
                 let verify_mode = server.client_verify;
                 let client_ca = server.client_ca.clone();
@@ -386,6 +387,43 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                             return;
                         }
                     }
+                    // `limit_conn zone n` (`ngx_stream_limit_conn_module`): the
+                    // slot is held for the whole session, and exceeding it ends
+                    // the connection with `$status` 503. The key is this
+                    // process's `$binary_remote_addr` rendering.
+                    let _conn_guard = {
+                        let mut held = Vec::new();
+                        let mut rejected = false;
+                        for (zone, limit) in &limit_conns {
+                            let key = if peer_unix {
+                                "unix:".to_string()
+                            } else {
+                                match peer.ip() {
+                                    std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
+                                    std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
+                                }
+                                .iter()
+                                .map(|b| *b as char)
+                                .collect()
+                            };
+                            let z = zone_for(zone, &key);
+                            match z.acquire(&key, *limit, None) {
+                                Some(g) => held.push(g),
+                                None => {
+                                    rejected = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if rejected {
+                            if let Some(a) = alog.as_mut() {
+                                a.status = 503;
+                            }
+                            drop(alog);
+                            return;
+                        }
+                        held
+                    };
                     // `listen ... proxy_protocol`: the header arrives before
                     // anything else, TLS included, and `$proxy_protocol_*`
                     // depends on it (`stream_proxy_protocol2_tlv.t`).
@@ -394,6 +432,12 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                         match crate::proxyproto::read_from(&mut client).await {
                             Ok(p) => Some(std::sync::Arc::new(p)),
                             Err(_) => {
+                                // `ngx_stream_proxy_protocol`: a malformed header
+                                // ends the session and `$status` reports 400
+                                // (`stream_status_variable.t`).
+                                if let Some(l) = alog.as_mut() {
+                                    l.status = 400;
+                                }
                                 let _ = client.shutdown().await;
                                 drop(alog);
                                 return;
@@ -511,13 +555,23 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                         match resolve_var_peer(&text, var_resolver.as_ref(), connect_timeout).await {
                             Ok(list) => var_peers = list,
                             Err(e) => {
-                                // nginx logs the failure and drops the session
-                                // without a byte ("no port in upstream", "<name>
-                                // could not be resolved").
+                                // nginx logs the failure, drops the session
+                                // without a byte, and `$status` reports 500
+                                // (`stream_status_variable.t`, port 8084: a
+                                // variable target with no `resolver`).
                                 crate::log::log_global(
                                     crate::log::Level::Error,
                                     &format!("stream {e}"),
                                 );
+                                if let Some(l) = alog.as_mut() {
+                                    l.status = 500;
+                                }
+                                // Stop here: falling through would reach an
+                                // empty peer set, report 502 and overwrite the
+                                // 500 that nginx logs for this case
+                                // (`stream_status_variable.t`, port 8084).
+                                drop(alog);
+                                return;
                             }
                         }
                     }
@@ -642,7 +696,13 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                     // saw for the three cases that expect data.
                     let Some(upstream) = upstream else {
                         // Every peer was at `max_conns`, refused or disabled:
-                        // nginx closes the client connection (`NGX_BUSY`).
+                        // nginx closes the client connection. A refused connect
+                        // is `$status` 502 (`stream_status_variable.t`, port
+                        // 8082 with `proxy_connect_timeout 0`).
+                        if let Some(a) = alog.as_mut() {
+                            a.status = 502;
+                        }
+                        drop(alog);
                         return;
                     };
                     let _guard = chosen;

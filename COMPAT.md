@@ -13,7 +13,7 @@
 
 | 项 | 命令 | 当前结果 |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 119 文件，WORSE=0 TRUNC=0（备用主机 `v100-222`，nginx 1823 / ngxrs 1828） |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 121 文件，WORSE=0 TRUNC=0（nginx 1847 / ngxrs 1852，116 个逐断言一致、5 个更优） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
 | 单元测试 | `cargo test --release` | **PASS** — 156 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
@@ -640,9 +640,39 @@ nginx 1823 / ngxrs 1828 断言，114 个逐断言一致、5 个更优（`http_he
 教训直接写在这里：上一轮"四条单元测试通过"并不足以证明实现正确 —— 单元测试里我自己
 构造的调用顺序恰好避开了 bug 1，也没有覆盖"淘汰后再打开失败"这条路径。
 
+### 2026-10-27 第十六轮：charset 过滤器与 gzip_static
+
+`charset.t` 4/9 → **9/9**、`charset_gzip_static.t` 4/15 → **15/15**，两者入清单。
+
+`ngx_http_charset_filter_module.c` 有三条反直觉规则，测试正好逐条断言：
+
+1. **nginx 没有内置转换表**。charset 只是一个**名字**，唯一存在的映射来自 `charset_map`。
+   所以 `charset foo` 而没有任何 map 时什么都不追加；而 `charset_map B A` 会顺带把 A、B
+   注册成 charset —— 这才是 `source_charset B` 能被解析的原因。
+2. **一张声明过的表同时服务两个方向**。postconfiguration 里
+   `tables[src][dst] = src2dst` 与 `tables[dst][src] = dst2src` 都会填上。这正是
+   "override charset" 需要的：上游回应已经带 `charset=A` 且 body 被 X→Y 重编码，外层
+   location 再转回 B，客户端看到的才是原始的 X。
+3. **需要重编码但已经带 Content-Encoding 的响应，整条跳过**：不追加 charset（"recode gzip"）。
+   而 source charset 为 `off` 的响应**无论如何**都追加（"plain"、"gzip"），因为那条分支
+   在编码检查之前就返回了。
+
+两处实现上的取舍：
+
+- charset 需要整个实体才能重编码，而我们的代理有一条直接写 socket 的流式路径。带 `charset`
+  的 location 现在走缓冲路径（`wants_buffered`）—— nginx 同样做不到边流边转码。
+- Content-Type 可能在 `headers`（动态构造）里，也可能预渲染在 `raw`（静态快路径）里。
+  往错的那一边追加会让头出现两次；`set_charset_param` 现在只改写响应实际携带的那一份。
+
+`gzip_static`：客户端接受 gzip 时用同目录的 `<path>.gz` 替代实体，Content-Type 仍按原始
+文件名取。替换发生在 open 之后，所以 ETag、长度与 Range 描述的都是真正发出的字节。
+
+顺带修掉一处重复的 `charset` 匹配分支：一个只设置 autoindex 宽度标志的旧分支排在前面，
+把新分支挡住了 —— `charset` 被解析后又被丢弃。
+
 ## 二、声明的测试清单
 
-清单在 `bench/declared.txt`，**119 个文件**，选取规则是机械的：
+清单在 `bench/declared.txt`，**121 个文件**，选取规则是机械的：
 
 1. 落在范围内（**参考构建 `-V` 能编出来的模块**：http core + proxy/cache/gzip/
    TLS/HTTP2/realip/auth_request/slice/sub/secure_link/dav/stub_status/gzip_static/

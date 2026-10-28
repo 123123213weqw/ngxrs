@@ -194,6 +194,10 @@ pub struct LocCfg {
     pub limit_conns: Vec<LimitConn>,
     /// `error_log` directives that apply to this location, in order.
     pub error_logs: Vec<LogSpec>,
+    /// `slice <size>`: fetch the entity in fixed-size slices, each its own
+    /// upstream request carrying `Range: $slice_range`
+    /// (`ngx_http_slice_filter_module`).
+    pub slice: Option<u64>,
     /// `server_tokens on|off|build` at location scope. `None` inherits, which is
     /// what nginx's `clcf` merge does -- a location-level `off` affects only that
     /// location (`h2_server_tokens.t` sets it inside `/off`).
@@ -401,6 +405,7 @@ impl LocCfg {
             access_logs: None,
             charset_utf8: false,
             error_logs: Vec::new(),
+            slice: None,
             server_tokens: None,
             gzip_static: false,
             charset: CharsetSpec::default(),
@@ -3612,6 +3617,17 @@ impl Builder {
                         dynamic: false,
                     });
                 }
+            }
+            "slice" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "slice requires a size"))?;
+                // nginx takes the usual size suffixes (`slice 1m`).
+                let n = parse_size(v)
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| sem(&d.file, d.line, format!("invalid slice size \"{v}\"")))?;
+                cfg.slice = Some(n);
             }
             "server_tokens" => {
                 let v = d

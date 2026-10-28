@@ -716,6 +716,10 @@ struct Vars<'a> {
     uri: &'a str,
     args: &'a str,
     server_port: u16,
+    /// `$slice_range`: the `Range` value for the current slice
+    /// (`ngx_http_slice_filter_module` provides it, the config forwards it with
+    /// `proxy_set_header Range $slice_range`).
+    slice_range: &'a str,
 }
 
 fn expand(spec: &str, v: &Vars<'_>) -> String {
@@ -767,6 +771,10 @@ fn expand(spec: &str, v: &Vars<'_>) -> String {
             }
             "proxy_host" => Some(v.host.to_string()),
             "is_args" => Some(if v.args.is_empty() { "" } else { "?" }.to_string()),
+            // `proxy_set_header Range $slice_range`: the value the slice module
+            // computed for this piece. Empty (so the header is dropped) when the
+            // request is not being sliced.
+            "slice_range" => Some(v.slice_range.to_string()),
             _ => {
                 if let Some(h) = name.strip_prefix("http_") {
                     let key = h.replace('_', "-");
@@ -1204,6 +1212,8 @@ pub async fn handle(
                 &args_only,
                 &remote,
                 req.method.as_str(),
+                // The streaming path never slices: `slice` forces buffering.
+                "",
             ),
             None => crate::cache::default_key(scheme, proxy_host, &req.raw_target),
         }
@@ -2204,6 +2214,7 @@ fn build_upstream_head(
     convert_head: bool,
     reval: Option<&crate::cache::Cached>,
     drop_range: bool,
+    slice_range: &str,
 ) -> Vec<u8> {
     // ---- request head ----
     let mut out = Vec::with_capacity(512);
@@ -2240,6 +2251,7 @@ fn build_upstream_head(
         uri: &uri_only,
         args: &args_only,
         server_port: 80,
+        slice_range,
     };
     let host = set
         .get("host")
@@ -2492,6 +2504,7 @@ async fn exchange(
         convert_head,
         cache.reval,
         drop_range,
+        "",
     );
 
     if std::env::var_os("NGXRS_DEBUG_PROXY").is_some() {
@@ -3568,6 +3581,312 @@ pub async fn fetch(
     peer_ip: &str,
     custom: &std::collections::HashMap<String, String>,
 ) -> Option<Response> {
+    match loc.slice {
+        None => fetch_plain(req, path, query, loc, http, peer_ip, custom, "").await,
+        Some(size) => fetch_sliced(req, path, query, loc, http, peer_ip, custom, size).await,
+    }
+}
+
+/// `ngx_http_slice_filter_module`: fetch the entity in fixed-size pieces.
+///
+/// Faithful to the module's three moving parts, transcribed below:
+///
+/// * `$slice_range` on the *first* request starts at
+///   `size * (get_start() / size)` -- the slice boundary at or below the
+///   client's range start -- not at zero;
+/// * every slice response must be a 206 whose `Content-Range` is exactly
+///   `start-(min(start+size, total)-1)` and whose ETag matches the first one,
+///   otherwise nginx aborts the request with no response at all;
+/// * slicing stops at the end of the client's own range, not at the end of the
+///   entity, and jumps forward when the client's range starts beyond the slice
+///   already fetched. That early stop is observable: `slice.t` checks that
+///   `bytes=2-2` is a cache MISS precisely because the earlier `bytes=0-0`
+///   request never fetched that slice.
+async fn fetch_sliced(
+    req: &Request,
+    path: &str,
+    query: &str,
+    loc: &LocCfg,
+    http: &Http,
+    peer_ip: &str,
+    custom: &std::collections::HashMap<String, String>,
+    size: u64,
+) -> Option<Response> {
+    // `ngx_http_slice_get_start`: `If-Range` and multi-range requests start at 0.
+    let mut pos = size * (slice_get_start(req) / size);
+    let mut body_start = pos;
+    let mut body: Vec<u8> = Vec::new();
+    // `None` until the first slice tells us the entity length.
+    let mut total_len: Option<u64> = None;
+    // Where to stop fetching: the end of the client's range, or the entity end.
+    let mut stop: Option<u64> = None;
+    let mut head: Option<Vec<(String, String)>> = None;
+    let mut etag: Option<String> = None;
+
+    loop {
+        if let Some(limit) = stop {
+            if pos >= limit {
+                break;
+            }
+        }
+        let range = format!("bytes={pos}-{}", pos + size - 1);
+        let mut sc = custom.clone();
+        sc.insert("slice_range".to_string(), range.clone());
+        let mut resp = fetch_plain(req, path, query, loc, http, peer_ip, &sc, &range).await?;
+        let h = crate::http::split_head(&resp.raw);
+        let get = |n: &str| {
+            h.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(n))
+                .map(|(_, v)| v.clone())
+        };
+
+        if resp.status != 206 {
+            // First response and not partial: nginx drops the slice context and
+            // serves it as it is. Later ones are "unexpected status code in
+            // slice response" and abort.
+            return if head.is_none() {
+                Some(resp)
+            } else {
+                Some(Response::empty(444))
+            };
+        }
+
+        // ETag must not change between slices.
+        let this_etag = get("etag");
+        match (&etag, &this_etag) {
+            (None, _) => etag = this_etag.clone(),
+            (Some(a), Some(b)) if a == b => {}
+            _ => return Some(Response::empty(444)),
+        }
+
+        // `Content-Range: bytes <first>-<last>/<complete>`; `*` is refused.
+        let Some((cr_first, cr_last, cr_total)) = get("content-range")
+            .and_then(|v| parse_content_range(&v))
+            .filter(|(_, _, t)| t.is_some())
+        else {
+            return Some(Response::empty(444));
+        };
+        let total = cr_total?;
+        let expected_end = (cr_first + size).min(total);
+        if cr_first != pos || cr_last + 1 != expected_end {
+            return Some(Response::empty(444));
+        }
+
+        let piece = crate::http::body_bytes(std::mem::replace(&mut resp.body, Body::Empty))
+            .await
+            .ok()?;
+
+        let mut jump_to: Option<u64> = None;
+        if head.is_none() {
+            // The first slice fixes the entity length and where to stop.
+            head = Some(h.clone());
+            total_len = Some(total);
+            match slice_client_range(req, total) {
+                // A single range the upstream honoured: stop at its end, and skip
+                // ahead when it starts past the slice we just fetched. The piece
+                // in hand is then *discarded* -- nginx never emits it, the range
+                // filter only keeps what the client asked for.
+                Some((off, end)) => {
+                    if expected_end + size <= off {
+                        jump_to = Some(size * (off / size));
+                    }
+                    stop = Some(end);
+                }
+                // No range, or one nginx refuses to apply (`single_range`): the
+                // whole entity is sent, so every slice is needed.
+                None => stop = Some(total),
+            }
+        }
+        match jump_to {
+            Some(j) => {
+                body.clear();
+                body_start = j;
+                pos = j;
+            }
+            None => {
+                body.extend_from_slice(&piece);
+                pos = expected_end;
+            }
+        }
+    }
+
+    let head = head?;
+
+    // Conditional requests are evaluated against the *assembled* response, which
+    // is what nginx does: the individual slices are stored as 206, so the cached
+    // path cannot answer `If-Match` / `If-None-Match` on its own
+    // (`slice.t`, "im bad"). Done here, for misses and hits alike.
+    let etag_hdr = head
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("etag"))
+        .map(|(_, v)| v.clone());
+    if let Some(im) = req.headers.get("if-match") {
+        let ok = etag_hdr
+            .as_deref()
+            .map(|e| crate::http::static_file::etag_list_matches(&im, e))
+            .unwrap_or(false)
+            || im.trim() == "*";
+        if !ok {
+            return Some(Response::empty(412).header("Content-Length", "0"));
+        }
+    } else if let Some(inm) = req.headers.get("if-none-match") {
+        if let Some(e) = etag_hdr.as_deref() {
+            if crate::http::static_file::etag_list_matches(&inm, e) {
+                let mut resp = Response::empty(304).header("ETag", e);
+                if let Some((_, lm)) = head
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("last-modified"))
+                {
+                    resp = resp.header("Last-Modified", lm.clone());
+                }
+                return Some(resp);
+            }
+        }
+    }
+
+    let body_start_at = body_start;
+    // The entity length, not the fetch bound: `Content-Range` reports the whole
+    // entity (`bytes 3-4/16`), and so does the 200 case's `Content-Length`.
+    let out_len = total_len?;
+
+    // The client's own range, applied to the assembled entity. `single_range` is
+    // set by nginx for slice responses, so a multi-range request gets the whole
+    // entity with 200 instead of a multipart body.
+    let want = slice_client_range(req, out_len).filter(|_| slice_single(req));
+    let (status, lo, hi) = match want {
+        Some((off, end)) if off >= body_start_at && end <= body_start_at + body.len() as u64 => {
+            (206u16, (off - body_start_at) as usize, (end - body_start_at) as usize)
+        }
+        _ => (200u16, 0, body.len()),
+    };
+    let out = body[lo..hi].to_vec();
+
+    // Headers: the first slice's, minus everything that describes a *piece*.
+    let mut raw = Vec::with_capacity(192);
+    for (k, v) in &head {
+        if k.eq_ignore_ascii_case("content-range")
+            || k.eq_ignore_ascii_case("accept-ranges")
+            || k.eq_ignore_ascii_case("content-length")
+            || k.eq_ignore_ascii_case("transfer-encoding")
+            || k.eq_ignore_ascii_case("connection")
+        {
+            continue;
+        }
+        raw.extend_from_slice(k.as_bytes());
+        raw.extend_from_slice(b": ");
+        raw.extend_from_slice(v.as_bytes());
+        raw.extend_from_slice(b"\r\n");
+    }
+    if status == 206 {
+        raw.extend_from_slice(b"Content-Range: bytes ");
+        raw.extend_from_slice((body_start_at + lo as u64).to_string().as_bytes());
+        raw.push(b'-');
+        raw.extend_from_slice((body_start_at + hi as u64 - 1).to_string().as_bytes());
+        raw.push(b'/');
+        raw.extend_from_slice(out_len.to_string().as_bytes());
+        raw.extend_from_slice(b"\r\n");
+    }
+    raw.extend_from_slice(b"Content-Length: ");
+    raw.extend_from_slice(out.len().to_string().as_bytes());
+    raw.extend_from_slice(b"\r\n");
+
+    Some(Response {
+        status,
+        headers: Vec::new(),
+        raw,
+        explicit_len: true,
+        no_error_page: false,
+        trailers: Vec::new(),
+        expect_trailers: false,
+        server_tokens: None,
+        // `add_header` already ran for the first slice, with that slice's
+        // `$upstream_cache_status` -- which is the value nginx reports.
+        headers_finalized: true,
+        body: Body::Bytes(out),
+    })
+}
+
+/// `ngx_http_slice_get_start`: the byte the client asked for, or 0.
+fn slice_get_start(req: &Request) -> u64 {
+    // `If-Range` makes the range conditional on a validator we cannot check
+    // here, so nginx starts from the beginning.
+    if req.headers.get("if-range").is_some() {
+        return 0;
+    }
+    let Some(v) = req.headers.get("range") else {
+        return 0;
+    };
+    let Some(rest) = v
+        .get(..6)
+        .filter(|p| p.eq_ignore_ascii_case("bytes="))
+        .map(|_| &v[6..])
+    else {
+        return 0;
+    };
+    // A multi-range request starts at 0.
+    if rest.contains(',') {
+        return 0;
+    }
+    let digits: &str = &rest[..rest
+        .bytes()
+        .take_while(|c| c.is_ascii_digit())
+        .count()];
+    if digits.is_empty() {
+        return 0;
+    }
+    digits.parse().unwrap_or(0)
+}
+
+/// The client's range as one `(start, end-exclusive)` span, if it is exactly one.
+fn slice_client_range(req: &Request, total: u64) -> Option<(u64, u64)> {
+    let v = req.headers.get("range")?;
+    match crate::http::static_file::parse_ranges(&v, total, usize::MAX) {
+        crate::http::static_file::MultiRange::Ranges(spans) if spans.len() == 1 => {
+            let (a, b) = spans[0];
+            Some((a, b + 1))
+        }
+        _ => None,
+    }
+}
+
+/// Whether the client asked for exactly one span (nginx's `single_range`).
+fn slice_single(req: &Request) -> bool {
+    !req
+        .headers
+        .get("range")
+        .map(|v| {
+            v.get(..6)
+                .filter(|p| p.eq_ignore_ascii_case("bytes="))
+                .and_then(|_| v.get(6..))
+                .map(|r| r.contains(','))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+/// `bytes 0-1/16` -> `(0, 1, Some(16))`; `bytes 0-1/*` -> `(0, 1, None)`.
+fn parse_content_range(v: &str) -> Option<(u64, u64, Option<u64>)> {
+    let rest = v.trim().strip_prefix("bytes")?.trim();
+    let (span, total) = rest.split_once('/')?;
+    let (a, b) = span.split_once('-')?;
+    let total = if total.trim() == "*" {
+        None
+    } else {
+        Some(total.trim().parse().ok()?)
+    };
+    Some((a.trim().parse().ok()?, b.trim().parse().ok()?, total))
+}
+
+async fn fetch_plain(
+    req: &Request,
+    path: &str,
+    query: &str,
+    loc: &LocCfg,
+    http: &Http,
+    peer_ip: &str,
+    custom: &std::collections::HashMap<String, String>,
+    slice_range: &str,
+) -> Option<Response> {
     let pp = loc.proxy_pass.clone()?;
     let fetch_vars = crate::http::ServerVars {
         req,
@@ -3598,7 +3917,7 @@ pub async fn fetch(
         .as_deref()
         .and_then(|name| http.cache_zones.iter().find(|z| z.name == name));
     let cache_key = if zone.is_some() {
-        cache_key_for(loc, req, peer_ip)
+        cache_key_for(loc, req, peer_ip, slice_range)
     } else {
         None
     };
@@ -3613,6 +3932,7 @@ pub async fn fetch(
         uri: path,
         args: query,
         server_port: 0,
+        slice_range,
     };
     let bypass = loc.proxy_cache_bypass.iter().any(|v| {
         let e = expand(v, &bypass_spec);
@@ -3748,6 +4068,7 @@ pub async fn fetch(
             false,
             None,
             false,
+            slice_range,
         );
         let write_failed = up.write_all(&out).await.is_err()
             || (!in_memory.is_empty() && up.write_all(in_memory).await.is_err());
@@ -4043,6 +4364,19 @@ fn cached_not_modified(entry: &crate::cache::Cached, req: &Request) -> Option<Re
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     };
+    // `If-Match` is evaluated before the hit is served: a cache HIT still has to
+    // answer 412 when the validator does not match. Only the upstream used to
+    // check it, so a cached response was returned regardless
+    // (`slice.t`, "im bad").
+    if let Some(im) = req.headers.get("if-match") {
+        let ok = hdr("etag")
+            .map(|etag| crate::http::static_file::etag_list_matches(im, etag))
+            .unwrap_or(false)
+            || im.trim() == "*";
+        if !ok {
+            return Some(Response::empty(412).header("Content-Length", "0"));
+        }
+    }
     let mut matched = false;
     if let Some(inm) = req.headers.get("if-none-match") {
         if let Some(etag) = hdr("etag") {
@@ -4094,7 +4428,12 @@ fn cached_response(entry: crate::cache::Cached, loc: &LocCfg, status: &str) -> R
     }
 }
 
-pub fn cache_key_for(loc: &LocCfg, req: &Request, peer_ip: &str) -> Option<String> {
+pub fn cache_key_for(
+    loc: &LocCfg,
+    req: &Request,
+    peer_ip: &str,
+    slice_range: &str,
+) -> Option<String> {
     let pp = loc.proxy_pass.as_ref()?;
     let scheme = "http";
     let proxy_host = &pp.host_header;
@@ -4114,6 +4453,7 @@ pub fn cache_key_for(loc: &LocCfg, req: &Request, peer_ip: &str) -> Option<Strin
             &args_only,
             peer_ip,
             req.method.as_str(),
+            slice_range,
         ),
         None => crate::cache::default_key(scheme, proxy_host, &req.raw_target),
     })
@@ -4198,6 +4538,7 @@ pub fn spawn_background_update(
         true,
         reval,
         true,
+        "",
     );
 
     let connect_timeout = loc.proxy_connect_timeout;
@@ -4724,3 +5065,4 @@ mod chunk_tests {
         assert_eq!(dechunk(b"0\r\n\r\n").as_deref(), Some(&b""[..]));
     }
 }
+

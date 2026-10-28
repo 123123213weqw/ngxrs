@@ -103,6 +103,9 @@ pub fn expand_key(
     args: &str,
     remote_addr: &str,
     method: &str,
+    // `$slice_range` is per-request mutable state: with `slice` set, the cache
+    // key normally contains it so every slice is a separate entry.
+    slice_range: &str,
 ) -> String {
     let mut out = String::with_capacity(spec.len() + 32);
     let b = spec.as_bytes();
@@ -141,6 +144,7 @@ pub fn expand_key(
             "args" => args,
             "remote_addr" => remote_addr,
             "request_method" => method,
+            "slice_range" => slice_range,
             "is_args" => {
                 if args.is_empty() {
                     ""

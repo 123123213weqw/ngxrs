@@ -5379,7 +5379,10 @@ async fn dispatch(
     // streamed reply, but the body half cannot, so a location that converts
     // takes the buffered path -- nginx likewise cannot recode while streaming.
     let charset_active = !matches!(loc.charset, crate::config::CharsetSpec::Off);
-    let wants_buffered = loc.ssi
+    // `slice` assembles the whole entity from several upstream requests before
+    // anything can go out, so it needs the buffered path.
+    let wants_buffered = loc.slice.is_some()
+        || loc.ssi
         || (has_sub_filter && !upgrade)
         || (charset_active && !upgrade)
         || (loc.gzip && crate::gzip::accepts_gzip(req) && loc.proxy_cache.is_none());

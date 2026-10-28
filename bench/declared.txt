@@ -90,6 +90,10 @@ access_log_variables.t
 # `max_conns` (per-peer cap, two-pool primary/backup walk), `hash` (both the
 # folded Cache::Memcached expression and the consistent ring), `least_conn`
 # with its smooth-WRR tie-break, and `random two least_conn`.
+# `stream_upstream.t`: the same balancers plus `max_fails`/`fail_timeout`
+# recovery, the single-peer rule, and `$upstream_addr` /
+# `$upstream_bytes_sent` / `$upstream_bytes_received` as per-attempt lists.
+stream_upstream.t
 stream_upstream_max_conns.t
 stream_upstream_hash.t
 stream_upstream_least_conn.t

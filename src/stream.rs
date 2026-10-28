@@ -286,6 +286,9 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                             break;
                         };
                         attempts += 1;
+                        if let Some(l) = alog.as_mut() {
+                            l.start_attempt(&peers.addr(idx).to_string());
+                        }
                         match tokio::time::timeout(
                             connect_timeout,
                             TcpStream::connect(peers.addr(idx)),
@@ -361,45 +364,58 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                         let Ok(tls_up) = connector.connect(name, upstream).await else {
                             return;
                         };
-                        match tls {
+                        let counts = match tls {
                             Some(sc) => {
                                 let acceptor = tokio_rustls::TlsAcceptor::from(sc);
                                 match acceptor.accept(client).await {
                                     Ok(c) => splice(c, tls_up).await,
-                                    Err(_) => {}
+                                    Err(_) => (0, 0),
                                 }
                             }
                             None => splice(client, tls_up).await,
+                        };
+                        if let Some(l) = alog.as_mut() {
+                            l.finish_attempt(counts.0, counts.1);
                         }
                         return;
                     }
                     // `listen ... ssl` terminates TLS here, before the splice.
-                    match tls {
-                        Some(cfg) => {
-                            let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
-                            match acceptor.accept(client).await {
-                                Ok(t) => proxy_io(t, upstream, timeout, peer).await,
-                                Err(_) => {
-                                    if let Some(l) = alog.as_mut() {
-                                        l.status = 500;
+                    let counts = {
+                        let _ = &tls;
+                        match tls {
+                            Some(cfg) => {
+                                let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+                                match acceptor.accept(client).await {
+                                    Ok(t) => proxy_io(t, upstream, timeout, peer).await,
+                                    Err(_) => {
+                                        if let Some(l) = alog.as_mut() {
+                                            l.status = 500;
+                                        }
+                                        (0, 0)
                                     }
                                 }
                             }
-                        }
-                        None => {
-                            if write_pp {
-                                use tokio::io::AsyncWriteExt;
-                                let local = client_local
-                                    .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
-                                let mut upstream = upstream;
-                                let _ = upstream
-                                    .write_all(&crate::proxyproto::write(&peer, &local))
-                                    .await;
-                                proxy_tcp(client, upstream, timeout, peer).await
-                            } else {
-                                proxy_tcp(client, upstream, timeout, peer).await
+                            None => {
+                                if write_pp {
+                                    use tokio::io::AsyncWriteExt;
+                                    let local = client_local
+                                        .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
+                                    let mut upstream = upstream;
+                                    let _ = upstream
+                                        .write_all(&crate::proxyproto::write(&peer, &local))
+                                        .await;
+                                    // The PROXY header is not counted in
+                                    // `$upstream_bytes_sent` by nginx.
+                                    let (a, b) = proxy_tcp(client, upstream, timeout, peer).await;
+                                    (a, b)
+                                } else {
+                                    proxy_tcp(client, upstream, timeout, peer).await
+                                }
                             }
                         }
+                    };
+                    if let Some(l) = alog.as_mut() {
+                        l.finish_attempt(counts.0, counts.1);
                     }
                 });
             }
@@ -502,7 +518,7 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
 /// upstream connection slot -- alive while the peer that already finished just
 /// sits there, which made `least_conn` see a tie where nginx sees a free peer
 /// (`stream_upstream_least_conn.t`) and held `max_conns` slots too long.
-async fn splice<A, B>(mut a: A, mut b: B)
+async fn splice<A, B>(mut a: A, mut b: B) -> (u64, u64)
 where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -510,6 +526,10 @@ where
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut ab = vec![0u8; 16 * 1024];
     let mut ba = vec![0u8; 16 * 1024];
+    // `$upstream_bytes_sent` / `$upstream_bytes_received` count what went to and
+    // came from `b`, i.e. the upstream.
+    let mut sent = 0u64;
+    let mut received = 0u64;
     loop {
         tokio::select! {
             r = a.read(&mut ab) => match r {
@@ -518,6 +538,7 @@ where
                     if b.write_all(&ab[..n]).await.is_err() {
                         break;
                     }
+                    sent += n as u64;
                 }
             },
             r = b.read(&mut ba) => match r {
@@ -526,20 +547,27 @@ where
                     if a.write_all(&ba[..n]).await.is_err() {
                         break;
                     }
+                    received += n as u64;
                 }
             },
         }
     }
     let _ = a.shutdown().await;
     let _ = b.shutdown().await;
+    (sent, received)
 }
 
 /// Splice a TLS-terminated client to a plaintext upstream.
-async fn proxy_io<C>(client: C, upstream: TcpStream, _idle: Duration, _peer: SocketAddr)
+async fn proxy_io<C>(
+    client: C,
+    upstream: TcpStream,
+    _idle: Duration,
+    _peer: SocketAddr,
+) -> (u64, u64)
 where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    splice(client, upstream).await;
+    splice(client, upstream).await
 }
 
 /// Serve `return <text>` on a stream listener, expanding the few variables a
@@ -558,6 +586,17 @@ pub struct StreamAccessLog {
     protocol: &'static str,
     started: std::time::Instant,
     pub status: u16,
+    /// One entry per upstream attempt: nginx logs `$upstream_addr` and the byte
+    /// counters as comma-separated per-try lists, so a retry after a refused
+    /// connect shows both peers (`stream_upstream.t`, "per-upstream variables").
+    attempts: Vec<StreamAttempt>,
+}
+
+#[derive(Debug, Clone)]
+struct StreamAttempt {
+    addr: String,
+    sent: u64,
+    received: u64,
 }
 
 impl StreamAccessLog {
@@ -577,7 +616,27 @@ impl StreamAccessLog {
             protocol,
             started: std::time::Instant::now(),
             status: 200,
+            attempts: Vec::new(),
         })
+    }
+}
+
+impl StreamAccessLog {
+    /// Record that a connection to `addr` is starting. A failed attempt keeps
+    /// zero counters unless [`finish_attempt`] runs.
+    pub fn start_attempt(&mut self, addr: &str) {
+        self.attempts.push(StreamAttempt {
+            addr: addr.to_string(),
+            sent: 0,
+            received: 0,
+        });
+    }
+
+    pub fn finish_attempt(&mut self, sent: u64, received: u64) {
+        if let Some(a) = self.attempts.last_mut() {
+            a.sent = sent;
+            a.received = received;
+        }
     }
 }
 
@@ -590,7 +649,37 @@ impl Drop for StreamAccessLog {
         let server_port = self.listen.port().to_string();
         let status = self.status.to_string();
         let session = format!("{:.3}", self.started.elapsed().as_secs_f64());
+        let upstream_addr = if self.attempts.is_empty() {
+            "-".to_string()
+        } else {
+            self.attempts
+                .iter()
+                .map(|a| a.addr.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let upstream_sent = if self.attempts.is_empty() {
+            "-".to_string()
+        } else {
+            self.attempts
+                .iter()
+                .map(|a| a.sent.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let upstream_recv = if self.attempts.is_empty() {
+            "-".to_string()
+        } else {
+            self.attempts
+                .iter()
+                .map(|a| a.received.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         let vars: Vec<(&str, &str)> = vec![
+            ("upstream_addr", &upstream_addr),
+            ("upstream_bytes_sent", &upstream_sent),
+            ("upstream_bytes_received", &upstream_recv),
             ("status", &status),
             ("remote_addr", &peer_ip),
             ("remote_port", &peer_port),
@@ -759,14 +848,19 @@ fn client_cert_vars(
     (verify, pem)
 }
 
-async fn proxy_tcp(client: TcpStream, upstream: TcpStream, _idle: Duration, _peer: SocketAddr) {
+async fn proxy_tcp(
+    client: TcpStream,
+    upstream: TcpStream,
+    _idle: Duration,
+    _peer: SocketAddr,
+) -> (u64, u64) {
     // The earlier comment here claimed `copy_bidirectional` returns as soon as
     // one side closes. It does not: it waits for *both* directions, so a backend
     // that answers and closes kept the session -- and the upstream connection
     // slot -- alive until the client also went away. With `proxy_half_close`
     // off (the default) nginx ends the session on the first EOF, which is what
     // `splice` now does.
-    splice(client, upstream).await;
+    splice(client, upstream).await
 }
 
 async fn serve_udp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {

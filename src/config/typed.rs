@@ -60,6 +60,31 @@ pub struct Location {
 /// `proxy_next_upstream` flags, nginx's `NGX_HTTP_UPSTREAM_FT_*` bits. The
 /// directive *replaces* the default, so `proxy_next_upstream http_500` no
 /// longer retries on connect errors.
+/// Parse a `*_next_upstream` argument list into flags. The directive *replaces*
+/// the default set, so an empty result means "never retry" only when `off` was
+/// given -- otherwise the caller keeps its own default.
+pub fn next_upstream_flags(args: &[String]) -> u32 {
+    let mut flags = 0u32;
+    for a in args {
+        flags |= match a.as_str() {
+            "off" => next_upstream::OFF,
+            "error" => next_upstream::ERROR,
+            "timeout" => next_upstream::TIMEOUT,
+            "invalid_header" => next_upstream::INVALID_HEADER,
+            "http_500" => next_upstream::HTTP_500,
+            "http_502" => next_upstream::HTTP_502,
+            "http_503" => next_upstream::HTTP_503,
+            "http_504" => next_upstream::HTTP_504,
+            "http_403" => next_upstream::HTTP_403,
+            "http_404" => next_upstream::HTTP_404,
+            "http_429" => next_upstream::HTTP_429,
+            "non_idempotent" => next_upstream::NON_IDEMPOTENT,
+            _ => 0,
+        };
+    }
+    flags
+}
+
 pub mod next_upstream {
     pub const OFF: u32 = 1 << 0;
     pub const ERROR: u32 = 1 << 1;
@@ -268,6 +293,14 @@ pub struct LocCfg {
     pub proxy_next_upstream_tries: u32,
     /// `proxy_next_upstream_timeout T`; zero = unlimited.
     pub proxy_next_upstream_timeout: Duration,
+    /// `grpc_next_upstream` flags. nginx keeps these in the grpc module's own
+    /// location conf, so a `proxy_next_upstream` in the same location does not
+    /// apply to `grpc_pass` and vice versa.
+    pub grpc_next_upstream: u32,
+    /// `grpc_next_upstream_tries N`; 0 = unlimited.
+    pub grpc_next_upstream_tries: u32,
+    /// `grpc_next_upstream_timeout T`; zero = unlimited.
+    pub grpc_next_upstream_timeout: Duration,
     pub proxy_buffering: bool,
     pub proxy_hide_headers: Vec<String>,
     // ---- fastcgi ----
@@ -503,6 +536,9 @@ impl LocCfg {
             proxy_next_upstream: next_upstream::DEFAULT,
             proxy_next_upstream_tries: 0,
             proxy_next_upstream_timeout: Duration::ZERO,
+            grpc_next_upstream: next_upstream::DEFAULT,
+            grpc_next_upstream_tries: 0,
+            grpc_next_upstream_timeout: Duration::ZERO,
             proxy_buffering: true,
             proxy_hide_headers: Vec::new(),
             fastcgi_pass: None,
@@ -4318,28 +4354,7 @@ impl Builder {
             }
             "proxy_no_cache" => cfg.proxy_no_cache = d.args.clone(),
             "proxy_cache_bypass" => cfg.proxy_cache_bypass = d.args.clone(),
-            "proxy_next_upstream" => {
-                // The argument list *replaces* the default; `off` clears it.
-                let mut flags = 0u32;
-                for a in &d.args {
-                    flags |= match a.as_str() {
-                        "off" => next_upstream::OFF,
-                        "error" => next_upstream::ERROR,
-                        "timeout" => next_upstream::TIMEOUT,
-                        "invalid_header" => next_upstream::INVALID_HEADER,
-                        "http_500" => next_upstream::HTTP_500,
-                        "http_502" => next_upstream::HTTP_502,
-                        "http_503" => next_upstream::HTTP_503,
-                        "http_504" => next_upstream::HTTP_504,
-                        "http_403" => next_upstream::HTTP_403,
-                        "http_404" => next_upstream::HTTP_404,
-                        "http_429" => next_upstream::HTTP_429,
-                        "non_idempotent" => next_upstream::NON_IDEMPOTENT,
-                        _ => 0,
-                    };
-                }
-                cfg.proxy_next_upstream = flags;
-            }
+            "proxy_next_upstream" => cfg.proxy_next_upstream = next_upstream_flags(&d.args),
             "proxy_next_upstream_tries" => {
                 cfg.proxy_next_upstream_tries =
                     d.args.first().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -4347,6 +4362,16 @@ impl Builder {
             "proxy_next_upstream_timeout" => {
                 if let Some(t) = d.args.first().and_then(|v| parse_time(v)) {
                     cfg.proxy_next_upstream_timeout = t;
+                }
+            }
+            "grpc_next_upstream" => cfg.grpc_next_upstream = next_upstream_flags(&d.args),
+            "grpc_next_upstream_tries" => {
+                cfg.grpc_next_upstream_tries =
+                    d.args.first().and_then(|v| v.parse().ok()).unwrap_or(0);
+            }
+            "grpc_next_upstream_timeout" => {
+                if let Some(t) = d.args.first().and_then(|v| parse_time(v)) {
+                    cfg.grpc_next_upstream_timeout = t;
                 }
             }
             "proxy_buffers"

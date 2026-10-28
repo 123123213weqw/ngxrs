@@ -199,7 +199,9 @@ async fn handle_stream(
                 "127.0.0.1",
             )
             .await;
-            send_http2_response(&mut respond, resp, tokens, false).await;
+            if !send_http2_response(&mut respond, resp, tokens, false).await {
+                return;
+            }
             return;
         }
         // `large_client_header_buffers` bounds header fields on HTTP/2 too:
@@ -269,7 +271,9 @@ async fn handle_stream(
                     "127.0.0.1",
                 )
                 .await;
-                send_http2_response(&mut respond, resp, tokens, false).await;
+                if !send_http2_response(&mut respond, resp, tokens, false).await {
+                return;
+            }
                 return;
             }
         };
@@ -405,7 +409,9 @@ async fn handle_stream(
                             listen_port,
                             "127.0.0.1",
                         );
-                        send_http2_response(&mut respond, resp, tokens, false).await;
+                        if !send_http2_response(&mut respond, resp, tokens, false).await {
+                return;
+            }
                         return;
                     }
                 }
@@ -464,7 +470,9 @@ async fn handle_stream(
         )
         .await;
 
-        send_http2_response(&mut respond, resp, tokens, head_only).await;
+        if !send_http2_response(&mut respond, resp, tokens, head_only).await {
+            return;
+        }
         if discarded {
             // Nothing consumed the body, so tell the client to stop sending it.
             // nginx resets with NO_ERROR (code 0) *after* the response, which is
@@ -480,7 +488,16 @@ async fn send_http2_response(
     resp: crate::http::Response,
     tokens: bool,
     head_only: bool,
-) {
+) -> bool {
+    // nginx's `return 444` closes the connection without sending anything, on
+    // every protocol -- the h1 path does that by propagating `ConnectionAborted`
+    // from the writer. Emitting a 444 HEADERS frame instead (which this did)
+    // leaks a status nginx never sends and, more importantly, makes a gRPC
+    // client treat the peer as answering rather than as having dropped.
+    if resp.status == 444 {
+        let _ = respond.send_reset(h2::Reason::INTERNAL_ERROR);
+        return false;
+    }
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     // A location-level `server_tokens` overrides the server's for this stream.
     let tokens = resp.server_tokens.unwrap_or(tokens);
@@ -547,18 +564,18 @@ async fn send_http2_response(
     // frames: HEADERS, DATA without END_STREAM, then the trailer HEADERS).
     let has_trailers = !resp.trailers.is_empty();
     let Ok(response) = builder.body(()) else {
-        return;
+        return true;
     };
     let Ok(mut send) = respond.send_response(response, !has_trailers && (head_only || len == 0))
     else {
-        return;
+        return true;
     };
     if head_only {
-        return;
+        return true;
     }
     if len > 0 && !has_trailers {
         let _ = send.send_data(Bytes::from(body), true);
-        return;
+        return true;
     }
     if len > 0 {
         let _ = send.send_data(Bytes::from(body), false);
@@ -575,6 +592,7 @@ async fn send_http2_response(
         }
         let _ = send.send_trailers(trailers);
     }
+    true
 }
 
 /// Headers HTTP/2 forbids (`RFC 9113` 8.2.2): HTTP/2 has its own framing, so the

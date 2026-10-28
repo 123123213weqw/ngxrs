@@ -198,19 +198,20 @@ pub async fn resolve_any(
     })
 }
 
-/// Send one request to the gRPC backend and translate the reply back.
-pub async fn fetch(
-    http: &Http,
-    loc: &LocCfg,
-    req: &Request,
-    path: &str,
-    query: &str,
-    peer_ip: &str,
-    vars: Option<&crate::http::ServerVars<'_>>,
-) -> Option<Response> {
-    let spec = loc.grpc_pass.as_ref()?;
-    let target = resolve_any(spec, http, vars).await?;
+/// Why a single gRPC attempt failed, in the vocabulary of
+/// `grpc_next_upstream`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FailKind {
+    /// The connection (or the h2 handshake) never came up: `error`.
+    Connect,
+    /// Connected, but the peer produced no usable HTTP/2 response. nginx folds
+    /// "closed without a reply" into `invalid_header`, which is why
+    /// `return 444` on a gRPC backend is retried under `invalid_header` only.
+    InvalidHeader,
+}
 
+/// Build the outbound HTTP/2 request for one peer.
+fn build_request(req: &Request, path: &str, query: &str, target: &Target) -> Option<H2Request<()>> {
     let mut uri = path.to_string();
     if !query.is_empty() {
         uri.push('?');
@@ -244,24 +245,11 @@ pub async fn fetch(
             }
         }
     }
-    let _ = peer_ip;
-    let request = b.body(()).ok()?;
+    b.body(()).ok()
+}
 
-    let tcp = tokio::net::TcpStream::connect(target.addr).await.ok()?;
-    tcp.set_nodelay(true).ok();
-    let (status, headers, body) = if target.ssl {
-        let connector = grpcs_connector()?;
-        // SNI takes a bare host name, not `host:port`.
-        let sni = split_host_port(&target.host, true)
-            .map(|(h, _)| h)
-            .unwrap_or_else(|| target.host.clone());
-        let name = rustls::pki_types::ServerName::try_from(sni).ok()?;
-        let tls = connector.connect(name, tcp).await.ok()?;
-        h2_roundtrip(tls, request).await?
-    } else {
-        h2_roundtrip(tcp, request).await?
-    };
-
+/// Turn an h2 reply into the response this server renders.
+fn translate(status: StatusCode, headers: http::HeaderMap, body: Vec<u8>) -> Response {
     let mut resp = Response::empty(status.as_u16());
     // `Response::raw` holds pre-rendered *header lines*, not a whole message:
     // status line and framing are added by the writer.
@@ -282,7 +270,307 @@ pub async fn fetch(
         }
     }
     resp.body = crate::http::Body::Bytes(body);
-    Some(resp)
+    resp
+}
+
+/// One attempt against one peer.
+async fn fetch_one(
+    req: &Request,
+    path: &str,
+    query: &str,
+    target: &Target,
+) -> Result<Response, FailKind> {
+    // Build first: a value HTTP/2 cannot carry is `invalid_header`, not a
+    // connection problem.
+    let request = match build_request(req, path, query, target) {
+        Some(r) => r,
+        None => return Err(FailKind::InvalidHeader),
+    };
+    let tcp = match tokio::net::TcpStream::connect(target.addr).await {
+        Ok(t) => t,
+        Err(_) => return Err(FailKind::Connect),
+    };
+    tcp.set_nodelay(true).ok();
+    let got = if target.ssl {
+        let connector = match grpcs_connector() {
+            Some(c) => c,
+            None => return Err(FailKind::Connect),
+        };
+        // SNI takes a bare host name, not `host:port`.
+        let sni = split_host_port(&target.host, true)
+            .map(|(h, _)| h)
+            .unwrap_or_else(|| target.host.clone());
+        let name = match rustls::pki_types::ServerName::try_from(sni) {
+            Ok(n) => n,
+            Err(_) => return Err(FailKind::Connect),
+        };
+        match connector.connect(name, tcp).await {
+            Ok(tls) => h2_roundtrip(tls, request).await,
+            Err(_) => return Err(FailKind::Connect),
+        }
+    } else {
+        h2_roundtrip(tcp, request).await
+    };
+    match got {
+        Some((status, headers, body)) => Ok(translate(status, headers, body)),
+        None => Err(FailKind::InvalidHeader),
+    }
+}
+
+/// One candidate peer, remembering where it came from so a failed attempt can
+/// be charged against `max_fails`.
+struct Cand {
+    target: Target,
+    peer: Option<(usize, usize)>,
+    /// `$upstream_addr` for this attempt (`127.0.0.1:8081`).
+    label: String,
+}
+
+/// The peers to try, in order.
+async fn candidates(
+    http: &Http,
+    spec: &str,
+    peer_ip: &str,
+    vars: Option<&crate::http::ServerVars<'_>>,
+) -> Option<Vec<Cand>> {
+    let expanded = match (spec.contains('$'), vars) {
+        (true, Some(v)) => v.expand(spec),
+        (true, None) => return None,
+        (false, _) => spec.to_string(),
+    };
+    let (rest, ssl) = split_scheme(&expanded);
+    let name = rest.trim_end_matches('/');
+
+    // An `upstream {}` block: walk its peers in the same order the HTTP proxy
+    // would, including `max_fails`/`fail_timeout` and the `rr`/`hash`/`random`
+    // rotation, so a backend taken out of service here is out for both modules.
+    if let Some(idx) = http.upstreams.iter().position(|u| u.name == name) {
+        let client_ip: std::net::IpAddr = peer_ip
+            .parse()
+            .unwrap_or_else(|_| std::net::IpAddr::from([127, 0, 0, 1]));
+        let order = crate::proxy::select_order(&http.upstreams[idx], idx, &client_ip, None)?;
+        let up = &http.upstreams[idx];
+        let out: Vec<Cand> = order
+            .iter()
+            .map(|&i| {
+                let srv = &up.servers[i];
+                Cand {
+                    target: Target {
+                        addr: srv.addr,
+                        host: name.to_string(),
+                        ssl,
+                    },
+                    peer: Some((idx, i)),
+                    label: srv.addr.to_string(),
+                }
+            })
+            .collect();
+        return if out.is_empty() { None } else { Some(out) };
+    }
+
+    // A literal or variable-resolved target: exactly one attempt.
+    let t = resolve_any(spec, http, vars).await?;
+    let label = t.addr.to_string();
+    Some(vec![Cand {
+        target: t,
+        peer: None,
+        label,
+    }])
+}
+
+/// Does this upstream status trip a `next_upstream http_XXX` flag?
+fn retry_on_status(status: u16, flags: u32) -> bool {
+    use crate::config::next_upstream as nu;
+    match status {
+        500 => flags & nu::HTTP_500 != 0,
+        502 => flags & nu::HTTP_502 != 0,
+        503 => flags & nu::HTTP_503 != 0,
+        504 => flags & nu::HTTP_504 != 0,
+        403 => flags & nu::HTTP_403 != 0,
+        404 => flags & nu::HTTP_404 != 0,
+        429 => flags & nu::HTTP_429 != 0,
+        _ => false,
+    }
+}
+
+/// Which statuses count against `max_fails`. Probed against nginx: 5xx and 429
+/// do, 403 and 404 do not.
+fn counts_as_failure(status: u16) -> bool {
+    matches!(status, 500 | 502 | 503 | 504 | 429)
+}
+
+/// Where the next attempt should go.
+enum Source {
+    /// An `upstream {}` block: peers are picked one at a time, because nginx
+    /// advances the round-robin counter on every *peer get*, not once per
+    /// request. Picking the whole order up front makes a retry reuse a stale
+    /// rotation and stops `max_fails` from ever reaching its limit.
+    Upstream {
+        idx: usize,
+        name: String,
+        ssl: bool,
+        client_ip: std::net::IpAddr,
+    },
+    /// A literal or variable-resolved target: exactly one attempt.
+    Single(Cand),
+}
+
+async fn source(http: &Http, spec: &str, peer_ip: &str, vars: Option<&crate::http::ServerVars<'_>>) -> Option<Source> {
+    let expanded = match (spec.contains('$'), vars) {
+        (true, Some(v)) => v.expand(spec),
+        (true, None) => return None,
+        (false, _) => spec.to_string(),
+    };
+    let (rest, ssl) = split_scheme(&expanded);
+    let name = rest.trim_end_matches('/');
+    if let Some(idx) = http.upstreams.iter().position(|u| u.name == name) {
+        let client_ip: std::net::IpAddr = peer_ip
+            .parse()
+            .unwrap_or_else(|_| std::net::IpAddr::from([127, 0, 0, 1]));
+        return Some(Source::Upstream {
+            idx,
+            name: name.to_string(),
+            ssl,
+            client_ip,
+        });
+    }
+    let t = resolve_any(spec, http, vars).await?;
+    let label = t.addr.to_string();
+    Some(Source::Single(Cand {
+        target: t,
+        peer: None,
+        label,
+    }))
+}
+
+/// One peer get, skipping the ones already tried in this request.
+fn pick_next(
+    http: &Http,
+    idx: usize,
+    name: &str,
+    ssl: bool,
+    client_ip: &std::net::IpAddr,
+    tried: &[usize],
+) -> Option<Cand> {
+    let up = &http.upstreams[idx];
+    let order = crate::proxy::select_order(up, idx, client_ip, None)?;
+    let pick = order.iter().copied().find(|i| !tried.contains(i))?;
+    let srv = &up.servers[pick];
+    Some(Cand {
+        target: Target {
+            addr: srv.addr,
+            host: name.to_string(),
+            ssl,
+        },
+        peer: Some((idx, pick)),
+        label: srv.addr.to_string(),
+    })
+}
+
+/// Send the request to a gRPC backend, following `grpc_next_upstream` across
+/// the peers of an `upstream {}` block.
+pub async fn fetch(
+    http: &Http,
+    loc: &LocCfg,
+    req: &Request,
+    path: &str,
+    query: &str,
+    peer_ip: &str,
+    vars: Option<&crate::http::ServerVars<'_>>,
+) -> Option<Response> {
+    use crate::config::next_upstream as nu;
+    let spec = loc.grpc_pass.as_deref()?;
+    let src = source(http, spec, peer_ip, vars).await?;
+
+    let flags = loc.grpc_next_upstream;
+    let retry_enabled = flags & nu::OFF == 0;
+    let mut tries = if loc.grpc_next_upstream_tries == 0 {
+        u32::MAX
+    } else {
+        loc.grpc_next_upstream_tries
+    };
+    let deadline = if loc.grpc_next_upstream_timeout.is_zero() {
+        None
+    } else {
+        Some(std::time::Instant::now() + loc.grpc_next_upstream_timeout)
+    };
+    let mut tried: Vec<usize> = Vec::new();
+    let mut last: Option<Response> = None;
+
+    loop {
+        if tries == 0 {
+            break;
+        }
+        if let Some(d) = deadline {
+            if std::time::Instant::now() >= d {
+                break;
+            }
+        }
+        let cand = match &src {
+            Source::Single(c) => {
+                if !tried.is_empty() {
+                    break;
+                }
+                tried.push(0);
+                Cand {
+                    target: c.target.clone(),
+                    peer: c.peer,
+                    label: c.label.clone(),
+                }
+            }
+            Source::Upstream {
+                idx,
+                name,
+                ssl,
+                client_ip,
+            } => match pick_next(http, *idx, name, *ssl, client_ip, &tried) {
+                Some(c) => {
+                    if let Some((_, i)) = c.peer {
+                        tried.push(i);
+                    }
+                    c
+                }
+                None => break,
+            },
+        };
+        tries -= 1;
+
+        let slot = crate::timing::begin();
+        crate::timing::set_addr(slot, &cand.label);
+        // Another attempt is possible only when the directive allows retrying
+        // and a peer may be left; `pick_next` answers the latter.
+        let more = retry_enabled;
+
+        match fetch_one(req, path, query, &cand.target).await {
+            Ok(resp) => {
+                crate::timing::set_status(slot, resp.status);
+                if let Some((u, i)) = cand.peer {
+                    crate::proxy::peer_mark(u, i, counts_as_failure(resp.status));
+                }
+                if more && retry_on_status(resp.status, flags) {
+                    last = Some(resp);
+                    continue;
+                }
+                return Some(resp);
+            }
+            Err(kind) => {
+                if let Some((u, i)) = cand.peer {
+                    crate::proxy::peer_mark(u, i, true);
+                }
+                let retry = more
+                    && match kind {
+                        FailKind::Connect => flags & nu::ERROR != 0,
+                        FailKind::InvalidHeader => flags & nu::INVALID_HEADER != 0,
+                    };
+                // Nothing has reached the client, so a failed final attempt is
+                // a 502 rather than the previous peer's response.
+                if !retry {
+                    return None;
+                }
+            }
+        }
+    }
+    last
 }
 
 async fn h2_roundtrip<S>(

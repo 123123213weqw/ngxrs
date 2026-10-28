@@ -2598,3 +2598,56 @@ Transfer-Encoding」改由 `head.chunked` 判断（走到那条路径就说明�
 bash bench/feature.sh 2>&1 | grep -E 'DIFF|cases match'
 TEST_LIST="proxy_chunked.t proxy_chunked_extra.t proxy_cache_vary.t" bash bench/nginxtests.sh
 ```
+
+## 本轮（`grpc_next_upstream`：gRPC 上游的重试与 peer 轮转）
+
+`grpc_next_upstream.t` **3/11 → 11/11，与 nginx 完全一致**。
+
+### `grpc_next_upstream` 之前根本不存在
+
+全源码 grep 无此指令——它落在「接受但忽略」里，而且 gRPC 路径**只解析一个目标、发一次请求**：
+`resolve_static` 直接取 `upstream{}` 里第一个非 down 非 backup 的 server，没有轮转、没有重试、
+没有 `max_fails` 记账、也没有 `$upstream_addr`。
+
+新增（与 proxy 共用同一套机制，避免两份实现漂移）：
+
+- `grpc_next_upstream` / `_tries` / `_timeout` 三个指令；flag 解析抽成
+  `config::typed::next_upstream_flags`，`proxy_next_upstream` 也改用它。
+- peer 选择复用 `proxy::select_order`（`rr`/`hash`/`random`、`max_fails`/`fail_timeout`、
+  backup 池），失败记账复用 `proxy::peer_mark`——因此**同一台后端对两个模块是同一种状态**，
+  这正是用例 `down after 500` 所依赖的。
+- `$upstream_addr` / `$upstream_status` 走已有的 `timing` 逐次记录。
+- 失败分类：连接/握手失败 → `error`；连上了但拿不到可用响应 → `invalid_header`。
+  这个区分不是学术性的——`return 444` 的后端只配 `invalid_header` 时会重试，配 `error` 时不会。
+
+### 两个只有靠 A/B 才能发现的语义
+
+**1. peer 必须逐次选取，不能一次取整张表。**
+nginx 的 rr 计数在**每次取 peer** 时推进。我第一版按请求算好整张候选表，于是重试复用了过期的
+轮转位置：`/500` 连续两次落在不同 peer 上，`max_fails=2` 永远攒不满，`down after 500` 因此失败。
+改成每次尝试都重新 `select_order` 并跳过已试过的 peer。
+
+**2. HTTP/2 下的 `return 444` 必须不发响应。**
+h1 路径是对的（写响应时直接抛 `ConnectionAborted`，连接断开），但 h2 路径**发出了一个 444 状态
+的 HEADERS 帧**：
+
+```
+curl --http1.1            /444 -> 000（连接断开，与 nginx 一致）
+curl --http2-prior-knowledge /444 -> 444   ← 修前
+```
+
+这不只是多一个状态码：gRPC 客户端因此认为对端「答了」而不是「掉了」，于是不按 `invalid_header`
+重试，`request 444` 那条也随之失败。现在 h2 发送 `RST_STREAM` 并结束连接。
+
+### 回归
+
+`bench/all.sh` **70/70 PASS**、声明清单 **PASS**（135 文件，WORSE=0 TRUNC=0）、单测 **178**。
+`h2.t` 117/145、`h2_headers.t` 73/112（较上轮各 +1/+2，无回归）；`grpc_pass.t` 7/7 不变。
+`grpc_ssl.t` 13/40 本轮前后相同——失败项是 HEADERS/DATA 帧级字段，与 `h2` crate 的帧构造绑定，
+不是本次改动引入的，也不在本次范围内。
+
+复现：
+
+```bash
+TEST_LIST="grpc_next_upstream.t" bash bench/nginxtests.sh   # 应 SAME 11/11
+```

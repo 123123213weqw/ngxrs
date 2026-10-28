@@ -206,7 +206,7 @@ fn peer_available(up: usize, sidx: usize, max_fails: u32, fail_timeout: Duration
 
 /// Every completed attempt refreshes `checked`; an unsuccessful one also
 /// bumps `fails`.
-fn peer_mark(up: usize, sidx: usize, failed: bool) {
+pub(crate) fn peer_mark(up: usize, sidx: usize, failed: bool) {
     let mut guard = peer_fail_cell().lock().unwrap_or_else(|e| e.into_inner());
     let p = guard.entry((up, sidx)).or_insert(PeerFail {
         fails: 0,
@@ -440,7 +440,7 @@ fn choose(
     }
 }
 
-fn select_order(
+pub(crate) fn select_order(
     up: &Upstream,
     idx: usize,
     client_ip: &std::net::IpAddr,

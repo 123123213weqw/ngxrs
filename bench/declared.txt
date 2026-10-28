@@ -338,3 +338,5 @@ stream_access.t
 stream_ssl_alpn.t
 
 stream_limit_rate.t
+
+stream_resolver.t

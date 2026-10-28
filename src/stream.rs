@@ -492,7 +492,7 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                     // `proxy_pass $var`: expand and resolve here, because the
                     // value only exists per connection (`stream_resolver.t`).
                     // ngx_stream_proxy_module does the same in its init handler.
-                    let mut var_peer: Option<(SocketAddr, String)> = None;
+                    let mut var_peers: Vec<SocketAddr> = Vec::new();
                     if let Some(spec) = var_target.as_ref() {
                         let text = {
                             let mut vb =
@@ -509,8 +509,11 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                             vb.expand(spec)
                         };
                         match resolve_var_peer(&text, var_resolver.as_ref(), connect_timeout).await {
-                            Ok((addr, label)) => var_peer = Some((addr, label)),
+                            Ok(list) => var_peers = list,
                             Err(e) => {
+                                // nginx logs the failure and drops the session
+                                // without a byte ("no port in upstream", "<name>
+                                // could not be resolved").
                                 crate::log::log_global(
                                     crate::log::Level::Error,
                                     &format!("stream {e}"),
@@ -522,15 +525,25 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                     let mut chosen: Option<crate::streamlb::Guard> = None;
                     let mut upstream = None;
                     let mut attempts = 0usize;
-                    // A variable target bypasses the balancer entirely: nginx
-                    // resolves it to one address and there is nothing to retry.
-                    if let Some((addr, label)) = var_peer.take() {
+                    // A variable target bypasses the balancer: nginx resolves the
+                    // name to a list and walks it, one peer per try, honouring
+                    // `proxy_next_upstream_tries` (0 = no limit). The suite relies
+                    // on this -- `$many` resolves to 127.0.0.2, 127.0.0.2,
+                    // 127.0.0.1, so two tries cannot reach the listener and three
+                    // can.
+                    let var_limit = if next_upstream_tries == 0 {
+                        var_peers.len()
+                    } else {
+                        next_upstream_tries as usize
+                    };
+                    for addr in var_peers.iter().take(var_limit) {
+                        let label = addr.to_string();
                         if let Some(l) = alog.as_mut() {
                             l.start_attempt(&label);
                         }
                         let attempt = match tokio::time::timeout(
                             connect_timeout,
-                            TcpStream::connect(addr),
+                            TcpStream::connect(*addr),
                         )
                         .await
                         {
@@ -542,11 +555,12 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                             )),
                         };
                         match attempt {
-                            Ok(s) => {
-                                if let UpConn::Tcp(t) = &s {
+                            Ok(u) => {
+                                if let UpConn::Tcp(t) = &u {
                                     let _ = t.set_nodelay(true);
                                 }
-                                upstream = Some(s);
+                                upstream = Some(u);
+                                break;
                             }
                             Err(e) => {
                                 if let Some(l) = alog.as_mut() {
@@ -621,11 +635,17 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                             _ => peers.release(idx, false, now()),
                         }
                     }
-                    let (Some(upstream), Some(_guard)) = (upstream, chosen) else {
+                    // The guard is only present when the balancer handed out a
+                    // slot. A `proxy_pass $var` target bypasses the balancer, so
+                    // requiring both here silently closed every such session --
+                    // no error, no bytes -- which is what `stream_resolver.t`
+                    // saw for the three cases that expect data.
+                    let Some(upstream) = upstream else {
                         // Every peer was at `max_conns`, refused or disabled:
                         // nginx closes the client connection (`NGX_BUSY`).
                         return;
                     };
+                    let _guard = chosen;
                     // `proxy_ssl on`: speak TLS to the upstream, then splice.
                     if proxy_ssl {
                         // `proxy_ssl_name` is a complex value (`proxy_ssl_name
@@ -999,13 +1019,13 @@ async fn resolve_var_peer(
     text: &str,
     resolver: Option<&std::sync::Arc<crate::resolver::Resolver>>,
     timeout: std::time::Duration,
-) -> Result<(SocketAddr, String), String> {
+) -> Result<Vec<SocketAddr>, String> {
     let text = text.trim();
     if text.is_empty() {
         return Err("empty proxy_pass value".to_string());
     }
     if let Ok(a) = text.parse::<SocketAddr>() {
-        return Ok((a, text.to_string()));
+        return Ok(vec![a]);
     }
     // `ngx_stream_proxy_module`: a name without a port is rejected outright.
     let (host, port) = match text.rsplit_once(':') {
@@ -1016,14 +1036,14 @@ async fn resolve_var_peer(
         None => return Err(format!("no port in upstream \"{text}\"")),
     };
     let r = resolver.ok_or_else(|| format!("no resolver defined to resolve {host}"))?;
-    let ip = match tokio::time::timeout(timeout, crate::resolver::resolve(r, host)).await {
-        Ok(Some(mut v)) => match v.pop() {
-            Some(ip) => ip,
-            None => return Err(format!("{host} could not be resolved")),
-        },
-        _ => return Err(format!("{host} could not be resolved")),
-    };
-    Ok((SocketAddr::new(ip, port), text.to_string()))
+    // Every address is kept, in the resolver's order, because
+    // `proxy_next_upstream_tries` exists precisely to walk that list: the suite
+    // resolves `$many` to 127.0.0.2, 127.0.0.2, 127.0.0.1 and expects two tries
+    // to fail while three succeed.
+    match tokio::time::timeout(timeout, crate::resolver::resolve(r, host)).await {
+        Ok(Some(v)) if !v.is_empty() => Ok(v.into_iter().map(|ip| SocketAddr::new(ip, port)).collect()),
+        _ => Err(format!("{host} could not be resolved")),
+    }
 }
 
 async fn splice_rated<A, B>(

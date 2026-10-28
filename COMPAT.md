@@ -3511,7 +3511,7 @@ proxy_download_rate 250，后端一次发 1000 字节
 TEST_LIST="stream_limit_rate.t" bash bench/nginxtests.sh   # 9/11，缺两条 time
 ```
 
-## 本轮（stream `resolver` + `proxy_next_upstream_tries`：可测量但未达一致）
+## 本轮（stream `resolver` + `proxy_next_upstream_tries`：resolver 已一致）
 
 ### 结果
 
@@ -3559,4 +3559,52 @@ TEST_LIST="stream_limit_rate.t" bash bench/nginxtests.sh   # 9/11，缺两条 ti
 ```bash
 TEST_LIST="stream_resolver.t stream_status_variable.t" bash bench/nginxtests.sh
 # 7/10 与 4/8
+```
+
+### 最终：`stream_resolver.t` 10/10 一致（同一轮内修完）
+
+第一轮修到 7/10 后，失败的三条（8081 `resolver`、8084 `resolved tries`、
+8086 `resolved tries zero`）都表现为**无错误日志、无数据**。逐步定位：
+
+1. **变量展开本身是对的。** 用 `return "up=[$upstream] sp=[$server_port]
+   many=[$many]"` 实测，输出
+   `up=[a.example.com:29590] sp=[29581] many=[29581.many.example.com]`，
+   所以不是 map 或 `$server_port` 的问题。
+
+2. **resolver 也确实发查询并收到了答案。** `TEST_NGINX_LEAVE=1` 保留测试目录后，
+   error.log 里有
+   `stream connect to 127.0.0.2:8214 failed: Connection refused` —— 说明多地址
+   遍历生效了，`$many` 的第一个地址被尝试过。
+
+3. 那么为什么 8081（单地址、目标就在本进程内）也没有数据？重读连接后的代码：
+
+   ```rust
+   let (Some(upstream), Some(_guard)) = (upstream, chosen) else {
+       return;
+   };
+   ```
+
+   `chosen` 是**负载均衡器发出的槽位 guard**，只在走 `peers.pick()` 时存在。
+   `proxy_pass $var` 绕过均衡器，`chosen` 恒为 `None`，于是这个解构永远失败，
+   连接被**静默关闭**——正好对应"无错误日志、无数据"。
+
+   改为只要求 `upstream`，把 `chosen` 当作可选：
+
+   ```rust
+   let Some(upstream) = upstream else { return; };
+   let _guard = chosen;
+   ```
+
+修完后 **10/10 一致**，已加入声明清单（165 文件）。
+
+### `stream_status_variable.t` 仍 4/8
+
+剩余 4 条是 `$status` 在变量目标与限流路径上的取值（400/500/502/503），
+本轮未查，**不计入清单**。
+
+复现：
+
+```bash
+TEST_LIST="stream_resolver.t stream_status_variable.t" bash bench/nginxtests.sh
+# 10/10 与 4/8
 ```

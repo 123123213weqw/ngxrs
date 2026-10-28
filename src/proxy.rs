@@ -1132,7 +1132,21 @@ pub async fn handle(
     } else {
         (loc.client_max_body_size as usize).min(MAX_PROXY_BODY)
     };
-    let body = match take_request_body(conn, req, body_limit).await {
+    // `proxy_request_buffering off`: the upstream connection has to be made
+    // before the client's body is read, so the remainder is streamed inside
+    // `exchange`. Only a `Content-Length` body can be streamed -- a chunked one
+    // would have to be re-chunked as it arrives, so it still buffers here.
+    let stream_rest: u64 = if loc.proxy_request_buffering || req.chunked {
+        0
+    } else if req.buffered_body.is_some() {
+        0
+    } else {
+        req.body_len
+    };
+    let body = if stream_rest > 0 {
+        Vec::new()
+    } else {
+        match take_request_body(conn, req, body_limit).await {
         Ok(b) => b,
         Err(e) if e.to_string() == "body too large" => {
             let resp = crate::http::error_response(413, tokens);
@@ -1151,7 +1165,8 @@ pub async fn handle(
                 sent: Vec::new(),
             })));
         }
-        Err(e) => return Err(e),
+            Err(e) => return Err(e),
+        }
     };
 
     let target_uri =
@@ -1700,6 +1715,7 @@ pub async fn handle(
                 http,
                 tidx,
                 status_retry,
+                stream_rest,
             )
             .await;
 
@@ -2216,6 +2232,11 @@ fn build_upstream_head(
     reval: Option<&crate::cache::Cached>,
     drop_range: bool,
     slice_range: &str,
+    // Request-body bytes that will follow the head without being in
+    // `body_of_request` yet (`proxy_request_buffering off`). The declared
+    // `Content-Length` has to include them, otherwise the upstream waits for a
+    // body the head says will never come.
+    body_stream: u64,
 ) -> Vec<u8> {
     // ---- request head ----
     let mut out = Vec::with_capacity(512);
@@ -2375,10 +2396,10 @@ fn build_upstream_head(
         out.extend_from_slice(b"Connection: close\r\n");
     }
 
-    if !body_of_request.is_empty() || req.body_len > 0 || req.chunked || req.buffered_body.is_some()
-    {
+    let declared_body = body_of_request.len() as u64 + body_stream;
+    if declared_body > 0 || req.chunked || req.buffered_body.is_some() {
         out.extend_from_slice(b"Content-Length: ");
-        out.extend_from_slice(body_of_request.len().to_string().as_bytes());
+        out.extend_from_slice(declared_body.to_string().as_bytes());
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b"\r\n");
@@ -2487,6 +2508,10 @@ async fn exchange(
     // allowed for this attempt (another peer can still take the request);
     // the caller only offers it before anything reaches the client.
     status_retry: Option<u32>,
+    // Bytes of the request body still to be read from the client and forwarded
+    // as they arrive (`proxy_request_buffering off`). Zero means the body in
+    // `body` is all of it.
+    stream_rest: u64,
 ) -> io::Result<Proxied> {
     let t_up = Instant::now();
     // ---- request head ----
@@ -2495,7 +2520,13 @@ async fn exchange(
     // (`ngx_http_proxy_create_request` + `ngx_http_upstream_cache_check_range`).
     let drop_range =
         cache.zone.is_some() && cache.key.is_some() && cache.status != "BYPASS" && !is_upgrade;
-    let out = build_upstream_head(
+
+    // Part of an unbuffered body can already be in the connection buffer, having
+    // arrived with the request head. It goes out in the *same* write as the head:
+    // nginx builds the head and the first body buf into one output chain, and the
+    // backend in `proxy_request_buffering.t` does a single `sysread` after
+    // `accept`, expecting both (`"preread - preread"`).
+    let mut out = build_upstream_head(
         req,
         target_uri,
         body,
@@ -2507,7 +2538,28 @@ async fn exchange(
         cache.reval,
         drop_range,
         "",
+        stream_rest,
     );
+    let early_body = if stream_rest > 0 {
+        let n = conn.buffered_len().min(stream_rest as usize);
+        if n > 0 {
+            let chunk = conn.take_available(n).await?;
+            retain_streamed(req, &chunk, loc.client_body_buffer_size as usize);
+            out.extend_from_slice(&chunk);
+            chunk.len() as u64
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    let stream_rest = stream_rest - early_body;
+    // `$request_body` survives an unbuffered pass in nginx, because
+    // `r->request_body` is still filled; `fastcgi_request_buffering.t` checks it
+    // through an `error_page` target. Keep what was streamed, up to
+    // `client_body_buffer_size` -- past that nginx spills to disk and the
+    // variable goes empty.
+    let body_cap = loc.client_body_buffer_size as usize;
 
     if std::env::var_os("NGXRS_DEBUG_PROXY").is_some() {
         eprintln!(
@@ -2529,6 +2581,9 @@ async fn exchange(
     }
     if !body.is_empty() {
         up.write_all(body).await?;
+    }
+    if stream_rest > 0 {
+        stream_request_body(conn, &mut up, stream_rest, req, body_cap).await?;
     }
     up.flush().await?;
 
@@ -3669,7 +3724,7 @@ async fn fetch_sliced(
                 fetch_plain(req, path, query, loc, http, peer_ip, &sc, &range).await?
             }
             SliceMode::Fastcgi => {
-                crate::fastcgi::fetch(req, path, query, loc, http, &[], peer_ip, &range)
+                crate::fastcgi::fetch(req, path, query, loc, http, &[], peer_ip, &range, None)
                     .await?
                     .0
             }
@@ -4117,6 +4172,7 @@ async fn fetch_plain(
             None,
             false,
             slice_range,
+            0,
         );
         let write_failed = up.write_all(&out).await.is_err()
             || (!in_memory.is_empty() && up.write_all(in_memory).await.is_err());
@@ -4589,6 +4645,7 @@ pub fn spawn_background_update(
         reval,
         true,
         "",
+        0,
     );
 
     let connect_timeout = loc.proxy_connect_timeout;
@@ -5116,4 +5173,57 @@ mod chunk_tests {
     }
 }
 
+/// Forward `remaining` bytes of the request body straight to the upstream as
+/// they arrive from the client (`proxy_request_buffering off`).
+///
+/// The upstream connection is already open at this point, which is the whole
+/// point of the directive: `proxy_request_buffering.t` accepts the connection
+/// before the client has sent a single body byte, and expects each part to
+/// travel through as it is written.
+async fn stream_request_body(
+    conn: &mut crate::conn::Conn,
+    up: &mut UpStream,
+    remaining: u64,
+    req: &Request,
+    cap: usize,
+) -> io::Result<()> {
+    let mut left = remaining;
+    while left > 0 {
+        let want = left.min(64 * 1024) as usize;
+        // Pass through whatever has arrived, not a fixed run of `want` bytes:
+        // nginx forwards each read as it comes, and the test reads the body back
+        // from the upstream between uploads (`proxy_request_buffering.t`,
+        // "preread - body part").
+        let chunk = conn.take_available(want).await?;
+        if chunk.is_empty() {
+            // The client closed early: nginx reports "client prematurely closed
+            // connection" and gives up on the upstream call.
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "client closed before the request body was complete",
+            ));
+        }
+        left -= chunk.len() as u64;
+        retain_streamed(req, &chunk, cap);
+        up.write_all(&chunk).await?;
+        up.flush().await?;
+    }
+    Ok(())
+}
 
+/// Append streamed body bytes to `req.streamed_body`, bounded by `cap`.
+///
+/// nginx fills `r->request_body` even with `*_request_buffering off`, so
+/// `$request_body` still answers after the upstream has consumed the body.
+/// Zero-length calls just make sure the cell exists.
+pub(crate) fn retain_streamed_pub(req: &Request, chunk: &[u8], cap: usize) {
+    retain_streamed(req, chunk, cap)
+}
+
+fn retain_streamed(req: &Request, chunk: &[u8], cap: usize) {
+    if let Ok(mut slot) = req.streamed_body.lock() {
+        let buf = slot.get_or_insert_with(Vec::new);
+        let room = cap.saturating_sub(buf.len());
+        buf.extend_from_slice(&chunk[..chunk.len().min(room)]);
+    }
+}

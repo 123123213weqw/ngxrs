@@ -148,6 +148,15 @@ pub struct Request {
     /// here. `None` on HTTP/1.1, where `body_len`/`chunked` describe a body
     /// still sitting on the connection.
     pub buffered_body: Option<Vec<u8>>,
+    /// Body bytes retained while they were *streamed* to an upstream
+    /// (`proxy_request_buffering off` / `fastcgi_request_buffering off`).
+    ///
+    /// nginx still fills `r->request_body` in unbuffered mode, so `$request_body`
+    /// keeps working after the upstream has consumed the body -- an `error_page`
+    /// target can read it. Streaming discards the bytes unless they are kept
+    /// here. Bounded by `client_body_buffer_size`; beyond that nginx spills to a
+    /// temp file and `$request_body` goes empty, which is what the cap models.
+    pub streamed_body: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
     /// `$request_body_file`: the temp file the body was written to.
     ///
     /// nginx spills a body to disk once it exceeds `client_body_buffer_size`,
@@ -552,6 +561,7 @@ impl Request {
             headers,
             body_len,
             buffered_body: None,
+            streamed_body: std::sync::Arc::new(std::sync::Mutex::new(None)),
             request_body_file: None,
             chunked,
             keepalive,

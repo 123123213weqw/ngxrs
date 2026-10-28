@@ -99,6 +99,11 @@ h2_trailers.t
 h2_server_tokens.t
 server_tokens.t
 
+# ---- request body not buffered ----
+# `proxy_request_buffering off`: the upstream connection is made before the
+# client's body is read, and the body is forwarded as it arrives.
+proxy_request_buffering.t
+
 # ---- slice filter / fastcgi cache ----
 # `slice` (fixed-size ranged subrequests over proxy and fastcgi, assembled into
 # one response, each slice its own cache entry) and `fastcgi_cache`.

@@ -631,6 +631,7 @@ fn synthesize_request(
         headers,
         body_len: 0,
         buffered_body: None,
+        streamed_body: std::sync::Arc::new(std::sync::Mutex::new(None)),
         request_body_file: None,
         chunked: false,
         keepalive: true,

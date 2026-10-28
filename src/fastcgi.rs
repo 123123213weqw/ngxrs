@@ -311,6 +311,11 @@ pub async fn fetch(
     body: &[u8],
     peer_ip: &str,
     slice_range: &str,
+    // `fastcgi_request_buffering off`: read the rest of the body from `conn` and
+    // forward it as it arrives, instead of taking a complete body. The connection
+    // to the responder is made before the body is read, which is what
+    // `fastcgi_request_buffering.t` observes with `accept()`.
+    mut body_stream: Option<(&mut crate::conn::Conn, u64)>,
 ) -> Option<(Response, bool)> {
     // `fastcgi_cache`: a hit is served without contacting the responder at all,
     // and a miss stores what came back against `fastcgi_cache_key`.
@@ -339,7 +344,20 @@ pub async fn fetch(
     }
     let mut out = match hit {
         Some(v) => v,
-        None => fetch_uncached(req, path, query, loc, http, body, peer_ip, slice_range).await?,
+        None => {
+            fetch_uncached(
+                req,
+                path,
+                query,
+                loc,
+                http,
+                body,
+                peer_ip,
+                slice_range,
+                body_stream.as_mut().map(|(c, n)| (&mut **c, *n)),
+            )
+            .await?
+        }
     };
     // `handle` writes the response straight to the connection -- it does not go
     // through `finalize_response` -- so `add_header` has to be applied here, the
@@ -472,8 +490,10 @@ async fn fetch_uncached(
     body: &[u8],
     peer_ip: &str,
     slice_range: &str,
+    mut body_stream: Option<(&mut crate::conn::Conn, u64)>,
 ) -> Option<(Response, bool)> {
     let fcgi = loc.fastcgi_pass.as_ref()?;
+    let cap = loc.client_body_buffer_size as usize;
 
     // ---- build the parameter list
     let (script_name, path_info) = split_path(path, loc);
@@ -546,14 +566,69 @@ async fn fetch_uncached(
         write_record(&mut out, FCGI_PARAMS, req_id, &chunk);
     }
     write_record(&mut out, FCGI_PARAMS, req_id, &[]);
-    if !body.is_empty() {
+    if body_stream.is_none() && !body.is_empty() {
         write_record(&mut out, FCGI_STDIN, req_id, &body);
     }
-    write_record(&mut out, FCGI_STDIN, req_id, &[]);
+    if body_stream.is_none() {
+        write_record(&mut out, FCGI_STDIN, req_id, &[]);
+    } else if let Some((conn, left)) = body_stream.as_mut() {
+        // Body bytes that arrived together with the request head go out in the
+        // same write as BEGIN/PARAMS: the responder in
+        // `fastcgi_request_buffering.t` does one `sysread` after `accept` and
+        // expects the STDIN record to be in it (`"preread - preread"`).
+        let n = conn.buffered_len().min(*left as usize);
+        if n > 0 {
+            match conn.take_available(n).await {
+                Ok(chunk) => {
+                    crate::proxy::retain_streamed_pub(req, &chunk, cap);
+                    write_record(&mut out, FCGI_STDIN, req_id, &chunk);
+                    *left -= chunk.len() as u64;
+                }
+                Err(e) => {
+                    eprintln!("ngxrs: [error] fastcgi read body: {e}");
+                    return Some((error_response(502), true));
+                }
+            }
+        }
+    }
 
     if let Err(e) = stream.write_all(&out).await {
         eprintln!("ngxrs: [error] fastcgi write failed: {e}");
         return Some((error_response(502), true));
+    }
+
+    // Unbuffered: BEGIN + PARAMS are already on the wire (so the responder can
+    // start), and each body chunk travels as its own STDIN record as the client
+    // produces it.
+    if let Some((conn, mut left)) = body_stream {
+        while left > 0 {
+            let want = left.min(64 * 1024) as usize;
+            let chunk = match conn.take_available(want).await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("ngxrs: [error] fastcgi read body: {e}");
+                    return Some((error_response(502), true));
+                }
+            };
+            if chunk.is_empty() {
+                eprintln!("ngxrs: [error] client closed before the request body was complete");
+                return Some((error_response(502), true));
+            }
+            left -= chunk.len() as u64;
+            crate::proxy::retain_streamed_pub(req, &chunk, cap);
+            let mut rec = Vec::with_capacity(chunk.len() + 8);
+            write_record(&mut rec, FCGI_STDIN, req_id, &chunk);
+            if let Err(e) = stream.write_all(&rec).await {
+                eprintln!("ngxrs: [error] fastcgi write failed: {e}");
+                return Some((error_response(502), true));
+            }
+        }
+        let mut end = Vec::with_capacity(8);
+        write_record(&mut end, FCGI_STDIN, req_id, &[]);
+        if let Err(e) = stream.write_all(&end).await {
+            eprintln!("ngxrs: [error] fastcgi write failed: {e}");
+            return Some((error_response(502), true));
+        }
     }
 
     // ---- read the responder's STDOUT ----
@@ -743,7 +818,23 @@ pub async fn handle(
     if req.expect_continue && req.version_minor == 1 {
         conn.send_100_continue().await?;
     }
-    let body = crate::proxy::take_request_body(conn, req, 32 * 1024 * 1024).await?;
+    // `fastcgi_request_buffering off`: do not read the body here — the responder
+    // connection has to be made first, and the body is streamed into STDIN as it
+    // arrives. A chunked body still buffers: it would have to be re-framed.
+    // A chunked body still buffers. Streaming it needs the client's chunk
+    // framing parsed incrementally and re-emitted as STDIN records; a first
+    // attempt took `fastcgi_request_buffering_chunked.t` from 17/21 to 12/21, so
+    // it is reverted rather than shipped half-working.
+    let stream_rest: u64 = if loc.fastcgi_request_buffering || req.buffered_body.is_some() {
+        0
+    } else {
+        req.body_len
+    };
+    let body = if stream_rest > 0 {
+        Vec::new()
+    } else {
+        crate::proxy::take_request_body(conn, req, 32 * 1024 * 1024).await?
+    };
     let peer = conn.peer.ip().to_string();
 
     // `slice` needs the whole entity assembled before anything is written, so a
@@ -751,7 +842,14 @@ pub async fn handle(
     // module is a filter: it drives subrequests and rewrites the response, which
     // is exactly buffering.
     let fetched = match loc.slice {
-        None => fetch(req, path, query, loc, http, &body, &peer, "").await,
+        None => {
+            let hook = if stream_rest > 0 {
+                Some((&mut *conn, stream_rest))
+            } else {
+                None
+            };
+            fetch(req, path, query, loc, http, &body, &peer, "", hook).await
+        }
         Some(n) => crate::proxy::fetch_sliced_for(
             crate::proxy::SliceMode::Fastcgi,
             req,

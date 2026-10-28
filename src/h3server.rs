@@ -207,6 +207,7 @@ fn synthesize(req: &H3Request, authority: Option<&str>, path: &str, query: &str)
         headers,
         body_len: 0,
         buffered_body: None,
+        streamed_body: std::sync::Arc::new(std::sync::Mutex::new(None)),
         request_body_file: None,
         chunked: false,
         keepalive: true,

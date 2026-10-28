@@ -276,6 +276,11 @@ pub struct LocCfg {
     /// `fastcgi_cache <zone>` and its companions. nginx keeps these on their own
     /// location conf (`ngx_http_fastcgi_loc_conf_t.cache`), independent of
     /// `proxy_cache`, so a location can cache one upstream module and not another.
+    /// `proxy_request_buffering` / `fastcgi_request_buffering` (nginx default
+    /// on). Off means the body is streamed to the upstream as it arrives from
+    /// the client, so the upstream connection is made before the body is read.
+    pub proxy_request_buffering: bool,
+    pub fastcgi_request_buffering: bool,
     pub fastcgi_cache: Option<String>,
     pub fastcgi_cache_key: Option<String>,
     pub fastcgi_cache_valid: Vec<(Vec<u16>, Duration)>,
@@ -502,6 +507,8 @@ impl LocCfg {
             proxy_hide_headers: Vec::new(),
             fastcgi_pass: None,
             fastcgi_params: Vec::new(),
+            proxy_request_buffering: true,
+            fastcgi_request_buffering: true,
             fastcgi_cache: None,
             fastcgi_cache_key: None,
             fastcgi_cache_valid: Vec::new(),
@@ -3888,6 +3895,28 @@ impl Builder {
                     name: d.args[0].clone(),
                     value: d.args[1..].join(" "),
                 });
+            }
+            "proxy_request_buffering" | "fastcgi_request_buffering" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, format!("{} requires on|off", d.name)))?;
+                let on = match v.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => {
+                        return Err(sem(
+                            &d.file,
+                            d.line,
+                            format!("invalid value \"{v}\" in \"{}\" directive", d.name),
+                        ))
+                    }
+                };
+                if d.name == "proxy_request_buffering" {
+                    cfg.proxy_request_buffering = on;
+                } else {
+                    cfg.fastcgi_request_buffering = on;
+                }
             }
             "fastcgi_cache" => {
                 let v = d

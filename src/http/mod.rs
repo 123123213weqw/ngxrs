@@ -398,6 +398,7 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
                     headers: crate::http::request::Headers::default(),
                     body_len: 0,
                     buffered_body: None,
+                    streamed_body: std::sync::Arc::new(std::sync::Mutex::new(None)),
                     request_body_file: None,
                     chunked: false,
                     keepalive: false,
@@ -3020,11 +3021,19 @@ impl<'a> ServerVars<'a> {
                 // Once the body is on disk nginx reports it as empty.
                 if self.req.request_body_file.is_some() {
                     String::new()
+                } else if let Some(b) = self.req.buffered_body.as_ref() {
+                    String::from_utf8_lossy(b).to_string()
                 } else {
+                    // An unbuffered upstream pass still leaves the body readable
+                    // in nginx: `r->request_body` is filled either way, so an
+                    // `error_page` target can print it
+                    // (`fastcgi_request_buffering.t`, "body in error page").
                     self.req
-                        .buffered_body
-                        .as_ref()
-                        .map(|b| String::from_utf8_lossy(b).to_string())
+                        .streamed_body
+                        .lock()
+                        .ok()
+                        .and_then(|b| b.clone())
+                        .map(|b| String::from_utf8_lossy(&b).to_string())
                         .unwrap_or_default()
                 }
             }
@@ -3691,7 +3700,7 @@ pub async fn resolve_response_local(
         // A `slice`d fastcgi location goes through the same slice loop as proxy:
         // the CGI is asked for one `Range` at a time and the pieces assembled.
         let fcgi_resp = match loc.slice {
-            None => crate::fastcgi::fetch(req, path, query, loc, http, &[], peer_ip, "").await,
+            None => crate::fastcgi::fetch(req, path, query, loc, http, &[], peer_ip, "", None).await,
             Some(n) => {
                 crate::proxy::fetch_sliced_for(
                     crate::proxy::SliceMode::Fastcgi,

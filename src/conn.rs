@@ -680,6 +680,35 @@ fn early_reject(buf: &[u8]) -> bool {
         }
     }
 
+    /// Bytes already buffered from the socket, without reading more.
+    pub fn buffered_len(&self) -> usize {
+        self.end - self.start
+    }
+
+    /// Read up to `max` bytes of body, returning as soon as anything is
+    /// available. This is what an unbuffered upstream call needs: nginx forwards
+    /// each read to the backend without waiting for the rest of the body
+    /// (`ngx_http_proxy_create_request` with `u->request_bufs` and the
+    /// `proxy_request_buffering off` read event handler).
+    pub async fn take_available(&mut self, max: usize) -> io::Result<Vec<u8>> {
+        let avail = self.end - self.start;
+        if avail > 0 {
+            let take = avail.min(max);
+            let out = self.buf[self.start..self.start + take].to_vec();
+            self.consume(take);
+            return Ok(out);
+        }
+        let mut out = Vec::with_capacity(max.min(16 * 1024));
+        if self.fill().await? == 0 {
+            return Ok(out);
+        }
+        let avail = self.end - self.start;
+        let take = avail.min(max);
+        out.extend_from_slice(&self.buf[self.start..self.start + take]);
+        self.consume(take);
+        Ok(out)
+    }
+
     /// Move exactly `len` bytes of body into `out`, using buffered bytes first.
     pub async fn take_into(&mut self, out: &mut Vec<u8>, len: usize) -> io::Result<()> {
         let mut remaining = len;

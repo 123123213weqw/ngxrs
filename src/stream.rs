@@ -289,14 +289,43 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                         if let Some(l) = alog.as_mut() {
                             l.start_attempt(&peers.addr(idx).to_string());
                         }
-                        match tokio::time::timeout(
-                            connect_timeout,
-                            TcpStream::connect(peers.addr(idx)),
-                        )
-                        .await
-                        {
-                            Ok(Ok(s)) => {
-                                let _ = s.set_nodelay(true);
+                        // A unix peer has no address; connect over the socket
+                        // (`stream { server unix:/path; }`, `stream_unix.t`).
+                        let attempt = match peers.unix(idx) {
+                            Some(path) => {
+                                match tokio::time::timeout(
+                                    connect_timeout,
+                                    tokio::net::UnixStream::connect(path),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(s)) => Ok(UpConn::Unix(s)),
+                                    Ok(Err(e)) => Err(e),
+                                    Err(_) => Err(std::io::Error::new(
+                                        std::io::ErrorKind::TimedOut,
+                                        "connect timed out",
+                                    )),
+                                }
+                            }
+                            None => match tokio::time::timeout(
+                                connect_timeout,
+                                TcpStream::connect(peers.addr(idx)),
+                            )
+                            .await
+                            {
+                                Ok(Ok(s)) => Ok(UpConn::Tcp(s)),
+                                Ok(Err(e)) => Err(e),
+                                Err(_) => Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "connect timed out",
+                                )),
+                            },
+                        };
+                        match attempt {
+                            Ok(s) => {
+                                if let UpConn::Tcp(t) = &s {
+                                    let _ = t.set_nodelay(true);
+                                }
                                 // `pick` already counted the connection; the
                                 // guard owns that slot from here on.
                                 chosen = Some(peers.guard(idx));
@@ -361,7 +390,12 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                                 .expect("localhost is a valid name")
                         });
                         let connector = tokio_rustls::TlsConnector::from(cfg);
-                        let Ok(tls_up) = connector.connect(name, upstream).await else {
+                        // `proxy_ssl` only makes sense over TCP; a unix peer is
+                        // a plain socket (nginx does not offer TLS there either).
+                        let UpConn::Tcp(tcp) = upstream else {
+                            return;
+                        };
+                        let Ok(tls_up) = connector.connect(name, tcp).await else {
                             return;
                         };
                         let counts = match tls {
@@ -518,6 +552,57 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
 /// upstream connection slot -- alive while the peer that already finished just
 /// sits there, which made `least_conn` see a tie where nginx sees a free peer
 /// (`stream_upstream_least_conn.t`) and held `max_conns` slots too long.
+/// The upstream side of a stream session: TCP, or a unix socket
+/// (`stream_unix.t`). `proxy_ssl` only applies to TCP.
+enum UpConn {
+    Tcp(TcpStream),
+    Unix(tokio::net::UnixStream),
+}
+
+impl tokio::io::AsyncRead for UpConn {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            UpConn::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            UpConn::Unix(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for UpConn {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            UpConn::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            UpConn::Unix(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            UpConn::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
+            UpConn::Unix(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            UpConn::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            UpConn::Unix(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
 async fn splice<A, B>(mut a: A, mut b: B) -> (u64, u64)
 where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -560,7 +645,7 @@ where
 /// Splice a TLS-terminated client to a plaintext upstream.
 async fn proxy_io<C>(
     client: C,
-    upstream: TcpStream,
+    upstream: UpConn,
     _idle: Duration,
     _peer: SocketAddr,
 ) -> (u64, u64)
@@ -850,7 +935,7 @@ fn client_cert_vars(
 
 async fn proxy_tcp(
     client: TcpStream,
-    upstream: TcpStream,
+    upstream: UpConn,
     _idle: Duration,
     _peer: SocketAddr,
 ) -> (u64, u64) {

@@ -253,6 +253,11 @@ impl PeerSet {
         self.servers[idx].addr
     }
 
+    /// `server unix:/path` in a stream upstream: the socket to connect to.
+    pub fn unix(&self, idx: usize) -> Option<&std::path::PathBuf> {
+        self.servers[idx].unix.as_deref()
+    }
+
     pub fn name(&self, idx: usize) -> &str {
         &self.servers[idx].name
     }
@@ -410,6 +415,7 @@ mod tests {
     fn peer(name: &str, weight: u32, max_conns: u32, backup: bool) -> UpstreamServer {
         UpstreamServer {
             addr: name.parse().unwrap(),
+            unix: None,
             weight,
             backup,
             down: false,

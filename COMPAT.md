@@ -2912,3 +2912,56 @@ proxy/grpc/uwsgi/fastcgi/stream 五处连接点**。本轮刻意没做：在收�
 TEST_LIST="fastcgi_unix.t fastcgi.t" bash bench/nginxtests.sh   # 应 SAME 8/8 与 10/10
 TEST_LIST="proxy_unix.t stream_unix.t" bash bench/nginxtests.sh # 目前 TRUNC，见上文
 ```
+
+## 本轮（`upstream { server unix: }` 与 stream 的 unix 上游）
+
+上一轮记录为"刻意未做"的那块完成了，`proxy_unix.t` 与 `stream_unix.t` 都从未运行变成一致。
+
+| 套件 | 修前 | 修后 |
+|---|---|---|
+| `proxy_unix.t` | TRUNC 0/7 | **7/7 一致** |
+| `stream_unix.t` | TRUNC 0/4 | **4/4 一致** |
+| `fastcgi_unix.t` | 8/8（上一轮） | 8/8 不变 |
+| `proxy.t` / `stream_ssl.t` / `stream_error_log.t` | — | 30/30、7/7、36/36 不变 |
+
+### 改动
+
+- `UpstreamServer` 增加 `unix: Option<Arc<PathBuf>>`；`upstream { server unix:/path; }`
+  在 http 与 stream 两处解析（地址留占位）。
+- `Chosen::Upstream` 带上同一个路径；proxy 的两条连接路径（socket 与 socket-free）
+  都在有路径时走 `connect_unix`，且**不进程池、不套 TLS**——池以 `SocketAddr` 为键，
+  而 unix 对端 nginx 也不会套 TLS。重试时同样认路径。
+- `proxy_pass http://$arg_b` 的展开值可能是 `unix:/path:/uri`（`proxy_unix.t` 的
+  "proxy with variables" 正是 `$arg_b = unix:<path>:/`）。因此动态目标多了一条
+  `dyn_unix` 分支，且 `dyn_uri` 不能再用"第一个 `/`"切分——unix 路径本身以 `/` 开头，
+  必须从 `:/` 分隔符之后取。
+- stream 侧新增 `UpConn::{Tcp,Unix}`（实现 `AsyncRead`/`AsyncWrite`），`proxy_io`
+  与 `proxy_tcp` 改收 `UpConn`；`proxy_ssl` 分支先取出 `Tcp`，因为 TLS 只对 TCP 有意义。
+  `streamlb::PeerSet` 增加 `unix(idx)`，`proxy_pass unix:/path` 直连也走同一条路。
+
+### 环境问题：`earlyoom` 会杀编译器
+
+多次出现 `cargo build` 报 `error: could not compile ... 1 previous error`，但同一目录
+单独再跑就成功。查明是这台机器常驻：
+
+```
+earlyoom -r 60 -m 5 -s 10 --prefer python|node|java|qemu|rustc|cargo|cc1plus ...
+```
+
+内存低于 5% 时它优先杀 `rustc`/`cargo`。**这会让 A/B 跑在旧二进制上而毫无提示**——
+本轮有两次就是这样：报"构建失败"，测试却照常给出数字。现在构建一律用重试循环，
+并以 `rc` 判定成功，而不是 `cargo build | tail -1`（管道只留最后一行，恰好把真正的
+错误行截掉）。
+
+### 仍未解决
+
+- `upstream { server unix: }` 的 `$upstream_addr` 语义：unix 对端打印为 `unix:<path>`
+  （与 `proxy_pass http://unix:` 一致），但**没有断言覆盖**，未实测。
+- grpc / uwsgi / scgi 的 `*_pass unix:`：本轮只做了 fastcgi 与 proxy。这几个模块的
+  连接层各自独立，未改。
+
+复现：
+
+```bash
+TEST_LIST="proxy_unix.t stream_unix.t" bash bench/nginxtests.sh   # 应 SAME 7/7 与 4/4
+```

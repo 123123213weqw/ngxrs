@@ -322,3 +322,5 @@ ssi.t
 ssi_if.t
 stub_status.t
 fastcgi_unix.t
+proxy_unix.t
+stream_unix.t

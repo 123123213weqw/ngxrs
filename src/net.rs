@@ -278,10 +278,29 @@ pub fn serve(cfg: Config) -> io::Result<()> {
                     up.method.clone(),
                     up.hash_key.clone(),
                 )
+            } else if let Some(path) = pp.strip_prefix("unix:") {
+                // `proxy_pass unix:/path` directly in a stream server
+                // (`stream_unix.t`).
+                crate::streamlb::PeerSet::new(
+                    vec![crate::config::UpstreamServer {
+                        addr: "127.0.0.1:0".parse().unwrap(),
+                        unix: Some(std::sync::Arc::new(std::path::PathBuf::from(path))),
+                        weight: 1,
+                        backup: false,
+                        down: false,
+                        name: pp.clone(),
+                        max_fails: 1,
+                        fail_timeout: std::time::Duration::from_secs(10),
+                        max_conns: 0,
+                    }],
+                    crate::config::LbMethod::RoundRobin,
+                    String::new(),
+                )
             } else if let Some(addr) = parse_stream_addr(pp) {
                 crate::streamlb::PeerSet::new(
                     vec![crate::config::UpstreamServer {
                         addr,
+                        unix: None,
                         weight: 1,
                         backup: false,
                         down: false,

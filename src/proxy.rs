@@ -357,6 +357,9 @@ enum Chosen {
         up: usize,
         sidx: usize,
         addr: SocketAddr,
+        /// `upstream { server unix:/path; }`: `addr` is a placeholder and the
+        /// connection goes over this socket (`proxy_unix.t`).
+        unix: Option<std::sync::Arc<std::path::PathBuf>>,
         name: String,
     },
 }
@@ -431,6 +434,7 @@ fn choose(
                             up: *idx,
                             sidx,
                             addr: s.addr,
+                            unix: s.unix.clone(),
                             name: s.name.clone(),
                         }
                     })
@@ -1057,9 +1061,32 @@ pub async fn handle(
     let dyn_uri: Option<String> = dynamic.as_deref().and_then(|e| {
         // The expanded value carries its own URI; the request's arguments are
         // not re-attached (nginx parses the value as a full URL).
-        e.find('/').map(|i| e[i..].to_string())
+        //
+        // For a unix target the socket path also starts with `/`, so the URI
+        // begins at the `:/` separator instead (`unix:/path:/uri`).
+        let from = match e.strip_prefix("unix:") {
+            Some(rest) => rest.find(":/").map(|i| i + "unix:".len() + 1),
+            None => e.find('/'),
+        };
+        from.map(|i| e[i..].to_string())
     });
+    // `proxy_pass http://$var` may expand to `unix:/path[:/uri]`, which nginx
+    // accepts (`proxy_unix.t`, "proxy with variables": `$arg_b` is
+    // `unix:<path>:/`). The socket path ends where the URI part begins, so the
+    // split is on the first `:/` after the `unix:` prefix.
+    let dyn_unix: Option<std::sync::Arc<std::path::PathBuf>> = dynamic
+        .as_deref()
+        .and_then(|e| e.strip_prefix("unix:"))
+        .map(|rest| {
+            let path = match rest.find(":/") {
+                Some(i) => &rest[..i],
+                None => rest,
+            };
+            std::sync::Arc::new(std::path::PathBuf::from(path))
+        });
     let dyn_target = match dynamic.as_deref() {
+        // A unix target is not an address; `dyn_unix` carries it instead.
+        Some(expanded) if expanded.starts_with("unix:") => None,
         Some(expanded) if !expanded.is_empty() => {
             match dynamic_addr(http, loc, expanded, pp.https, vars).await {
                 Some(a) => Some(a),
@@ -1081,14 +1108,16 @@ pub async fn handle(
         }
         None => None,
     };
-    let Some(candidates) = dyn_target
-        .map(|addrs| {
+    let Some(candidates) = (match &dyn_unix {
+        Some(path) => Some(vec![Chosen::Unix(path.clone())]),
+        None => dyn_target.map(|addrs| {
             addrs
                 .into_iter()
                 .enumerate()
                 .map(|(i, a)| Chosen::Direct(i, a))
                 .collect()
-        })
+        }),
+    })
         .or_else(|| choose(http, loc, &peer_ip, Some(vars)))
     else {
         // Peer selection found nothing live: nginx records the upstream group
@@ -1624,7 +1653,24 @@ pub async fn handle(
                         continue 'candidates;
                     }
                 },
-                Chosen::Upstream { up, sidx, addr, .. } => {
+                Chosen::Upstream { up, sidx, addr, unix, .. } => {
+                    // `upstream { server unix:/path; }`: connect over the socket.
+                    // Not pooled (the pool is keyed by SocketAddr) and never
+                    // wrapped in TLS, matching nginx, which uses a plain socket
+                    // for a unix peer whatever `proxy_pass` scheme is written.
+                    if let Some(path) = unix {
+                        match connect_unix(path, loc.proxy_connect_timeout).await {
+                            Ok(stream) => (stream, false, *up, *sidx),
+                            Err(e) => {
+                                eprintln!(
+                                    "ngxrs: [error] upstream connect unix:{} failed: {e}",
+                                    path.display()
+                                );
+                                // Same treatment as a failed TCP connect below.
+                                continue 'candidates;
+                            }
+                        }
+                    } else {
                     let pooled = if want_pool && http.upstreams[*up].keepalive > 0 {
                         checkout(key).map(|(st, created, requests)| {
                             key.created = created;
@@ -1670,6 +1716,7 @@ pub async fn handle(
                                 continue 'candidates;
                             }
                         },
+                    }
                     }
                 }
             };
@@ -4121,6 +4168,15 @@ async fn fetch_plain(
                     continue;
                 }
             }
+        } else if let Chosen::Upstream { unix: Some(path), .. } = &cand {
+            // `upstream { server unix:/path; }` (`proxy_unix.t`).
+            match connect_unix(path, loc.proxy_connect_timeout).await {
+                Ok(s) => s,
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            }
         } else {
             let addr = match &cand {
                 Chosen::Direct(_, a) => *a,
@@ -4177,6 +4233,9 @@ async fn fetch_plain(
                 reused = false;
                 let fresh = match &cand {
                     Chosen::Unix(path) => connect_unix(path, loc.proxy_connect_timeout).await,
+                    Chosen::Upstream { unix: Some(path), .. } => {
+                        connect_unix(path, loc.proxy_connect_timeout).await
+                    }
                     _ => {
                         let addr = match &cand {
                             Chosen::Direct(_, a) => *a,

@@ -1261,6 +1261,9 @@ pub struct ProxyPass {
 #[derive(Debug, Clone)]
 pub struct UpstreamServer {
     pub addr: SocketAddr,
+    /// `server unix:/path` (nginx allows it in http and stream upstreams).
+    /// `addr` is a placeholder in that case; connections go over this socket.
+    pub unix: Option<std::sync::Arc<std::path::PathBuf>>,
     pub weight: u32,
     pub backup: bool,
     pub down: bool,
@@ -2131,13 +2134,20 @@ fn parse_upstream(d: &Directive) -> Result<Upstream, ConfigError> {
                     .args
                     .first()
                     .ok_or_else(|| sem(&child.file, child.line, "server requires an address"))?;
-                let mut addr = parse_listen(addr_arg).ok_or_else(|| {
+                let unix = addr_arg
+                    .strip_prefix("unix:")
+                    .map(|p| std::sync::Arc::new(std::path::PathBuf::from(p)));
+                let mut addr = if unix.is_some() {
+                    SocketAddr::from(([127, 0, 0, 1], 0))
+                } else {
+                    parse_listen(addr_arg).ok_or_else(|| {
                     sem(
                         &child.file,
                         child.line,
                         format!("invalid server address \"{addr_arg}\""),
                     )
-                })?;
+                })?
+                };
                 // upstream "host:port" without an IP is resolved later; here we
                 // accept IPv4/IPv6 literals and fall back to 127.0.0.1.
                 if !addr_arg.contains(':') {
@@ -2145,6 +2155,7 @@ fn parse_upstream(d: &Directive) -> Result<Upstream, ConfigError> {
                 }
                 let mut srv = UpstreamServer {
                     addr,
+                    unix,
                     weight: 1,
                     backup: false,
                     down: false,
@@ -2320,6 +2331,7 @@ mod chash_tests {
         .iter()
         .map(|(n, w)| UpstreamServer {
             addr: "127.0.0.1:28001".parse().unwrap(),
+            unix: None,
             weight: *w,
             backup: false,
             down: false,
@@ -5074,18 +5086,26 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                     let a = child.args.first().ok_or_else(|| {
                         sem(&child.file, child.line, "server requires an address")
                     })?;
-                    let mut addr = parse_listen(a).ok_or_else(|| {
+                    let unix = a
+                        .strip_prefix("unix:")
+                        .map(|p| std::sync::Arc::new(std::path::PathBuf::from(p)));
+                    let mut addr = if unix.is_some() {
+                        SocketAddr::from(([127, 0, 0, 1], 0))
+                    } else {
+                        parse_listen(a).ok_or_else(|| {
                         sem(
                             &child.file,
                             child.line,
                             format!("invalid server address \"{a}\""),
                         )
-                    })?;
+                    })?
+                    };
                     if !a.contains(':') {
                         addr = SocketAddr::new(addr.ip(), 80);
                     }
                     let mut srv = UpstreamServer {
                         addr,
+                        unix,
                         weight: 1,
                         backup: false,
                         down: false,

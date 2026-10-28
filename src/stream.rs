@@ -40,6 +40,10 @@ pub struct StreamServer {
     pub access: Vec<crate::config::typed::AccessRule>,
     /// `limit_conn <zone> <n>`: at most `n` simultaneous sessions per key.
     pub limit_conns: Vec<(String, u32)>,
+    /// `proxy_download_rate` / `proxy_upload_rate`, bytes per second; 0 is
+    /// unlimited (`ngx_stream_proxy_module`).
+    pub proxy_download_rate: u64,
+    pub proxy_upload_rate: u64,
     /// `set_real_ip_from`: trusted peers whose PROXY header rewrites
     /// `$remote_addr` (`ngx_stream_realip_module`). `realip_from_unix` covers
     /// `set_real_ip_from unix:`, which has no address to match.
@@ -341,6 +345,8 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                 let realip_from = server.realip_from.clone();
                 let realip_unix = server.realip_from_unix;
                 let access = server.access.clone();
+                let dl_rate = server.proxy_download_rate;
+                let ul_rate = server.proxy_upload_rate;
                 let verify_mode = server.client_verify;
                 let client_ca = server.client_ca.clone();
                 let trusted_ca = server.trusted_ca.clone();
@@ -636,10 +642,10 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                                         .await;
                                     // The PROXY header is not counted in
                                     // `$upstream_bytes_sent` by nginx.
-                                    let (a, b) = proxy_tcp(client, upstream, timeout, peer).await;
+                                    let (a, b) = proxy_tcp(client, upstream, timeout, peer, ul_rate, dl_rate).await;
                                     (a, b)
                                 } else {
-                                    proxy_tcp(client, upstream, timeout, peer).await
+                                    proxy_tcp(client, upstream, timeout, peer, ul_rate, dl_rate).await
                                 }
                             }
                         }
@@ -799,12 +805,62 @@ impl tokio::io::AsyncWrite for UpConn {
     }
 }
 
+/// Cumulative byte allowance, nginx's model for `proxy_*_rate`.
+///
+/// nginx does not use a token bucket with burst: it allows `rate * elapsed`
+/// bytes in total since the session started, so the average is exactly `rate`
+/// from the first byte. That distinction is observable -- `stream_limit_rate.t`
+/// sets `proxy_download_rate 250` against 1011 bytes and expects the transfer to
+/// take at least four seconds (1011/250 = 4.04), and `rate 1` to hand over
+/// exactly one byte immediately.
+struct Rate {
+    rate: u64,
+    sent: u64,
+    started: std::time::Instant,
+}
+
+impl Rate {
+    fn new(rate: u64) -> Rate {
+        Rate {
+            rate,
+            sent: 0,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// How many bytes may be in flight right now, and how long to wait when the
+    /// answer is zero. `None` means unlimited.
+    fn allowance(&self) -> Option<u64> {
+        if self.rate == 0 {
+            return None;
+        }
+        let elapsed = self.started.elapsed().as_micros() as u64;
+        let allowed = self.rate.saturating_mul(elapsed) / 1_000_000;
+        Some(allowed.saturating_sub(self.sent))
+    }
+}
+
 async fn splice<A, B>(mut a: A, mut b: B) -> (u64, u64)
 where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    splice_rated(a, b, 0, 0).await
+}
+
+async fn splice_rated<A, B>(
+    mut a: A,
+    mut b: B,
+    upload_rate: u64,
+    download_rate: u64,
+) -> (u64, u64)
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut up = Rate::new(upload_rate);
+    let mut down = Rate::new(download_rate);
     let mut ab = vec![0u8; 16 * 1024];
     let mut ba = vec![0u8; 16 * 1024];
     // `$upstream_bytes_sent` / `$upstream_bytes_received` count what went to and
@@ -812,23 +868,45 @@ where
     let mut sent = 0u64;
     let mut received = 0u64;
     loop {
+        // A zero allowance means the budget for this instant is used up; sleep
+        // for the time one byte needs and re-check.
+        let up_n = match up.allowance() {
+            None => ab.len(),
+            Some(0) => {
+                let wait = std::time::Duration::from_micros(1_000_000 / up.rate.max(1));
+                tokio::time::sleep(wait.min(std::time::Duration::from_millis(50))).await;
+                continue;
+            }
+            Some(n) => (n as usize).min(ab.len()),
+        };
+        let down_n = match down.allowance() {
+            None => ba.len(),
+            Some(0) => {
+                let wait = std::time::Duration::from_micros(1_000_000 / down.rate.max(1));
+                tokio::time::sleep(wait.min(std::time::Duration::from_millis(50))).await;
+                continue;
+            }
+            Some(n) => (n as usize).min(ba.len()),
+        };
         tokio::select! {
-            r = a.read(&mut ab) => match r {
+            r = a.read(&mut ab[..up_n]) => match r {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     if b.write_all(&ab[..n]).await.is_err() {
                         break;
                     }
                     sent += n as u64;
+                    up.sent += n as u64;
                 }
             },
-            r = b.read(&mut ba) => match r {
+            r = b.read(&mut ba[..down_n]) => match r {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     if a.write_all(&ba[..n]).await.is_err() {
                         break;
                     }
                     received += n as u64;
+                    down.sent += n as u64;
                 }
             },
         }
@@ -1175,6 +1253,8 @@ async fn proxy_tcp(
     upstream: UpConn,
     _idle: Duration,
     _peer: SocketAddr,
+    upload: u64,
+    download: u64,
 ) -> (u64, u64) {
     // The earlier comment here claimed `copy_bidirectional` returns as soon as
     // one side closes. It does not: it waits for *both* directions, so a backend

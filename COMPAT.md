@@ -3403,3 +3403,51 @@ ALPN 时该变量为空（`'no alpn'` 断言），提供的都不匹配时 rustl
 TEST_LIST="stream_ssl_alpn.t" bash bench/nginxtests.sh    # 应 SAME 8/8
 bash bench/declared.sh                                    # 应 PASS，不回退到重试
 ```
+
+## 本轮（stream 限速：解析完成，**限速本身未生效**）
+
+### 结果
+
+| 套件 | 修前 | 修后 |
+|---|---|---|
+| `stream_limit_rate.t` | TRUNC **0/11**（配置被拒：`unknown directive "proxy_download_rate"`） | **9/11**（2 条时间断言失败） |
+
+passing 的 9 条包含全部**数据**断言（`exact limit`、`unlimited`、`limited`、
+`download - one byte`、`upload - one byte`、`download - data`、`upload - data`）。
+失败的是 `download - time` 与 `upload - time`（`diff >= 4`）。
+
+无回归：`stream_proxy.t` 7/7、`stream_upstream.t` 8/8、`stream_ssl.t` 7/7 仍 SAME。
+
+### 已完成
+
+- `proxy_download_rate` / `proxy_upload_rate` 在 `stream {}` 与 stream server 两级解析，
+  server 覆盖 main，默认 0（不限）。
+- `Rate` 结构实现 nginx 的**累积配额**模型（`allowed = rate × 已用时间`），
+  而不是带突发容量的 token bucket——这个区别是可观测的：`rate 250` 对 1011 字节
+  要求 ≥4 秒（1011/250 = 4.04），`rate 1` 要求立刻只交出 1 字节。
+- `splice_rated` 按配额限制每次 `read` 的可用字节数。
+
+### 未解决：限速未真正生效，且我没能定位
+
+实测（不是推断）：
+
+```
+proxy_download_rate 250，后端一次发 1000 字节
+  ngxrs:  bytes=1000  elapsed=0.00s     <- 应约 4 秒
+```
+
+即限速完全没作用到数据路径。已排除并修正的一处真实错误：`proxy_tcp` 的
+`(upload, download)` 形参在调用点被写成了 `(dl_rate, ul_rate)`，**参数顺序反了**；
+改正后实测仍是 0.00s，说明还有第二个原因。
+
+本轮剩余预算不足以继续定位，因此**如实记为缺陷，不计入声明清单**。
+排查入口（下轮从这里开始）：在 `splice_rated` 开头打印 `upload_rate/download_rate`
+确认非零，再看 `Rate::allowance` 是否被 `None` 短路——因为若 `serve_tcp` 取到的是
+`StreamServer` 的默认值 0，`allowance()` 恒为 `None`，行为与"完全不限速"一致，
+而数据断言全部通过正好符合这个症状。
+
+复现：
+
+```bash
+TEST_LIST="stream_limit_rate.t" bash bench/nginxtests.sh   # 9/11，缺两条 time
+```

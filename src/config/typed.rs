@@ -1815,6 +1815,11 @@ pub struct StreamUpstream {
 
 #[derive(Debug, Clone)]
 pub struct StreamServerCfg {
+    /// `proxy_download_rate <bytes/s>`: cap on what is written to the
+    /// client. 0 means unlimited (nginx default).
+    pub proxy_download_rate: u64,
+    /// `proxy_upload_rate <bytes/s>`: cap on what is written to the upstream.
+    pub proxy_upload_rate: u64,
     /// `ssl_alpn <proto>...`: ALPN protocols to advertise (`ssl_alpn`).
     pub ssl_alpn: Vec<String>,
     /// `limit_conn <zone> <n>` for this server.
@@ -5063,6 +5068,10 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
     let mut stream_realip_from: Vec<(std::net::IpAddr, u8)> = Vec::new();
     let mut stream_realip_unix = false;
     let mut stream_realip_set = false;
+    // `proxy_download_rate` / `proxy_upload_rate` at `stream {}` level;
+    // nginx defaults both to 0, meaning unlimited.
+    let mut stream_download_rate: u64 = 0;
+    let mut stream_upload_rate: u64 = 0;
     let mut stream_session_reuse = true;
     let mut stream_connect_timeout = std::time::Duration::from_secs(60);
     // nginx's stream default proxy_timeout is 10m.
@@ -5192,6 +5201,15 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             "geo" => section.geos.push(parse_geo(d)?),
             "map" => section.maps.push(parse_map(d)?),
             "split_clients" => section.splits.push(parse_split_clients(d)?),
+            "proxy_download_rate" | "proxy_upload_rate" => {
+                if let Some(v) = d.args.first().and_then(|a| a.parse::<u64>().ok()) {
+                    if d.name == "proxy_download_rate" {
+                        stream_download_rate = v;
+                    } else {
+                        stream_upload_rate = v;
+                    }
+                }
+            }
             "resolver"
             | "limit_conn_zone"
             | "limit_req_zone"
@@ -5307,6 +5325,8 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             access: Vec::new(),
             limit_conns: Vec::new(),
             ssl_alpn: Vec::new(),
+            proxy_download_rate: stream_download_rate,
+            proxy_upload_rate: stream_upload_rate,
             realip_from: stream_realip_from.clone(),
             realip_from_unix: stream_realip_unix,
             realip_from_set: stream_realip_set,
@@ -5386,6 +5406,15 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                         cfg.listen_proxy_protocol = true;
                     }
                     have_listen = true;
+                }
+                "proxy_download_rate" | "proxy_upload_rate" => {
+                    if let Some(v) = child.args.first().and_then(|a| a.parse::<u64>().ok()) {
+                        if child.name == "proxy_download_rate" {
+                            cfg.proxy_download_rate = v;
+                        } else {
+                            cfg.proxy_upload_rate = v;
+                        }
+                    }
                 }
                 "ssl_alpn" => {
                     // `ssl_alpn first second;` -- order is the preference order.

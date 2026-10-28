@@ -212,6 +212,23 @@ enum FailKind {
 
 /// Build the outbound HTTP/2 request for one peer.
 fn build_request(req: &Request, path: &str, query: &str, target: &Target) -> Option<H2Request<()>> {
+    build_request_opt(req, path, query, target, true)
+}
+
+/// `streaming` drops `content-length`.
+///
+/// The `h2` crate enforces the declared length: forwarding a request that says
+/// `content-length: 0` and then pushing 5 bytes of DATA makes it raise
+/// GOAWAY(PROTOCOL_ERROR) locally, which is exactly what every gRPC request did
+/// (50/57 attempts). The body length is not known in streaming mode anyway, and
+/// gRPC does not require the header.
+fn build_request_opt(
+    req: &Request,
+    path: &str,
+    query: &str,
+    target: &Target,
+    with_length: bool,
+) -> Option<H2Request<()>> {
     let mut uri = path.to_string();
     if !query.is_empty() {
         uri.push('?');
@@ -237,6 +254,9 @@ fn build_request(req: &Request, path: &str, query: &str, target: &Target) -> Opt
                 | "upgrade"
                 | "proxy-connection"
         ) {
+            continue;
+        }
+        if !with_length && n == "content-length" {
             continue;
         }
         if let Ok(v) = HeaderValue::from_str(value) {
@@ -573,6 +593,145 @@ pub async fn fetch(
         }
     }
     last
+}
+
+/// Forward a request whose body has not finished arriving.
+///
+/// nginx's gRPC module is an ordinary upstream module: it connects and sends
+/// HEADERS as soon as the request head is known, then relays DATA frames while
+/// the client is still producing them. Collecting the body first cannot match
+/// that -- the backend would see END_STREAM on HEADERS and no DATA at all,
+/// which is exactly `grpc.t`'s "request - HEADERS flags" (5 where nginx sends
+/// 4) and "request - DATA" (nothing).
+///
+/// The chunk boundary is preserved and `RecvStream::is_end_stream` decides the
+/// outgoing END_STREAM, so a single client DATA frame carrying END_STREAM
+/// arrives as a single DATA frame with flags 1.
+pub async fn stream_once(
+    req: &Request,
+    path: &str,
+    query: &str,
+    target: &Target,
+    mut body: h2::RecvStream,
+) -> Response {
+    let fail = || translate(StatusCode::BAD_GATEWAY, http::HeaderMap::new(), Vec::new());
+    let request = match build_request_opt(req, path, query, target, false) {
+        Some(r) => r,
+        None => return fail()
+    };
+    let tcp = match tokio::net::TcpStream::connect(target.addr).await {
+        Ok(t) => t,
+        Err(_) => return fail()
+    };
+    tcp.set_nodelay(true).ok();
+    let got = if target.ssl {
+        let connector = match grpcs_connector() {
+            Some(c) => c,
+            None => return fail(),
+        };
+        let sni = split_host_port(&target.host, true)
+            .map(|(h, _)| h)
+            .unwrap_or_else(|| target.host.clone());
+        let name = match rustls::pki_types::ServerName::try_from(sni) {
+            Ok(n) => n,
+            Err(_) => return fail(),
+        };
+        match connector.connect(name, tcp).await {
+            Ok(tls) => h2_stream_roundtrip(tls, request, &mut body).await,
+            Err(_) => None,
+        }
+    } else {
+        h2_stream_roundtrip(tcp, request, &mut body).await
+    };
+    match got {
+        Some((status, headers, out)) => translate(status, headers, out),
+        None => fail(),
+    }
+}
+
+async fn h2_stream_roundtrip<S>(
+    io: S,
+    request: H2Request<()>,
+    body: &mut h2::RecvStream,
+) -> Option<(StatusCode, http::HeaderMap, Vec<u8>)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut client, conn) = match h2::client::handshake(io).await {
+        Ok(v) => v,
+        Err(e) => {
+            return None;
+        }
+    };
+    // Drive the connection in its own task.
+    //
+    // Selecting on it inline is wrong: once the backend has written its
+    // response and closed, the connection future resolves in the same poll
+    // where the response future would have become ready, and an unbiased (or
+    // even biased) `select!` can take the connection branch and discard a
+    // perfectly good response -- measured as 56/56 requests answering 502 with
+    // "conn ended before response".
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let (resp, mut send) = match client.send_request(request, false) {
+        Ok(v) => v,
+        Err(e) => {
+            return None;
+        }
+    };
+    tokio::pin!(resp);
+
+    let mut body_done = false;
+    let got = loop {
+        tokio::select! {
+            biased;
+            r = &mut resp => match r {
+                Ok(x) => break x,
+                Err(e) => {
+                    return None;
+                }
+            },
+            c = body.data(), if !body_done => {
+                match c {
+                    Some(Ok(d)) => {
+                        let end = body.is_end_stream();
+                        let n = d.len();
+                        if send.send_data(d, end).is_err() {
+                            return None;
+                        }
+                        let _ = body.flow_control().release_capacity(n);
+                        if end {
+                            body_done = true;
+                        }
+                    }
+                    Some(Err(_)) => return None,
+                    // Stream ended without a final chunk: close the outbound
+                    // side so the backend still answers instead of waiting.
+                    None => {
+                        let _ = send.send_data(Bytes::new(), true);
+                        body_done = true;
+                    }
+                }
+            }
+        }
+    };
+
+    drop(send);
+    let (parts, mut inbound) = got.into_parts();
+    let mut out = Vec::new();
+    loop {
+        match inbound.data().await {
+            Some(Ok(d)) => {
+                out.extend_from_slice(&d);
+                let _ = inbound.flow_control().release_capacity(d.len());
+            }
+            Some(Err(_)) => return None,
+            None => break,
+        }
+    }
+    Some((parts.status, parts.headers, out))
 }
 
 async fn h2_roundtrip<S>(

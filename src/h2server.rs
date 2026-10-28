@@ -301,6 +301,30 @@ async fn handle_stream(
             .and_then(|v| v.parse().ok());
         let max_body = loc.client_max_body_size;
         let mut recv = request.into_body();
+
+        // ---- gRPC: relay the body while it is still arriving ----
+        //
+        // nginx's gRPC module is an ordinary upstream module, so HEADERS reach
+        // the backend as soon as the request head is parsed and DATA frames are
+        // forwarded as the client produces them. Collecting the body first
+        // sends END_STREAM on HEADERS plus no DATA at all, which is `grpc.t`'s
+        // "request - HEADERS flags" (5 where nginx sends 4) and "request -
+        // DATA" (nothing). Only the `grpc_pass` location is affected, and only
+        // when the body has not already finished on the header block.
+        if !head_only && !recv.is_end_stream() {
+            if let Some(spec) = loc.grpc_pass.clone() {
+                if !spec.contains('$') {
+                    if let Some(target) = crate::grpc::resolve_static(&spec, http) {
+                        let resp =
+                            crate::grpc::stream_once(&h1, &path, &query, &target, recv).await;
+                        if !send_http2_response(&mut respond, resp, tokens, head_only).await {
+                            return;
+                        }
+                        return;
+                    }
+                }
+            }
+        }
         let mut body: Vec<u8> = Vec::new();
         let mut too_large = false;
         // Flow control is released in blocks, not per DATA frame.

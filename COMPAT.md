@@ -3190,3 +3190,62 @@ TEST_LIST="stream_realip.t stream_realip_hostname.t stream_ssl_realip.t proxy_pr
 TEST_LIST="dav.t dav_chunked.t dav_utf8.t slice.t secure_link.t sub_filter_slice.t" \
   bash bench/nginxtests.sh     # 应全 SAME（sub_filter_slice 为 BETTER）
 ```
+
+## 本轮（gRPC 请求体流式转发：部分实现，响应侧未通过）
+
+### 已做
+
+`grpc.t` 此前在我方**一条断言都跑不出来**（0/152，记为 TRUNC），原因是
+HTTP/2 入站时把 DATA 帧先收完才路由，于是发往上游的 HEADERS 带 `END_STREAM`、
+且没有 DATA：
+
+```
+#   Failed test 'request - HEADERS flags'      got '5'  expected '4'
+#   Failed test 'request - DATA'               got undef
+```
+
+nginx 的 gRPC 是普通上游模块：HEADERS 在请求头解析完就发出去，DATA 边收边转。
+现在 `src/h2server.rs` 在 `!recv.is_end_stream()` 且 location 有静态 `grpc_pass`
+时走新的 `grpc::stream_once`，由它连上游、发 HEADERS(`end_of_stream=false`)、
+用 `RecvStream::is_end_stream` 决定每个 DATA 帧的 END_STREAM，再把响应回给客户端。
+
+### 结果（`TEST_LIST="grpc.t grpc_ssl.t" bash bench/nginxtests.sh`）
+
+| 套件 | 修前 | 修后 |
+|---|---|---|
+| `grpc.t` | TRUNC **0/152** | **60/152**（90 落后） |
+| `grpc_ssl.t` | 13/40 | **20/40** |
+
+请求侧（HEADERS flags=4、DATA 'Hello'、length 5、flags 1、sid match）现在全部通过。
+
+### 未解决：响应侧 502
+
+`response - status` 仍是 **502**。埋点（临时写入 `/tmp/ngxrs_grpc.dbg`，已移除）
+显示 61 次失败尝试里 55 次是
+
+```
+resp err Error { kind: GoAway(b"", PROTOCOL_ERROR, Library) }
+```
+
+`Library` 表示 GOAWAY 是**本地 h2 crate 自己发出**的，即它认定协议违规。已排除：
+
+- `content-length` 与 DATA 字节数不符（在流式路径里删掉该头后错误照旧）
+- `select!` 抢跑（把连接驱动放进独立 task、响应分支 `biased` 优先，错误照旧）
+- 连接提前结束（那是同一错误的另一种表现）
+
+下一步的怀疑方向：HEADERS 与 DATA 之间插入了一次 `.await` 后，本 crate 对
+`send_request` 的 `end_of_stream=false` + 延后 DATA 的组合有额外校验（缓冲模式下
+两者在同一轮内发出，`grpc_pass.t` 7/7 因此正常）。要确认需要能抓到 h2 crate
+内部错误的原因字符串，本机没有可用的 tracing 出口。
+
+### 为什么保留
+
+改动让 `grpc.t` 从「一条断言都没跑」变成 60 条通过，且未使任何既有套件变差
+（`grpc_pass.t` 7/7、`grpc_next_upstream.t` 11/11 均不变）。响应侧仍 502，
+因此 `grpc.t` / `grpc_ssl.t` **不计入声明清单**，如实记为落后。
+
+复现：
+
+```bash
+TEST_LIST="grpc.t grpc_ssl.t" bash bench/nginxtests.sh   # 60/152、20/40
+```

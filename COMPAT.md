@@ -13,7 +13,7 @@
 
 | 项 | 命令 | 当前结果 |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 130 文件，WORSE=0 TRUNC=0（nginx 2000 / ngxrs 2005，125 个逐断言一致、5 个更优） |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 132 文件，WORSE=0 TRUNC=0（nginx 2028 / ngxrs 2033，127 个逐断言一致、5 个更优） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
 | 单元测试 | `cargo test --release` | **PASS** — 156 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
@@ -860,9 +860,35 @@ content-length` 与空 `:method` 那几条，发来的体长度与 `content-leng
 本文件记录过的 HPACK / 帧级条目同类：结构性限制，不是待办的 bug。因此该文件停在
 48/51、**不进声明清单**。
 
+### 2026-10-28 第二十二轮：`server_tokens` 是 location 级，不是 server 级
+
+`server_tokens.t` 12/14 → **14/14**、`h2_server_tokens.t` 11/14 → **14/14**，两者入清单
+（130 → **132** 文件）。
+
+`server_tokens` 原本只在 http/server 作用域解析，写进 `location` 时落进了「接受但未接线」
+那一支，于是被丢弃。nginx 把它放在 `clcf` 上并向下合并，而这两个文件正是把 `off` 放进
+`/off` 里，用来验证 server 级默认值不会渗进来。
+
+有三处必须一致，因为 `Server` 行是**发射器**写的，而它们只知道 server 级标志：
+
+1. `LocCfg::server_tokens: Option<bool>`（`None` 表示继承），在 location 作用域解析；
+2. `finalize_response` 把这个选择记录到 `Response` 上，两种协议的发射器都能取用，不必把
+   location 一路传下去；
+3. 内置错误页在 `<hr>` 之后**重复**一次签名，那段也要改写 —— 这就是第三条断言
+   （"404 body"），也说明了只改头部为什么不够。
+
+顺带一提：`server_tokens.t` 此前也停在 12/14，现在同样 SAME。它不在 h2 那个文件里，
+说明缺陷在共享路径而不在 HTTP/2 代码 —— 这正是维护 130 文件全量回归的价值。
+
+**关于 slice**：本轮先做 `slice.t`，但**放弃了**。第一版（解析 `slice`、把 `$slice_range`
+接进缓存键展开器、在缓冲 fetch 里按片循环）把这个文件从 64/87 变成 **61/87**：它整体替换了
+上游头，导致验证器消失、`if-range` 系列回退，还额外发出了一个与 `add_header` 重复的
+`X-Cache-Status`。那是净负收益，所以**回退了工作区而不是提交**。slice 需要单独一轮，先把
+验证器与 cache-status 的语义定清楚，而不是在同一轮里边试边塞。
+
 ## 二、声明的测试清单
 
-清单在 `bench/declared.txt`，**130 个文件**，选取规则是机械的：
+清单在 `bench/declared.txt`，**132 个文件**，选取规则是机械的：
 
 1. 落在范围内（**参考构建 `-V` 能编出来的模块**：http core + proxy/cache/gzip/
    TLS/HTTP2/realip/auth_request/slice/sub/secure_link/dav/stub_status/gzip_static/

@@ -13,7 +13,7 @@
 
 | 项 | 命令 | 当前结果 |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 128 文件，WORSE=0 TRUNC=0（nginx 1951 / ngxrs 1956，123 个逐断言一致、5 个更优） |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 129 文件，WORSE=0 TRUNC=0（nginx 1976 / ngxrs 1981，124 个逐断言一致、5 个更优） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
 | 单元测试 | `cargo test --release` | **PASS** — 156 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 见 `BENCH.md`；c=128 吞吐与 64 KB 尾延迟均优于 nginx，条件见该文件 |
@@ -767,9 +767,39 @@ chunk 分帧原样转出，客户端看到 `a\r\n0123456789\r\n`，而 nginx 给
 新增 4 个单元测试钉住终止符规则，其中一条特意对比「`dechunk` 认为 `0\r\n` 已完整、而
 消息其实还没结束」。
 
+### 2026-10-28 第十九轮：HTTP/2 头过滤器
+
+`h2_absolute_redirect.t` 7/25 → **25/25**，入清单（128 → **129** 文件）。
+
+四个互相独立的缺陷，症状都是「同一个请求在 h2 上与 HTTP/1 结果不同」：
+
+| 缺陷 | 表现 |
+|---|---|
+| `Location` 只对 `raw` 做绝对化 | `return 301 /x` 与目录重定向把 `Location` 留在未渲染的 `headers` 里，h1 靠 `write_redirect` 兜底 —— 而 h2 从不经过它 |
+| h2server 把监听端口写死成 443 | 明文监听 8080 上生成 `http://on:443/` |
+| `:path` 未解码 | 直接用了 `request.uri().path()`（仍是 `%20`），`/dir%20sp` 匹配不到磁盘上的 `dir sp`，补斜杠重定向从不触发 |
+| 非法 `:authority` 在帧循环里直接回 400 | 完全跳过 `error_page`。该测试的配置正是把 400 映射到页面，用来观察「回落到监听地址」这一行为 |
+
+修法：`finalize_response` 同时处理 `headers` 与 `raw` 两处（已绝对化的值再处理是幂等的，
+h1 不受影响）；端口从 `group.addr.port()` 传入；`parse_target` 负责解码；400 走新增的
+`error_page_response`（内部调用 `finalize_response`），与 h1 路径一致。
+
+一个过程中的教训值得记下：我第一版改 `:path` 时把 `query` 也一起换成了 `parse_target`
+的返回值（它只收到 path，自然是空），于是每个 `Location` 都丢了 `?a=b`。测试立刻就抓到了
+—— 这也是即使看起来只是「头部格式」的文件也应该留在声明清单里的理由。
+
+**未完成：`ssl_verify_depth.t`（仍 2/11）**，两个互相独立的阻塞点，都如实记录而不是绕口径：
+
+1. `ssl_verify_depth` 未解析，且验证器是 webpki 的 `verify_for_usage` —— 它会构建路径但
+   **不提供深度上限**。要复现 nginx 的语义，得自己走一遍链（按 issuer/subject 或 AKI 匹配
+   DER），在中间证书数超过指令值时拒绝；当前依赖集里没有 X.509 解析器。
+2. 更基础的一条：那条路径上的响应**完全没有** `X-Client` / `X-Verify` 头，即
+   `add_header ... $ssl_client_s_dn always` 没有发出。这本身是较小的 bug，但只修它只能把
+   2/11 变成约 7/11，而半个文件不能进声明清单。
+
 ## 二、声明的测试清单
 
-清单在 `bench/declared.txt`，**128 个文件**，选取规则是机械的：
+清单在 `bench/declared.txt`，**129 个文件**，选取规则是机械的：
 
 1. 落在范围内（**参考构建 `-V` 能编出来的模块**：http core + proxy/cache/gzip/
    TLS/HTTP2/realip/auth_request/slice/sub/secure_link/dav/stub_status/gzip_static/

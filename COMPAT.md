@@ -13,7 +13,7 @@
 
 | 项 | 命令 | 当前结果（2026-10-28 复验） |
 |---|---|---|
-| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 135 文件，WORSE=0 TRUNC=0（nginx 2142 / ngxrs 2147，130 个逐断言一致、5 个更优） |
+| 声明清单 A/B | `bash bench/declared.sh` | **PASS** — 167 文件，WORSE=0 TRUNC=0（nginx 2581 / ngxrs 2597，160 个逐断言一致、7 个更优：http_headers_multi / http_resolver / proxy_cache_range / proxy_if / proxy_noclose / ssi_if / sub_filter_slice） |
 | 自有差分套件 | `bash bench/all.sh` | **PASS** — 70/70（19 静态 + 28 功能 + 9 TLS/H2 + 14 fastcgi/uwsgi/scgi/grpc/stream） |
 | 单元测试 | `cargo test --release` | **PASS** — 178 passed |
 | 性能 | `CONNS=128 REPEAT=3 bash bench/abba_raw.sh` | 判据由 **64 KB p99** 满足：默认 39.35 ms → 749 µs，对照组（nginx `sendfile off`）1.16 ms → 747 µs。64 KB 吞吐只算持平（1.002 / 1.025），1 KB 落后（0.861–0.932）。原始输出见 `bench/results/raw-20261028-1603{42}.txt` 与 `raw-20261028-161005.txt` |
@@ -3749,3 +3749,32 @@ fastcgi 全家 15 个套件全部与 nginx 一致（fastcgi_request_buffering 17
 chunked 21/21、keepalive 8/8、variables 5/5、split 3/3、body2 4/4、
 header_params 6/6、merge 11/11+6/6、cache 7/7、unix 8/8、body 7/7、
 buffering 4/4、fastcgi.t 10/10）。
+
+## 本轮（2026-10-27 轮的 8 个 WORSE 文件全部清零，声明清单 135 → 167）
+
+上一轮"范围纠偏"记录的 8 个 WORSE 文件经复测全部与 nginx 一致（作者近期
+轮次修掉 + 本轮 fastcgi 改动顺带覆盖），已全部纳入声明清单：
+
+| 文件 | 旧 | 现状 |
+|---|---|---|
+| `slice.t` | 23 断言未对齐（81/87） | **87/87** |
+| `secure_link.t` | 6 | **21/21** |
+| `limit_req2.t` | 5 | **16/16** |
+| `realip_hostname.t` | 2 | **6/6** |
+| `auth_basic.t` | 2 | **27/27** |
+| `sub_filter_multi.t` | 2 | **44/44** |
+| `auth_request.t` | 1 | **22/22** |
+| `sub_filter.t` | 1 | **32/32** |
+
+复测命令：`TEST_LIST="limit_req2.t auth_basic.t sub_filter_multi.t sub_filter.t
+auth_request.t slice.t secure_link.t realip_hostname.t" bash bench/nginxtests.sh`
+（12 文件 297/297，含 limit_req/limit_req_delay/auth_request_satisfy/set）。
+
+清单维护：`uwsgi.t` 双方环境性 0 断言，按机械规则第 2 条剔除（双方都跳过的
+套件什么也证明不了）。声明门复核：`bash bench/declared.sh` →
+**PASS — 167 文件，WORSE=0 TRUNC=0**。
+
+### 全量扫描的剩余差距（未变）
+
+stream 深层指令、HTTP/2 帧级（h2 crate）、gRPC 上游帧、TLS OCSP/CRL、
+http core 的 disable_symlinks 与 resolver AAAA——见上方"差异总账"。

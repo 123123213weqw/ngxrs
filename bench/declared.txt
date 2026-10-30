@@ -299,7 +299,6 @@ mail_smtp.t
 mail_smtp_greeting_delay.t
 mail_smtp_xclient.t
 scgi.t
-uwsgi.t
 
 # ---- suites that already matched but were never listed ----
 # Found by checking every suite reported identical in earlier rounds against
@@ -315,6 +314,7 @@ http_method.t
 limit_conn.t
 limit_req.t
 limit_req_delay.t
+limit_req2.t
 referer.t
 rewrite.t
 split_clients.t

@@ -42,6 +42,10 @@ pub struct Resolver {
     pub timeout: Duration,
     /// `valid=`: overrides the TTL the server sends.
     pub valid: Option<Duration>,
+    /// `ipv4=on|off`: query A records (on by default).
+    pub ipv4: bool,
+    /// `ipv6=on|off`: query AAAA records (on by default).
+    pub ipv6: bool,
     /// Identity of this directive instance. nginx keeps one rbtree per resolver,
     /// so two locations with different `resolver` directives do not share
     /// answers.
@@ -55,14 +59,28 @@ impl Resolver {
         let _ = prefix;
         let mut servers = Vec::new();
         let mut valid = None;
+        // `ipv4=`/`ipv6=`: which record types to query (both on by default).
+        let mut ipv4 = true;
+        let mut ipv6 = true;
         for a in args {
             if let Some(v) = a.strip_prefix("valid=") {
                 valid = crate::config::typed::parse_time(v);
                 continue;
             }
+            if let Some(v) = a.strip_prefix("ipv4=") {
+                ipv4 = v == "on";
+                continue;
+            }
+            if let Some(v) = a.strip_prefix("ipv6=") {
+                ipv6 = v == "on";
+                continue;
+            }
             if let Some(addr) = parse_server(a) {
                 servers.push(addr);
             }
+        }
+        if !ipv4 && !ipv6 {
+            return None;
         }
         if servers.is_empty() {
             return None;
@@ -71,6 +89,8 @@ impl Resolver {
             servers,
             timeout: Duration::from_secs(30),
             valid,
+            ipv4,
+            ipv6,
             id: next_id(),
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
@@ -144,6 +164,7 @@ const T_CNAME: u16 = 5;
 const T_AAAA: u16 = 28;
 
 /// What one response said.
+#[derive(Clone)]
 struct Answer {
     /// `nan`: answer records in the message, whatever their type. A response
     /// with none is `NXDOMAIN` when it arrives last and the other type had no
@@ -225,6 +246,52 @@ enum Fail {
 }
 
 /// Resolve `name`, returning every address nginx would try.
+// Names with a resolution already running. The first task is the leader; any
+// other task resolving the same name joins it and reads the cache once the
+// leader publishes -- nginx does the same with `ctx->waiting`.
+fn inflight_map() -> &'static std::sync::Mutex<
+    std::collections::HashMap<(u64, String), std::sync::Arc<tokio::sync::Notify>>,
+> {
+    static M: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                (u64, String),
+                std::sync::Arc<tokio::sync::Notify>,
+            >,
+        >,
+    > = std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Elects the leader for one name. The leader gets `true` and must run the
+/// queries, then call `inflight_finish`; a follower gets the leader's notify.
+fn inflight_start(id: u64, key: &str) -> (bool, Option<std::sync::Arc<tokio::sync::Notify>>) {
+    let mut m = inflight_map().lock().unwrap_or_else(|e| e.into_inner());
+    match m.get(&(id, key.to_string())) {
+        Some(n) => (false, Some(n.clone())),
+        None => {
+            let n = std::sync::Arc::new(tokio::sync::Notify::new());
+            m.insert((id, key.to_string()), n.clone());
+            // The leader also carries the Arc: its guard's finish must
+            // ptr_eq-check against the entry it owns.
+            (true, Some(n))
+        }
+    }
+}
+
+fn inflight_finish(id: u64, key: &str, arc: &std::sync::Arc<tokio::sync::Notify>) {
+    let mut m = inflight_map().lock().unwrap_or_else(|e| e.into_inner());
+    // Only the leader owning the current entry may remove it: a follower
+    // woken early may already be the next leader for this name.
+    if m.get(&(id, key.to_string()))
+        .map(|cur| std::sync::Arc::ptr_eq(cur, arc))
+        == Some(true)
+    {
+        m.remove(&(id, key.to_string()));
+        arc.notify_waiters();
+    }
+}
+
 pub async fn resolve(resolver: &Resolver, name: &str) -> Option<Vec<IpAddr>> {
     resolve_rec(resolver, name, 0).await
 }
@@ -247,6 +314,39 @@ async fn resolve_rec(resolver: &Resolver, name: &str, recursion: u32) -> Option<
         }
         None => {}
     }
+    // A concurrent resolution of the same name is joined, not duplicated: the
+    // follower waits for the leader to publish and then reads the cache
+    // (`http_resolver_cname.t`, "CNAME in progress").
+    let (leader, notify) = inflight_start(resolver.id, &key);
+    if !leader {
+        if let Some(n) = &notify {
+            n.notified().await;
+        }
+        return match cache_get(resolver.id, &key) {
+            Some(Entry::Addrs { addrs, .. }) => Some(addrs),
+            Some(Entry::Cname { target, .. }) => {
+                Box::pin(resolve_rec(resolver, &target, recursion + 1)).await
+            }
+            None => None,
+        };
+    }
+    // Every leader exit publishes, or a leaked entry hangs later followers.
+    struct InflightGuard {
+        id: u64,
+        key: String,
+        notify: std::sync::Arc<tokio::sync::Notify>,
+    }
+    impl Drop for InflightGuard {
+        fn drop(&mut self) {
+            inflight_finish(self.id, &self.key, &self.notify);
+        }
+    }
+    let guard = InflightGuard {
+        id: resolver.id,
+        key: key.clone(),
+        notify: notify.clone().unwrap(),
+    };
+    let _guard = guard;
 
     // Both types go to the same server, and the pairing is decided once per
     // name: `r->last_connection++` happens when the node is created.
@@ -257,9 +357,29 @@ async fn resolve_rec(resolver: &Resolver, name: &str, recursion: u32) -> Option<
         resolver.servers[idx % resolver.servers.len()]
     };
     let budget = Instant::now() + resolver.timeout;
+    // A disabled record type is not queried at all; an empty synthesized
+    // answer feeds `combine` the same way a real 0-record response would.
+    let empty = Answer {
+        nan: 0,
+        addrs: Vec::new(),
+        cname: None,
+        ttl: None,
+    };
     let (ra, ra6) = tokio::join!(
-        query(resolver, &key, T_A, sockaddr, budget),
-        query(resolver, &key, T_AAAA, sockaddr, budget)
+        async {
+            if resolver.ipv4 {
+                query(resolver, &key, T_A, sockaddr, budget).await
+            } else {
+                Ok(empty.clone())
+            }
+        },
+        async {
+            if resolver.ipv6 {
+                query(resolver, &key, T_AAAA, sockaddr, budget).await
+            } else {
+                Ok(empty.clone())
+            }
+        }
     );
     let a = ra.ok()?;
     let a6 = ra6.ok()?;
@@ -275,7 +395,7 @@ async fn resolve_rec(resolver: &Resolver, name: &str, recursion: u32) -> Option<
         .or(ttl.map(|t| Duration::from_secs(t as u64)))
         .unwrap_or(Duration::ZERO);
 
-    match step {
+    let result = match step {
         Step::Export => {
             let mut addrs = a.addrs;
             addrs.extend(a6.addrs);
@@ -302,10 +422,17 @@ async fn resolve_rec(resolver: &Resolver, name: &str, recursion: u32) -> Option<
                     },
                 );
             }
+            // The CNAME is an intermediate result: followers waiting on this
+            // name wake now and follow the target themselves (sharing the
+            // target's query) instead of waiting for the whole chain.
+            if let Some(n) = &notify {
+                inflight_finish(resolver.id, &key, n);
+            }
             Box::pin(resolve_rec(resolver, &target, recursion + 1)).await
         }
         Step::Fail => None,
-    }
+    };
+    result
 }
 
 /// Send one query, resending every `RESEND` on the next server until `budget`

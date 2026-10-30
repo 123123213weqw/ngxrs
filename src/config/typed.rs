@@ -1282,6 +1282,9 @@ pub struct ProxyPass {
     pub uri: Option<String>,
     pub host_header: String,
     pub https: bool,
+    /// `proxy_pass http://name` where `name` has no `upstream`: resolved per
+    /// request through the `resolver`, exactly like a variable target.
+    pub runtime_name: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2118,6 +2121,7 @@ pub fn parse_proxy_pass(url: &str) -> Option<ProxyPass> {
             uri,
             host_header: "localhost".to_string(),
             https: false,
+            runtime_name: false,
         });
     }
     let (authority, uri) = match rest.find('/') {
@@ -2147,6 +2151,7 @@ pub fn parse_proxy_pass(url: &str) -> Option<ProxyPass> {
         uri,
         host_header,
         https: scheme,
+        runtime_name: false,
     })
 }
 
@@ -2426,8 +2431,14 @@ fn resolve_proxy_upstreams(http: &mut Http) -> Result<(), ConfigError> {
         .enumerate()
         .map(|(i, u)| (u.name.clone(), i))
         .collect();
+    // `fix` needs the resolver presence while holding &mut locations.
+    let has_resolver = http.resolver.is_some();
 
-    fn fix(cfg: &mut LocCfg, lookup: &HashMap<String, usize>) -> Result<(), ConfigError> {
+    fn fix(
+        cfg: &mut LocCfg,
+        lookup: &HashMap<String, usize>,
+        has_resolver: bool,
+    ) -> Result<(), ConfigError> {
         // A bare  was kept as a name: now that the
         // upstream table is complete, an unknown name is a config error, the
         // same as nginx reports at parse time.
@@ -2457,29 +2468,44 @@ fn resolve_proxy_upstreams(http: &mut Http) -> Result<(), ConfigError> {
                     }
                 }
                 None => {
-                    return Err(ConfigError::Semantic {
-                        file: PathBuf::from("<config>"),
-                        line: 0,
-                        msg: format!("proxy_pass refers to unknown upstream \"{name}\""),
-                    })
+                    // nginx resolves an unknown name per request through the
+                    // `resolver` (http_resolver_cleanup.t): undefined name +
+                    // resolver is legal, undefined name without one is not.
+                    // A location- or server-level `resolver` counts too.
+                    if !has_resolver && cfg.resolver.is_none() {
+                        return Err(ConfigError::Semantic {
+                            file: PathBuf::from("<config>"),
+                            line: 0,
+                            msg: format!(
+                                "proxy_pass refers to unknown upstream \"{name}\""
+                            ),
+                        });
+                    }
+                    pp.target = ProxyTarget::Addr(UNIX_PLACEHOLDER);
+                    pp.host_header = name.clone();
+                    pp.runtime_name = true;
                 }
             }
         }
         Ok(())
     }
 
-    fn walk(locs: &mut [Location], lookup: &HashMap<String, usize>) -> Result<(), ConfigError> {
+    fn walk(
+        locs: &mut [Location],
+        lookup: &HashMap<String, usize>,
+        has_resolver: bool,
+    ) -> Result<(), ConfigError> {
         for l in locs {
-            fix(&mut l.cfg, lookup)?;
-            walk(&mut l.nested, lookup)?;
+            fix(&mut l.cfg, lookup, has_resolver)?;
+            walk(&mut l.nested, lookup, has_resolver)?;
         }
         Ok(())
     }
 
-    fix(&mut http.default_loc, &lookup)?;
+    fix(&mut http.default_loc, &lookup, has_resolver)?;
     for s in &mut http.servers {
-        fix(&mut s.default_loc, &lookup)?;
-        walk(&mut s.locations, &lookup)?;
+        fix(&mut s.default_loc, &lookup, has_resolver)?;
+        walk(&mut s.locations, &lookup, has_resolver)?;
     }
     let _ = http;
     Ok(())

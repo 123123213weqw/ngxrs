@@ -3812,3 +3812,25 @@ dynamic_addr 剥方括号后按 IP 解析。
 - http_disable_symlinks 1 条（alias 变量）。
 - resolver 家族（AAAA/CNAME/TTL/cleanup，5 文件 79 断言）是 http core 剩余
   的大头，需要把最小 DNS 客户端升级为 A+AAAA+CNAME 完整实现。
+
+## 本轮（resolver 家族清零：ipv4=/ipv6=、in-flight 共享、undefined upstream + resolver）
+
+resolver 五个套件全部与 nginx 一致：`http_resolver.t` 40/40、
+`http_resolver_aaaa.t` 74/74、`http_resolver_cname.t` 13/13（"CNAME in
+progress" 补上）、`http_resolver_ipv4.t` 5/5、`http_resolver_cleanup.t`
+0/3 → **3/3**。A/B 25 文件 527/526（24 SAME + 1 BETTER），bench/all.sh
+70/70，单测 178/178。
+
+1. **`resolver ... ipv4=on|off ipv6=on|off`**：此前只解析不生效。禁用的类型
+   不发查询，以合成的 0 记录 Answer 喂给 combine——"ipv4 only" 出 A、
+   "ipv6 only" 出 AAAA 的语义自然成立。
+2. **in-flight 共享**：同名并发解析此前各自起查询。现在首个任务是 leader，
+   后来者 join 并等 leader 发布后读缓存（nginx 的 `ctx->waiting`）。关键
+   细节：`?` 提前返回会泄漏 in-flight 条目，后来的同名请求全部挂死——
+   改用 Drop guard 发布；CNAME 是**中间结果**，Follow 时提前唤醒 follower
+   （它们自己追目标并共享目标的查询），而不是等整条链跑完——
+   "CNAME in progress" 的两条 502 因此都在时限内。
+3. **`proxy_pass http://name` 未定义 upstream + resolver**：配置期此前直接
+   拒绝；nginx 允许（运行时经 resolver 解析）。现在有 resolver 时转运行时
+   名字目标（与变量目标同路），无 resolver 仍报 nginx 同款配置错误。
+   http_resolver_cleanup.t 的整个配置因此能启动。

@@ -1057,7 +1057,7 @@ pub async fn handle(
     // A `proxy_pass` whose authority contains variables is resolved per
     // request (`proxy_pass http://$arg_b`). nginx looks the expanded value up
     // as an `upstream` name first and otherwise needs `resolver`.
-    let dynamic = if pp.host_header.contains('$') {
+    let dynamic = if pp.host_header.contains('$') || pp.runtime_name {
         Some(vars.expand(&pp.host_header))
     } else {
         None

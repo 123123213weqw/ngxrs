@@ -4796,11 +4796,52 @@ impl Builder {
         for child in block {
             match child.name.as_str() {
                 "listen" => {
-                    let addr = child
-                        .args
-                        .first()
-                        .and_then(|a| parse_listen_any(a))
-                        .ok_or_else(|| {
+                    // `listen 127.0.0.1:8182-8183` (and `[::1]:p1-p2`) opens a
+                    // separate listening socket per port, all mapping to this
+                    // server (http_listen.t).
+                    let addr_str =
+                        child.args.first().cloned().unwrap_or_default();
+                    let range: Option<(u16, u16)> =
+                        match addr_str.rsplit_once(':') {
+                            Some((_, p))
+                                if p.contains('-') && !p.starts_with('-') =>
+                            {
+                                match p.split_once('-') {
+                                    Some((a, b)) => {
+                                        match (a.parse::<u16>(), b.parse::<u16>()) {
+                                            (Ok(a), Ok(b))
+                                                if a <= b
+                                                    && b as u32 - a as u32
+                                                        <= 65_535 =>
+                                            {
+                                                Some((a, b))
+                                            }
+                                            _ => None,
+                                        }
+                                    }
+                                    None => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                    let addrs: Vec<ListenAddr> = match range {
+                        Some((p1, p2)) => {
+                            let host = &addr_str[..addr_str.rfind(':').unwrap()];
+                            let mut v = Vec::new();
+                            for p in p1..=p2 {
+                                v.push(parse_listen_any(&format!("{host}:{p}")).ok_or_else(
+                                    || {
+                                        sem(
+                                            &child.file,
+                                            child.line,
+                                            format!("invalid listen address \"{host}:{p}\""),
+                                        )
+                                    },
+                                )?);
+                            }
+                            v
+                        }
+                        None => vec![parse_listen_any(&addr_str).ok_or_else(|| {
                             sem(
                                 &child.file,
                                 child.line,
@@ -4809,7 +4850,9 @@ impl Builder {
                                     child.args.first().cloned().unwrap_or_default()
                                 ),
                             )
-                        })?;
+                        })?],
+                    };
+                    for addr in addrs {
                     let is_default = child.args[1..]
                         .iter()
                         .any(|p| p == "default_server" || p == "default");
@@ -4826,7 +4869,8 @@ impl Builder {
                         quic = true;
                     }
                     let pp_now = child.args[1..].iter().any(|p| p == "proxy_protocol");
-                    listens.push((addr, is_default, listen_ssl, quic_now, pp_now));
+                        listens.push((addr, is_default, listen_ssl, quic_now, pp_now));
+                    }
                 }
                 "server_name" => {
                     names.extend(child.args.iter().cloned());

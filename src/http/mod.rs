@@ -1398,6 +1398,8 @@ struct RwVars<'a> {
     query: &'a str,
     vars: &'a std::collections::HashMap<String, String>,
     server_port: u16,
+    /// `$server_addr`: the local address of the accepted connection.
+    server_addr: &'a str,
     /// `$server_name` / `$host`: `index $server_name.html` is a documented
     /// pattern (`index.t`, "var").
     server_name: &'a str,
@@ -1435,6 +1437,7 @@ fn get_var(name: &str, v: &RwVars<'_>) -> String {
         // nginx's rewrite phase evaluates these from the request's server
         // context; without them `if ($server_port = ...)` can never match.
         "server_port" => v.server_port.to_string(),
+        "server_addr" => v.server_addr.to_string(),
         "host" | "http_host" => v
             .req
             .host
@@ -1579,6 +1582,7 @@ fn apply_rewrites(
     server: &Server,
     default_type: &str,
     server_port: u16,
+    server_addr: &str,
 ) -> RewriteOutcome {
     apply_rewrites_parts(
         req,
@@ -1591,6 +1595,7 @@ fn apply_rewrites(
         server,
         default_type,
         server_port,
+        server_addr,
         &secure_link_seed(loc, req),
     )
 }
@@ -1623,6 +1628,7 @@ fn apply_rewrites_parts(
     server: &Server,
     default_type: &str,
     server_port: u16,
+    server_addr: &str,
     seed: &[(&str, String)],
 ) -> RewriteOutcome {
     let mut ignored_override = None;
@@ -1639,6 +1645,7 @@ fn apply_rewrites_parts(
         server,
         default_type,
         server_port,
+        server_addr,
         &mut ignored_override,
         &mut ignored_seen,
         &mut ignored_missing,
@@ -1663,6 +1670,8 @@ fn apply_rewrites_full(
     server: &Server,
     default_type: &str,
     server_port: u16,
+    // `$server_addr`: the accepted connection's local address.
+    server_addr: &str,
     // Set when a matching `if` carried its own `proxy_pass`, which nginx lets
     // override the location's target while the condition holds.
     proxy_override: &mut Option<(crate::config::ProxyPass, Option<String>)>,
@@ -1720,6 +1729,7 @@ fn apply_rewrites_full(
                     query: &args,
                     vars: &vars,
                     server_port,
+                    server_addr,
                     server_name: if_server_name,
                     loc: if_loc,
                 };
@@ -1751,6 +1761,7 @@ fn apply_rewrites_full(
                     rewrites,
                     default_type,
                     server_port,
+                    server_addr,
                     &mut matched,
                     if_loc,
                     server.name_display(),
@@ -1776,7 +1787,7 @@ fn apply_rewrites_full(
         }
     }
     for rw in rewrites {
-        if let Some(out) = apply_one(rw, &mut uri, &mut args, req, &vars, server_port) {
+        if let Some(out) = apply_one(rw, &mut uri, &mut args, req, &vars, server_port, server_addr) {
             return (out, vars);
         }
     }
@@ -1797,6 +1808,8 @@ fn run_if(
     _rewrites: &[crate::config::Rewrite],
     default_type: &str,
     server_port: u16,
+    // `$server_addr` for `set` / `if` expansions.
+    server_addr: &str,
     // Set to whether the condition held. `None` alone cannot distinguish "the
     // condition was false" from "the condition held but produced no terminal
     // outcome", and `proxy_pass` inside `if` needs that difference.
@@ -1811,6 +1824,7 @@ fn run_if(
             query: args,
             vars,
             server_port,
+            server_addr,
             server_name: if_server_name,
             loc: if_loc,
         };
@@ -1827,6 +1841,7 @@ fn run_if(
             query: args,
             vars,
             server_port,
+            server_addr,
             server_name: if_server_name,
             loc: if_loc,
         };
@@ -1853,7 +1868,7 @@ fn run_if(
         return Some(RewriteOutcome::Respond(resp));
     }
     for rw in &ifb.rewrites {
-        if let Some(out) = apply_one(rw, uri, args, req, vars, server_port) {
+        if let Some(out) = apply_one(rw, uri, args, req, vars, server_port, server_addr) {
             return Some(out);
         }
     }
@@ -1868,6 +1883,7 @@ fn apply_one(
     req: &Request,
     vars: &std::collections::HashMap<String, String>,
     server_port: u16,
+    server_addr: &str,
 ) -> Option<RewriteOutcome> {
     if !rw.re.is_match(uri) {
         return None;
@@ -1890,12 +1906,12 @@ fn apply_one(
     // `$secure_link` are expanded in the same pass -- a rewrite that uses a
     // named variable (`rewrite ^ /$secure_link break;`) is ordinary usage.
     let expanded_uri = |tmpl: &str| {
-        expand_replacement(tmpl, &caps, req, uri, args, vars, server_port, false)
+        expand_replacement(tmpl, &caps, req, uri, args, vars, server_port, server_addr, false)
     };
     let target = expanded_uri(uri_tmpl);
     let new_args = match arg_tmpl {
         Some(t) if !t.is_empty() => {
-            let a = expand_replacement(t, &caps, req, uri, args, vars, server_port, true);
+            let a = expand_replacement(t, &caps, req, uri, args, vars, server_port, server_addr, true);
             if drop_args || args.is_empty() {
                 a
             } else {
@@ -2096,6 +2112,7 @@ fn expand_replacement(
     query: &str,
     vars: &std::collections::HashMap<String, String>,
     server_port: u16,
+    server_addr: &str,
     escape_args: bool,
 ) -> String {
     let ctx = RwVars {
@@ -2104,6 +2121,7 @@ fn expand_replacement(
         query,
         vars,
         server_port,
+        server_addr,
         server_name: "",
         loc: None,
     };
@@ -3340,6 +3358,7 @@ pub fn resolve_target<'a>(
     loc: &'a LocCfg,
     http: &Http,
     server_port: u16,
+    server_addr: &str,
 ) -> Target<'a> {
     let mut cur_path = path.to_string();
     let mut cur_query = query.to_string();
@@ -3360,6 +3379,7 @@ pub fn resolve_target<'a>(
             server,
             &http.default_type,
             server_port,
+            server_addr,
             &secure_link_seed(loc, req),
         ) {
             RewriteOutcome::Respond(r) => return Target::Done(r),
@@ -3410,6 +3430,7 @@ pub fn resolve_target<'a>(
             server,
             &http.default_type,
             server_port,
+            server_addr,
             &mut proxy_override,
             &mut if_proxy_seen,
             &mut proxy_override_missing,
@@ -3484,6 +3505,7 @@ pub fn resolve_target<'a>(
                 query: &cur_query,
                 vars: &vars,
                 server_port,
+                server_addr,
                 server_name: server.name_display(),
                 loc: Some(cur_loc),
             };
@@ -3795,7 +3817,7 @@ pub async fn resolve_response_local(
         }
     }
 
-    let mut resp = match resolve_target(req, path, query, server, loc, http, server_port) {
+    let mut resp = match resolve_target(req, path, query, server, loc, http, server_port, local_addr) {
         Target::Done(r) => r,
         Target::Loc(p, q, l, skip, _rw, set_vars) => {
             return render_resolved_state(
@@ -3885,7 +3907,7 @@ pub async fn resolve_response_state(
         }
     }
 
-    let mut resp = match resolve_target(req, path, query, server, loc, http, server_port) {
+    let mut resp = match resolve_target(req, path, query, server, loc, http, server_port, local_addr) {
         Target::Done(r) => r,
         Target::Loc(p, q, l, skip, _rw, set_vars) => {
             return render_resolved_state(
@@ -4498,6 +4520,7 @@ async fn finalize_response(
             cur_loc,
             http,
             server_port,
+            local_addr,
         ) {
             Target::Done(r) => r,
             Target::Loc(p, q, l, _skip, _rw, _set_vars) => {
@@ -4595,6 +4618,7 @@ async fn finalize_response(
             query: &cur_query,
             vars: custom,
             server_port,
+            server_addr: local_addr,
             server_name: server.name_display(),
             loc: Some(cur_loc),
         };
@@ -4961,7 +4985,7 @@ async fn dispatch(
     let uri_rewritten;
     let pre;
     let mut set_vars;
-    match resolve_target(req, path, query, server, loc, http, listen_port) {
+    match resolve_target(req, path, query, server, loc, http, listen_port, local_addr) {
         Target::Done(r) => {
             resolved_path = path.to_string();
             resolved_query = query.to_string();
@@ -4987,6 +5011,9 @@ async fn dispatch(
         &*resolved_loc,
     );
 
+    // `$server_addr` is the accepted connection's local address, visible to
+    // every consumer (return, add_header, logs) through the variable map.
+    set_vars.insert("server_addr".to_string(), local_addr.to_string());
     // `real_ip_*`: a trusted proxy's header rewrites $remote_addr. The
     // rewritten and original values are per-request variables, so every
     // later ServerVars sees them through the custom map.

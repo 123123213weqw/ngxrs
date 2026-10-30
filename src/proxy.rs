@@ -386,6 +386,12 @@ async fn dynamic_addr(
         }
         _ => (authority, default_port),
     };
+    // An IPv6 literal arrives bracketed (proxy_pass http://[::1]:8182/t);
+    // the brackets are URI syntax, not part of the address.
+    let host = host
+        .strip_prefix('[')
+        .map(|h| h.strip_suffix(']').unwrap_or(h))
+        .unwrap_or(host);
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return Some(vec![std::net::SocketAddr::new(ip, port)]);
     }

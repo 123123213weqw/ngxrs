@@ -3778,3 +3778,37 @@ auth_request.t slice.t secure_link.t realip_hostname.t" bash bench/nginxtests.sh
 
 stream 深层指令、HTTP/2 帧级（h2 crate）、gRPC 上游帧、TLS OCSP/CRL、
 http core 的 disable_symlinks 与 resolver AAAA——见上方"差异总账"。
+
+## 本轮（http core 两个 0 分套件清零：listen 端口范围 + $server_addr）
+
+`http_listen.t` 0/11 → **11/11**，`http_disable_symlinks.t` 30/30 → **29/30**
+（唯一剩项 `"from=" exact match` 需要 alias 支持变量，见已知缺口清单）。
+A/B 30 文件 563/559（29 SAME + 1 BETTER），bench/all.sh 70/70，单测 178/178。
+
+### listen 端口范围
+
+`listen 127.0.0.1:8182-8183` / `listen [::1]:8182-8183`（http_listen.t）此前
+配置期直接拒绝。现在解析期展开为每个端口一个监听 socket（同一 server，
+nginx 语义：一条 listen 指令 = 一组 socket），范围上限 65535。
+
+### $server_addr
+
+此前 rewrite/return 阶段不可求值（RwVars 无此分支、custom 表无键）——
+`return 200 "$server_addr:$server_port"` 输出 ":8125"。现在：
+
+- RwVars 增加 `server_addr`（连接的本地地址，dispatch 的 local_addr 一路
+  穿进 apply_rewrites/_full/run_if/expand_replacement/resolve_target——
+  这些函数的真实签名比记忆中多了 secure_link seed/proxy_override/if_loc
+  等参数，按实际文本逐一对齐）；
+- ServerVars 侧经 dispatch 种进 per-request 变量表（与 realip 重写同路），
+  add_header/return/日志全链路可见。
+
+顺带：proxy_pass 的动态目标支持 **IPv6 字面量**（`proxy_pass
+http://[::1]:8182/t` 此前把 \x27[\x27 当地址的一部分送去 resolver）——
+dynamic_addr 剥方括号后按 IP 解析。
+
+### 遗留
+
+- http_disable_symlinks 1 条（alias 变量）。
+- resolver 家族（AAAA/CNAME/TTL/cleanup，5 文件 79 断言）是 http core 剩余
+  的大头，需要把最小 DNS 客户端升级为 A+AAAA+CNAME 完整实现。

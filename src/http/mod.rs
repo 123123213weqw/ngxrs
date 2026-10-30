@@ -5318,7 +5318,56 @@ async fn dispatch(
         if let Some(o) =
             crate::fastcgi::handle(conn, req, path, query, loc, http, server.server_tokens).await?
         {
-            return Ok(o);
+            return match o {
+                crate::fastcgi::FcgiOut::Written(o) => Ok(o),
+                crate::fastcgi::FcgiOut::Intercept { status } => {
+                    // `fastcgi_intercept_errors`: run the error_page pipeline
+                    // for the upstream status, the way the proxy module does.
+                    let mut resp = error_response(status, false);
+                    let peer_ip = conn.peer_ip_str();
+                    let mut custom = set_vars.clone();
+                    for (k, v) in captures {
+                        custom.insert(k.clone(), v.clone());
+                    }
+                    resp = finalize_response(
+                        req,
+                        &mut resp,
+                        path,
+                        query,
+                        server,
+                        http,
+                        &peer_ip,
+                        peer_port,
+                        listen_port,
+                        captures,
+                        &mut custom,
+                        state,
+                        local_addr,
+                    )
+                    .await;
+                    let status = resp.status;
+                    let sent = if sent_headers_needed(server) {
+                        split_head(&resp.raw)
+                    } else {
+                        Vec::new()
+                    };
+                    let bytes = write_response_ka(
+                        conn,
+                        resp,
+                        keepalive_allowed,
+                        server.server_tokens,
+                        req.method == Method::Head,
+                        None,
+                    )
+                    .await?;
+                    Ok(Outcome {
+                        status,
+                        bytes,
+                        close: !keepalive_allowed,
+                        sent,
+                    })
+                }
+            };
         }
     }
 

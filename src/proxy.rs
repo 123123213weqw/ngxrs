@@ -3628,6 +3628,44 @@ impl crate::conn::Conn {
         Ok(out)
     }
 
+    /// Read one client chunk (size line, payload, terminator). `Ok(None)` is
+    /// the terminal 0-chunk. The FastCGI module streams chunked request bodies
+    /// with this when `fastcgi_request_buffering off`: each chunk travels as
+    /// its own STDIN record.
+    pub async fn next_chunk(&mut self, max: usize) -> io::Result<Option<Vec<u8>>> {
+        let line = self.read_line_pub().await?;
+        let size_str = String::from_utf8_lossy(&line)
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let size = u64::from_str_radix(&size_str, 16)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))?;
+        if size == 0 {
+            loop {
+                let l = self.read_line_pub().await?;
+                if l.is_empty() {
+                    break;
+                }
+            }
+            return Ok(None);
+        }
+        if size as usize > max {
+            return Err(crate::http::body_too_large());
+        }
+        let mut out = Vec::with_capacity(size as usize);
+        self.take_into(&mut out, size as usize).await?;
+        let tail = self.read_line_pub().await?;
+        if !tail.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad chunk terminator",
+            ));
+        }
+        Ok(Some(out))
+    }
+
     /// Read and de-chunk a chunked body into memory (bounded).
     pub async fn take_chunked_body(&mut self, max: usize) -> io::Result<Vec<u8>> {
         let mut out = Vec::new();

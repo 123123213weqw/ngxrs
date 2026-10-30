@@ -750,6 +750,7 @@ async fn fetch_uncached(
 
     // ---- send it (with fastcgi_next_upstream iteration) ----
     let mut attempt: usize = 0;
+    let mut chunked_done = false;
     let (stdout, caught_stderr) = 'attempts: loop {
         let (cand_target, up_mark, cand_addr): (DynTarget, Option<(usize, usize)>, Option<std::net::SocketAddr>) =
             match &up_order {
@@ -847,17 +848,41 @@ async fn fetch_uncached(
         // same write as BEGIN/PARAMS: the responder in
         // `fastcgi_request_buffering.t` does one `sysread` after `accept` and
         // expects the STDIN record to be in it (`"preread - preread"`).
-        let n = conn.buffered_len().min(*left as usize);
-        if n > 0 {
-            match conn.take_available(n).await {
-                Ok(chunk) => {
-                    crate::proxy::retain_streamed_pub(req, &chunk, cap);
-                    write_record(&mut out, FCGI_STDIN, req_id, &chunk);
-                    *left -= chunk.len() as u64;
+        if req.chunked {
+            // Framed bytes: parse the buffered chunks now and append their
+            // STDIN records to the initial write, so the preread travels in
+            // the same read as BEGIN/PARAMS. A terminal 0-chunk here closes
+            // the body before the streaming loop starts.
+            while conn.buffered_len() > 0 {
+                match conn.next_chunk(loc.client_max_body_size as usize).await {
+                    Ok(Some(chunk)) => {
+                        crate::proxy::retain_streamed_pub(req, &chunk, cap);
+                        write_record(&mut out, FCGI_STDIN, req_id, &chunk);
+                    }
+                    Ok(None) => {
+                        chunked_done = true;
+                        write_record(&mut out, FCGI_STDIN, req_id, &[]);
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("ngxrs: [error] fastcgi read body: {e}");
+                        return Some((error_response(502), true));
+                    }
                 }
-                Err(e) => {
-                    eprintln!("ngxrs: [error] fastcgi read body: {e}");
-                    return Some((error_response(502), true));
+            }
+        } else {
+            let n = conn.buffered_len().min(*left as usize);
+            if n > 0 {
+                match conn.take_available(n).await {
+                    Ok(chunk) => {
+                        crate::proxy::retain_streamed_pub(req, &chunk, cap);
+                        write_record(&mut out, FCGI_STDIN, req_id, &chunk);
+                        *left -= chunk.len() as u64;
+                    }
+                    Err(e) => {
+                        eprintln!("ngxrs: [error] fastcgi read body: {e}");
+                        return Some((error_response(502), true));
+                    }
                 }
             }
         }
@@ -872,6 +897,53 @@ async fn fetch_uncached(
     // start), and each body chunk travels as its own STDIN record as the client
     // produces it.
     if let Some((conn, left)) = body_stream.as_mut() {
+        if req.chunked {
+            if !chunked_done {
+            // Chunks that arrive together share one STDIN record (nginx
+            // writes what its buffer holds per flush); a burst ends when the
+            // connection buffer runs dry or the record grows large.
+            let mut total: u64 = 0;
+            let mut rec: Vec<u8> = Vec::with_capacity(8192);
+            loop {
+                match conn.next_chunk(loc.client_max_body_size as usize).await {
+                    Ok(Some(chunk)) => {
+                        total += chunk.len() as u64;
+                        if total > loc.client_max_body_size {
+                            return Some((error_response(413), true));
+                        }
+                        crate::proxy::retain_streamed_pub(req, &chunk, cap);
+                        write_record(&mut rec, FCGI_STDIN, req_id, &chunk);
+                        if conn.buffered_len() == 0 || rec.len() > 32 * 1024 {
+                            if let Err(e) = stream.write_all(&rec).await {
+                                eprintln!("ngxrs: [error] fastcgi write failed: {e}");
+                                return Some((error_response(502), true));
+                            }
+                            rec.clear();
+                        }
+                    }
+                    Ok(None) => {
+                        if !rec.is_empty() {
+                            if let Err(e) = stream.write_all(&rec).await {
+                                eprintln!("ngxrs: [error] fastcgi write failed: {e}");
+                                return Some((error_response(502), true));
+                            }
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("ngxrs: [error] fastcgi read body: {e}");
+                        return Some((error_response(502), true));
+                    }
+                }
+            }
+            let mut end = Vec::with_capacity(8);
+            write_record(&mut end, FCGI_STDIN, req_id, &[]);
+            if let Err(e) = stream.write_all(&end).await {
+                eprintln!("ngxrs: [error] fastcgi write failed: {e}");
+                return Some((error_response(502), true));
+            }
+            }
+        } else {
         while *left > 0 {
             let want = (*left).min(64 * 1024) as usize;
             let chunk = match conn.take_available(want).await {
@@ -899,6 +971,7 @@ async fn fetch_uncached(
         if let Err(e) = stream.write_all(&end).await {
             eprintln!("ngxrs: [error] fastcgi write failed: {e}");
             return Some((error_response(502), true));
+        }
         }
     }
 
@@ -1179,6 +1252,13 @@ impl tokio::io::AsyncWrite for FcgiConn {
     }
 }
 
+/// What one FastCGI request produced: a written outcome, or an error status
+/// that `fastcgi_intercept_errors` hands to the error_page pipeline.
+pub enum FcgiOut {
+    Written(Outcome),
+    Intercept { status: u16 },
+}
+
 pub async fn handle(
     conn: &mut Conn,
     req: &Request,
@@ -1187,7 +1267,7 @@ pub async fn handle(
     loc: &LocCfg,
     http: &Http,
     tokens: bool,
-) -> io::Result<Option<Outcome>> {
+) -> io::Result<Option<FcgiOut>> {
     if loc.fastcgi_pass.is_none() {
         return Ok(None);
     }
@@ -1205,6 +1285,11 @@ pub async fn handle(
     // it is reverted rather than shipped half-working.
     let stream_rest: u64 = if loc.fastcgi_request_buffering || req.buffered_body.is_some() {
         0
+    } else if req.chunked {
+        // Chunked bodies stream as well: each client chunk becomes one STDIN
+        // record, so an interactive responder sees the preread chunks before
+        // the client sends the terminating one.
+        u64::MAX
     } else {
         req.body_len
     };
@@ -1268,6 +1353,15 @@ pub async fn handle(
         chunked.extend_from_slice(b"0\r\n\r\n");
         resp.body = Body::Bytes(chunked);
     }
+    // `fastcgi_intercept_errors`: a special-status reply goes through the
+    // location's `error_page` instead of the responder's body. Nothing has
+    // been written yet, so the pipeline in dispatch can still run.
+    if loc.fastcgi_intercept_errors
+        && crate::util::is_special_status(status)
+        && loc.error_pages.contains_key(&status)
+    {
+        return Ok(Some(FcgiOut::Intercept { status }));
+    }
     let bytes = crate::http::write_response(
         conn,
         resp,
@@ -1276,12 +1370,12 @@ pub async fn handle(
         req.method == crate::http::request::Method::Head,
     )
     .await?;
-    Ok(Some(Outcome {
+    Ok(Some(FcgiOut::Written(Outcome {
         status,
         bytes,
         close: false,
         sent: Vec::new(),
-    }))
+    })))
 }
 
 async fn respond(

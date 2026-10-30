@@ -373,6 +373,9 @@ pub struct LocCfg {
     /// `fastcgi_keep_conn on`: leave the FastCGI connection open after the
     /// response so the upstream pool can reuse it.
     pub fastcgi_keep_conn: bool,
+    /// `fastcgi_intercept_errors on`: a special-status reply goes through the
+    /// location's `error_page` instead of the responder's body.
+    pub fastcgi_intercept_errors: bool,
     /// `fastcgi_next_upstream` flags (`next_upstream::*`); default
     /// `error timeout` like nginx.
     pub fastcgi_next_upstream: u32,
@@ -583,6 +586,7 @@ impl LocCfg {
             secure_link_secret: None,
             fastcgi_catch_stderr: Vec::new(),
             fastcgi_keep_conn: false,
+            fastcgi_intercept_errors: false,
             fastcgi_next_upstream: crate::config::next_upstream::DEFAULT,
             fastcgi_connect_timeout: Duration::from_secs(60),
             fastcgi_read_timeout: Duration::from_secs(60),
@@ -4059,6 +4063,23 @@ impl Builder {
                     }
                 };
             }
+            "fastcgi_intercept_errors" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "fastcgi_intercept_errors requires on|off"))?;
+                cfg.fastcgi_intercept_errors = match v.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => {
+                        return Err(sem(
+                            &d.file,
+                            d.line,
+                            format!("invalid value \"{v}\" in fastcgi_intercept_errors"),
+                        ))
+                    }
+                };
+            }
             "fastcgi_next_upstream" => {
                 let mut flags = 0u32;
                 for a in &d.args {
@@ -4351,7 +4372,6 @@ impl Builder {
             | "fastcgi_busy_buffers_size"
             | "fastcgi_temp_file_write_size"
             | "fastcgi_max_temp_file_size"
-            | "fastcgi_intercept_errors"
             | "fastcgi_pass_request_body"
             | "fastcgi_pass_request_headers"
             | "fastcgi_store"

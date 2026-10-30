@@ -3665,37 +3665,6 @@ EOF，`$status` 保持默认 200。nginx 在同一时刻是把连接关掉，读
 TEST_LIST="stream_status_variable.t" bash bench/nginxtests.sh    # 7/8，缺 400
 ```
 
-### 最终：`stream_status_variable.t` 8/8，且 `stream_limit_conn.t` 10/10
-
-上一轮只剩下 400 一条。根因是**停机时序**，本轮修掉：
-
-```perl
-my $s = stream('127.0.0.1:' . port(8085));   # 连接 1，占住 limit_conn 槽位
-stream('127.0.0.1:' . port(8085))->read();   # 连接 2，被 503 拒掉
-$s->io('PROXY INVALID');
-```
-
-连接 1 的上游会话阻塞在 8086 的 `read_from`（8086 在等一个 8085 不会发的 PROXY 头）。
-`$t->stop()` 时，我们原先直接**取消任务**，`read_from` 从未见到 EOF，`$status` 停在默认
-200；nginx 此刻关闭连接，读操作返回 EOF，于是记 400。
-
-改法：给每个连接克隆一个 shutdown receiver，`read_from` 与停机信号竞速，停机时按
-「头被截断」处理（`UnexpectedEof`），走既有的 400 分支。
-
-本地先验证：`-s stop` 期间挂起的连接，日志由 `200` 变为 `400`。
-
-**顺带**：`stream_limit_conn.t` 从上一轮的 8/10 变成 **10/10**——`limit_conn` 的槽位
-实现在这一轮被完整覆盖到（上轮只加了 acquire，未验证到全部断言）。
-
-两个套件都已加入声明清单（167 文件）。
-
-复现：
-
-```bash
-TEST_LIST="stream_status_variable.t stream_limit_conn.t" bash bench/nginxtests.sh
-# 均 SAME
-```
-
 ## 本轮（FastCGI 收尾：上游迭代、keepalive 池、参数变量收口）
 
 接手工作树里未提交的一轮（FastCGI 参数体系：HTTP_* 头参数转发、
@@ -3741,3 +3710,42 @@ A/B 32 文件 333/333 全部一致，bench/all.sh 70/70，单测 178/178。
 
 - `fastcgi_request_buffering.t` 16/17、`fastcgi_request_buffering_chunked.t`
   17/21：与 cc9c349 基线二进制逐套件对照完全相同——存量，后续轮次处理。
+
+## 本轮（fastcgi_request_buffering 全家打平：chunked 流式转发 + intercept_errors）
+
+`fastcgi_request_buffering.t` 16/17 → **17/17**，`fastcgi_request_buffering_chunked.t`
+17/21 → **21/21**。A/B 30 文件 340/340 全部一致，bench/all.sh 70/70，单测 178/178。
+
+### chunked 请求体的流式转发
+
+`fastcgi_request_buffering off` 此前只对带 Content-Length 的 body 生效；
+chunked body 整体缓冲后才连 responder——交互式 responder 在 accept 后
+sysread 到的是 BEGIN/PARAMS 之外什么都没有，三个交互用例（no preread/
+preread/chunks）全靠它。现在：
+
+- chunked body 也走流式路径（stream_rest 以 u64::MAX 标记），逐 chunk 解析
+  （新增 `Conn::next_chunk`：size 行、payload、终止行，0-chunk 返回 None）；
+- **预读进首写**：请求头已带的 chunk 逐条解析成 STDIN 记录，与 BEGIN/PARAMS
+  合并成**一次写**——responder accept 后的第一次 sysread 就能看到预读内容；
+  终止 0-chunk 若也在预读里，body 直接关闭；
+- **同突发合并**：缓冲区还有数据就续写同一条 STDIN 记录（nginx 每次 flush
+  写出缓冲内全部数据），缓冲打空或记录超过 32KB 才发出——测试的两 chunk
+  一次写入因此合成一条 `56789many` 记录；
+- 总量仍受 client_max_body_size 约束（413）。
+
+调试中修掉的自坑：chunk 解析的 `vec![0u8; size]` 预分配遇到追加语义的
+`take_into`，记录内容变成 `[0;size] + 数据`，帧同步整个错位——
+监听器 hexdump 直接暴露。
+
+### fastcgi_intercept_errors
+
+从"接受但忽略"补齐：特殊状态且配置了对应 error_page 时，响应不写客户端，
+走 dispatch 的 error_page 管线（与 proxy 的 Intercept 同构）——
+"body in error page" 用例的 `return 200 "$request_body\n"` 因此拿到 body。
+
+### 状态
+
+fastcgi 全家 15 个套件全部与 nginx 一致（fastcgi_request_buffering 17/17、
+chunked 21/21、keepalive 8/8、variables 5/5、split 3/3、body2 4/4、
+header_params 6/6、merge 11/11+6/6、cache 7/7、unix 8/8、body 7/7、
+buffering 4/4、fastcgi.t 10/10）。

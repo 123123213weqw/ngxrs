@@ -214,6 +214,7 @@ fn synthesize(req: &H3Request, authority: Option<&str>, path: &str, query: &str)
         host: authority.map(|a| InStr::new(&normalize_host(a))),
         expect_continue: false,
         tls: None,
+        add_uri_to_alias: std::sync::atomic::AtomicBool::new(false),
         started: std::time::Instant::now(),
     }
 }

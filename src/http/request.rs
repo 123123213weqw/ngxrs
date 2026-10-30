@@ -182,6 +182,11 @@ pub struct Request {
     pub request_id: String,
     /// When the request head finished parsing. Backs `$request_time`.
     pub started: std::time::Instant,
+    /// nginx's `r->add_uri_to_alias`: set by the try_files module once a
+    /// candidate matched and kept for the rest of the request, so the final
+    /// static serve appends the URI to a regex location's `alias`. Cell
+    /// because the request is shared while the flag is set mid-dispatch.
+    pub add_uri_to_alias: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for Request {
@@ -570,6 +575,7 @@ impl Request {
             tls: None,
             proxy_protocol: None,
             request_id: crate::util::new_request_id(),
+            add_uri_to_alias: std::sync::atomic::AtomicBool::new(false),
             started: std::time::Instant::now(),
         })
     }

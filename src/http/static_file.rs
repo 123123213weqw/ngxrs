@@ -36,7 +36,11 @@ pub fn respond_indexed(
     if let Some(r) = small_content(req, loc) {
         return Ok(r);
     }
-    let fs_path = map_path(uri, loc);
+    let fs_path = map_path_flagged(
+        uri,
+        loc,
+        req.add_uri_to_alias.load(std::sync::atomic::Ordering::Relaxed),
+    );
     respond_fs_indexed(req, &fs_path, uri, loc, http, expanded_index)
 }
 
@@ -81,12 +85,25 @@ pub fn document_root_of(loc: &LocCfg) -> PathBuf {
 }
 
 pub fn map_path(uri: &str, loc: &LocCfg) -> PathBuf {
+    map_path_flagged(uri, loc, false)
+}
+
+/// `add_uri_to_alias` mirrors nginx's request flag: a regex location's
+/// `alias` is the whole path for a direct serve, but the try_files module
+/// sets the flag so its candidates get the URI appended
+/// (ngx_http_try_files_module.c:261).
+pub fn map_path_flagged(uri: &str, loc: &LocCfg, add_uri_to_alias: bool) -> PathBuf {
     match &loc.alias {
         Some(alias) => {
             // The offset belongs to the location that declared `alias`; a
-            // nested location inherits both.
+            // nested location inherits both. A regex location's `alias` is the
+            // whole path unless the caller asked for the URI on top.
             let cut = loc.alias_prefix_len.min(uri.len());
-            let suffix = uri[cut..].trim_start_matches('/');
+            let suffix = if loc.alias_prefix_len == 0 && !add_uri_to_alias {
+                ""
+            } else {
+                uri[cut..].trim_start_matches('/')
+            };
             // An exact-match location leaves no remainder; `alias` then *is*
             // the file. `Path::join("")` would append a separator and turn
             // `/tmp/t2.html` into `/tmp/t2.html/`, which never stats.

@@ -433,6 +433,7 @@ async fn handle_conn_inner(mut conn: Conn, cfg: Arc<Config>, group_idx: usize, c
                         }
                         std::sync::Arc::new(info)
                     }),
+                    add_uri_to_alias: std::sync::atomic::AtomicBool::new(false),
                     started: std::time::Instant::now(),
                 };
                 let mut resp = error_response(e.status, default_server.server_tokens);
@@ -1368,6 +1369,25 @@ async fn route(
     };
     let index_ref = expanded_index.as_deref();
     let prof_content = crate::prof::start();
+    // A variable `alias` (`alias %%TESTDIR%%/$1`) expands per request against
+    // the location's captures; the expanded alias is also what
+    // `disable_symlinks from=$document_root` compares against
+    // (http_disable_symlinks.t, "from= exact match").
+    let alias_owned;
+    let loc = if loc
+        .alias
+        .as_ref()
+        .map(|a| a.to_string_lossy().contains('$'))
+        .unwrap_or(false)
+    {
+        let expanded = vars.expand(&loc.alias.as_ref().unwrap().to_string_lossy());
+        let mut l = loc.clone();
+        l.alias = Some(std::path::PathBuf::from(expanded));
+        alias_owned = l;
+        &alias_owned
+    } else {
+        loc
+    };
     let out = match static_file::respond_indexed(req, path, loc, http, index_ref) {
         Ok(r) => r,
         Err(_) => error_response(404, server.server_tokens),
@@ -3475,7 +3495,13 @@ pub fn resolve_target<'a>(
 
     if !cur_loc.try_files.is_empty() && !skip_return {
         match try_files_action(req, &cur_path, cur_loc) {
-            Some(TryFilesAction::Serve(uri)) => cur_path = uri,
+            Some(TryFilesAction::Serve(uri)) => {
+                // nginx keeps `add_uri_to_alias` set for the rest of the
+                // request: the final static serve appends the URI to the
+                // regex location's alias.
+                req.add_uri_to_alias.store(true, std::sync::atomic::Ordering::Relaxed);
+                cur_path = uri;
+            }
             Some(TryFilesAction::Redirect(uri)) => {
                 let (p, q) = match uri.split_once('?') {
                     Some((p, q)) => (p.to_string(), q.to_string()),
@@ -3595,7 +3621,7 @@ pub async fn error_page_response(
         &mut custom,
         ConnState {
             requests: 0,
-            started: std::time::Instant::now(),
+        started: std::time::Instant::now(),
         },
         local_addr,
     )
@@ -6042,7 +6068,7 @@ fn try_files_action(req: &Request, path: &str, loc: &LocCfg) -> Option<TryFilesA
             format!("/{uri}")
         };
 
-        let fs_path = static_file::map_path(&uri, loc);
+        let fs_path = static_file::map_path_flagged(&uri, loc, true);
         // `disable_symlinks` refuses the open, and try_files moves on to the
         // next candidate -- `/try_on/try` is such a case: the symlink is
         // rejected and `$uri.html` answers.

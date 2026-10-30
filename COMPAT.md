@@ -3834,3 +3834,28 @@ progress" 补上）、`http_resolver_ipv4.t` 5/5、`http_resolver_cleanup.t`
    拒绝；nginx 允许（运行时经 resolver 解析）。现在有 resolver 时转运行时
    名字目标（与变量目标同路），无 resolver 仍报 nginx 同款配置错误。
    http_resolver_cleanup.t 的整个配置因此能启动。
+
+## 本轮（disable_symlinks 收官：regex-alias 语义 + $server_addr + add_uri_to_alias）
+
+`http_disable_symlinks.t` 29/30 → **30/30**。A/B 26 文件 519/518（25 SAME +
+1 BETTER），bench/all.sh 70/70，单测 178/178。http core 差距至此清零。
+
+1. **regex location 的 `alias` 展开**：`alias %%TESTDIR%%/$1` 此前按字面存储，
+   `$1` 从不展开。现在 route 阶段用位置捕获展开（展开后的 alias 同时是
+   `disable_symlinks from=$document_root` 的比较基准——nginx 的
+   `r->doc_root` 对 regex-alias 就是展开值，\"from= exact match\" 依赖
+   from 与完整路径相等时整体免检）。
+2. **regex-alias 不追加 URI**（nginx 的 map_uri_to_path：regex 位置的 alias
+   就是整个路径）。try_files 模块例外——它置位 `r->add_uri_to_alias` 并
+   **保持到请求结束**，候选与最终 serve 都追加 URI。对应实现：Request 增加
+   `add_uri_to_alias`（AtomicBool），try_files Serve 时置位，
+   respond_indexed 读取；`map_path` 拆出 `map_path_flagged`。
+3. 首版把旗标泛化替换时误伤了 ConnState 的字面量与 TLS 初始化器，逐处还原
+   （教训：盲替换在同名 `started:` 字段上必炸，需按结构体逐个确认）。
+
+### http core 差距清零
+
+resolver 家族（AAAA/CNAME/TTL/cleanup/ipv4=ipv6=）、listen 端口范围、
+$server_addr、disable_symlinks 全部与 nginx 一致。剩余差距集中在：
+stream 深层指令（179 条中的大部分）、HTTP/2 帧级（h2 crate 拥有）、
+gRPC 上游帧、TLS OCSP/CRL/stapling、upstream max_conns/resolve。

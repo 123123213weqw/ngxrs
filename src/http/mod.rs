@@ -1255,6 +1255,14 @@ async fn access_then_route(
         };
         custom.insert("invalid_referer".to_string(), val.to_string());
     }
+    // $fastcgi_script_name / $fastcgi_path_info are per-location values the
+    // FastCGI module computes from the URI; precompute them so every consumer
+    // (add_header, return, rewrites, logs) sees the same pair.
+    if loc.fastcgi_pass.is_some() {
+        let (script, info) = crate::fastcgi::split_path_pub(path, loc, req);
+        custom.insert("fastcgi_script_name".to_string(), script);
+        custom.insert("fastcgi_path_info".to_string(), info);
+    }
     let check = access_phase(req, loc, server, http, &view!(custom), &mut sets).await;
     if let Some(denied) = check {
         return denied;
@@ -1450,6 +1458,25 @@ fn get_var(name: &str, v: &RwVars<'_>) -> String {
             Some(loc) => static_file::document_root_of(loc)
                 .to_string_lossy()
                 .to_string(),
+            None => String::new(),
+        },
+        // nginx registers these two as ordinary variables, filled by the FastCGI
+        // module's `fastcgi_script_name` / `fastcgi_path_info` get_handlers, so
+        // `add_header X-Script-Name $fastcgi_script_name` works
+        // (`fastcgi_variables.t`). `$uri` ends with `/` -> `fastcgi_index` is
+        // appended.
+        "fastcgi_script_name" => match v.loc {
+            Some(loc) => {
+                let (script, _) = crate::fastcgi::split_path_pub(v.path, loc, v.req);
+                script
+            }
+            None => String::new(),
+        },
+        "fastcgi_path_info" => match v.loc {
+            Some(loc) => {
+                let (_, info) = crate::fastcgi::split_path_pub(v.path, loc, v.req);
+                info
+            }
             None => String::new(),
         },
         "request_filename" => match v.loc {

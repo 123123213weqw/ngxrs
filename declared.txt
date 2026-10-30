@@ -1,0 +1,269 @@
+# Declared conformance list.
+#
+# Scope: what the reference build can actually do, not "an nginx default".
+# The baseline is configured (see BENCH.md) with
+#   --with-http_realip_module --with-http_auth_request_module
+#   --with-http_slice_module --with-http_sub_module
+#   --with-http_secure_link_module --with-http_dav_module
+#   --with-http_stub_status_module --with-http_gzip_static_module
+#   --with-threads --with-stream --with-stream_ssl_module
+#   --with-stream_realip_module --with-mail --with-mail_ssl_module
+# so those modules are IN scope; anything the reference cannot be built to
+# expose (lua, njs, perl, xslt, image_filter, mp4, geoip, ...) is out.
+#
+# Selection rule, applied mechanically from a full 348-file scan:
+#   1. the suite is inside the scope above;
+#   2. BOTH servers emitted at least one assertion (a suite that skips on both
+#      sides proves nothing and is excluded -- see the SKIP bucket);
+#   3. no assertion passes on nginx and fails on ngxrs (WORSE = 0);
+#   4. the run is not truncated on our side (TRUNC = 0), i.e. both sides emitted
+#      the same number of assertion lines.
+# Files where BOTH servers fail some assertions are allowed and kept: the
+# criterion is "nginx passes and ngxrs does not", not absolute conformance.
+#
+# Counts are the last measured ngxrs result.
+
+# ---- http core ----
+http_absolute_redirect.t
+http_error_page.t
+http_headers_multi.t
+http_include.t
+http_keepalive.t
+http_keepalive_shutdown.t
+http_location.t
+http_location_auto.t
+http_server_name.t
+http_try_files.t
+http_uri.t
+http_variables.t
+
+# ---- realip ----
+# `set_real_ip_from` accepts an address, a CIDR, a hostname resolved at
+# configuration time, and `unix:`; the peer must be trusted before its header
+# is believed, which decides `$remote_addr` and therefore `allow`/`deny`,
+# the limit_req/limit_conn keys and access_log.
+realip.t
+realip_hostname.t
+realip_remote_addr.t
+realip_remote_port.t
+
+# ---- rewrite / if ----
+# `if` operators: truthiness, `=`/`!=`, `~`/`~*`/`!~`/`!~*`, and the file
+# tests (`-f -d -e -x` and their `!` forms), whose operand is a path with
+# variables in it.
+rewrite_if.t
+
+# ---- stream PROXY protocol & TLS variables ----
+# `listen ... proxy_protocol` on the stream side (input), `$proxy_protocol_*`
+# including TLVs, the header written before a TLS handshake when `proxy_ssl` and
+# `proxy_protocol` are both on, and the `$ssl_*` facts a terminated connection
+# reports.
+stream_proxy_protocol.t
+stream_proxy_protocol_ssl.t
+stream_proxy_protocol_ipv6.t
+stream_proxy_protocol2_tlv.t
+stream_ssl_variables.t
+stream_proxy_ssl_name_complex.t
+
+# ---- stream geo / map ----
+# `geo` (CIDR and `ranges`, `default`, `delete`, `include`) and `map` in
+# `stream {}` context, plus repeated `listen` in one stream server.
+stream_geo.t
+stream_map.t
+stream_set.t
+stream_split_clients.t
+
+# ---- request_id / access_log ----
+# `$request_id` (one 32-hex id per request, shared with subrequests and the log),
+# and the log writer's details: longest-match variable expansion, `${name}`,
+# `if=`, per-format `escape=`, dynamic log paths, and `-` for a not-found
+# variable in the default escape mode.
+request_id.t
+# The log writer end to end: `if=`, per-format `escape=`, dynamic log paths,
+# and `open_log_file_cache` (a handle cached within `valid` keeps writing to the
+# inode after the path is renamed away; `min_uses` and `max` decide which paths
+# get that treatment).
+access_log.t
+access_log_variables.t
+
+# ---- stream upstream balancers ----
+# `max_conns` (per-peer cap, two-pool primary/backup walk), `hash` (both the
+# folded Cache::Memcached expression and the consistent ring), `least_conn`
+# with its smooth-WRR tie-break, and `random two least_conn`.
+# `stream_upstream.t`: the same balancers plus `max_fails`/`fail_timeout`
+# recovery, the single-peer rule, and `$upstream_addr` /
+# `$upstream_bytes_sent` / `$upstream_bytes_received` as per-attempt lists.
+stream_upstream.t
+stream_upstream_max_conns.t
+stream_upstream_hash.t
+stream_upstream_least_conn.t
+stream_upstream_random.t
+
+# ---- charset filter ----
+# `charset` / `source_charset` / `charset_types` / `override_charset` /
+# `charset_map`, including the reverse direction of a declared map (one
+# `charset_map B A` serves B->A and A->B, like nginx's two table registrations).
+charset.t
+# `gzip_static`: a sibling `.gz` replaces the entity, with Content-Type still
+# taken from the original name -- and the combination with charset, where a
+# response that *would* need recoding is left completely alone.
+charset_gzip_static.t
+
+# ---- index ----
+# `index` as a complex value, its internal redirect (`$uri` changes), absolute
+# index names, the redirect-cycle 500, and `log_not_found`.
+index.t
+
+# ---- headers ----
+# `add_header` with `always`, the special-header names (`ETag`/`Last-Modified`
+# are *set*, so an empty value clears them), and `expires` in every form
+# including a complex value (`expires $arg_e`).
+headers.t
+
+# ---- request body ----
+# `$request_body` / `$request_body_file` (the body has to be in memory before
+# dispatch, because the variable is read by `add_header` after the upstream
+# answered), `client_body_buffer_size` / `client_body_in_file_only` spilling,
+# `client_max_body_size` for chunked bodies, and chunk-framing validation.
+body.t
+body_chunked.t
+
+# ---- resolver ----
+# A + AAAA in parallel, CNAME following with nginx's `process_a` state machine,
+# TTL/`valid=` caching, per-name server rotation, resend, and TCP fallback on a
+# truncated answer.
+http_resolver.t
+http_resolver_aaaa.t
+
+# ---- autoindex ----
+# `autoindex_format html|json|jsonp|xml`. nginx's JSON/XML bodies are compared
+# byte for byte, including the fact that entry names are emitted as raw UTF-8
+# bytes and only `\\`, `"` and control characters are escaped.
+autoindex_format.t
+
+# ---- PROXY protocol ----
+# `listen ... proxy_protocol` (v1 text and v2 binary with TLVs),
+# `$proxy_protocol_*`, `real_ip_header proxy_protocol`, and `stream`'s
+# `proxy_protocol on`. `allow`/`deny` and the access log follow the rewritten
+# address because nginx's realip runs in POST_READ, before ACCESS.
+proxy_protocol.t
+proxy_protocol2.t
+proxy_protocol2_tlv.t
+proxy_protocol_ipv6.t
+
+# ---- dav ----
+# `dav_methods PUT DELETE MKCOL COPY MOVE`, `dav_access`,
+# `create_full_put_path`, `min_delete_depth`, and the `Depth`/`Overwrite`/
+# `Destination` headers.
+dav.t
+dav_chunked.t
+dav_utf8.t
+
+# ---- secure_link ----
+# Both styles: `secure_link`+`secure_link_md5` (base64url MD5, optional
+# expiry) and the old `secure_link_secret` path form, including inheritance.
+secure_link.t
+
+# ---- sub_filter ----
+# Multiple patterns, longest match first, per-pattern `once`, variables in both
+# operands, and the filter running on proxied responses as well as local ones.
+sub_filter.t
+sub_filter_multi.t
+sub_filter_merge.t
+
+# ---- limit_req / limit_conn ----
+limit_req_dry_run.t
+limit_conn_dry_run.t
+
+# ---- auth ----
+# `auth_basic` including `$apr1$` hashes and a variable in
+# `auth_basic_user_file`; `satisfy` combining auth_basic with auth_request;
+# `auth_request` into proxy, static, cache and FastCGI subrequests.
+auth_basic.t
+auth_request.t
+auth_request_satisfy.t
+auth_request_set.t
+
+# ---- reverse proxy ----
+proxy.t
+proxy_available.t
+proxy_bind.t
+proxy_cache.t
+proxy_cache_bypass.t
+proxy_cache_chunked.t
+proxy_cache_control.t
+proxy_cache_convert_head.t
+proxy_cache_error.t
+proxy_cache_lock.t
+proxy_cache_lock_age.t
+proxy_cache_max_range_offset.t
+proxy_cache_min_free.t
+proxy_cache_path.t
+proxy_cache_range.t
+proxy_cache_revalidate.t
+proxy_cache_use_stale.t
+proxy_cache_valid.t
+proxy_cache_variables.t
+proxy_cache_vary.t
+proxy_chunked_extra.t
+proxy_cookie.t
+proxy_cookie_flags.t
+proxy_duplicate_headers.t
+proxy_force_ranges.t
+proxy_if.t
+proxy_intercept_errors.t
+proxy_limit_rate.t
+proxy_max_temp_file_size.t
+proxy_next_upstream.t
+proxy_noclose.t
+proxy_redirect.t
+proxy_request_buffering_keepalive.t
+proxy_ssi_body.t
+proxy_ssl.t
+proxy_ssl_keepalive.t
+
+# ---- upstream ----
+upstream.t
+upstream_hash.t
+upstream_ip_hash.t
+upstream_keepalive.t
+upstream_least_conn.t
+upstream_random.t
+upstream_zone.t
+upstream_zone_ssl.t
+
+# ---- gzip ----
+gzip.t
+
+# ---- TLS / SNI / HTTP2 ----
+# `h2_host.t` is deliberately absent: its four remaining failures are requests
+# the `h2` crate rejects (RST_STREAM / GOAWAY) before routing, where nginx
+# answers 400. See COMPAT.md "已知偏差" #1 with the repro probe.
+ssl_certificate_chain.t
+ssl_sni.t
+ssl_sni_sessions.t
+h2_proxy_max_temp_file_size.t
+h2_ssl_proxy_cache.t
+
+# ---- fastcgi / grpc ----
+# `fastcgi_pass` may be a complex value (a literal address, an `upstream` name,
+# or `$var`), and a `Location` header without `Status` is a 302.
+fastcgi.t
+fastcgi_body.t
+grpc_pass.t
+
+# ---- stream ----
+stream_error_log.t
+stream_proxy.t
+stream_proxy_ssl.t
+stream_ssl.t
+stream_ssl_verify_client.t
+
+# ---- mail ----
+mail_capability.t
+mail_error_log.t
+mail_imap.t
+mail_pop3.t
+mail_smtp.t
+mail_smtp_greeting_delay.t
+mail_smtp_xclient.t

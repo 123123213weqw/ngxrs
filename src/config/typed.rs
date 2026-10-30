@@ -306,6 +306,15 @@ pub struct LocCfg {
     // ---- fastcgi ----
     pub fastcgi_pass: Option<FastcgiPass>,
     pub fastcgi_params: Vec<FastcgiParam>,
+    /// Whether *this* scope has declared a `fastcgi_param`. nginx inherits the
+    /// parent's parameter list only when the child declares none, so the first
+    /// `fastcgi_param` in a block discards everything inherited
+    /// (`fastcgi_merge_params2.t`).
+    pub fastcgi_params_set: bool,
+    /// `fastcgi_pass_request_headers` (nginx default on): every client request
+    /// header is forwarded as an `HTTP_<NAME>` parameter unless a
+    /// `fastcgi_param` already defines that name.
+    pub fastcgi_pass_request_headers: bool,
     /// `fastcgi_cache <zone>` and its companions. nginx keeps these on their own
     /// location conf (`ngx_http_fastcgi_loc_conf_t.cache`), independent of
     /// `proxy_cache`, so a location can cache one upstream module and not another.
@@ -361,6 +370,12 @@ pub struct LocCfg {
     pub secure_link_secret: Option<String>,
     /// `fastcgi_catch_stderr`: a STDERR substring that turns the reply into 502.
     pub fastcgi_catch_stderr: Vec<String>,
+    /// `fastcgi_keep_conn on`: leave the FastCGI connection open after the
+    /// response so the upstream pool can reuse it.
+    pub fastcgi_keep_conn: bool,
+    /// `fastcgi_next_upstream` flags (`next_upstream::*`); default
+    /// `error timeout` like nginx.
+    pub fastcgi_next_upstream: u32,
     pub fastcgi_connect_timeout: Duration,
     pub fastcgi_read_timeout: Duration,
     // ---- uwsgi / scgi ----
@@ -543,6 +558,8 @@ impl LocCfg {
             proxy_hide_headers: Vec::new(),
             fastcgi_pass: None,
             fastcgi_params: Vec::new(),
+            fastcgi_params_set: false,
+            fastcgi_pass_request_headers: true,
             proxy_request_buffering: true,
             fastcgi_request_buffering: true,
             fastcgi_cache: None,
@@ -565,6 +582,8 @@ impl LocCfg {
             secure_link_md5: None,
             secure_link_secret: None,
             fastcgi_catch_stderr: Vec::new(),
+            fastcgi_keep_conn: false,
+            fastcgi_next_upstream: crate::config::next_upstream::DEFAULT,
             fastcgi_connect_timeout: Duration::from_secs(60),
             fastcgi_read_timeout: Duration::from_secs(60),
             uwsgi_pass: None,
@@ -844,6 +863,9 @@ pub fn compile_rewrite(re_src: &str, replacement: &str, flag: RewriteFlag) -> Op
 pub struct FastcgiPass {
     /// The literal address. Only meaningful when `dynamic` is false.
     pub addr: SocketAddr,
+    /// `fastcgi_pass <upstream>`: the bare name, resolved against the
+    /// upstream table for candidate iteration and the keepalive pool.
+    pub upstream: Option<String>,
     /// The configured value as written. Kept because `fastcgi_pass` accepts a
     /// complex value (`fastcgi_pass $arg_b`) that nginx resolves per request,
     /// against either an `upstream` name or `host:port`.
@@ -1825,6 +1847,10 @@ pub struct StreamServerCfg {
     pub proxy_upload_rate: u64,
     /// `proxy_next_upstream_tries <n>`: peers to try, 0 = unlimited.
     pub next_upstream_tries: u32,
+    /// `tcp_nodelay on|off`: TCP_NODELAY on the upstream connection.
+    pub tcp_nodelay: bool,
+    /// `proxy_half_close on`: keep the other direction alive after an EOF.
+    pub proxy_half_close: bool,
     /// `proxy_pass` containing a variable: resolved per connection.
     pub proxy_pass_var: Option<String>,
     /// `ssl_alpn <proto>...`: ALPN protocols to advertise (`ssl_alpn`).
@@ -2398,6 +2424,25 @@ fn resolve_proxy_upstreams(http: &mut Http) -> Result<(), ConfigError> {
         .collect();
 
     fn fix(cfg: &mut LocCfg, lookup: &HashMap<String, usize>) -> Result<(), ConfigError> {
+        // A bare  was kept as a name: now that the
+        // upstream table is complete, an unknown name is a config error, the
+        // same as nginx reports at parse time.
+        if let Some(fcgi) = cfg.fastcgi_pass.as_ref() {
+            let bare = fcgi.dynamic
+                && !fcgi.spec.contains('$')
+                && !fcgi.spec.contains(':')
+                && !fcgi.spec.starts_with("unix:");
+            if bare && !lookup.contains_key(&fcgi.spec) {
+                return Err(ConfigError::Semantic {
+                    file: PathBuf::from("<config>"),
+                    line: 0,
+                    msg: format!(
+                        "fastcgi_pass refers to unknown upstream [{}]",
+                        fcgi.spec
+                    ),
+                });
+            }
+        }
         if let (Some(name), Some(pp)) = (cfg.proxy_upstream_name.clone(), cfg.proxy_pass.as_mut()) {
             match lookup.get(&name) {
                 Some(&idx) => {
@@ -3711,6 +3756,7 @@ impl Builder {
                 if v.contains('$') {
                     cfg.fastcgi_pass = Some(FastcgiPass {
                         addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                        upstream: None,
                         spec: v.clone(),
                         dynamic: true,
                         unix: None,
@@ -3722,6 +3768,20 @@ impl Builder {
                     let unix = v.strip_prefix("unix:").map(|p| {
                         std::sync::Arc::new(std::path::PathBuf::from(p))
                     });
+                    // : a bare name is an 
+                    // lookup. Upstreams may be declared after this location,
+                    // so it is kept as a name and validated in the resolve
+                    // pass (nginx rejects an unknown one at config time too).
+                    if unix.is_none() && !v.contains(':') && !v.contains('/') {
+                        cfg.fastcgi_pass = Some(FastcgiPass {
+                            addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                            upstream: Some(v.clone()),
+                            spec: v.clone(),
+                            dynamic: true,
+                            unix: None,
+                        });
+                        return Ok(true);
+                    }
                     let addr = if unix.is_some() {
                         SocketAddr::from(([127, 0, 0, 1], 0))
                     } else {
@@ -3735,6 +3795,7 @@ impl Builder {
                     };
                     cfg.fastcgi_pass = Some(FastcgiPass {
                         addr,
+                        upstream: None,
                         spec: v.clone(),
                         dynamic: false,
                         unix,
@@ -3981,6 +4042,41 @@ impl Builder {
                 cfg.secure_link_secret = d.args.first().cloned();
                 cfg.secure_link_secret_set = true;
             }
+            "fastcgi_keep_conn" => {
+                let v = d
+                    .args
+                    .first()
+                    .ok_or_else(|| sem(&d.file, d.line, "fastcgi_keep_conn requires on|off"))?;
+                cfg.fastcgi_keep_conn = match v.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => {
+                        return Err(sem(
+                            &d.file,
+                            d.line,
+                            format!("invalid value \"{v}\" in fastcgi_keep_conn"),
+                        ))
+                    }
+                };
+            }
+            "fastcgi_next_upstream" => {
+                let mut flags = 0u32;
+                for a in &d.args {
+                    flags |= match a.as_str() {
+                        "off" => next_upstream::OFF,
+                        "error" => next_upstream::ERROR,
+                        "timeout" => next_upstream::TIMEOUT,
+                        "invalid_header" => next_upstream::INVALID_HEADER,
+                        "http_500" => next_upstream::HTTP_500,
+                        "http_503" => next_upstream::HTTP_503,
+                        "http_403" => next_upstream::HTTP_403,
+                        "http_404" => next_upstream::HTTP_404,
+                        "non_idempotent" => next_upstream::NON_IDEMPOTENT,
+                        _ => 0,
+                    };
+                }
+                cfg.fastcgi_next_upstream = flags;
+            }
             "fastcgi_catch_stderr" => {
                 // nginx buffers STDERR and answers 502 when it contains one of
                 // these strings (`ngx_http_fastcgi_module`'s
@@ -3990,7 +4086,29 @@ impl Builder {
                     cfg.fastcgi_catch_stderr.push(v.clone());
                 }
             }
+            "fastcgi_pass_request_headers" => {
+                let v = d.args.first().ok_or_else(|| {
+                    sem(&d.file, d.line, "fastcgi_pass_request_headers requires on|off")
+                })?;
+                cfg.fastcgi_pass_request_headers = match v.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => {
+                        return Err(sem(
+                            &d.file,
+                            d.line,
+                            format!("invalid value \"{v}\" in \"fastcgi_pass_request_headers\""),
+                        ))
+                    }
+                };
+            }
             "fastcgi_param" => {
+                // The first parameter of this scope replaces the inherited list
+                // wholesale -- nginx merges the *config*, not the arrays.
+                if !cfg.fastcgi_params_set {
+                    cfg.fastcgi_params.clear();
+                    cfg.fastcgi_params_set = true;
+                }
                 if d.args.len() < 2 {
                     return Err(sem(
                         &d.file,
@@ -4236,7 +4354,6 @@ impl Builder {
             | "fastcgi_intercept_errors"
             | "fastcgi_pass_request_body"
             | "fastcgi_pass_request_headers"
-            | "fastcgi_keep_conn"
             | "fastcgi_store"
             | "fastcgi_store_access"
             | "fastcgi_cache_no_cache"
@@ -4526,6 +4643,9 @@ impl Builder {
         };
 
         let mut cfg = parent.clone();
+        // The inherited parameter list survives until this scope declares one of
+        // its own (see `fastcgi_params_set`).
+        cfg.fastcgi_params_set = false;
         // `sub_filter` entries accumulate, with this scope's own rules first and
         // the inherited ones after (nginx's merge order). Each rule sees the
         // previous rule's output, so getting this backwards makes a location's
@@ -5079,6 +5199,10 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
     // nginx defaults both to 0, meaning unlimited.
     let mut stream_download_rate: u64 = 0;
     let mut stream_upload_rate: u64 = 0;
+    // `tcp_nodelay` defaults to on in ngx_stream_proxy_module;
+    // `proxy_half_close` defaults to off.
+    let mut stream_tcp_nodelay = true;
+    let mut stream_half_close = false;
     let mut stream_session_reuse = true;
     let mut stream_connect_timeout = std::time::Duration::from_secs(60);
     // nginx's stream default proxy_timeout is 10m.
@@ -5213,6 +5337,12 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                     section.resolver = Some(std::sync::Arc::new(r));
                 }
             }
+            "tcp_nodelay" => {
+                stream_tcp_nodelay = d.args.first().map(|v| v == "on").unwrap_or(true);
+            }
+            "proxy_half_close" => {
+                stream_half_close = d.args.first().map(|v| v == "on").unwrap_or(false);
+            }
             "proxy_download_rate" | "proxy_upload_rate" => {
                 if let Some(v) = d.args.first().and_then(|a| a.parse::<u64>().ok()) {
                     if d.name == "proxy_download_rate" {
@@ -5339,6 +5469,8 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             ssl_alpn: Vec::new(),
             next_upstream_tries: 0,
             proxy_pass_var: None,
+            tcp_nodelay: stream_tcp_nodelay,
+            proxy_half_close: stream_half_close,
             proxy_download_rate: stream_download_rate,
             proxy_upload_rate: stream_upload_rate,
             realip_from: stream_realip_from.clone(),
@@ -5420,6 +5552,12 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                         cfg.listen_proxy_protocol = true;
                     }
                     have_listen = true;
+                }
+                "tcp_nodelay" => {
+                    cfg.tcp_nodelay = child.args.first().map(|v| v == "on").unwrap_or(true);
+                }
+                "proxy_half_close" => {
+                    cfg.proxy_half_close = child.args.first().map(|v| v == "on").unwrap_or(false);
                 }
                 "proxy_next_upstream_tries" => {
                     if let Some(v) = child.args.first().and_then(|a| a.parse::<u32>().ok()) {

@@ -349,6 +349,8 @@ pub fn serve(cfg: Config) -> io::Result<()> {
             proxy_timeout: sc.proxy_timeout,
             proxy_connect_timeout: sc.proxy_connect_timeout,
             next_upstream_tries: sc.next_upstream_tries,
+            tcp_nodelay: sc.tcp_nodelay,
+            proxy_half_close: sc.proxy_half_close,
             proxy_pass_var: if sc.proxy_pass.as_deref().is_some_and(|p| p.contains('$')) {
                 sc.proxy_pass.clone()
             } else {

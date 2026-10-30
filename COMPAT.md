@@ -3695,3 +3695,49 @@ $s->io('PROXY INVALID');
 TEST_LIST="stream_status_variable.t stream_limit_conn.t" bash bench/nginxtests.sh
 # 均 SAME
 ```
+
+## 本轮（FastCGI 收尾：上游迭代、keepalive 池、参数变量收口）
+
+接手工作树里未提交的一轮（FastCGI 参数体系：HTTP_* 头参数转发、
+fastcgi_pass_request_headers、参数继承合并、缓存条件头注入——
+fastcgi_header_params/merge_params/merge_params2 据此打平），本轮补完剩余缺口。
+A/B 32 文件 333/333 全部一致，bench/all.sh 70/70，单测 178/178。
+
+### 四个套件打平
+
+| 套件 | 修前 | 修后 | nginx |
+|---|---|---|---|
+| fastcgi_variables.t | 2/5 | **5/5** | 5/5 |
+| fastcgi_split.t | 2/3 | **3/3** | 3/3 |
+| fastcgi_keepalive.t | 0/8（配置都起不来） | **8/8** | 8/8 |
+| fastcgi_body2.t | 2/4 | **4/4** | 4/4 |
+
+1. **`fastcgi_pass <upstream>`**（裸组名）：配置期被 parse_listen 拒绝，
+   fastcgi_keepalive/split/body2 三个套件连配置都起不来。裸名（无 `: `、无
+   `/`、无变量）按候选 upstream 名接受，resolve 期对未知名字报 nginx 同款
+   配置错误。
+2. **$fastcgi_script_name / $fastcgi_path_info**：此前只在 rewrite 阶段可求值，
+   add_header 里输出字面模板。现在 access 阶段按位置预计算（含 fastcgi_index
+   的 `uri 以 / 结尾则追加 index` 规则），add_header/return/日志全链路可见；
+   FastCGI 响应头的 add_header 路径（无变量上下文）单独展开这两个变量。
+3. **fastcgi_next_upstream**：fetch 路径改为候选迭代——裸组名按
+   select_order（轮转 + backup 尾随 + max_fails 出局）展开；连接失败/超时、
+   读超时、**响应无头块（invalid_header）** 都按位标志决定重试；成功/失败都记
+   max_fails（与 proxy 共用 peer_mark）。split 的 `invalid_header` 与 body2 的
+   默认 `error timeout`（daemon 故意睡 3s 触发 1s 读超时转 backup）都因此打平。
+   流式请求体（request_buffering off）不重试（body 已消耗）。
+4. **fastcgi_keep_conn + 上游 keepalive 池**：FCGI_KEEP_CONN 标志按指令置位；
+   TCP 连接按 upstream server 地址入池/复用（容量 = upstream keepalive），
+   HEAD 之后不入池（nginx 不读 HEAD 响应体，连接作废——"new connection
+   after HEAD"）。修注：首版 checkin 条件误写成"仅复用连接才入池"，新建连接
+   永不入池，池形同虚设——单请求探针测不出来，靠套件的跨请求计数暴露。
+
+### 顺带
+
+- `parse_time` 无关的一个此前会话遗留：`expires modified +1h` 的加号前缀。
+- 单测 122 → 178（作者未提交轮次包含新增单元测试）。
+
+### 仍开着的缺口（与基线二进制对照确认非本轮回归）
+
+- `fastcgi_request_buffering.t` 16/17、`fastcgi_request_buffering_chunked.t`
+  17/21：与 cc9c349 基线二进制逐套件对照完全相同——存量，后续轮次处理。

@@ -214,6 +214,19 @@ fn expand(spec: &str, v: &Vars<'_>) -> String {
 }
 
 /// Split SCRIPT_NAME / PATH_INFO the way `fastcgi_split_path_info` does.
+/// `$fastcgi_script_name` / `$fastcgi_path_info` for this request, including the
+/// `fastcgi_index` rule: a URI ending in `/` gets the index appended.
+pub fn split_path_pub(path: &str, loc: &LocCfg, req: &Request) -> (String, String) {
+    let _ = req;
+    let (script, info) = split_path(path, loc);
+    if path.ends_with('/') {
+        if let Some(index) = loc.fastcgi_index.as_deref() {
+            return (format!("{path}{index}"), String::new());
+        }
+    }
+    (script, info)
+}
+
 fn split_path(path: &str, loc: &LocCfg) -> (String, String) {
     if let Some(re) = &loc.fastcgi_split_path_info {
         if let Some(caps) = re.captures(path) {
@@ -363,10 +376,26 @@ pub async fn fetch(
     // through `finalize_response` -- so `add_header` has to be applied here, the
     // way the proxy module does it.
     {
+        // add_header values may reference $fastcgi_script_name /
+        // $fastcgi_path_info; the generic add-header context has no location,
+        // so the two FastCGI-owned variables are expanded here.
+        let chr36 = char::from_u32(0x24).unwrap();
+        let (script, info) = split_path_pub(path, loc, req);
+        let hdrs: Vec<(String, String)> = loc
+            .headers
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    v.replace(&format!("{}fastcgi_script_name", chr36), &script)
+                        .replace(&format!("{}fastcgi_path_info", chr36), &info),
+                )
+            })
+            .collect();
         let resp_headers = crate::http::split_head(&out.0.raw);
         crate::http::apply_add_headers_full(
             &mut out.0.raw,
-            &loc.headers,
+            &hdrs,
             out.0.status,
             cache_status,
             "",
@@ -481,6 +510,86 @@ fn mark_cache_status(resp: &mut Response, status: &str) {
     resp.cache_status = Some(status.to_string());
 }
 
+
+
+// ---- upstream candidates, next_upstream retries, keepalive pool ----------
+
+/// Why one FastCGI attempt failed; decides the `fastcgi_next_upstream` retry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FcgiFail {
+    ConnectFailed,
+    ConnectTimeout,
+}
+
+fn fcgi_pool() -> &'static std::sync::Mutex<
+    std::collections::HashMap<
+        std::net::SocketAddr,
+        Vec<(tokio::net::TcpStream, std::time::Instant)>,
+    >,
+> {
+    static P: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                std::net::SocketAddr,
+                Vec<(tokio::net::TcpStream, std::time::Instant)>,
+            >,
+        >,
+    > = std::sync::OnceLock::new();
+    P.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn fcgi_checkout(key: std::net::SocketAddr) -> Option<tokio::net::TcpStream> {
+    let mut guard = fcgi_pool().lock().ok()?;
+    let list = guard.get_mut(&key)?;
+    while let Some((s, t)) = list.pop() {
+        if t.elapsed() < std::time::Duration::from_secs(50) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+fn fcgi_checkin(key: std::net::SocketAddr, s: tokio::net::TcpStream, cap: usize) {
+    if cap == 0 {
+        return;
+    }
+    if let Ok(mut guard) = fcgi_pool().lock() {
+        let list = guard.entry(key).or_default();
+        if list.len() < cap {
+            list.push((s, std::time::Instant::now()));
+        }
+    }
+}
+
+/// Connect to one candidate (TCP with the connect timeout, or a unix socket).
+async fn connect_cand(target: &DynTarget, loc: &LocCfg) -> Result<FcgiConn, FcgiFail> {
+    match target {
+        DynTarget::Tcp(addr) => {
+            match tokio::time::timeout(loc.fastcgi_connect_timeout, TcpStream::connect(*addr)).await
+            {
+                Ok(Ok(s)) => {
+                    let _ = s.set_nodelay(true);
+                    Ok(FcgiConn::Tcp(s))
+                }
+                Ok(Err(_)) => Err(FcgiFail::ConnectFailed),
+                Err(_) => Err(FcgiFail::ConnectTimeout),
+            }
+        }
+        DynTarget::Unix(path) => {
+            match tokio::time::timeout(
+                loc.fastcgi_connect_timeout,
+                tokio::net::UnixStream::connect(path),
+            )
+            .await
+            {
+                Ok(Ok(s)) => Ok(FcgiConn::Unix(s)),
+                Ok(Err(_)) => Err(FcgiFail::ConnectFailed),
+                Err(_) => Err(FcgiFail::ConnectTimeout),
+            }
+        }
+    }
+}
+
 async fn fetch_uncached(
     req: &Request,
     path: &str,
@@ -518,88 +627,217 @@ async fn fetch_uncached(
         slice_range,
     };
 
-    // `fastcgi_pass $var` is resolved here, once the variables are known. The
-    // value may be an `upstream` name or a literal `host:port`.
-    // The target is either a TCP address or a unix socket path.
-    let target: DynTarget = if fcgi.dynamic {
+    // A bare `fastcgi_pass <upstream>` iterates the group: next_upstream
+    // retries, backups, max_fails. Anything else stays a single target.
+    let client_ip: std::net::IpAddr =
+        peer_ip.parse().unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
+    let mut up_order: Option<(usize, Vec<usize>)> = None;
+    if let Some(upname) = &fcgi.upstream {
+        let Some(ui) = http.upstreams.iter().position(|u| &u.name == upname) else {
+            return Some((error_response(502), true));
+        };
+        let up = &http.upstreams[ui];
+        let Some(order) = crate::proxy::select_order(up, ui, &client_ip, None) else {
+            return Some((error_response(502), true));
+        };
+        up_order = Some((ui, order));
+    }
+    let candidates_len: usize = up_order.as_ref().map(|(_, o)| o.len()).unwrap_or(1);
+    let pool_cap: usize = if loc.fastcgi_keep_conn {
+        up_order
+            .as_ref()
+            .map(|(ui, _)| http.upstreams[*ui].keepalive)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let can_retry = body_stream.is_none();
+    let nu = loc.fastcgi_next_upstream;
+    let head_only = req.method == crate::http::request::Method::Head;
+    let mut static_target: Option<DynTarget> = if fcgi.upstream.is_some() {
+        None
+    } else if fcgi.dynamic {
         let value = expand(&fcgi.spec, &vars);
         match resolve_dyn(&value, http) {
-            Some(t) => t,
+            Some(t) => Some(t),
             None => {
                 eprintln!("ngxrs: [error] fastcgi_pass \"{value}\" is not a resolvable address");
                 return Some((error_response(502), true));
             }
         }
     } else if let Some(path) = &fcgi.unix {
-        DynTarget::Unix(path.as_ref().clone())
+        Some(DynTarget::Unix(path.as_ref().clone()))
     } else {
-        DynTarget::Tcp(fcgi.addr)
+        Some(DynTarget::Tcp(fcgi.addr))
     };
 
-    let mut params: Vec<(String, String)> = Vec::with_capacity(loc.fastcgi_params.len() + 8);
+    let mut params: Vec<(String, String)> = Vec::with_capacity(loc.fastcgi_params.len() + 16);
     params.push(("GATEWAY_INTERFACE".to_string(), "CGI/1.1".to_string()));
     for p in &loc.fastcgi_params {
         let FastcgiParam { name, value } = p;
         params.push((name.clone(), expand(value, &vars)));
     }
 
-    // ---- send it ----
-    let mut stream = match &target {
-        DynTarget::Tcp(addr) => {
-            match tokio::time::timeout(loc.fastcgi_connect_timeout, TcpStream::connect(*addr)).await
+    // `$upstream_cache_last_modified` / `$upstream_cache_etag` are only defined
+    // for a revalidated entry; with nothing cached they expand to the empty
+    // string, and nginx's `skip_empty` then omits the parameter entirely
+    // (`fastcgi_merge_params.t`, "if-modified-since cleared with cache").
+    let mut skip_empty: Vec<String> = Vec::new();
+    if loc.fastcgi_cache.is_some() {
+        // `ngx_http_fastcgi_cache_headers`: added only when the user's own
+        // `fastcgi_param` list does not already define the name, and they both
+        // suppress the client-header passthrough below and replace the value.
+        for (name, val) in [
+            ("HTTP_IF_MODIFIED_SINCE", ""),
+            ("HTTP_IF_UNMODIFIED_SINCE", ""),
+            ("HTTP_IF_NONE_MATCH", ""),
+            ("HTTP_IF_MATCH", ""),
+            ("HTTP_RANGE", ""),
+            ("HTTP_IF_RANGE", ""),
+        ] {
+            if params
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case(name))
             {
-                Ok(Ok(s)) => {
-                    let _ = s.set_nodelay(true);
-                    FcgiConn::Tcp(s)
-                }
-                Ok(Err(e)) => {
-                    eprintln!("ngxrs: [error] fastcgi connect {addr} failed: {e}");
-                    return Some((error_response(502), true));
-                }
-                Err(_) => {
-                    eprintln!("ngxrs: [error] fastcgi connect {addr} timed out");
-                    return Some((error_response(504), true));
-                }
+                continue;
             }
+            params.push((name.to_string(), val.to_string()));
+            skip_empty.push(name.to_string());
         }
-        DynTarget::Unix(path) => {
-            match tokio::time::timeout(
-                loc.fastcgi_connect_timeout,
-                tokio::net::UnixStream::connect(path),
-            )
-            .await
-            {
-                Ok(Ok(s)) => FcgiConn::Unix(s),
-                Ok(Err(e)) => {
-                    eprintln!(
-                        "ngxrs: [error] fastcgi connect unix:{} failed: {e}",
-                        path.display()
-                    );
-                    return Some((error_response(502), true));
-                }
-                Err(_) => {
-                    eprintln!(
-                        "ngxrs: [error] fastcgi connect unix:{} timed out",
-                        path.display()
-                    );
-                    return Some((error_response(504), true));
-                }
-            }
-        }
-    };
+    }
 
+    // `fastcgi_pass_request_headers` (default on): every client header becomes an
+    // `HTTP_<NAME>` parameter -- uppercase, `-` to `_` -- unless a parameter of
+    // that name already exists. Repeated headers are joined with ", " in request
+    // order, which is what `ngx_http_link_multi_headers` produces
+    // (`fastcgi_header_params.t`).
+    if loc.fastcgi_pass_request_headers {
+        let mut order: Vec<String> = Vec::new();
+        let mut joined: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        // Repeated headers are joined by ", " -- except `Cookie`, which uses "; ".
+        // nginx writes the separator per header (`ngx_http_fastcgi_create_request`
+        // emits "; " for cookies), and the distinction is asserted directly
+        // (`fastcgi_header_params.t`).
+        for (k, v) in req.headers.iter() {
+            let mut name = String::with_capacity(5 + k.len());
+            name.push_str("HTTP_");
+            for c in k.bytes() {
+                name.push(match c {
+                    b'-' => '_',
+                    c => c.to_ascii_uppercase() as char,
+                });
+            }
+            if params.iter().any(|(p, _)| p.eq_ignore_ascii_case(&name)) {
+                continue;
+            }
+            let sep = if name == "HTTP_COOKIE" { "; " } else { ", " };
+            match joined.get_mut(&name) {
+                Some(prev) => {
+                    prev.push_str(sep);
+                    prev.push_str(v);
+                }
+                None => {
+                    joined.insert(name.clone(), v.to_string());
+                    order.push(name);
+                }
+            }
+        }
+        for name in order {
+            let v = joined.remove(&name).unwrap_or_default();
+            params.push((name, v));
+        }
+    }
+
+    // ---- send it (with fastcgi_next_upstream iteration) ----
+    let mut attempt: usize = 0;
+    let (stdout, caught_stderr) = 'attempts: loop {
+        let (cand_target, up_mark, cand_addr): (DynTarget, Option<(usize, usize)>, Option<std::net::SocketAddr>) =
+            match &up_order {
+                Some((ui, order)) => {
+                    let sidx = order[attempt.min(order.len() - 1)];
+                    let s = &http.upstreams[*ui].servers[sidx];
+                    (DynTarget::Tcp(s.addr), Some((*ui, sidx)), Some(s.addr))
+                }
+                None => (static_target.take().expect("single fastcgi target"), None, None),
+            };
+        // ---- connect: pool checkout first, else a fresh connection ----
+        let mut stream = {
+            let checkout_key = match &cand_target {
+                DynTarget::Tcp(a) if pool_cap > 0 => Some(*a),
+                _ => None,
+            };
+            if let Some(key) = checkout_key {
+                match fcgi_checkout(key) {
+                    Some(s) => FcgiConn::Tcp(s),
+                    None => match connect_cand(&cand_target, loc).await {
+                        Ok(s) => s,
+                        Err(kind) => {
+                            let (resp, retryable) = match kind {
+                                FcgiFail::ConnectFailed => (
+                                    error_response(502),
+                                    nu & crate::config::next_upstream::ERROR != 0,
+                                ),
+                                FcgiFail::ConnectTimeout => (
+                                    error_response(504),
+                                    nu & crate::config::next_upstream::TIMEOUT != 0,
+                                ),
+                            };
+                            if let Some((ui, si)) = up_mark {
+                                crate::proxy::peer_mark(ui, si, true);
+                            }
+                            if attempt + 1 < candidates_len && can_retry && retryable {
+                                attempt += 1;
+                                continue 'attempts;
+                            }
+                            return Some((resp, true));
+                        }
+                    },
+                }
+            } else {
+                match connect_cand(&cand_target, loc).await {
+                    Ok(s) => s,
+                    Err(kind) => {
+                            let (resp, retryable) = match kind {
+                                FcgiFail::ConnectFailed => (
+                                    error_response(502),
+                                    nu & crate::config::next_upstream::ERROR != 0,
+                                ),
+                                FcgiFail::ConnectTimeout => (
+                                    error_response(504),
+                                    nu & crate::config::next_upstream::TIMEOUT != 0,
+                                ),
+                            };
+                            if let Some((ui, si)) = up_mark {
+                                crate::proxy::peer_mark(ui, si, true);
+                            }
+                            if attempt + 1 < candidates_len && can_retry && retryable {
+                                attempt += 1;
+                                continue 'attempts;
+                            }
+                            return Some((resp, true));
+                    }
+                }
+            }
+        };
     let req_id: u16 = 1;
     let mut out = Vec::with_capacity(4096);
     let mut begin = Vec::with_capacity(8);
     begin.extend_from_slice(&FCGI_RESPONDER.to_be_bytes());
-    begin.push(0); // flags: no keep-alive
+    begin.push(u8::from(loc.fastcgi_keep_conn)); // FCGI_KEEP_CONN
     begin.extend_from_slice(&[0u8; 5]);
     write_record(&mut out, FCGI_BEGIN_REQUEST, req_id, &begin);
+    if !skip_empty.is_empty() {
+        params.retain(|(k, v)| {
+            !(v.is_empty() && skip_empty.iter().any(|s| s.eq_ignore_ascii_case(k)))
+        });
+    }
+
     for chunk in encode_params(&params) {
         write_record(&mut out, FCGI_PARAMS, req_id, &chunk);
     }
     write_record(&mut out, FCGI_PARAMS, req_id, &[]);
     if body_stream.is_none() && !body.is_empty() {
+        eprintln!("ngxrs: [dbg-body] buffered body={} cl={:?}", body.len(), params.iter().find(|(k,_)| k=="CONTENT_LENGTH").map(|(_,v)| v));
         write_record(&mut out, FCGI_STDIN, req_id, &body);
     }
     if body_stream.is_none() {
@@ -633,9 +871,9 @@ async fn fetch_uncached(
     // Unbuffered: BEGIN + PARAMS are already on the wire (so the responder can
     // start), and each body chunk travels as its own STDIN record as the client
     // produces it.
-    if let Some((conn, mut left)) = body_stream {
-        while left > 0 {
-            let want = left.min(64 * 1024) as usize;
+    if let Some((conn, left)) = body_stream.as_mut() {
+        while *left > 0 {
+            let want = (*left).min(64 * 1024) as usize;
             let chunk = match conn.take_available(want).await {
                 Ok(c) => c,
                 Err(e) => {
@@ -647,7 +885,7 @@ async fn fetch_uncached(
                 eprintln!("ngxrs: [error] client closed before the request body was complete");
                 return Some((error_response(502), true));
             }
-            left -= chunk.len() as u64;
+            *left -= chunk.len() as u64;
             crate::proxy::retain_streamed_pub(req, &chunk, cap);
             let mut rec = Vec::with_capacity(chunk.len() + 8);
             write_record(&mut rec, FCGI_STDIN, req_id, &chunk);
@@ -677,10 +915,30 @@ async fn fetch_uncached(
             Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => break,
             Ok(Err(e)) => {
                 eprintln!("ngxrs: [error] fastcgi read failed: {e}");
+                if let Some((ui, si)) = up_mark {
+                    crate::proxy::peer_mark(ui, si, true);
+                }
+                if attempt + 1 < candidates_len
+                    && can_retry
+                    && nu & crate::config::next_upstream::ERROR != 0
+                {
+                    attempt += 1;
+                    continue 'attempts;
+                }
                 return Some((error_response(502), true));
             }
             Err(_) => {
                 crate::log::log_global(crate::log::Level::Error, "fastcgi read timed out");
+                if let Some((ui, si)) = up_mark {
+                    crate::proxy::peer_mark(ui, si, true);
+                }
+                if attempt + 1 < candidates_len
+                    && can_retry
+                    && nu & crate::config::next_upstream::TIMEOUT != 0
+                {
+                    attempt += 1;
+                    continue 'attempts;
+                }
                 return Some((error_response(504), true));
             }
         }
@@ -734,6 +992,35 @@ async fn fetch_uncached(
             _ => {}
         }
     }
+
+        // A response with no header block at all is `invalid_header` for
+        // next_upstream purposes (fastcgi_split.t).
+        if !stdout.is_empty() && !stdout.contains(&b':') {
+            if let Some((ui, si)) = up_mark {
+                crate::proxy::peer_mark(ui, si, true);
+            }
+            if attempt + 1 < candidates_len
+                && can_retry
+                && nu & crate::config::next_upstream::INVALID_HEADER != 0
+            {
+                attempt += 1;
+                continue 'attempts;
+            }
+        }
+        if let Some((ui, si)) = up_mark {
+            crate::proxy::peer_mark(ui, si, false);
+        }
+        // A HEAD stops reading at the head, so nginx closes the upstream
+        // connection instead of reusing it (fastcgi_keepalive.t).
+        if pool_cap > 0 && !head_only {
+            if let Some(addr) = cand_addr {
+                if let FcgiConn::Tcp(s) = stream {
+                    fcgi_checkin(addr, s, pool_cap);
+                }
+            }
+        }
+        break (stdout, caught_stderr);
+    };
 
     if caught_stderr {
         return Some((error_response(502), true));

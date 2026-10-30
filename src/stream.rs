@@ -42,6 +42,13 @@ pub struct StreamServer {
     pub limit_conns: Vec<(String, u32)>,
     /// `proxy_next_upstream_tries <n>`: peers to try, 0 = unlimited.
     pub next_upstream_tries: u32,
+    /// `tcp_nodelay on|off`: TCP_NODELAY on the upstream connection (nginx
+    /// default on).
+    pub tcp_nodelay: bool,
+    /// `proxy_half_close on`: an EOF only closes that direction; the opposite
+    /// one keeps running (nginx default off, where the first EOF ends the whole
+    /// session).
+    pub proxy_half_close: bool,
     /// `proxy_pass` with a variable: expanded per connection and resolved with
     /// `resolver`.
     pub proxy_pass_var: Option<String>,
@@ -357,6 +364,8 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                 let resolver = server.resolver.clone();
                 let next_upstream_tries = server.next_upstream_tries;
                 let limit_conns = server.limit_conns.clone();
+                let tcp_nodelay = server.tcp_nodelay;
+                let half_close = server.proxy_half_close;
                 let proxy_pass_var = server.proxy_pass_var.clone();
                 let verify_mode = server.client_verify;
                 let client_ca = server.client_ca.clone();
@@ -624,7 +633,10 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                         match attempt {
                             Ok(u) => {
                                 if let UpConn::Tcp(t) = &u {
-                                    let _ = t.set_nodelay(true);
+                                    // `tcp_nodelay`: the proxy sets this on the
+                                    // upstream connection, and nginx defaults it
+                                    // to on (`stream_tcp_nodelay.t`).
+                                    let _ = t.set_nodelay(tcp_nodelay);
                                 }
                                 upstream = Some(u);
                                 break;
@@ -688,7 +700,7 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                         match attempt {
                             Ok(s) => {
                                 if let UpConn::Tcp(t) = &s {
-                                    let _ = t.set_nodelay(true);
+                                    let _ = t.set_nodelay(tcp_nodelay);
                                 }
                                 // `pick` already counted the connection; the
                                 // guard owns that slot from here on.
@@ -818,10 +830,10 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                                         .await;
                                     // The PROXY header is not counted in
                                     // `$upstream_bytes_sent` by nginx.
-                                    let (a, b) = proxy_tcp(client, upstream, timeout, peer, ul_rate, dl_rate).await;
+                                    let (a, b) = proxy_tcp(client, upstream, timeout, peer, ul_rate, dl_rate, half_close).await;
                                     (a, b)
                                 } else {
-                                    proxy_tcp(client, upstream, timeout, peer, ul_rate, dl_rate).await
+                                    proxy_tcp(client, upstream, timeout, peer, ul_rate, dl_rate, half_close).await
                                 }
                             }
                         }
@@ -1029,7 +1041,7 @@ where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    splice_rated(a, b, 0, 0).await
+    splice_rated(a, b, 0, 0, false).await
 }
 
 /// nginx puts `proxy_*_rate` on the **write** side: reads stay unthrottled and
@@ -1124,6 +1136,7 @@ async fn splice_rated<A, B>(
     mut b: B,
     upload_rate: u64,
     download_rate: u64,
+    half_close: bool,
 ) -> (u64, u64)
 where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -1138,10 +1151,24 @@ where
     // came from `b`, i.e. the upstream.
     let mut sent = 0u64;
     let mut received = 0u64;
+    // With `proxy_half_close on` an EOF closes only that direction, so the
+    // opposite one can still carry data (`stream_proxy_half_close.t` sends from
+    // one side, half-closes, and expects the reply). The default is nginx's:
+    // the first EOF ends the whole session.
+    let (mut a_done, mut b_done) = (false, false);
     loop {
+        if a_done && b_done {
+            break;
+        }
         tokio::select! {
-            r = a.read(&mut ab) => match r {
-                Ok(0) | Err(_) => break,
+            r = a.read(&mut ab), if !a_done => match r {
+                Ok(0) | Err(_) => {
+                    if !half_close {
+                        break;
+                    }
+                    a_done = true;
+                    let _ = b.shutdown().await;
+                }
                 Ok(n) => {
                     if write_paced(&mut b, &ab[..n], &mut up).await.is_err() {
                         break;
@@ -1149,8 +1176,14 @@ where
                     sent += n as u64;
                 }
             },
-            r = b.read(&mut ba) => match r {
-                Ok(0) | Err(_) => break,
+            r = b.read(&mut ba), if !b_done => match r {
+                Ok(0) | Err(_) => {
+                    if !half_close {
+                        break;
+                    }
+                    b_done = true;
+                    let _ = a.shutdown().await;
+                }
                 Ok(n) => {
                     if write_paced(&mut a, &ba[..n], &mut down).await.is_err() {
                         break;
@@ -1505,6 +1538,7 @@ async fn proxy_tcp(
     _peer: SocketAddr,
     upload: u64,
     download: u64,
+    half_close: bool,
 ) -> (u64, u64) {
     // The earlier comment here claimed `copy_bidirectional` returns as soon as
     // one side closes. It does not: it waits for *both* directions, so a backend
@@ -1515,7 +1549,7 @@ async fn proxy_tcp(
     // Rates must reach the paced splice; passing them in and then
     // calling the unlimited `splice` is exactly the bug that left
     // `proxy_download_rate` silently inert.
-    splice_rated(client, upstream, upload, download).await
+    splice_rated(client, upstream, upload, download, half_close).await
 }
 
 async fn serve_udp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {

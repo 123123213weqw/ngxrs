@@ -1897,6 +1897,9 @@ pub struct StreamServerCfg {
     pub proxy_ssl_name: Option<String>,
     /// `return <text>` in a stream server.
     pub return_text: Option<String>,
+    /// `proxy_responses <n>`: upstream answers that complete a UDP session
+    /// (0 = unlimited, session lives until `proxy_timeout`).
+    pub proxy_responses: u32,
     /// `ssl_verify_client`: 0 off, 1 on, 2 optional, 3 optional_no_ca.
     pub ssl_verify_client: u8,
     /// `ssl_client_certificate`: trust anchors for the client chain.
@@ -5297,6 +5300,7 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
     let mut stream_connect_timeout = std::time::Duration::from_secs(60);
     // nginx's stream default proxy_timeout is 10m.
     let mut stream_proxy_timeout = std::time::Duration::from_secs(600);
+    let mut stream_proxy_responses: u32 = 0;
 
     for d in dirs {
         match d.name.as_str() {
@@ -5542,6 +5546,11 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                         crate::config::parse_time(v).unwrap_or(stream_proxy_timeout);
                 }
             }
+            "proxy_responses" => {
+                if let Some(v) = d.args.first() {
+                    stream_proxy_responses = v.parse().unwrap_or(0);
+                }
+            }
             other => b.warn(
                 d,
                 format!("unknown directive \"{other}\" in stream context; ignored"),
@@ -5552,6 +5561,7 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
     for sd in server_dirs {
         let mut per_server_timeout = false;
         let mut per_server_proxy_timeout = false;
+        let mut per_server_responses = false;
         let mut cfg = StreamServerCfg {
             listen: SocketAddr::from(([0, 0, 0, 0], 0)),
             access: Vec::new(),
@@ -5578,6 +5588,7 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             proxy_ssl_name: None,
             return_text: None,
             proxy_timeout: stream_proxy_timeout,
+            proxy_responses: stream_proxy_responses,
             proxy_connect_timeout: Duration::from_secs(60),
             ssl_verify_client: stream_verify_client,
             ssl_client_certificate: stream_client_ca.clone(),
@@ -5756,6 +5767,12 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                 "return" => {
                     cfg.return_text = Some(child.args.join(" "));
                 }
+                "proxy_responses" => {
+                    per_server_responses = true;
+                    if let Some(v) = child.args.first() {
+                        cfg.proxy_responses = v.parse().unwrap_or(0);
+                    }
+                }
                 "error_log" => {
                     if let Some(spec) = parse_log_spec(&b.prefix.clone(), &child.args) {
                         cfg.error_logs.push(spec);
@@ -5823,7 +5840,6 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                 }
                 "proxy_protocol"
                 | "proxy_buffer_size"
-                | "proxy_responses"
                 | "preread_buffer_size"
                 | "preread_timeout"
                 | "set"
@@ -5873,6 +5889,10 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
         }
         if !per_server_proxy_timeout {
             cfg.proxy_timeout = stream_proxy_timeout;
+        }
+        //  inherits independently of the timeout pair.
+        if !per_server_responses {
+            cfg.proxy_responses = stream_proxy_responses;
         }
         // A server that says nothing inherits the `stream {}` default; the
         // directive is off when neither mentions it.

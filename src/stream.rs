@@ -76,6 +76,9 @@ pub struct StreamServer {
     pub tls: Option<std::sync::Arc<rustls::ServerConfig>>,
     /// `return <text>`: answer with this text instead of proxying.
     pub return_text: Option<String>,
+    /// `proxy_responses <n>`: upstream answers that complete a UDP session
+    /// (0 = unlimited, session lives until `proxy_timeout`).
+    pub proxy_responses: u32,
     /// `proxy_ssl on`: speak TLS to the upstream.
     pub proxy_ssl: bool,
     /// `proxy_ssl_session_reuse`: hand the client config to the resumption
@@ -1569,10 +1572,21 @@ async fn serve_udp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
     );
     let sock = Arc::new(sock);
 
-    // Per-client upstream socket so replies can be matched back.
-    let mut sessions: BTreeMap<SocketAddr, Arc<UdpSocket>> = BTreeMap::new();
-    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Per-client session state. The guards live in the session TASK (not
+    // here): the task releases them when the session completes (responses >=
+    // proxy_responses * requests) or times out.
+    struct UdpSession {
+        up: Arc<UdpSocket>,
+        last_seen: std::time::Instant,
+    }
+
+    let mut sessions: BTreeMap<SocketAddr, UdpSession> = BTreeMap::new();
     let mut buf = vec![0u8; 65535];
+    let maps = server.maps.clone();
+    let geos = server.geos.clone();
+    let splits = server.splits.clone();
+    let return_text = server.return_text.clone();
+    let limit_conns = server.limit_conns.clone();
 
     loop {
         tokio::select! {
@@ -1582,57 +1596,171 @@ async fn serve_udp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                // UDP: one backend per client session, chosen once so the
-                // session keeps talking to the same peer.
+
+                // Expire sessions past proxy_timeout. The session task's own
+                // timeout releases the guards at the same moment.
+                let timeout = server.proxy_timeout;
+                sessions.retain(|_, s| s.last_seen.elapsed() < timeout);
+
+                // A `return` server answers the datagram directly; the
+                // variable view sees the client's address (stream_udp_stream.t
+                // relies on `$remote_port` staying stable per session).
+                if let Some(text) = &return_text {
+                    let v = crate::streamvars::Vars {
+                        peer,
+                        peer_unix: false,
+                        eff: None,
+                        local: server.listen,
+                        udp: true,
+                        maps: &maps,
+                        geos: &geos,
+                        ssl: None,
+                        proxy_protocol: None,
+                        custom: &NO_CUSTOM,
+                        splits: &splits,
+                        connection: crate::stats::accepted(),
+                    };
+                    let body = v.expand(text);
+                    let _ = sock.send_to(body.as_bytes(), peer).await;
+                    continue;
+                }
+
+                // Existing session: forward the datagram, bump the request
+                // counter. The session task watches for completion.
+                if let Some(sess) = sessions.get_mut(&peer) {
+                    sess.last_seen = std::time::Instant::now();
+                    let _ = sess.up.send(&buf[..n]).await;
+                    continue;
+                }
+
+                // New session: `limit_conn zone n` counts per client address;
+                // a rejected datagram is dropped with no reply.
+                let mut conn_guards: Vec<crate::limit::ConnGuard> = Vec::new();
+                {
+                    let mut held: Vec<crate::limit::ConnGuard> = Vec::new();
+                    let mut rejected = false;
+                    for (zone, limit) in &limit_conns {
+                        let key = match peer.ip() {
+                            std::net::IpAddr::V4(v4) => v4
+                                .octets()
+                                .iter()
+                                .map(|b| *b as char)
+                                .collect::<String>(),
+                            std::net::IpAddr::V6(v6) => v6
+                                .octets()
+                                .iter()
+                                .map(|b| *b as char)
+                                .collect::<String>(),
+                        };
+                        let z = zone_for(zone, &key);
+                        match z.acquire(&key, *limit, None) {
+                            Some(g) => held.push(g),
+                            None => {
+                                rejected = true;
+                                break;
+                            }
+                        }
+                    }
+                    if rejected {
+                        continue;
+                    }
+                    conn_guards = held;
+                }
+
+                // Pick the backend; the slot stays counted for the session's
+                // lifetime (least_conn / max_conns balance on it).
+                let hash_key = if server.peers.hash_key.is_empty() {
+                    None
+                } else {
+                    Some(
+                        crate::streamvars::Vars {
+                            peer,
+                            peer_unix: false,
+                            eff: None,
+                            local: server.listen,
+                            udp: true,
+                            maps: &maps,
+                            geos: &geos,
+                            ssl: None,
+                            proxy_protocol: None,
+                            custom: &NO_CUSTOM,
+                            splits: &splits,
+                            connection: crate::stats::accepted(),
+                        }
+                        .expand(&server.peers.hash_key),
+                    )
+                };
                 let mut tried = vec![false; server.peers.len()];
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
-                let backend = match server.peers.pick(&mut tried, None, now) {
-                    Some(i) => {
-                        // A UDP "connection" is a session, not a socket: the
-                        // slot is taken for the pick and released at once so a
-                        // long-lived session does not pin `max_conns`.
-                        let a = server.peers.addr(i);
-                        server.peers.release(i, true, now);
-                        a
-                    }
-                    None => continue,
-                };
-                let up = if let Some(s) = sessions.get(&peer) {
-                    s.clone()
+                let backend_idx =
+                    match server.peers.pick(&mut tried, hash_key.as_deref(), now) {
+                        Some(i) => i,
+                        None => continue,
+                    };
+                let backend = server.peers.addr(backend_idx);
+                let bind_addr: SocketAddr = if backend.is_ipv4() {
+                    "0.0.0.0:0".parse().unwrap()
                 } else {
-                    let bind_addr: SocketAddr = if backend.is_ipv4() {
-                        "0.0.0.0:0".parse().unwrap()
-                    } else {
-                        "[::]:0".parse().unwrap()
-                    };
-                    let s = match UdpSocket::bind(bind_addr).await {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-                    if s.connect(backend).await.is_err() {
+                    "[::]:0".parse().unwrap()
+                };
+                let up = match UdpSocket::bind(bind_addr).await {
+                    Ok(s) => Arc::new(s),
+                    Err(_) => {
+                        server.peers.release(backend_idx, false, now);
                         continue;
                     }
-                    let s = Arc::new(s);
-                    sessions.insert(peer, s.clone());
-                    s
                 };
+                if up.connect(backend).await.is_err() {
+                    server.peers.release(backend_idx, false, now);
+                    continue;
+                }
+
+                let requests = Arc::new(std::sync::atomic::AtomicU32::new(1));
+                let responses = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+                sessions.insert(peer, UdpSession {
+                    up: up.clone(),
+                    last_seen: std::time::Instant::now(),
+                });
                 let _ = up.send(&buf[..n]).await;
 
-                // Reply path for this session (one task per client session).
-                let socks = sock.clone();
-                let up2 = up.clone();
+                // Session task: relay upstream responses to the client, watch
+                // for completion (`responses >= proxy_responses * requests`),
+                // and hold the limit_conn + peer guards for the session's
+                // lifetime. When the session completes (or times out), the
+                // guards drop here — immediately freeing the slots so
+                // least_conn sees the peer as available.
+                let sock2 = sock.clone();
                 let timeout = server.proxy_timeout;
+                let responses_wanted = server.proxy_responses;
+                let peer_guard = server.peers.guard(backend_idx);
                 tokio::spawn(async move {
                     let mut rbuf = vec![0u8; 65535];
+                    let _guards = conn_guards;
+                    let _peer_guard = peer_guard;
                     loop {
-                        match tokio::time::timeout(timeout, up2.recv(&mut rbuf)).await {
+                        match tokio::time::timeout(timeout, up.recv(&mut rbuf)).await {
                             Ok(Ok(m)) => {
-                                let _ = socks.send_to(&rbuf[..m], peer).await;
+                                let _ = sock2.send_to(&rbuf[..m], peer).await;
+                                responses
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let r = responses
+                                    .load(std::sync::atomic::Ordering::Relaxed);
+                                let q = requests
+                                    .load(std::sync::atomic::Ordering::Relaxed);
+                                if responses_wanted > 0 && r >= responses_wanted * q {
+                                    // Dropping _guards/_peer_guard releases the
+                                    // limit_conn and peer slots.
+                                    return;
+                                }
                             }
-                            _ => return,
+                            _ => {
+                                return;
+                            }
                         }
                     }
                 });

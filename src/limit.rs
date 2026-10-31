@@ -132,6 +132,7 @@ impl ConnZone {
             });
         }
         let list = slots.entry(key.to_string()).or_default();
+        eprintln!("ngxrs: [dbg-lc] T={} zone acquire key={:?} len={} limit={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_millis(), key, list.len(), limit);
         if list.len() as u32 >= limit {
             let before = list.len();
             list.retain(|s| match s.fd {
@@ -183,6 +184,7 @@ pub struct ConnGuard {
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
+        eprintln!("ngxrs: [dbg-lc] T={} ConnGuard drop key={:?} id={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_millis(), self.key, self.id);
         if !self.counted {
             return;
         }

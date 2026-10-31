@@ -360,6 +360,7 @@ pub fn serve(cfg: Config) -> io::Result<()> {
             sinks: crate::config::typed::open_sinks(&sc.error_logs),
             tls: stream_tls(&sc),
             return_text: sc.return_text.clone(),
+            proxy_responses: sc.proxy_responses,
             proxy_ssl: sc.proxy_ssl,
             proxy_ssl_session_reuse: sc.proxy_ssl_session_reuse,
             proxy_ssl_name: sc.proxy_ssl_name.clone(),

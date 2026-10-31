@@ -361,6 +361,13 @@ pub fn serve(cfg: Config) -> io::Result<()> {
             tls: stream_tls(&sc),
             return_text: sc.return_text.clone(),
             proxy_responses: sc.proxy_responses,
+            upstream_name: if sc.proxy_pass.as_deref().is_some_and(|p| {
+                cfg.stream.upstreams.iter().any(|u| &u.name == p)
+            }) {
+                sc.proxy_pass.clone()
+            } else {
+                None
+            },
             proxy_ssl: sc.proxy_ssl,
             proxy_ssl_session_reuse: sc.proxy_ssl_session_reuse,
             proxy_ssl_name: sc.proxy_ssl_name.clone(),

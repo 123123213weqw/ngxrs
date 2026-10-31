@@ -79,6 +79,9 @@ pub struct StreamServer {
     /// `proxy_responses <n>`: upstream answers that complete a UDP session
     /// (0 = unlimited, session lives until `proxy_timeout`).
     pub proxy_responses: u32,
+    /// The upstream group name (`proxy_pass u2` → `u2`), for `$upstream_addr`
+    /// when no live upstreams exist.
+    pub upstream_name: Option<String>,
     /// `proxy_ssl on`: speak TLS to the upstream.
     pub proxy_ssl: bool,
     /// `proxy_ssl_session_reuse`: hand the client config to the resumption
@@ -365,6 +368,7 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                 let dl_rate = server.proxy_download_rate;
                 let ul_rate = server.proxy_upload_rate;
                 let resolver = server.resolver.clone();
+                let upstream_name = server.upstream_name.clone();
                 let next_upstream_tries = server.next_upstream_tries;
                 let limit_conns = server.limit_conns.clone();
                 let tcp_nodelay = server.tcp_nodelay;
@@ -662,6 +666,14 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                     };
                     while upstream.is_none() && attempts < max_attempts {
                         let Some(idx) = peers.pick(&mut tried, hash_key.as_deref(), now()) else {
+                            // No live upstreams: nginx logs the group name as
+                            // `$upstream_addr` (stream_upstream_zone.t).
+                            if let Some(name) = &upstream_name {
+                                if let Some(l) = alog.as_mut() {
+                                    l.start_attempt(name);
+                                    l.finish_attempt(0, 0);
+                                }
+                            }
                             break;
                         };
                         attempts += 1;

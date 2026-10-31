@@ -82,6 +82,8 @@ pub struct StreamServer {
     /// The upstream group name (`proxy_pass u2` → `u2`), for `$upstream_addr`
     /// when no live upstreams exist.
     pub upstream_name: Option<String>,
+    /// Zone key expressions: (name, key expr from ).
+    pub limit_conn_zone_keys: Vec<(String, String)>,
     /// `proxy_ssl on`: speak TLS to the upstream.
     pub proxy_ssl: bool,
     /// `proxy_ssl_session_reuse`: hand the client config to the resumption
@@ -371,6 +373,7 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                 let upstream_name = server.upstream_name.clone();
                 let next_upstream_tries = server.next_upstream_tries;
                 let limit_conns = server.limit_conns.clone();
+                let limit_conn_zone_keys = server.limit_conn_zone_keys.clone();
                 let tcp_nodelay = server.tcp_nodelay;
                 let half_close = server.proxy_half_close;
                 let proxy_pass_var = server.proxy_pass_var.clone();
@@ -419,13 +422,26 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                             let key = if peer_unix {
                                 "unix:".to_string()
                             } else {
-                                match peer.ip() {
-                                    std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
-                                    std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
-                                }
-                                .iter()
-                                .map(|b| *b as char)
-                                .collect()
+                                let key_expr = limit_conn_zone_keys
+                                    .iter()
+                                    .find(|(n, _)| n == zone)
+                                    .map(|(_, k)| k.clone())
+                                    .unwrap_or_else(|| "$binary_remote_addr".to_string());
+                                let v = crate::streamvars::Vars {
+                                    peer,
+                                    peer_unix,
+                                    eff: None,
+                                    local: client_local.unwrap_or(peer),
+                                    udp: false,
+                                    maps: &maps,
+                                    geos: &geos,
+                                    ssl: None,
+                                    proxy_protocol: None,
+                                    custom: &NO_CUSTOM,
+                                    splits: &splits,
+                                    connection: crate::stats::accepted(),
+                                };
+                                v.expand(&key_expr)
                             };
                             let z = zone_for(zone, &key);
                             match z.acquire(&key, *limit, None) {
@@ -572,7 +588,7 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                                 base_vars(
                                     peer,
                                     peer_unix,
-                                    eff,
+                                    None,
                                     local.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
                                     &maps,
                                     &geos,

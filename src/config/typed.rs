@@ -1900,6 +1900,8 @@ pub struct StreamServerCfg {
     /// `proxy_responses <n>`: upstream answers that complete a UDP session
     /// (0 = unlimited, session lives until `proxy_timeout`).
     pub proxy_responses: u32,
+    /// `limit_conn_zone` declarations at stream level: (name, key expr).
+    pub limit_conn_zone_keys: Vec<(String, String)>,
     /// `ssl_verify_client`: 0 off, 1 on, 2 optional, 3 optional_no_ca.
     pub ssl_verify_client: u8,
     /// `ssl_client_certificate`: trust anchors for the client chain.
@@ -5301,6 +5303,7 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
     // nginx's stream default proxy_timeout is 10m.
     let mut stream_proxy_timeout = std::time::Duration::from_secs(600);
     let mut stream_proxy_responses: u32 = 0;
+    let mut stream_proxy_responses_keys: Vec<(String, String)> = Vec::new();
 
     for d in dirs {
         match d.name.as_str() {
@@ -5447,7 +5450,6 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                 }
             }
             "resolver"
-            | "limit_conn_zone"
             | "limit_req_zone"
             | "variables_hash_max_size"
             | "variables_hash_bucket_size"
@@ -5551,6 +5553,21 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
                     stream_proxy_responses = v.parse().unwrap_or(0);
                 }
             }
+            "limit_conn_zone" => {
+                if let (Some(key), Some(zspec)) =
+                    (d.args.first(), d.args.get(1))
+                {
+                    if let Some(name) = zspec
+                        .split_once("zone=")
+                        .and_then(|(_, rest)| rest.split(':').next())
+                    {
+                        stream_proxy_responses_keys.push((
+                            name.to_string(),
+                            key.clone(),
+                        ));
+                    }
+                }
+            }
             other => b.warn(
                 d,
                 format!("unknown directive \"{other}\" in stream context; ignored"),
@@ -5589,6 +5606,7 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
             return_text: None,
             proxy_timeout: stream_proxy_timeout,
             proxy_responses: stream_proxy_responses,
+            limit_conn_zone_keys: stream_proxy_responses_keys.clone(),
             proxy_connect_timeout: Duration::from_secs(60),
             ssl_verify_client: stream_verify_client,
             ssl_client_certificate: stream_client_ca.clone(),
@@ -5893,6 +5911,7 @@ fn build_stream(dirs: &[Directive], b: &mut Builder) -> Result<StreamSection, Co
         //  inherits independently of the timeout pair.
         if !per_server_responses {
             cfg.proxy_responses = stream_proxy_responses;
+            cfg.limit_conn_zone_keys = stream_proxy_responses_keys.clone();
         }
         // A server that says nothing inherits the `stream {}` default; the
         // directive is off when neither mentions it.

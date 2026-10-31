@@ -339,6 +339,7 @@ pub fn serve(cfg: Config) -> io::Result<()> {
             listen: sc.listen,
             access: sc.access.clone(),
             limit_conns: sc.limit_conns.clone(),
+            limit_conn_zone_keys: sc.limit_conn_zone_keys.clone(),
             proxy_download_rate: sc.proxy_download_rate,
             proxy_upload_rate: sc.proxy_upload_rate,
             realip_from: sc.realip_from.clone(),

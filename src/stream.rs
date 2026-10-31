@@ -283,6 +283,17 @@ async fn accept_stream(l: &Lsn) -> std::io::Result<Accepted> {
 
 /// Run every stream listener until `shutdown` fires.
 pub async fn serve(cfg: Arc<StreamConfig>, mut shutdown: watch::Receiver<bool>) {
+    // Pre-create access_log files (nginx opens them at configuration load).
+    for server in &cfg.servers {
+        for al in &server.access_logs {
+            if !al.path.exists() {
+                if let Some(parent) = al.path.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                std::fs::File::create(&al.path).ok();
+            }
+        }
+    }
     let mut handles = Vec::new();
     for server in cfg.servers.clone() {
         let mut sd = shutdown.clone();
@@ -367,6 +378,14 @@ async fn serve_tcp(server: StreamServer, shutdown: &mut watch::Receiver<bool>) {
                 let realip_from = server.realip_from.clone();
                 let realip_unix = server.realip_from_unix;
                 let access = server.access.clone();
+                // Pre-create access_log files (nginx opens them at startup).
+                for al in &server.access_logs {
+                    let p = &al.path;
+                    if !p.exists() {
+                        std::fs::create_dir_all(p.parent().unwrap_or(std::path::Path::new("."))).ok();
+                        std::fs::File::create(p).ok();
+                    }
+                }
                 let dl_rate = server.proxy_download_rate;
                 let ul_rate = server.proxy_upload_rate;
                 let resolver = server.resolver.clone();
@@ -1259,6 +1278,8 @@ pub struct StreamAccessLog {
     protocol: &'static str,
     started: std::time::Instant,
     pub status: u16,
+    /// The system hostname for `$hostname`.
+    pub hostname: String,
     /// One entry per upstream attempt: nginx logs `$upstream_addr` and the byte
     /// counters as comma-separated per-try lists, so a retry after a refused
     /// connect shows both peers (`stream_upstream.t`, "per-upstream variables").
@@ -1289,6 +1310,10 @@ impl StreamAccessLog {
             protocol,
             started: std::time::Instant::now(),
             status: 200,
+            hostname: std::fs::read_to_string("/proc/sys/kernel/hostname")
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase(),
             attempts: Vec::new(),
         })
     }
@@ -1349,6 +1374,34 @@ impl Drop for StreamAccessLog {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
+        let bytes_sent_s = self
+            .attempts
+            .iter()
+            .map(|a| a.sent.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let bytes_recv_s = self
+            .attempts
+            .iter()
+            .map(|a| a.received.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let time_local = crate::util::strftime_gmt(
+            now,
+            "%d/%b/%Y:%H:%M:%S +0000",
+        );
+        let time_iso8601 = crate::util::strftime_gmt(
+            now,
+            "%Y-%m-%dT%H:%M:%S+00:00",
+        );
+        let msec = format!(
+            "{}.{:03}",
+            now,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_millis())
+                .unwrap_or(0)
+        );
         let vars: Vec<(&str, &str)> = vec![
             ("upstream_addr", &upstream_addr),
             ("upstream_bytes_sent", &upstream_sent),
@@ -1360,9 +1413,13 @@ impl Drop for StreamAccessLog {
             ("server_port", &server_port),
             ("protocol", self.protocol),
             ("session_time", &session),
-            ("bytes_sent", "-"),
-            ("bytes_received", "-"),
-            ("time_local", ""),
+            ("bytes_sent", &bytes_sent_s),
+            ("bytes_received", &bytes_recv_s),
+            ("time_local", &time_local),
+            ("time_iso8601", &time_iso8601),
+            ("msec", &msec),
+            ("nginx_version", crate::COMPAT_VERSION),
+            ("hostname", &self.hostname),
         ];
         for log in &self.logs {
             let line = crate::http::expand_log(&log.format, &vars, now);

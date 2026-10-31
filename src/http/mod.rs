@@ -7359,7 +7359,7 @@ fn path_prefix_of(resolved: &std::path::Path, tmpl: &str) -> Option<std::path::P
 }
 
 /// `access_log ... escape=`: nginx escapes `"`, `\` and every byte below 0x20.
-fn escape_log_value(line: &str, mode: crate::config::Escape) -> String {
+pub(crate) fn escape_log_value(line: &str, mode: crate::config::Escape) -> String {
     use crate::config::Escape;
     if mode == Escape::None {
         return line.to_string();

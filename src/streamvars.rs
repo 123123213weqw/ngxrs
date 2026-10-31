@@ -126,6 +126,32 @@ impl Vars<'_> {
             }
             "status" => "200".to_string(),
             "bytes_sent" | "bytes_received" => "0".to_string(),
+            "nginx_version" => crate::COMPAT_VERSION.to_string(),
+            "hostname" => std::fs::read_to_string("/proc/sys/kernel/hostname")
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase(),
+            "pid" => std::process::id().to_string(),
+            "msec" => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                format!("{}.{:03}", now.as_secs(), now.subsec_millis())
+            }
+            "time_local" => crate::util::strftime_gmt(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+                "%d/%b/%Y:%H:%M:%S +0000",
+            ),
+            "time_iso8601" => crate::util::strftime_gmt(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+                "%Y-%m-%dT%H:%M:%S+00:00",
+            ),
             "session_time" => "0.000".to_string(),
             "connection" => self.connection.to_string(),
             "connection_requests" => "1".to_string(),

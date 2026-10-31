@@ -5193,6 +5193,45 @@ fn parse_geo(d: &Directive) -> Result<crate::geo::GeoDef, ConfigError> {
                     def.delete(v);
                 }
             }
+            "include" => {
+                // `include` inside a geo block: the file contains one geo
+                // entry per line (`CIDR value;` or `from-to value;`). nginx
+                // reads the file and parses each line as an entry, not as a
+                // general config directive. The file path is relative to the
+                // prefix.
+                let path = match c.args.first() {
+                    Some(p) => p.clone(),
+                    None => continue,
+                };
+                let full = if std::path::Path::new(&path).is_absolute() {
+                    std::path::PathBuf::from(&path)
+                } else {
+                    std::path::Path::new(d.file.as_os_str())
+                        .parent()
+                        .unwrap_or(std::path::Path::new("."))
+                        .join(&path)
+                };
+                let content = std::fs::read_to_string(&full).unwrap_or_default();
+                for line in content.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    // Strip trailing ';' and split into key + value.
+                    let line = line.strip_suffix(';').unwrap_or(line);
+                    let mut parts = line.splitn(2, ' ');
+                    let key = parts.next().unwrap_or("").trim();
+                    let value = parts.next().unwrap_or("").trim();
+                    if key.is_empty() {
+                        continue;
+                    }
+                    if key == "default" {
+                        def.set_default(value.to_string());
+                    } else {
+                        def.add(key, value.to_string());
+                    }
+                }
+            }
             key => {
                 if let Some(v) = c.args.first() {
                     def.add(key, v.clone());

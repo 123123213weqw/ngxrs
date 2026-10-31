@@ -64,6 +64,24 @@ impl GeoDef {
     pub fn add(&mut self, key: &str, value: String) -> bool {
         if self.ranges {
             if let Some((s, e)) = parse_range(key) {
+                // Fast path: a range that starts after the last range's end
+                // cannot overlap with anything, so subtract is a no-op. The
+                // geo_binary.t test has 100K sequential non-overlapping
+                // ranges — O(n) instead of O(n^2).
+                if self
+                    .ranges_v
+                    .last()
+                    .map(|last| last.v6 == s.1 && s.0 > last.end)
+                    .unwrap_or(true)
+                {
+                    self.ranges_v.push(Range {
+                        start: s.0,
+                        end: e.0,
+                        v6: s.1,
+                        value,
+                    });
+                    return true;
+                }
                 self.subtract(s.0, e.0, s.1);
                 self.ranges_v.push(Range {
                     start: s.0,
